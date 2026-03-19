@@ -28,6 +28,15 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Staleness rebalance configuration
+  # When a sample's staleness (current_param_version - sample_start_version) exceeds this threshold,
+  # idle rollout instances will be scheduled to help process stale samples
+  staleness_rebalance_threshold: 3
+
+  # Maximum number of historical weight versions to keep in checkpoint engine
+  # This allows idle rollout instances to fetch historical weights for stale samples
+  max_weight_versions: 5
+
 # Rollout config
 rollout:
 

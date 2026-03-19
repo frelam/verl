@@ -148,15 +148,23 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         super().__init__(config, worker_group, rollout_resource_pool, reward_loop_worker_handles)
 
     @auto_await
-    async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
+    async def generate_sequences_single(
+        self, prompts: DataProto, worker_id: int = None, required_param_version: int = None
+    ) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
         Args:
             prompts (DataProto): Input batch. Single sample data
+            worker_id (int, optional): Specific worker to use. If None, uses round-robin.
+            required_param_version (int, optional): Required parameter version for the worker.
+
         Returns:
             DataProto: Output batch.
         """
-        worker = self._select_best_worker()
+        if worker_id is not None and 0 <= worker_id < len(self.agent_loop_workers):
+            worker = self.agent_loop_workers[worker_id]
+        else:
+            worker = self._select_best_worker()
         output_future = worker.generate_sequences.remote(prompts)
         return await asyncio.wrap_future(output_future.future())
 

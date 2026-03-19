@@ -190,8 +190,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Setup checkpoint manager after rollouter is initialized"""
         replicas = ray.get(rollouter.get_replicas.remote())
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        max_weight_versions = self.config.async_training.get("max_weight_versions", 5)
         self.checkpoint_manager = CheckpointEngineManager(
-            config=checkpoint_engine_config, trainer=self.actor_wg, replicas=replicas
+            config=checkpoint_engine_config,
+            trainer=self.actor_wg,
+            replicas=replicas,
+            max_weight_versions=max_weight_versions,
         )
         print("[FullyAsyncTrainer] Checkpoint manager initialized")
 
@@ -518,14 +522,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"self.current_param_version: {self.current_param_version}"
         )
 
-        # Reset staleness in rollouter
-        timing_raw = ray.get(self.rollouter.reset_staleness.remote())
+        timing_raw = ray.get(self.rollouter.reset_staleness.remote(new_param_version=self.current_param_version))
         self.logger.log(
             data=timing_raw,
             step=self.current_param_version,
         )
 
-        # Log aggregated training metrics
         self.logger.log(
             data=self.metrics_aggregator.get_aggregated_metrics(),
             step=self.current_param_version,

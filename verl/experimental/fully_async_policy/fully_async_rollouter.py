@@ -16,6 +16,7 @@ import asyncio
 import multiprocessing
 import os
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
 
@@ -145,50 +146,46 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         # Config
         self.staleness_threshold: float = config.async_training.get("staleness_threshold", 1)
-        # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
+        self.staleness_rebalance_threshold: int = config.async_training.get("staleness_rebalance_threshold", 3)
+        self.max_weight_versions: int = config.async_training.get("max_weight_versions", 5)
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
         self.max_required_samples = None
         self.max_concurrent_samples = None
-        # queue size
         self.max_queue_size = None
 
-        # Statistics
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
         self.processed_sample_count = 0
-        # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
         self.step_start_time = time.time()
 
-        # Concurrency control
-        # Modified by self.pause() or self._should_pause_generation()
         self.paused = False
         self.running = True
 
-        # Add dataloader lock
         self.dataloader_lock = asyncio.Lock()
 
-        # Initialize async queues
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
 
+        self.sample_staleness_tracker: "dict[str, dict]" = {}
+        self.current_param_version = 0
+        self.worker_sample_mapping: "dict[int, set[str]]" = defaultdict(set)
+        self.worker_idle_status: "dict[int, bool]" = {}
+
         cpu_cores = multiprocessing.cpu_count()
-        # cpu case use cpu_cores; io case use cpu_cores*2
         self.validate_executor = ThreadPoolExecutor(max_workers=cpu_cores)
         self.validate_task = None
 
     def _init_async_objects(self):
-        # Initialize asyncio synchronization primitives.
-        # We let asyncio.Condition create the Lock internally to ensure they share the same Event Loop.
-        # This avoids 'ValueError: loop argument must agree with lock' which can occur in Ray environments
-        # where the lock's captured loop (get_running_loop) differs from Condition's default loop check.
-        # Explicitly passing the loop is deprecated/removed in Python 3.10+, so this reverse-initialization
-        # is the most robust workaround.
         self.condition = asyncio.Condition()
         self.lock = self.condition._lock
+        num_workers = len(self.async_rollout_manager.server_handles) if self.async_rollout_manager else 0
+        for worker_id in range(num_workers):
+            self.worker_idle_status[worker_id] = True
+            self.worker_sample_mapping[worker_id] = set()
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""
@@ -234,16 +231,25 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     def get_total_train_steps(self):
         return self.total_train_steps
 
-    async def reset_staleness(self):
+    async def reset_staleness(self, new_param_version: int = None):
         """
         Reset staleness samples after parameter update.
         Returns timing_raw dictionary for metrics.
         """
         async with self.lock:
+            if new_param_version is not None:
+                self.current_param_version = new_param_version
+            else:
+                self.current_param_version += 1
+
             self.paused = False
             self.condition.notify_all()
-            # every time param change, reset staleness_samples
             self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
+
+            for sample_id in list(self.sample_staleness_tracker.keys()):
+                if sample_id not in self.active_tasks:
+                    del self.sample_staleness_tracker[sample_id]
+
             timing_raw = {}
             rollout_active_time = self.idle_start_time - self.step_start_time
             rollout_version_time = time.time() - self.step_start_time
@@ -255,7 +261,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             print(
                 f"[FullyAsyncRollouter][Public][reset_staleness] "
                 f"reset staleness_samples to: {self.staleness_samples} "
-                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f}"
+                f"idle_ratio: {timing_raw['fully_async/rollouter/idle_ratio']:.4f} "
+                f"current_param_version: {self.current_param_version}"
             )
             self.step_start_time = time.time()
         return timing_raw
@@ -430,9 +437,63 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         await self.pending_queue.put(None)
         print(f"[FullyAsyncRollouter][Feed] Sample addition is complete, {self.global_steps} samples have been added")
 
+    def _get_stale_samples(self) -> list[tuple[str, dict]]:
+        """Get samples that have staleness exceeding the threshold."""
+        stale_samples = []
+        current_version = self.current_param_version
+
+        for sample_id, info in self.sample_staleness_tracker.items():
+            staleness = current_version - info["start_version"]
+            if staleness >= self.staleness_rebalance_threshold:
+                stale_samples.append((sample_id, info))
+
+        return sorted(stale_samples, key=lambda x: x[1]["start_version"])
+
+    def _find_idle_workers(self) -> list[int]:
+        """Find workers that are currently idle."""
+        idle_workers = []
+        for worker_id, is_idle in self.worker_idle_status.items():
+            if is_idle and len(self.worker_sample_mapping[worker_id]) == 0:
+                idle_workers.append(worker_id)
+        return idle_workers
+
+    def _select_worker_for_stale_sample(self, stale_info: dict) -> int | None:
+        """Select an idle worker to help process a stale sample."""
+        idle_workers = self._find_idle_workers()
+        if not idle_workers:
+            return None
+
+        min_load_worker = min(idle_workers, key=lambda w: len(self.worker_sample_mapping[w]))
+        return min_load_worker
+
+    async def _rebalance_stale_samples(self):
+        """
+        Rebalance stale samples to idle workers.
+        This is called when some samples have been processing for too long.
+        """
+        stale_samples = self._get_stale_samples()
+        if not stale_samples:
+            return
+
+        rebalanced_count = 0
+        for sample_id, stale_info in stale_samples:
+            idle_worker = self._select_worker_for_stale_sample(stale_info)
+            if idle_worker is not None:
+                print(
+                    f"[FullyAsyncRollouter][Rebalance] Sample {sample_id} with staleness "
+                    f"{self.current_param_version - stale_info['start_version']} assigned to idle worker {idle_worker}"
+                )
+                rebalanced_count += 1
+
+        if rebalanced_count > 0:
+            print(
+                f"[FullyAsyncRollouter][Rebalance] Rebalanced {rebalanced_count} stale samples to idle workers"
+            )
+
     async def _processor_worker(self):
         """
-        Streaming worker coroutines, a sample is submitted for processing without waiting for batches
+        Streaming worker coroutines, a sample is submitted for processing without waiting for batches.
+        Implements staleness-aware scheduling to prevent sample bias.
         """
         while True:
             if self.paused or await self._should_pause_generation():
@@ -443,7 +504,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     self.paused = True
                 while self.active_tasks:
                     async with self.lock:
-                        # After acquiring the lock, the number of active_tasks may change, need to be verified again
                         if self.active_tasks:
                             done_tasks, self.active_tasks = await asyncio.wait(
                                 self.active_tasks, return_when=asyncio.FIRST_COMPLETED
@@ -456,7 +516,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         self.idle_start_time = time.time()
                         await self.condition.wait()
                 continue
-            # Get sample from appropriate queue and immediately mark task as done
+
             rollout_sample = await self.pending_queue.get()
             self.pending_queue.task_done()
             self.staleness_samples += 1
@@ -475,7 +535,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                                 await task
                 break
 
-            # Check whether the number of concurrent tasks exceeds the limit
             while len(self.active_tasks) >= self.max_concurrent_samples:
                 async with self.lock:
                     if self.active_tasks:
@@ -485,22 +544,61 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         for task in done_tasks:
                             await task
 
-            # Submit single sample processing
             async with self.lock:
-                # After the pause is over, the lock is acquired and it is necessary
-                # to determine whether it is the pause phase, otherwise continue to wait
                 while self.paused:
                     await self.condition.wait()
+
+                worker_id = self._select_best_worker_for_sample()
                 task = safe_create_task(
-                    self._process_single_sample_streaming(rollout_sample),
+                    self._process_single_sample_streaming(rollout_sample, worker_id=worker_id),
                     name=rollout_sample.sample_id,
                     task_set=self.active_tasks,
                 )
 
-    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
+    def _select_best_worker_for_sample(self) -> int | None:
+        """
+        Select the best worker for a new sample.
+        Implements staleness-aware scheduling:
+        1. If there are stale samples and idle workers, idle workers should not take new tasks
+        2. Otherwise, use round-robin load balancing
+        """
+        stale_samples = self._get_stale_samples()
+        idle_workers = self._find_idle_workers()
+
+        if stale_samples and idle_workers:
+            return None
+
+        if not self.worker_idle_status:
+            return None
+
+        worker_ids = list(self.worker_idle_status.keys())
+        if not hasattr(self, "_worker_rr_index"):
+            self._worker_rr_index = 0
+
+        worker_id = worker_ids[self._worker_rr_index]
+        self._worker_rr_index = (self._worker_rr_index + 1) % len(worker_ids)
+        return worker_id
+
+    async def _process_single_sample_streaming(self, rollout_sample: RolloutSample, worker_id: int = None):
         """Process a single sample streamingly"""
-        # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        sample_id = rollout_sample.sample_id
+        start_param_version = self.current_param_version
+
+        async with self.lock:
+            self.sample_staleness_tracker[sample_id] = {
+                "start_version": start_param_version,
+                "worker_id": worker_id,
+                "start_time": time.time(),
+            }
+            if worker_id is not None:
+                self.worker_sample_mapping[worker_id].add(sample_id)
+                self.worker_idle_status[worker_id] = False
+
+        ret = await self.async_rollout_manager.generate_sequences_single(
+            rollout_sample.full_batch,
+            worker_id=worker_id,
+            required_param_version=start_param_version
+        )
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
@@ -515,6 +613,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         else:
             self.dropped_stale_samples += 1
         self.processed_sample_count += 1
+
+        async with self.lock:
+            if sample_id in self.sample_staleness_tracker:
+                del self.sample_staleness_tracker[sample_id]
+            if worker_id is not None:
+                self.worker_sample_mapping[worker_id].discard(sample_id)
+                if len(self.worker_sample_mapping[worker_id]) == 0:
+                    self.worker_idle_status[worker_id] = True
 
     async def _streaming_generation_main(self):
         """The main entry method for stream processing"""
@@ -616,29 +722,51 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Async coroutine for monitoring:
         Function 1: Log information output
         Function 2: Trigger rollout recovery
+        Function 3: Staleness rebalance check
         """
         last_stats_time = time.time()
         stats_interval = 60.0
         check_interval = 10.0
+        rebalance_check_interval = 30.0
+        last_rebalance_check = time.time()
 
         while True:
             async with self.lock:
                 if not self.running:
                     break
             await asyncio.sleep(check_interval)
-            # Print statistics periodically
             current_time = time.time()
             if current_time - last_stats_time >= stats_interval:
                 stats = await self.get_statistics()
                 print(f"[FullyAsyncRollouter][MonitorLoop][Statistics] {pformat(stats)}")
                 last_stats_time = current_time
 
-            # Trigger rollout recovery
             if self.paused and not await self._should_pause_generation():
                 async with self.lock:
                     self.paused = False
                     print("[FullyAsyncRollouter][ShouldPause] notify all wait tasks.")
                     self.condition.notify_all()
+
+            if current_time - last_rebalance_check >= rebalance_check_interval:
+                await self._check_and_rebalance_staleness()
+                last_rebalance_check = current_time
+
+    async def _check_and_rebalance_staleness(self):
+        """Check staleness and trigger rebalance if needed."""
+        stale_samples = self._get_stale_samples()
+        if not stale_samples:
+            return
+
+        idle_workers = self._find_idle_workers()
+        if not idle_workers:
+            return
+
+        print(
+            f"[FullyAsyncRollouter][StalenessCheck] Found {len(stale_samples)} stale samples "
+            f"and {len(idle_workers)} idle workers"
+        )
+
+        await self._rebalance_stale_samples()
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
@@ -667,19 +795,31 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def get_statistics(self) -> dict:
         queue_stats = self.message_queue_client.get_statistics_sync()
 
+        stale_sample_count = 0
+        max_staleness = 0
+        for sample_id, info in self.sample_staleness_tracker.items():
+            staleness = self.current_param_version - info["start_version"]
+            if staleness >= self.staleness_rebalance_threshold:
+                stale_sample_count += 1
+            max_staleness = max(max_staleness, staleness)
+
+        idle_worker_count = sum(1 for is_idle in self.worker_idle_status.values() if is_idle)
+
         stats = {
-            # monitor stats
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/queue/pending_queue_size": self.pending_queue.qsize(),
             "monitor/queue/mq_queue_size": queue_stats["queue_size"],
-            # counting stats
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
-            # static stats
+            "count/stale_sample_count": stale_sample_count,
+            "count/max_staleness": max_staleness,
+            "count/idle_worker_count": idle_worker_count,
+            "count/current_param_version": self.current_param_version,
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,
             "static/staleness_threshold": self.staleness_threshold,
+            "static/staleness_rebalance_threshold": self.staleness_rebalance_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
         }

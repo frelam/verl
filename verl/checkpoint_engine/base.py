@@ -332,6 +332,7 @@ class CheckpointEngineManager:
         config: The checkpoint engine config.
         trainer: The trainer worker group.
         replicas: The list of rollout replicas.
+        max_weight_versions: Maximum number of historical weight versions to keep.
     """
 
     def __init__(
@@ -339,12 +340,16 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         trainer: RayWorkerGroup,
         replicas: list[RolloutReplica],
+        max_weight_versions: int = 5,
     ) -> None:
         self.config = config
         self.backend = config.backend
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
+        self.max_weight_versions = max_weight_versions
+        self.weight_version_cache: "dict[int, dict[str, torch.Tensor]]" = {}
+        self.current_version = 0
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -443,3 +448,55 @@ class CheckpointEngineManager:
 
         # 8. resume all unfinished requests for partial rollout
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
+
+    def _save_weight_version(self, version: int, weights: dict[str, torch.Tensor]):
+        """Save a weight version to the cache.
+
+        Args:
+            version: The version number of the weights.
+            weights: Dictionary of weight name to tensor.
+        """
+        self.weight_version_cache[version] = weights
+        self.current_version = version
+        
+        versions_to_remove = sorted(self.weight_version_cache.keys())
+        while len(versions_to_remove) > self.max_weight_versions:
+            oldest_version = versions_to_remove.pop(0)
+            del self.weight_version_cache[oldest_version]
+            print(f"[CheckpointEngineManager] Removed oldest weight version {oldest_version}")
+
+    def get_weight_version(self, version: int) -> dict[str, torch.Tensor] | None:
+        """Get a specific weight version from the cache.
+
+        Args:
+            version: The version number of the weights to retrieve.
+
+        Returns:
+            Dictionary of weight name to tensor, or None if version not found.
+        """
+        return self.weight_version_cache.get(version)
+
+    def get_available_versions(self) -> list[int]:
+        """Get list of available weight versions.
+
+        Returns:
+            List of version numbers available in the cache.
+        """
+        return sorted(self.weight_version_cache.keys())
+
+    @auto_await
+    async def update_weights_with_version(self, global_steps: int = None, target_version: int = None):
+        """Update weights from trainer to rollout replicas with version tracking.
+
+        Args:
+            global_steps: The global steps of the trainer.
+            target_version: If specified, update to this specific version instead of latest.
+        """
+        if target_version is not None and target_version in self.weight_version_cache:
+            print(f"[CheckpointEngineManager] Using cached weight version {target_version}")
+            return
+        
+        await self.update_weights(global_steps=global_steps)
+        
+        if global_steps is not None:
+            self.current_version = global_steps
