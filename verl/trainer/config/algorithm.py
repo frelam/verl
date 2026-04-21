@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "RewardResampleConfig", "KLControlConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -54,6 +54,46 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class RewardResampleConfig(BaseConfig):
+    """Configuration for reward-based resampling (used in DAPO/GRPO).
+
+    Dynamically adjusts sampling weights based on reward scores, allowing
+    low-reward samples to be sampled with higher probability. This helps
+    the model focus on harder prompts during training.
+
+    When group_key is set (default "uid"), resampling operates at the group level:
+    all samples sharing the same group key are treated as one unit. The group's
+    average reward determines the group's sampling weight, and the entire group
+    is resampled together. This is essential for GRPO/DAPO where advantages
+    are computed within groups.
+
+    Args:
+        enable (bool): Whether to enable reward-based resampling.
+        reweight_method (str): Method for computing weights from scores.
+            - "inverse_pow": weights = (max_score - score + eps) ^ weight_pow.
+              Lower scores get higher weights. weight_pow controls the strength.
+            - "softmax_inverse": weights = softmax(-score / temperature).
+              Lower scores get higher weights via softmax. temperature controls sharpness.
+            - "pow": weights = |score| ^ weight_pow (favors high reward, same as PF-PPO).
+            - "max_min": Only keep max and min score samples.
+            - "max_random": Weighted sampling favoring max score.
+        weight_pow (float): Power exponent for 'inverse_pow' and 'pow' methods. Default: 2.0.
+        temperature (float): Temperature for 'softmax_inverse' method. Lower = sharper. Default: 1.0.
+        score_key (str): Key in data.batch to use as scores. Default: "token_level_scores".
+        group_key (Optional[str]): Key in data.non_tensor_batch for group assignment.
+            Default: "uid" (group-level resampling). Set to null to disable group-level and
+            use sample-level resampling instead.
+    """
+
+    enable: bool = False
+    reweight_method: str = "inverse_pow"
+    weight_pow: float = 2.0
+    temperature: float = 1.0
+    score_key: str = "token_level_scores"
+    group_key: Optional[str] = "uid"
 
 
 @dataclass
@@ -658,6 +698,7 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    reward_resample: Optional[RewardResampleConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

@@ -2266,6 +2266,245 @@ def compute_pf_ppo_reweight_data(
     return resampled_data
 
 
+def compute_reward_based_resample(
+    data,
+    reweight_method: str = "inverse_pow",
+    weight_pow: float = 2.0,
+    temperature: float = 1.0,
+    score_key: str = "token_level_scores",
+    group_key: str = "uid",
+):
+    """Resample data based on reward scores with support for inverse and group-level weighting.
+
+    Unlike compute_pf_ppo_reweight_data which favors high-reward samples,
+    this function supports inverse weighting to increase the sampling probability
+    of low-reward samples, which is useful for DAPO/GRPO training to focus on
+    harder prompts.
+
+    When group_key is provided (default "uid"), resampling operates at the group level:
+    all samples sharing the same uid are treated as one unit. The group's average reward
+    determines the group's sampling weight, and the entire group is resampled together.
+    This is essential for GRPO/DAPO where advantages are computed within groups.
+
+    Supported reweight methods:
+        - "inverse_pow": weights = (max_score - score + eps) ^ weight_pow
+          Lower scores get higher weights. weight_pow controls the strength.
+        - "softmax_inverse": weights = softmax(-score / temperature)
+          Lower scores get higher weights via softmax. temperature controls sharpness.
+        - "pow": weights = |score| ^ weight_pow (same as PF-PPO, favors high reward)
+        - "max_min": Only keep max and min score samples (same as PF-PPO)
+        - "max_random": Weighted sampling favoring max score (same as PF-PPO)
+
+    Args:
+        data: DataProto object containing batch, non_tensor_batch and meta_info.
+        reweight_method: Method for computing weights from scores.
+        weight_pow: Power exponent for 'inverse_pow' and 'pow' methods.
+        temperature: Temperature for 'softmax_inverse' method. Lower = sharper.
+        score_key: Key in data.batch to use as scores. Defaults to "token_level_scores".
+        group_key: Key in data.non_tensor_batch for group assignment. Defaults to "uid".
+            When provided, resampling operates at group level. Set to None to disable.
+
+    Returns:
+        DataProto: Resampled data with the same structure.
+    """
+
+    @torch.no_grad()
+    def compute_weights(scores: torch.Tensor, reweight_method: str, weight_pow: float, temperature: float) -> torch.Tensor:
+        if reweight_method == "inverse_pow":
+            max_score = torch.max(scores)
+            weights = torch.pow(max_score - scores + 1e-8, weight_pow)
+        elif reweight_method == "softmax_inverse":
+            weights = torch.softmax(-scores / temperature, dim=0)
+        elif reweight_method == "pow":
+            weights = torch.pow(torch.abs(scores), weight_pow)
+        elif reweight_method == "max_min":
+            max_score = torch.max(scores)
+            min_score = torch.min(scores)
+            weights = torch.where((scores == max_score) | (scores == min_score), 1.0, 0.0)
+        elif reweight_method == "max_random":
+            max_score = torch.max(scores)
+            weights = torch.where(scores == max_score, 0.4, 0.1)
+        else:
+            raise ValueError(f"Unsupported reweight_method: {reweight_method}")
+        return weights
+
+    scores = data.batch[score_key].sum(dim=-1)
+
+    if group_key is not None and group_key in data.non_tensor_batch:
+        group_ids = data.non_tensor_batch[group_key]
+        unique_groups, group_indices_np = np.unique(group_ids, return_inverse=True)
+        num_groups = len(unique_groups)
+        group_indices = torch.from_numpy(group_indices_np)
+
+        group_scores_sum = torch.zeros(num_groups, dtype=scores.dtype, device=scores.device)
+        group_counts = torch.zeros(num_groups, dtype=torch.long, device=scores.device)
+        group_scores_sum.scatter_add_(0, group_indices, scores)
+        group_counts.scatter_add_(0, group_indices, torch.ones_like(scores, dtype=torch.long))
+        group_mean_scores = group_scores_sum / group_counts.clamp(min=1)
+
+        group_weights = compute_weights(group_mean_scores, reweight_method, weight_pow, temperature)
+        group_weights = torch.clamp(group_weights + 1e-8, min=1e-8)
+
+        num_sampled_groups = num_groups
+        sampled_group_indices = torch.multinomial(group_weights, num_sampled_groups, replacement=True)
+
+        sample_indices_list = []
+        for gid in sampled_group_indices:
+            member_mask = group_indices == gid
+            member_positions = torch.where(member_mask)[0]
+            sample_indices_list.append(member_positions)
+        sample_indices = torch.cat(sample_indices_list)
+
+        group_mean_score_values = group_mean_scores[sampled_group_indices]
+        resampled_group_mean = group_mean_score_values.mean().item()
+        original_group_mean = group_mean_scores.mean().item()
+    else:
+        weights = compute_weights(scores, reweight_method, weight_pow, temperature)
+        weights = torch.clamp(weights + 1e-8, min=1e-8)
+
+        batch_size = scores.shape[0]
+        sample_indices = torch.multinomial(weights, batch_size, replacement=True)
+        original_group_mean = scores.mean().item()
+        resampled_group_mean = data.batch[score_key].sum(dim=-1)[sample_indices].mean().item()
+
+    resampled_batch = {key: tensor[sample_indices] for key, tensor in data.batch.items()}
+
+    sample_indices_np = sample_indices.numpy()
+    resampled_non_tensor_batch = {}
+    for key, array in data.non_tensor_batch.items():
+        if isinstance(array, np.ndarray):
+            resampled_non_tensor_batch[key] = array[sample_indices_np]
+        else:
+            resampled_non_tensor_batch[key] = [array[i] for i in sample_indices_np]
+
+    resampled_meta_info = {}
+    for key, value in data.meta_info.items():
+        if isinstance(value, list) and len(value) == len(sample_indices_np):
+            resampled_meta_info[key] = [value[i] for i in sample_indices_np]
+        else:
+            resampled_meta_info[key] = value
+
+    from copy import deepcopy
+
+    resampled_data = deepcopy(data)
+    resampled_data.batch = type(data.batch)(resampled_batch)
+    resampled_data.batch.batch_size = data.batch.batch_size
+    resampled_data.non_tensor_batch = resampled_non_tensor_batch
+    resampled_data.meta_info = resampled_meta_info
+
+    return resampled_data
+
+
+def filter_groups_by_metric(
+    data,
+    metric: str = "acc",
+    group_key: str = "uid",
+):
+    """Filter out groups whose metric values are all the same (e.g., all correct or all wrong).
+
+    This implements the DAPO dynamic sampling strategy: groups where all responses
+    have the same metric value (e.g., all acc=1 or all acc=0) provide no useful
+    gradient signal and should be filtered out.
+
+    Args:
+        data: DataProto object containing batch, non_tensor_batch and meta_info.
+        metric: Metric key to use for filtering. Supports:
+            - "acc": Uses reward_extra_info["acc"] from non_tensor_batch.
+            - "score": Uses token_level_scores sum per sample.
+            - "seq_reward": Uses token_level_rewards sum per sample.
+            - "seq_final_reward": Uses the final token reward per sample.
+        group_key: Key in data.non_tensor_batch for group assignment. Defaults to "uid".
+
+    Returns:
+        tuple[DataProto, dict]: Filtered data and metrics dict containing:
+            - "filter_groups/total_groups": Total number of groups before filtering.
+            - "filter_groups/filtered_groups": Number of groups removed.
+            - "filter_groups/kept_groups": Number of groups kept.
+            - "filter_groups/kept_ratio": Ratio of groups kept.
+    """
+    group_ids = data.non_tensor_batch[group_key]
+    unique_groups, group_indices_np = np.unique(group_ids, return_inverse=True)
+    num_groups = len(unique_groups)
+    group_indices = torch.from_numpy(group_indices_np)
+
+    if metric == "acc":
+        if "acc" not in data.non_tensor_batch:
+            raise ValueError("filter_groups metric='acc' requires 'acc' in non_tensor_batch (reward_extra_info).")
+        sample_values = np.array(data.non_tensor_batch["acc"], dtype=np.float32)
+    elif metric == "score":
+        sample_values = data.batch["token_level_scores"].sum(dim=-1)
+    elif metric == "seq_reward":
+        sample_values = data.batch["token_level_rewards"].sum(dim=-1)
+    elif metric == "seq_final_reward":
+        rewards = data.batch["token_level_rewards"]
+        mask = data.batch["response_mask"]
+        seq_len = mask.sum(dim=-1).clamp(min=1).long()
+        sample_values = rewards[torch.arange(rewards.size(0)), seq_len - 1]
+    else:
+        raise ValueError(f"Unsupported filter_groups metric: {metric}")
+
+    if isinstance(sample_values, np.ndarray):
+        sample_values = torch.from_numpy(sample_values)
+
+    group_value_sum = torch.zeros(num_groups, dtype=sample_values.dtype, device=sample_values.device)
+    group_counts = torch.zeros(num_groups, dtype=torch.long, device=sample_values.device)
+    group_value_sum.scatter_add_(0, group_indices, sample_values)
+    group_counts.scatter_add_(0, group_indices, torch.ones_like(sample_values, dtype=torch.long))
+    group_mean = group_value_sum / group_counts.clamp(min=1)
+
+    group_all_same = (group_mean == 0.0) | (group_mean == 1.0)
+    kept_group_mask = ~group_all_same
+    kept_group_indices = torch.where(kept_group_mask)[0]
+
+    kept_sample_mask = torch.zeros(len(sample_values), dtype=torch.bool)
+    for gid in kept_group_indices:
+        kept_sample_mask |= (group_indices == gid)
+
+    kept_indices = torch.where(kept_sample_mask)[0]
+
+    filtered_data = _index_data(data, kept_indices)
+
+    filter_metrics = {
+        "filter_groups/total_groups": float(num_groups),
+        "filter_groups/filtered_groups": float(num_groups - len(kept_group_indices)),
+        "filter_groups/kept_groups": float(len(kept_group_indices)),
+        "filter_groups/kept_ratio": float(len(kept_group_indices) / max(num_groups, 1)),
+    }
+
+    return filtered_data, filter_metrics
+
+
+def _index_data(data, indices):
+    """Index a DataProto by sample indices, returning a new DataProto with selected samples."""
+    from copy import deepcopy
+
+    indices_np = indices.numpy() if isinstance(indices, torch.Tensor) else np.asarray(indices)
+
+    resampled_batch = {key: tensor[indices] for key, tensor in data.batch.items()}
+
+    resampled_non_tensor_batch = {}
+    for key, array in data.non_tensor_batch.items():
+        if isinstance(array, np.ndarray):
+            resampled_non_tensor_batch[key] = array[indices_np]
+        else:
+            resampled_non_tensor_batch[key] = [array[i] for i in indices_np]
+
+    resampled_meta_info = {}
+    for key, value in data.meta_info.items():
+        if isinstance(value, list) and len(value) == len(indices_np):
+            resampled_meta_info[key] = [value[i] for i in indices_np]
+        else:
+            resampled_meta_info[key] = value
+
+    resampled_data = deepcopy(data)
+    resampled_data.batch = type(data.batch)(resampled_batch)
+    resampled_data.batch.batch_size = data.batch.batch_size
+    resampled_data.non_tensor_batch = resampled_non_tensor_batch
+    resampled_data.meta_info = resampled_meta_info
+
+    return resampled_data
+
+
 def compute_policy_loss_reinforce(
     rollout_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
