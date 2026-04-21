@@ -103,16 +103,23 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     kld = kld * response_mask
     beta = kl_ctrl.value
 
-    token_level_rewards = token_level_scores - beta * kld
+    sequence_score = (token_level_scores * response_mask).sum(dim=-1)
+    correct_mask = (sequence_score > 0).unsqueeze(-1).float()
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+    token_level_rewards = token_level_scores - beta * kld * correct_mask
+
+    current_kl = masked_mean(kld, mask=response_mask, axis=-1)
     current_kl = torch.mean(current_kl, dim=0).item()
 
-    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
     data.batch["token_level_rewards"] = token_level_rewards
 
-    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
+    num_correct = int(correct_mask.sum().item())
+    metrics = {
+        "actor/reward_kl_penalty": current_kl,
+        "actor/reward_kl_penalty_coeff": beta,
+        "actor/reward_kl_correct_ratio": num_correct / batch_size,
+    }
 
     return data, metrics
 
@@ -233,10 +240,8 @@ def compute_advantage(
                 config.pf_ppo.get("weight_pow"),
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        # Initialize the mask for GRPO calculation
         grpo_calculation_mask = data.batch["response_mask"]
 
-        # Call compute_grpo_outcome_advantage with parameters matching its definition
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
             response_mask=grpo_calculation_mask,
@@ -245,6 +250,17 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        if config is not None and config.get("reward_resample", None) is not None:
+            reward_resample_cfg = config.reward_resample
+            if reward_resample_cfg.get("enable", False):
+                data = core_algos.compute_reward_based_resample(
+                    data,
+                    reweight_method=reward_resample_cfg.get("reweight_method", "inverse_pow"),
+                    weight_pow=reward_resample_cfg.get("weight_pow", 2.0),
+                    temperature=reward_resample_cfg.get("temperature", 1.0),
+                    score_key=reward_resample_cfg.get("score_key", "token_level_scores"),
+                    group_key=reward_resample_cfg.get("group_key", "uid"),
+                )
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
@@ -1529,6 +1545,49 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    # Apply filter_groups (DAPO dynamic sampling): filter out groups
+                    # whose metric values are all the same (e.g., all correct or all wrong).
+                    filter_groups_cfg = self.config.algorithm.get("filter_groups", None)
+                    if filter_groups_cfg is not None and filter_groups_cfg.get("enable", False):
+                        with marked_timer("filter_groups", timing_raw, color="orange"):
+                            batch.batch["token_level_scores"] = reward_tensor
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update(
+                                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                                )
+                            if not self.config.algorithm.use_kl_in_reward:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            fg_metric = filter_groups_cfg.get("metric", "seq_reward")
+                            filtered_batch, filter_metrics = core_algos.filter_groups_by_metric(
+                                batch, metric=fg_metric, group_key="uid"
+                            )
+                            metrics.update(filter_metrics)
+
+                            num_prompt_in_batch = len(
+                                np.unique(filtered_batch.non_tensor_batch.get("uid", np.arange(len(filtered_batch.batch))))
+                            )
+                            prompt_bsz = self.config.data.train_batch_size
+
+                            if num_prompt_in_batch < prompt_bsz and filtered_batch.batch.batch_size[0] > 0:
+                                print(
+                                    f"filter_groups: {num_prompt_in_batch=} < {prompt_bsz=}, "
+                                    f"kept {filter_metrics['filter_groups/kept_groups']}/"
+                                    f"{filter_metrics['filter_groups/total_groups']} groups"
+                                )
+
+                            if filtered_batch.batch.batch_size[0] > 0:
+                                batch = filtered_batch
+                                reward_tensor = batch.batch["token_level_scores"]
+                                reward_extra_infos_dict = {
+                                    k: v.tolist() if isinstance(v, np.ndarray) else v
+                                    for k, v in batch.non_tensor_batch.items()
+                                    if k in {"acc", "reward_scores"}
+                                    or (reward_extra_infos_dict and k in reward_extra_infos_dict)
+                                }
+                            else:
+                                print("filter_groups: all groups filtered out, using original batch")
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
