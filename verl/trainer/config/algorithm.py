@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "RewardResampleConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "RewardResampleConfig", "GroupResampleConfig", "KLControlConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -94,6 +94,28 @@ class RewardResampleConfig(BaseConfig):
     temperature: float = 1.0
     score_key: str = "token_level_scores"
     group_key: Optional[str] = "uid"
+
+
+@dataclass
+class GroupResampleConfig(BaseConfig):
+    """Configuration for group-level dynamic resampling (used in DAPO/GRPO).
+
+    When a group has all-zero or all-one rewards (degenerate group), the GRPO
+    advantage is zero, providing no gradient signal. This feature detects such
+    groups and regenerates responses for those specific prompts, replacing the
+    degenerate responses with new ones that may have useful gradient signals.
+
+    Args:
+        enable (bool): Whether to enable group-level dynamic resampling.
+        metric (str): Metric to detect degenerate groups: "acc", "score",
+            "seq_reward", "seq_final_reward".
+        max_resample_rounds (int): Maximum number of resampling rounds per step.
+            Each round regenerates responses for degenerate groups. Default: 3.
+    """
+
+    enable: bool = False
+    metric: str = "seq_reward"
+    max_resample_rounds: int = 3
 
 
 @dataclass
@@ -699,6 +721,7 @@ class AlgoConfig(BaseConfig):
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
     reward_resample: Optional[RewardResampleConfig] = None
+    group_resample: Optional[GroupResampleConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None

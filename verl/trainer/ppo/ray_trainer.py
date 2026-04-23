@@ -1546,6 +1546,144 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                    # Group-level dynamic resampling: for groups with all-zero or all-one
+                    # rewards, regenerate responses for those specific prompts.
+                    group_resample_cfg = self.config.algorithm.get("group_resample", None)
+                    if group_resample_cfg is not None and group_resample_cfg.get("enable", False):
+                        with marked_timer("group_resample", timing_raw, color="magenta"):
+                            batch.batch["token_level_scores"] = reward_tensor
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update(
+                                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                                )
+                            if not self.config.algorithm.use_kl_in_reward:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                            gr_metric = group_resample_cfg.get("metric", "seq_reward")
+                            max_rounds = group_resample_cfg.get("max_resample_rounds", 3)
+                            rollout_n = self.config.actor_rollout_ref.rollout.n
+
+                            for resample_round in range(max_rounds):
+                                sample_is_degenerate, gr_metrics = core_algos.find_degenerate_groups(
+                                    batch, metric=gr_metric, group_key="uid"
+                                )
+                                metrics.update(gr_metrics)
+
+                                num_degenerate = sample_is_degenerate.sum().item()
+                                if num_degenerate == 0:
+                                    break
+
+                                num_degenerate_groups = int(gr_metrics["group_resample/degenerate_groups"])
+                                print(
+                                    f"group_resample round {resample_round + 1}/{max_rounds}: "
+                                    f"{num_degenerate_groups} degenerate groups, "
+                                    f"{num_degenerate} samples to regenerate"
+                                )
+
+                                degenerate_uids = np.unique(
+                                    batch.non_tensor_batch["uid"][sample_is_degenerate.numpy()]
+                                )
+                                prompt_indices_list = []
+                                for uid_val in degenerate_uids:
+                                    uid_mask = batch.non_tensor_batch["uid"] == uid_val
+                                    first_idx = np.where(uid_mask)[0][0]
+                                    prompt_indices_list.append(first_idx)
+                                prompt_indices = torch.tensor(prompt_indices_list, dtype=torch.long)
+
+                                if len(prompt_indices) == 0:
+                                    break
+
+                                prompt_batch = batch[prompt_indices.tolist()]
+
+                                new_uids = np.array(
+                                    [str(uuid.uuid4()) for _ in range(len(prompt_batch.batch))],
+                                    dtype=object,
+                                )
+                                prompt_batch.non_tensor_batch["uid"] = new_uids
+
+                                prompt_gen_batch = self._get_gen_batch(prompt_batch)
+                                prompt_gen_batch.meta_info["global_steps"] = self.global_steps
+                                prompt_gen_output = prompt_gen_batch.repeat(
+                                    repeat_times=rollout_n, interleave=True
+                                )
+                                prompt_gen_output = self.async_rollout_manager.generate_sequences(prompt_gen_output)
+
+                                prompt_batch = prompt_batch.repeat(
+                                    repeat_times=rollout_n, interleave=True
+                                )
+                                prompt_batch = prompt_batch.union(prompt_gen_output)
+                                prompt_batch.batch["response_mask"] = compute_response_mask(prompt_batch)
+
+                                if self.use_rm and "rm_scores" not in prompt_batch.batch.keys():
+                                    prompt_batch_reward = self._compute_reward_colocate(prompt_batch)
+                                    prompt_batch = prompt_batch.union(prompt_batch_reward)
+
+                                new_reward_tensor, new_reward_extra_infos = extract_reward(prompt_batch)
+                                prompt_batch.batch["token_level_scores"] = new_reward_tensor
+                                if new_reward_extra_infos:
+                                    prompt_batch.non_tensor_batch.update(
+                                        {k: np.array(v) for k, v in new_reward_extra_infos.items()}
+                                    )
+                                if not self.config.algorithm.use_kl_in_reward:
+                                    prompt_batch.batch["token_level_rewards"] = prompt_batch.batch["token_level_scores"]
+
+                                kept_mask = ~sample_is_degenerate
+                                kept_indices = torch.where(kept_mask)[0]
+
+                                new_batch_keys = set(batch.batch.keys()) | set(prompt_batch.batch.keys())
+                                merged_batch = {}
+                                for key in new_batch_keys:
+                                    old_tensor = batch.batch.get(key)
+                                    new_tensor = prompt_batch.batch.get(key)
+                                    if old_tensor is not None and new_tensor is not None:
+                                        merged_batch[key] = torch.cat([old_tensor[kept_indices], new_tensor], dim=0)
+                                    elif old_tensor is not None:
+                                        merged_batch[key] = old_tensor[kept_indices]
+                                    else:
+                                        merged_batch[key] = new_tensor
+
+                                merged_non_tensor = {}
+                                all_nt_keys = set(batch.non_tensor_batch.keys()) | set(prompt_batch.non_tensor_batch.keys())
+                                for key in all_nt_keys:
+                                    old_arr = batch.non_tensor_batch.get(key)
+                                    new_arr = prompt_batch.non_tensor_batch.get(key)
+                                    if old_arr is not None and new_arr is not None:
+                                        if isinstance(old_arr, np.ndarray) and isinstance(new_arr, np.ndarray):
+                                            merged_non_tensor[key] = np.concatenate([old_arr[kept_indices.numpy()], new_arr])
+                                        else:
+                                            merged_non_tensor[key] = np.concatenate([
+                                                np.array(old_arr)[kept_indices.numpy()],
+                                                np.array(new_arr)
+                                            ])
+                                    elif old_arr is not None:
+                                        merged_non_tensor[key] = old_arr[kept_indices.numpy()] if isinstance(old_arr, np.ndarray) else np.array(old_arr)[kept_indices.numpy()]
+                                    else:
+                                        merged_non_tensor[key] = new_arr
+
+                                from verl import DataProto as _DP
+                                batch = _DP.from_single_dict(
+                                    {**merged_batch, **merged_non_tensor},
+                                    meta_info=batch.meta_info,
+                                )
+
+                                reward_tensor = batch.batch["token_level_scores"]
+                                reward_extra_infos_dict = {
+                                    k: v.tolist() if isinstance(v, np.ndarray) else v
+                                    for k, v in batch.non_tensor_batch.items()
+                                    if k in {"acc", "reward_scores"}
+                                    or (new_reward_extra_infos and k in new_reward_extra_infos)
+                                }
+
+                            final_degenerate, final_metrics = core_algos.find_degenerate_groups(
+                                batch, metric=gr_metric, group_key="uid"
+                            )
+                            remaining = final_metrics["group_resample/degenerate_groups"]
+                            metrics["group_resample/remaining_degenerate"] = remaining
+                            print(
+                                f"group_resample done: {remaining} degenerate groups remain after "
+                                f"{min(resample_round + 1, max_rounds)} rounds"
+                            )
+
                     # Apply filter_groups (DAPO dynamic sampling): filter out groups
                     # whose metric values are all the same (e.g., all correct or all wrong).
                     filter_groups_cfg = self.config.algorithm.get("filter_groups", None)
