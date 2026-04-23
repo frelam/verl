@@ -13,6 +13,17 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+import sympy
+from sympy.parsing.latex import parse_latex
+import re
+
+def is_math_equal(expr1: str, expr2: str) -> bool:
+    try:
+        parsed_expr1 = parse_latex(expr1)
+        parsed_expr2 = parse_latex(expr2)
+        return sympy.simplify(parsed_expr1 - parsed_expr2) == 0
+    except Exception:
+        return False
 
 def compute_score(solution_str, ground_truth) -> float:
     retval = 0.0
@@ -41,7 +52,7 @@ def is_equiv(str1, str2, verbose=False):
         ss2 = strip_string(str2)
         if verbose:
             print(ss1, ss2)
-        return ss1 == ss2
+        return is_math_equal(ss1, ss2)
     except Exception:
         return str1 == str2
 
@@ -221,4 +232,12 @@ def strip_string(string):
     # NOTE: X/Y changed to \frac{X}{Y} in dataset, but in simple cases fix in case the model output is X/Y
     string = fix_a_slash_b(string)
 
+    string = string.replace(" ", "")
+    string = string.replace('{,}', ',')
+
+    string = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', string)
+
+    string = re.sub(r'\\(?:mbox)\{.*', '', string)
+
+    string = re.sub(r'\\text\{([^{}]*)\}', r'\1', string)
     return string
