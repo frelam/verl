@@ -2505,6 +2505,67 @@ def _index_data(data, indices):
     return resampled_data
 
 
+def find_degenerate_groups(data, metric: str = "seq_reward", group_key: str = "uid"):
+    """Find groups where all samples have the same metric value (all 0 or all 1).
+
+    Args:
+        data: DataProto object containing batch, non_tensor_batch and meta_info.
+        metric: Metric key to use for detection. Same options as filter_groups_by_metric.
+        group_key: Key in data.non_tensor_batch for group assignment.
+
+    Returns:
+        tuple[Tensor, dict]: A boolean tensor of shape [num_samples] where True means
+            the sample belongs to a degenerate group, and a metrics dict containing:
+            - "group_resample/total_groups": Total number of groups.
+            - "group_resample/degenerate_groups": Number of degenerate groups.
+            - "group_resample/degenerate_ratio": Ratio of degenerate groups.
+    """
+    group_ids = data.non_tensor_batch[group_key]
+    unique_groups, group_indices_np = np.unique(group_ids, return_inverse=True)
+    num_groups = len(unique_groups)
+    group_indices = torch.from_numpy(group_indices_np)
+
+    if metric == "acc":
+        if "acc" not in data.non_tensor_batch:
+            raise ValueError("metric='acc' requires 'acc' in non_tensor_batch.")
+        sample_values = np.array(data.non_tensor_batch["acc"], dtype=np.float32)
+    elif metric == "score":
+        sample_values = data.batch["token_level_scores"].sum(dim=-1)
+    elif metric == "seq_reward":
+        sample_values = data.batch["token_level_rewards"].sum(dim=-1)
+    elif metric == "seq_final_reward":
+        rewards = data.batch["token_level_rewards"]
+        mask = data.batch["response_mask"]
+        seq_len = mask.sum(dim=-1).clamp(min=1).long()
+        sample_values = rewards[torch.arange(rewards.size(0)), seq_len - 1]
+    else:
+        raise ValueError(f"Unsupported metric: {metric}")
+
+    if isinstance(sample_values, np.ndarray):
+        sample_values = torch.from_numpy(sample_values)
+
+    group_value_sum = torch.zeros(num_groups, dtype=sample_values.dtype, device=sample_values.device)
+    group_counts = torch.zeros(num_groups, dtype=torch.long, device=sample_values.device)
+    group_value_sum.scatter_add_(0, group_indices, sample_values)
+    group_counts.scatter_add_(0, group_indices, torch.ones_like(sample_values, dtype=torch.long))
+    group_mean = group_value_sum / group_counts.clamp(min=1)
+
+    degenerate_mask = (group_mean == 0.0) | (group_mean == 1.0)
+    degenerate_group_ids = torch.where(degenerate_mask)[0]
+
+    sample_is_degenerate = torch.zeros(len(sample_values), dtype=torch.bool)
+    for gid in degenerate_group_ids:
+        sample_is_degenerate |= (group_indices == gid)
+
+    metrics = {
+        "group_resample/total_groups": float(num_groups),
+        "group_resample/degenerate_groups": float(degenerate_mask.sum().item()),
+        "group_resample/degenerate_ratio": float(degenerate_mask.sum().item() / max(num_groups, 1)),
+    }
+
+    return sample_is_degenerate, metrics
+
+
 def compute_policy_loss_reinforce(
     rollout_log_prob: torch.Tensor,
     log_prob: torch.Tensor,
