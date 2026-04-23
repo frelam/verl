@@ -13,15 +13,16 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
+from mpmath import e1
 import sympy
-from sympy.parsing.latex import parse_latex
+from latex2sympy2 import latex2sympy
 import re
 
 def is_math_equal(expr1: str, expr2: str) -> bool:
     try:
-        parsed_expr1 = parse_latex(expr1)
-        parsed_expr2 = parse_latex(expr2)
-        return sympy.simplify(parsed_expr1 - parsed_expr2) == 0
+        e1 = latex2sympy(expr1)
+        e2 = latex2sympy(expr2)
+        return sympy.simplify(e1 - e2) == 0
     except Exception:
         return False
 
@@ -195,6 +196,9 @@ def strip_string(string):
     # remove dollar signs
     string = string.replace("\\$", "")
 
+    string = re.sub(r'\\text\{([^{}]*)\}', r'\1', string)
+    string = re.sub(r'\(([A-Za-z])\)', r'\1', string)
+
     # remove units (on the right)
     string = remove_right_units(string)
 
@@ -232,12 +236,11 @@ def strip_string(string):
     # NOTE: X/Y changed to \frac{X}{Y} in dataset, but in simple cases fix in case the model output is X/Y
     string = fix_a_slash_b(string)
 
-    string = string.replace(" ", "")
     string = string.replace('{,}', ',')
 
     string = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', string)
 
     string = re.sub(r'\\(?:mbox)\{.*', '', string)
 
-    string = re.sub(r'\\text\{([^{}]*)\}', r'\1', string)
+    string = re.sub(r'_[{]?\d+[}]?', '', string)
     return string
