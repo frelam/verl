@@ -106,9 +106,10 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     sequence_score = (token_level_scores * response_mask).sum(dim=-1)
     correct_mask = (sequence_score > 0).unsqueeze(-1).float()
 
-    token_level_rewards = token_level_scores - beta * kld * correct_mask
+    kld_mean = masked_mean(kld, mask=response_mask, axis=-1).unsqueeze(-1)
+    token_level_rewards = token_level_scores - beta * kld_mean * correct_mask
 
-    current_kl = masked_mean(kld, mask=response_mask, axis=-1)
+    current_kl = kld_mean.squeeze(-1)
     current_kl = torch.mean(current_kl, dim=0).item()
 
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
