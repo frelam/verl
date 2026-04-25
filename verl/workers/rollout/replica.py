@@ -43,6 +43,8 @@ class TokenOutput(BaseModel):
     """logprobs of response token ids"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
+    sampling_token_indices: Optional[list[list[int]]] = None
+    """For each response token, the list of candidate token ids from top-k/top-p sampling."""
     stop_reason: Optional[str] = None
     """stop reason: 'completed', 'aborted', or None for unknown"""
     num_preempted: Optional[int] = None

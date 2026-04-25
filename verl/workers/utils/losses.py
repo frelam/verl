@@ -131,8 +131,13 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     # add kl loss
     if config.use_kl_loss:
         ref_log_prob = data["ref_log_prob"]
-        # compute kl loss
-        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
+        old_log_prob_for_kl = data.get("old_log_probs", None) if config.use_unbiased_kl else None
+        kld = kl_penalty(
+            logprob=log_prob,
+            ref_logprob=ref_log_prob,
+            kl_penalty=config.kl_loss_type,
+            old_log_prob=old_log_prob_for_kl,
+        )
         kl_loss = agg_loss(
             loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
         )
