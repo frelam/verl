@@ -98,6 +98,12 @@ calculate_sum_pi_squared: false
 # Whether to use KL loss instead of KL reward penalty. True for GRPO
 use_kl_loss: false
 
+# Whether to use IS-reweighted unbiased KL estimate (DeepSeek-V3.2).
+# When enabled, the KL divergence is reweighted by the importance sampling ratio
+# r = exp(log_prob - old_log_prob) to obtain an unbiased gradient estimate under
+# the current policy, correcting for off-policy bias in the KL term.
+use_unbiased_kl: false
+
 # Whether to enable PrefixGrouper shared-prefix forward
 use_prefix_grouper: false
 
@@ -110,6 +116,13 @@ kl_loss_coef: 0.001
 
 # Type of KL divergence loss. Options: "kl"(k1), "abs", "mse"(k2), "low_var_kl"(k3), "full"
 kl_loss_type: low_var_kl
+
+# Whether to apply keep sampling mask (DeepSeek-V3.2).
+# When enabled, logits during training are masked to only consider tokens that were
+# in the sampling set during rollout, ensuring training-inference consistency.
+# Requires rollout to provide sampling_token_indices in the batch data
+# (set rollout.enable_keep_sampling_mask=true).
+use_keep_sampling_mask: false
 
 # Number of PPO epochs per batch
 ppo_epochs: 1

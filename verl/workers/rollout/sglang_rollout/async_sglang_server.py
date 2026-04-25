@@ -581,6 +581,11 @@ class SGLangHttpServer:
         prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
         if prompt_logprobs is not None:
             return_logprob = True
+        if self.config.enable_keep_sampling_mask:
+            num_tokens = self.config.keep_sampling_mask_num_tokens
+            if num_tokens > 0:
+                return_logprob = True
+                sampling_params["top_logprobs_num"] = num_tokens
 
         request = {
             "rid": request_id,
@@ -669,10 +674,19 @@ class SGLangHttpServer:
             extra_fields["spec_num_accepted_tokens"] = int(meta_info["spec_accept_token_num"])
             extra_fields["spec_num_verify_steps"] = int(meta_info["spec_verify_ct"])
 
+        sampling_token_indices = None
+        if self.config.enable_keep_sampling_mask and return_logprob:
+            output_token_logprobs = output["meta_info"]["output_token_logprobs"]
+            sampling_token_indices = []
+            for log_prob, token_id, top_logprobs in output_token_logprobs:
+                indices = sorted(top_logprobs.keys()) if top_logprobs else [token_id]
+                sampling_token_indices.append(indices)
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
+            sampling_token_indices=sampling_token_indices,
             stop_reason=finish_reason,
             extra_fields=extra_fields,
         )

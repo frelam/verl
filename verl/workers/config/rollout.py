@@ -264,6 +264,9 @@ class RolloutConfig(BaseConfig):
     enable_rollout_routing_replay: bool = False
     moe_load_balance_metrics_interval: int = 0
 
+    enable_keep_sampling_mask: bool = False
+    keep_sampling_mask_num_tokens: int = 0
+
     enable_sleep_mode: bool = True
 
     mtp: MtpConfig = field(default_factory=MtpConfig)

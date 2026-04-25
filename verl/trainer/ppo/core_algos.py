@@ -2144,22 +2144,38 @@ def compute_value_loss(
     return vf_loss, vf_clipfrac
 
 
-def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
+def kl_penalty(
+    logprob: torch.FloatTensor,
+    ref_logprob: torch.FloatTensor,
+    kl_penalty,
+    old_log_prob: torch.FloatTensor | None = None,
+) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.
     See more description in http://joschu.net/blog/kl-approx.html
 
+    When old_log_prob is provided, the KL estimate is reweighted by the importance sampling ratio
+    r = exp(logprob - old_log_prob) to obtain an unbiased estimate under the current policy π_θ,
+    following the DeepSeek-V3.2 technique. Without reweighting, the KL estimate is unbiased under
+    the old (rollout) policy π_old, but its gradient is biased w.r.t. the current policy.
+
     Args:
-        logprob:
-        ref_logprob:
+        logprob: Log probability under the current policy π_θ, shape (batch, seq_len).
+        ref_logprob: Log probability under the reference policy π_ref, shape (batch, seq_len).
+        kl_penalty: KL penalty type string, e.g. "kl", "k1", "k3", "k3+", etc.
+        old_log_prob: Log probability under the old (rollout) policy π_old, shape (batch, seq_len).
+            If provided, the KL estimate is IS-reweighted for unbiased gradient estimation.
 
     Returns:
-        kl_estimate
+        kl_estimate: Unbiased KL divergence estimate, shape (batch, seq_len).
     """
     # Strip the optional '+' suffix so e.g. "k3+" dispatches to "k3".
     base_kl_penalty = kl_penalty[:-1] if kl_penalty.endswith("+") else kl_penalty
     forward_score = kl_penalty_forward(logprob, ref_logprob, base_kl_penalty)
     if not kl_penalty.endswith("+") or kl_penalty in ("mse", "k2"):
+        if old_log_prob is not None:
+            is_ratio = (logprob - old_log_prob).clamp(-20, 20).exp().detach()
+            forward_score = forward_score * is_ratio
         return forward_score
 
     """
@@ -2168,6 +2184,10 @@ def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_pe
     so we use a straight through trick here if the kl_penalty method ends with '+', e.g., k3+. 
     """
     backward_score = 0.5 * (logprob - ref_logprob).square()
+
+    if old_log_prob is not None:
+        is_ratio = (logprob - old_log_prob).clamp(-20, 20).exp().detach()
+        backward_score = backward_score * is_ratio
 
     return backward_score - backward_score.detach() + forward_score.detach()
 

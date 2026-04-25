@@ -102,6 +102,11 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 if output.routed_experts is not None
                 else None
             ),
+            sampling_token_indices=(
+                output.sampling_token_indices[: self.response_length]
+                if output.sampling_token_indices is not None
+                else None
+            ),
             multi_modal_data=multi_modal_data,
             mm_processor_kwargs=mm_processor_kwargs,
             num_turns=2,

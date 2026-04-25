@@ -75,7 +75,7 @@ from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
-def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl", use_unbiased_kl=False):
     """Apply KL penalty to the token-level rewards.
 
     This function computes the KL divergence between the reference policy and current policy,
@@ -85,6 +85,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
         data (DataProto): The data containing batched model outputs and inputs.
         kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
         kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+        use_unbiased_kl (bool, optional): Whether to use IS-reweighted unbiased KL estimate.
+            Defaults to False.
 
     Returns:
         tuple: A tuple containing:
@@ -97,8 +99,10 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 
     # compute kl between ref_policy and current policy
     # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+    old_log_prob_for_kl = data.batch.get("old_log_probs", None) if use_unbiased_kl else None
     kld = core_algos.kl_penalty(
-        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty,
+        old_log_prob=old_log_prob_for_kl,
     )  # (batch_size, response_length)
     kld = kld * response_mask
     beta = kl_ctrl.value
@@ -1799,7 +1803,8 @@ class RayPPOTrainer:
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
-                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty,
+                                use_unbiased_kl=self.config.actor_rollout_ref.actor.use_unbiased_kl,
                             )
                             metrics.update(kl_metrics)
                         else:

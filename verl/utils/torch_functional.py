@@ -362,6 +362,29 @@ def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2,
     return (eos_mask.cumsum(dim=1) - eos_mask).eq(0).to(dtype)
 
 
+def apply_keep_sampling_mask(
+    logits: torch.Tensor,
+    sampling_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Apply keep sampling mask to logits for DeepSeek-V3.2 Keep Sampling Mask.
+
+    During rollout, top-p/top-k sampling truncates the vocabulary to a subset of allowed tokens.
+    This function masks logits to only consider tokens that were in the sampling set during rollout,
+    then re-normalizes the log probabilities. This ensures training-inference consistency:
+    tokens that had zero probability during sampling should also have zero log-prob during training.
+
+    Args:
+        logits: Model output logits of shape (..., vocab_size).
+        sampling_mask: Boolean mask of shape (..., vocab_size), where True indicates
+            tokens that were in the sampling set during rollout.
+
+    Returns:
+        Modified logits with non-sampled tokens set to -inf, shape (..., vocab_size).
+    """
+    masked_logits = logits.masked_fill(~sampling_mask, float("-inf"))
+    return masked_logits
+
+
 def compute_grad_norm(model: nn.Module) -> float:
     """Compute the squared L2 norm of all gradients in a model.
 

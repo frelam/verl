@@ -91,6 +91,7 @@ class AgentData:
         self.tool_calls: list[FunctionCall] = []
 
         self.routed_experts = None
+        self.sampling_token_indices = None
 
         # Extra fields for dynamic addition, e.g., tool session data
         self.extra_fields: dict[str, Any] = {}
@@ -200,6 +201,7 @@ class ToolAgentLoop(AgentLoopBase):
                 if agent_data.routed_experts is not None
                 else None
             ),
+            sampling_token_indices=agent_data.sampling_token_indices,
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
@@ -281,6 +283,9 @@ class ToolAgentLoop(AgentLoopBase):
 
         if output.routed_experts is not None:
             agent_data.routed_experts = output.routed_experts
+
+        if output.sampling_token_indices is not None:
+            agent_data.sampling_token_indices = output.sampling_token_indices
 
         # Check termination conditions
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:

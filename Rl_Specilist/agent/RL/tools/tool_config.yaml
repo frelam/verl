@@ -1,0 +1,44 @@
+tools:
+  - class_name: "Rl_Specilist.agent.RL.tools.calculator_tool.CalculatorTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "calculator"
+        description: >-
+          A safe calculator for arithmetic expressions. Supports +, -, *, /, **, %,
+          parentheses, and functions: sqrt, sin, cos, tan, log, log10, exp, floor,
+          ceil, factorial, gcd, abs, round, min, max. Constants: pi, e.
+          Use this when you need to compute a precise numeric value.
+        parameters:
+          type: "object"
+          properties:
+            expression:
+              type: "string"
+              description: "A mathematical expression, e.g. '2 + 3 * 4' or 'sqrt(144) + log10(1000)'"
+          required: ["expression"]
+
+  - class_name: "Rl_Specilist.agent.RL.tools.answer_submit_tool.AnswerSubmitTool"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "submit_answer"
+        description: >-
+          Submit your final answer with a self-reported confidence score (0.0 to 1.0).
+          You will receive feedback on whether the answer is correct.
+          You may revise and resubmit if incorrect. Call this at least once to
+          finish the task. Set confidence honestly: 1.0 means you are certain,
+          0.5 means a coin flip, 0.0 means you are guessing.
+        parameters:
+          type: "object"
+          properties:
+            answer:
+              type: "string"
+              description: "Your final answer to the question."
+            confidence:
+              type: "number"
+              description: "Your confidence that the answer is correct, between 0.0 and 1.0."
+          required: ["answer", "confidence"]
