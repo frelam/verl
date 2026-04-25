@@ -112,6 +112,28 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
+    def _apply_sampling_mask_to_logits(
+        self, logits: torch.Tensor, sampling_token_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply keep sampling mask to logits for DeepSeek-V3.2 Keep Sampling Mask.
+
+        Uses the sampling token indices recorded during rollout to mask logits,
+        ensuring training-inference consistency: tokens that had zero probability
+        during sampling should also have zero log-prob during training.
+
+        Args:
+            logits: Model output logits of shape (..., vocab_size).
+            sampling_token_indices: Token indices from rollout of shape (..., num_candidates).
+                Negative values indicate padding (no valid index at that position).
+
+        Returns:
+            Modified logits with non-sampled tokens set to -inf, shape (..., vocab_size).
+        """
+        valid_mask = sampling_token_indices >= 0
+        mask = torch.zeros_like(logits, dtype=torch.bool)
+        mask.scatter_(-1, sampling_token_indices.clamp(min=0), valid_mask)
+        return logits.masked_fill(~mask, float("-inf"))
+
     def _forward_micro_batch(
         self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
     ) -> dict[str, torch.Tensor]:
@@ -260,6 +282,14 @@ class DataParallelPPOActor(BasePPOActor):
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
 
+                    if self.config.use_keep_sampling_mask:
+                        sampling_token_indices_rmpad = micro_batch["sampling_token_indices"]
+                        if self.use_remove_padding:
+                            sampling_token_indices_rmpad = index_first_axis(
+                                rearrange(sampling_token_indices_rmpad, "b s n -> (b s) n"), indices
+                            )
+                        logits_rmpad = self._apply_sampling_mask_to_logits(logits_rmpad, sampling_token_indices_rmpad)
+
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
                     if calculate_entropy:
@@ -369,6 +399,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if self.config.use_keep_sampling_mask:
+                        sampling_token_indices = micro_batch["sampling_token_indices"]
+                        sampling_token_indices = sampling_token_indices[:, -response_length - 1 : -1, :]
+                        logits = self._apply_sampling_mask_to_logits(logits, sampling_token_indices)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
@@ -462,6 +496,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys += [k for k in ["prompts", "response_mask"] if k in data.batch]
             if "uid" in data.non_tensor_batch:
                 non_tensor_select_keys.append("uid")
+        if self.config.use_keep_sampling_mask and "sampling_token_indices" in data.batch.keys():
+            select_keys.append("sampling_token_indices")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -530,6 +566,8 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if self.config.use_keep_sampling_mask and "sampling_token_indices" in data.batch.keys():
+            select_keys.append("sampling_token_indices")
         # Include pre-computed IS weights if present in batch
         # Weights are computed centrally in trainer and added to batch when algorithm.rollout_is=True
         if "rollout_is_weights" in data.batch.keys():
@@ -652,9 +690,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
-                        # compute kl loss
+                        old_log_prob_for_kl = model_inputs.get("old_log_probs", None) if self.config.use_unbiased_kl else None
                         kld = kl_penalty(
-                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
+                            logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type,
+                            old_log_prob=old_log_prob_for_kl,
                         )
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 

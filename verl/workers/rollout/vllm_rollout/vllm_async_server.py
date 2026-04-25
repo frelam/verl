@@ -478,6 +478,10 @@ class vLLMHttpServer:
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"
         )
         sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
+        if self.config.enable_keep_sampling_mask:
+            num_tokens = self.config.keep_sampling_mask_num_tokens
+            if num_tokens > 0:
+                sampling_params["logprobs"] = num_tokens
         sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
         sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
@@ -528,6 +532,12 @@ class vLLMHttpServer:
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
 
+        sampling_token_indices = None
+        if self.config.enable_keep_sampling_mask and sampling_params.logprobs is not None and sampling_params.logprobs > 0:
+            sampling_token_indices = []
+            for logprobs_dict in final_res.outputs[0].logprobs:
+                sampling_token_indices.append(sorted(logprobs_dict.keys()))
+
         # Determine stop reason from finish_reason
         finish_reason = final_res.outputs[0].finish_reason
         if finish_reason == "abort":
@@ -546,6 +556,7 @@ class vLLMHttpServer:
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
+            sampling_token_indices=sampling_token_indices,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
             extra_fields=extra_fields,

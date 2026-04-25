@@ -80,6 +80,16 @@ def left_right_2_no_padding(data: TensorDict) -> TensorDict:
         )
         data["routed_experts"] = routed_experts_nested
 
+    sampling_token_indices = data.get("sampling_token_indices", None)
+    if sampling_token_indices is not None and not sampling_token_indices.is_nested:
+        sampling_token_indices_rmpad = index_first_axis(
+            sampling_token_indices.flatten(0, 1), indices
+        )
+        sampling_token_indices_nested = torch.nested.nested_tensor_from_jagged(
+            sampling_token_indices_rmpad, offsets=cu_seqlens
+        )
+        data["sampling_token_indices"] = sampling_token_indices_nested
+
     # (bsz, seqlen, topk)
     teacher_logprobs = data.get("teacher_logprobs", None)
     teacher_ids = data.get("teacher_ids", None)

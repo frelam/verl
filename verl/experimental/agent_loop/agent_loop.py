@@ -196,6 +196,8 @@ class AgentLoopOutput(BaseModel):
     """Log probabilities for the response tokens."""
     routed_experts: Optional[Any] = None
     """Routed experts for the total tokens."""
+    sampling_token_indices: Optional[list[list[int]]] = None
+    """For each token, the list of candidate token ids from top-k/top-p sampling."""
     multi_modal_data: Optional[dict[str, Any]] = None
     """Multi-modal data for multi-modal tools."""
     reward_score: Optional[float] = None
@@ -233,6 +235,8 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded token ids corresponding to the teacher log probabilities."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
+    sampling_token_indices: Optional[torch.Tensor] = None
+    """Padded sampling token indices for the response tokens, shape (1, response_length, num_candidates)."""
     multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
     """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
     extra_fields: dict[str, Any] = {}
@@ -707,6 +711,18 @@ class AgentLoopWorker:
 
             routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
 
+        sampling_token_indices = None
+        if output.sampling_token_indices is not None:
+            num_candidates = max(len(indices) for indices in output.sampling_token_indices)
+            response_len = self.rollout_config.response_length
+            sampling_token_indices = torch.full(
+                (1, response_len, num_candidates), -1, dtype=torch.long
+            )
+            actual_len = len(output.sampling_token_indices)
+            for i, indices in enumerate(output.sampling_token_indices):
+                for j, idx in enumerate(indices):
+                    sampling_token_indices[0, i, j] = idx
+
         multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
         position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
         await self._compute_score(
@@ -751,6 +767,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             response_logprobs=response_logprobs,
             routed_experts=routed_experts,
+            sampling_token_indices=sampling_token_indices,
             multi_modal_inputs=multi_modal_inputs,
             multi_modal_data=output.multi_modal_data,
             teacher_logprobs=teacher_logprobs,
@@ -886,6 +903,10 @@ class AgentLoopWorker:
             optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
         if inputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+        if inputs[0].sampling_token_indices is not None:
+            optional_outputs["sampling_token_indices"] = torch.cat(
+                [input.sampling_token_indices for input in inputs], dim=0
+            )
         if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
             optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
             optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)

@@ -379,6 +379,12 @@ class SGLangHttpServer:
         sampling_params["max_new_tokens"] = max_new_tokens
         return_logprob = sampling_params.pop("logprobs", False)
 
+        if self.config.enable_keep_sampling_mask:
+            num_tokens = self.config.keep_sampling_mask_num_tokens
+            if num_tokens > 0:
+                return_logprob = True
+                sampling_params["top_logprobs_num"] = num_tokens
+
         request = {
             "rid": request_id,
             "input_ids": prompt_ids,
@@ -428,10 +434,19 @@ class SGLangHttpServer:
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
 
+        sampling_token_indices = None
+        if self.config.enable_keep_sampling_mask and return_logprob:
+            output_token_logprobs = output["meta_info"]["output_token_logprobs"]
+            sampling_token_indices = []
+            for log_prob, token_id, top_logprobs in output_token_logprobs:
+                indices = sorted(top_logprobs.keys()) if top_logprobs else [token_id]
+                sampling_token_indices.append(indices)
+
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
+            sampling_token_indices=sampling_token_indices,
             stop_reason=finish_reason,
             extra_fields={"global_steps": self.global_steps},
         )

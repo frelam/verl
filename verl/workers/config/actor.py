@@ -118,9 +118,14 @@ class ActorConfig(BaseConfig):
         tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
         tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
         use_kl_loss (bool): Whether to use KL divergence loss.
+        use_unbiased_kl (bool): Whether to use IS-reweighted unbiased KL estimate (DeepSeek-V3.2).
         use_torch_compile (bool): Whether to use torch.compile for optimization.
         kl_loss_coef (float): KL divergence loss coefficient.
         kl_loss_type (str): Type of KL loss to use.
+        use_keep_sampling_mask (bool): Whether to apply keep sampling mask (DeepSeek-V3.2).
+            When enabled, logits are masked to only consider tokens that were in the
+            sampling set during rollout, ensuring training-inference consistency.
+            Requires rollout to provide sampling_token_indices in the batch data.
         ppo_epochs (int): Number of PPO epochs per training step.
         shuffle (bool): Whether to shuffle data during training.
         checkpoint (CheckpointConfig): Configuration for checkpointing.
@@ -160,11 +165,12 @@ class ActorConfig(BaseConfig):
     tau_neg: float = 1.05
     calculate_entropy: bool = False
     use_kl_loss: bool = False
-    # Whether to enable PrefixGrouper-based shared-prefix forward
+    use_unbiased_kl: bool = False
     use_prefix_grouper: bool = False
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"
+    use_keep_sampling_mask: bool = False
     ppo_epochs: int = 1
     shuffle: bool = False
     data_loader_seed: int = 1
