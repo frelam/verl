@@ -177,6 +177,9 @@ def strip_string(string):
 
     # remove inverse spaces
     string = string.replace("\\!", "")
+    string = string.replace("\\,", "")
+    string = string.replace("\\;", "")
+    string = string.replace("\\:", "")
 
     # replace \\ with \
     string = string.replace("\\\\", "\\")
@@ -224,11 +227,14 @@ def strip_string(string):
 
     # remove spaces
     string = string.replace(" ", "")
+    string = re.sub(r'\((\d+[\+\-]\d+i?)\)', r'\1', string)
+    if not re.match(r'^[a-zA-Z]+$', string):
+        string = re.sub(r'[a-z]{2,}\^?\d*$', '', string)
 
     # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1).
     # Also does a/b --> \\frac{a}{b}
     string = fix_fracs(string)
-
+    string = re.sub(r'(\d+)/(\d+)', r'\\frac{\1}{\2}', string)
     # manually change 0.5 --> \frac{1}{2}
     if string == "0.5":
         string = "\\frac{1}{2}"
