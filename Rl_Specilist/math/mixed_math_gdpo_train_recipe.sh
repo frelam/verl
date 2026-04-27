@@ -1,11 +1,11 @@
 set -x
 
 python3 -m verl.trainer.main_ppo \
-    custom_reward_function.path='mixed_math_custom_reward.py' \
+    custom_reward_function.path='mixed_math_gdpo_reward.py' \
     custom_reward_function.name='compute_score' \
     algorithm.adv_estimator=gdpo \
-    +algorithm.gdpo_reward_keys='["accuracy_reward", "format_reward", "repetition_reward", "wait_reward"]' \
-    +algorithm.gdpo_reward_weights='[0.7, 0.1, 0.1, 0.1]' \
+    +algorithm.gdpo_reward_keys='["accuracy_reward", "format_reward", "wait_reward"]' \
+    +algorithm.gdpo_reward_weights='[0.8, 0.1, 0.1]' \
     data.train_file='PATH_TO_TRAIN_PARQUET' \
     data.val_file='PATH_TO_TEST_PARQUET' \
     data.train_batch_size=32 \
