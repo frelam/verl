@@ -81,6 +81,18 @@ class PolicyLossConfig(BaseConfig):
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
+        use_offpolicy_seq_mask (bool): Whether to use Off-Policy Sequence Masking (DeepSeek-V3.2).
+            When enabled, tokens with negative advantage and high KL divergence (π_old >> π_θ)
+            are masked out from the loss computation. This prevents the model from being
+            penalized for actions it would no longer take, improving training stability
+            in asynchronous/off-policy settings.
+        offpolicy_seq_mask_kl_threshold (float): δ — KL divergence threshold for off-policy
+            sequence masking. Only negative-advantage tokens with KL(π_old || π_θ) > δ
+            are masked. Larger values allow more off-policy tolerance. Typical range: 1.0–5.0.
+        offpolicy_seq_mask_granularity (str): Masking granularity for off-policy sequence masking.
+            - "token": Apply mask at token level (per-token KL check).
+            - "sequence": Apply mask at sequence level (if any token triggers the mask,
+              the entire sequence is masked).
     """
 
     loss_mode: str = "vanilla"
@@ -90,6 +102,9 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    use_offpolicy_seq_mask: bool = False
+    offpolicy_seq_mask_kl_threshold: float = 3.0
+    offpolicy_seq_mask_granularity: str = "token"
 
 
 @dataclass
