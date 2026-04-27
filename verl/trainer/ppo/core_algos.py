@@ -436,12 +436,25 @@ def compute_gdpo_outcome_advantage(
         if gdpo_weights is not None:
             reward_weights = list(gdpo_weights)
 
+        if "overlong_reward" in non_tensor_batch:
+            comp = non_tensor_batch["overlong_reward"]
+            rm_score = torch.tensor(np.asarray(comp, dtype=np.float32), device=device)
+            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+            rm_scores[torch.arange(rm_scores.size(0), device=device), valid_response_length] = rm_score
+            score_list.append(rm_scores)
+            overlong_weight = float(np.asarray(non_tensor_batch["overlong_penalty_factor"])[0])
+            if reward_weights is not None:
+                reward_weights.append(overlong_weight)
+            else:
+                reward_weights = [1.0] * len(gdpo_reward_keys) + [overlong_weight]
+
     if score_list is None:
         score_list = [token_level_rewards]
 
     num_scores = len(score_list)
 
     if reward_weights is not None:
+        reward_weights = [w / sum(reward_weights) for w in reward_weights]
         weights = torch.tensor(reward_weights, dtype=torch.float32, device=token_level_rewards.device)
     else:
         weights = torch.ones(num_scores, dtype=torch.float32, device=token_level_rewards.device)
