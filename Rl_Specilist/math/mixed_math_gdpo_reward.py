@@ -87,13 +87,14 @@ def _compute_score(
         repetition_bonus = 0.0
         wait_bonus = 0.0
 
-    score = float(0.7 * base_score + 0.1 * format_bonus + 0.1 * repetition_bonus + 0.1 * wait_bonus)
+    # score = float(0.7 * base_score + 0.1 * format_bonus + 0.1 * repetition_bonus + 0.1 * wait_bonus)
+    score = float(0.8 * base_score + 0.1 * format_bonus + 0.1 * wait_bonus)
 
     return {
         "score": score,
         "accuracy_reward": float(base_score),
         "format_reward": float(format_bonus),
-        "repetition_reward": float(repetition_bonus),
+        # "repetition_reward": float(repetition_bonus),
         "wait_reward": float(wait_bonus),
     }
 
