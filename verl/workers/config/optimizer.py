@@ -15,6 +15,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
 from omegaconf import MISSING
 
 from verl.base_config import BaseConfig
@@ -27,6 +28,7 @@ __all__ = [
     "VeOmniOptimizerConfig",
     "TorchtitanOptimizerConfig",
     "AutomodelOptimizerConfig",
+    "MuonOptimizerConfig",
 ]
 
 
@@ -215,14 +217,68 @@ class AutomodelOptimizerConfig(OptimizerConfig):
         return super().__post_init__()
 
 
-def build_optimizer(parameters, config: FSDPOptimizerConfig):
+@dataclass
+class MuonOptimizerConfig(FSDPOptimizerConfig):
+    """Muon optimizer configuration for FSDP.
+
+    Muon (MomentUm Orthogonalized by Newton-Schulz) optimizes 2D weight
+    matrices by orthogonalizing the gradient momentum. Non-2D parameters
+    (embeddings, output heads, biases, LayerNorm) are optimized with AdamW.
+
+    References:
+        - https://kellerjordan.github.io/posts/muon/
+        - https://github.com/MoonshotAI/Moonlight
+
+    Args:
+        momentum (float): Momentum factor for Muon (Nesterov-style). Default 0.95.
+        ns_steps (int): Number of Newton-Schulz iteration steps. Default 5.
+        ns_eps (float): Epsilon for Newton-Schulz normalization. Default 1e-7.
+        rms_scale (float): Scaling factor for consistent RMS updates across
+            different matrix shapes. Set to 0.2 to match AdamW update RMS
+            (from MoonshotAI). Set to 0 to disable. Default 0.2.
+        adamw_lr (Optional[float]): Learning rate for AdamW (non-2D params).
+            If None, uses the base ``lr``. Default None.
+        adamw_betas (tuple): Betas for AdamW. Default (0.9, 0.999).
+        adamw_eps (float): Epsilon for AdamW. Default 1e-8.
+        muon_param_filter (str): How to filter 2D params for Muon.
+            "hidden": Only hidden-layer 2D params (exclude embed/lm_head).
+            "all_2d": All 2D params. Default "hidden".
+    """
+
+    _mutable_fields = FSDPOptimizerConfig._mutable_fields.copy()
+
+    optimizer: str = "MuonWithAdamW"
+    optimizer_impl: str = "verl.utils.muon"
+    momentum: float = 0.95
+    ns_steps: int = 5
+    ns_eps: float = 1e-7
+    rms_scale: float = 0.2
+    adamw_lr: Optional[float] = None
+    adamw_betas: tuple = (0.9, 0.999)
+    adamw_eps: float = 1e-8
+    muon_param_filter: str = "hidden"
+
+    def __post_init__(self):
+        assert self.muon_param_filter in ("hidden", "all_2d"), (
+            f"muon_param_filter must be 'hidden' or 'all_2d', got '{self.muon_param_filter}'"
+        )
+        return super().__post_init__()
+
+
+def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=None):
     """Build an optimizer based on the configuration.
 
     Dynamically imports and instantiates an optimizer class from the specified module.
+    When the optimizer is MuonWithAdamW, parameters are automatically split into
+    2D hidden-layer params (for Muon) and other params (for AdamW).
 
     Args:
         parameters: Model parameters to optimize
         config: FSDPOptimizerConfig with optimizer settings
+        named_parameters: Optional iterable of (name, param) tuples. When provided
+            and using Muon, enables name-based parameter filtering (e.g., excluding
+            embed/lm_head from Muon). If None, Muon falls back to dimension-based
+            filtering only.
 
     Returns:
         Optimizer instance
@@ -240,15 +296,23 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
         # BitsAndBytes AdamW 8bit
         config.optimizer_impl = "bitsandbytes.optim"
         config.optimizer = "AdamW8bit"
+
+        # Muon + AdamW (mixed optimizer)
+        config.optimizer = "MuonWithAdamW"
+        config.optimizer_impl = "verl.utils.muon"
     """
     import importlib
+
+    optimizer_name_lower = config.optimizer.lower()
+
+    if "muon" in optimizer_name_lower and isinstance(config, MuonOptimizerConfig):
+        return _build_muon_optimizer(parameters, config, named_parameters=named_parameters)
 
     optimizer_args = {
         "lr": config.lr,
         "weight_decay": config.weight_decay,
     }
 
-    optimizer_name_lower = config.optimizer.lower()
     if "adam" in optimizer_name_lower or "ademamix" in optimizer_name_lower:
         optimizer_args["betas"] = config.betas
 
@@ -269,3 +333,62 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig):
         ) from e
 
     return optimizer_cls(parameters, **optimizer_args)
+
+
+_MUON_EXCLUDE_PATTERNS = ("embed", "lm_head", "norm", "bias")
+
+
+def _should_use_muon(name: str, param: torch.nn.Parameter, param_filter: str) -> bool:
+    if param.ndim < 2:
+        return False
+
+    if param_filter == "all_2d":
+        return True
+
+    name_lower = name.lower()
+    for pattern in _MUON_EXCLUDE_PATTERNS:
+        if pattern in name_lower:
+            return False
+
+    return True
+
+
+def _build_muon_optimizer(parameters, config: MuonOptimizerConfig, named_parameters=None):
+    from verl.utils.muon import MuonWithAdamW
+
+    muon_params = []
+    adamw_params = []
+
+    param_filter = config.muon_param_filter
+
+    if named_parameters is not None:
+        name_to_param = {}
+        for name, p in named_parameters:
+            name_to_param[id(p)] = name
+
+        for p in parameters:
+            name = name_to_param.get(id(p), "")
+            if _should_use_muon(name, p, param_filter):
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+    else:
+        for p in parameters:
+            if p.ndim >= 2 and param_filter == "all_2d":
+                muon_params.append(p)
+            else:
+                adamw_params.append(p)
+
+    return MuonWithAdamW(
+        muon_params=muon_params,
+        adamw_params=adamw_params,
+        lr=config.lr,
+        momentum=config.momentum,
+        ns_steps=config.ns_steps,
+        weight_decay=config.weight_decay,
+        ns_eps=config.ns_eps,
+        rms_scale=config.rms_scale,
+        adamw_lr=config.adamw_lr,
+        adamw_betas=config.adamw_betas,
+        adamw_eps=config.adamw_eps,
+    )

@@ -655,7 +655,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
-            actor_optimizer = build_optimizer(actor_module_fsdp.parameters(), optim_config)
+            actor_optimizer = build_optimizer(
+                actor_module_fsdp.parameters(), optim_config, named_parameters=actor_module_fsdp.named_parameters()
+            )
 
             total_steps = optim_config.get("total_training_steps", 0)
             num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
@@ -1607,7 +1609,9 @@ class CriticWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage("After critic FSDP", logger=None)
 
-        critic_optimizer = build_optimizer(critic_module.parameters(), config.optim)
+        critic_optimizer = build_optimizer(
+            critic_module.parameters(), config.optim, named_parameters=critic_module.named_parameters()
+        )
 
         total_steps = config.optim.get("total_training_steps", 0)
         num_warmup_steps = int(config.optim.get("lr_warmup_steps", -1))
