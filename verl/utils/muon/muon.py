@@ -263,5 +263,4 @@ def _reshard_update(full_update: torch.Tensor, param) -> torch.Tensor:
     device_mesh = param.device_mesh
     placements = param.placements
 
-    distributed_update = distribute_tensor(full_update, device_mesh, placements)
-    return distributed_update.to_local()
+    return distribute_tensor(full_update, device_mesh, placements)
