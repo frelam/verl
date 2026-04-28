@@ -91,7 +91,7 @@ from verl.utils.qat import apply_qat, enable_qat_fuse
 from verl.utils.ray_utils import get_event_loop
 from verl.utils.transformers_compat import get_auto_model_for_vision2seq
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
-from verl.workers.config.optimizer import build_optimizer
+from verl.workers.config.optimizer import _is_muon_config, build_optimizer
 from verl.workers.rollout import get_rollout_class
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
@@ -542,6 +542,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if optim_config is not None and _is_muon_config(optim_config):
+            self.use_orig_params = True
+            if self.rank == 0:
+                print("[actor model] Muon optimizer requires use_orig_params=True for FSDP1.")
         if self.config.actor.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(actor_module)
             if vision_tower is not None:
@@ -561,6 +565,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self._restore_w4a4_input_scales(actor_module, self.config.model.path)
 
         torch.distributed.barrier()
+
+        pre_fsdp_param_info = None
+        if role == "actor" and optim_config is not None and _is_muon_config(optim_config):
+            pre_fsdp_param_info = {id(p): (name, p.ndim) for name, p in actor_module.named_parameters()}
 
         if self.rank == 0:
             print_model_size(actor_module)
@@ -656,7 +664,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 
             actor_optimizer = build_optimizer(
-                actor_module_fsdp.parameters(), optim_config, named_parameters=actor_module_fsdp.named_parameters()
+                actor_module_fsdp.parameters(),
+                optim_config,
+                named_parameters=actor_module_fsdp.named_parameters(),
+                pre_fsdp_param_info=pre_fsdp_param_info,
             )
 
             total_steps = optim_config.get("total_training_steps", 0)
@@ -1553,6 +1564,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
+        if _is_muon_config(config.optim):
+            self.use_orig_params = True
+            if self.rank == 0:
+                print("[critic model] Muon optimizer requires use_orig_params=True for FSDP1.")
         if self.config.model.get("freeze_vision_tower", False):
             vision_tower = get_vl_model_vision_tower(critic_module)
             if vision_tower is not None:
@@ -1565,6 +1580,11 @@ class CriticWorker(Worker, DistProfilerExtension):
                     print("[critic model] No vision tower found.")
 
         # Note: We force turn off CPUOffload for critic because it causes incorrect results when using grad accumulation
+
+        pre_fsdp_param_info = None
+        if _is_muon_config(config.optim):
+            pre_fsdp_param_info = {id(p): (name, p.ndim) for name, p in critic_module.named_parameters()}
+
         if config.strategy == "fsdp":
             critic_module = FSDP(
                 critic_module,
@@ -1610,7 +1630,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         log_gpu_memory_usage("After critic FSDP", logger=None)
 
         critic_optimizer = build_optimizer(
-            critic_module.parameters(), config.optim, named_parameters=critic_module.named_parameters()
+            critic_module.parameters(),
+            config.optim,
+            named_parameters=critic_module.named_parameters(),
+            pre_fsdp_param_info=pre_fsdp_param_info,
         )
 
         total_steps = config.optim.get("total_training_steps", 0)

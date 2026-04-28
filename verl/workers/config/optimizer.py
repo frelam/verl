@@ -265,7 +265,7 @@ class MuonOptimizerConfig(FSDPOptimizerConfig):
         return super().__post_init__()
 
 
-def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=None):
+def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=None, pre_fsdp_param_info=None):
     """Build an optimizer based on the configuration.
 
     Dynamically imports and instantiates an optimizer class from the specified module.
@@ -279,6 +279,10 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=No
             and using Muon, enables name-based parameter filtering (e.g., excluding
             embed/lm_head from Muon). If None, Muon falls back to dimension-based
             filtering only.
+        pre_fsdp_param_info: Optional dict mapping ``id(param)`` to ``(name, ndim)``
+            tuples captured **before** FSDP wrapping. When provided, the original
+            ndim and name are used for Muon parameter classification, which is
+            essential when FSDP1 flattens parameters into 1D FlatParameters.
 
     Returns:
         Optimizer instance
@@ -308,7 +312,9 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=No
     if "muon" in optimizer_name_lower and (
         isinstance(config, MuonOptimizerConfig) or _is_muon_config(config)
     ):
-        return _build_muon_optimizer(parameters, config, named_parameters=named_parameters)
+        return _build_muon_optimizer(
+            parameters, config, named_parameters=named_parameters, pre_fsdp_param_info=pre_fsdp_param_info
+        )
 
     optimizer_args = {
         "lr": config.lr,
@@ -359,8 +365,9 @@ def _get_config_val(config, key, default=None):
         return default
 
 
-def _should_use_muon(name: str, param: torch.nn.Parameter, param_filter: str) -> bool:
-    if param.ndim < 2:
+def _should_use_muon(name: str, param: torch.nn.Parameter, param_filter: str, original_ndim: int | None = None) -> bool:
+    ndim = original_ndim if original_ndim is not None else param.ndim
+    if ndim < 2:
         return False
 
     if param_filter == "all_2d":
@@ -374,7 +381,7 @@ def _should_use_muon(name: str, param: torch.nn.Parameter, param_filter: str) ->
     return True
 
 
-def _build_muon_optimizer(parameters, config, named_parameters=None):
+def _build_muon_optimizer(parameters, config, named_parameters=None, pre_fsdp_param_info=None):
     from verl.utils.muon import MuonWithAdamW
 
     muon_params = []
@@ -389,13 +396,22 @@ def _build_muon_optimizer(parameters, config, named_parameters=None):
 
         for p in parameters:
             name = name_to_param.get(id(p), "")
-            if _should_use_muon(name, p, param_filter):
+            original_ndim = None
+            if pre_fsdp_param_info is not None and id(p) in pre_fsdp_param_info:
+                pre_name, pre_ndim = pre_fsdp_param_info[id(p)]
+                name = name or pre_name
+                original_ndim = pre_ndim
+            if _should_use_muon(name, p, param_filter, original_ndim=original_ndim):
                 muon_params.append(p)
             else:
                 adamw_params.append(p)
     else:
         for p in parameters:
-            if p.ndim >= 2 and param_filter == "all_2d":
+            original_ndim = None
+            if pre_fsdp_param_info is not None and id(p) in pre_fsdp_param_info:
+                original_ndim = pre_fsdp_param_info[id(p)][1]
+            ndim = original_ndim if original_ndim is not None else p.ndim
+            if ndim >= 2 and param_filter == "all_2d":
                 muon_params.append(p)
             else:
                 adamw_params.append(p)
