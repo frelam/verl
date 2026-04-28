@@ -22,22 +22,30 @@ The Newton-Schulz iteration runs in bfloat16 and only involves matrix multiplica
 
 ## Quick Start
 
-### Command Line
+### Command Line (Recommended)
 
-Add the following flags to your existing training script:
+Use `_target_` to switch the optimizer config class, and `+` prefix for Muon-specific fields that don't exist in the base `FSDPOptimizerConfig` struct:
 
 ```bash
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     actor_rollout_ref.actor.optim._target_=verl.workers.config.MuonOptimizerConfig \
+    actor_rollout_ref.actor.optim.optimizer=MuonWithAdamW \
+    actor_rollout_ref.actor.optim.optimizer_impl=verl.utils.muon \
     actor_rollout_ref.actor.optim.lr=2e-3 \
-    actor_rollout_ref.actor.optim.momentum=0.95 \
-    actor_rollout_ref.actor.optim.ns_steps=5 \
-    actor_rollout_ref.actor.optim.rms_scale=0.2 \
-    actor_rollout_ref.actor.optim.muon_param_filter=hidden \
-    actor_rollout_ref.actor.optim.weight_decay=0.01 \
+    +actor_rollout_ref.actor.optim.momentum=0.95 \
+    +actor_rollout_ref.actor.optim.ns_steps=5 \
+    +actor_rollout_ref.actor.optim.rms_scale=0.2 \
+    +actor_rollout_ref.actor.optim.muon_param_filter=hidden \
+    +actor_rollout_ref.actor.optim.ns_eps=1e-7 \
+    +actor_rollout_ref.actor.optim.adamw_lr=null \
+    +actor_rollout_ref.actor.optim.adamw_betas=[0.9,0.999] \
+    +actor_rollout_ref.actor.optim.adamw_eps=1e-8 \
     ...
 ```
+
+> [!IMPORTANT]
+> The `+` prefix is required for Muon-specific fields (`momentum`, `ns_steps`, `rms_scale`, `muon_param_filter`, `ns_eps`, `adamw_lr`, `adamw_betas`, `adamw_eps`) because they don't exist in the base `FSDPOptimizerConfig` struct. Without `+`, OmegaConf will raise a "Key is not in struct" error. Fields inherited from `FSDPOptimizerConfig` (`optimizer`, `optimizer_impl`, `lr`, `weight_decay`, etc.) do NOT need the `+` prefix.
 
 ### YAML Configuration
 
@@ -123,12 +131,17 @@ python3 -m verl.trainer.main_ppo \
     data.max_response_length=2048 \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-7B \
     actor_rollout_ref.actor.optim._target_=verl.workers.config.MuonOptimizerConfig \
+    actor_rollout_ref.actor.optim.optimizer=MuonWithAdamW \
+    actor_rollout_ref.actor.optim.optimizer_impl=verl.utils.muon \
     actor_rollout_ref.actor.optim.lr=2e-3 \
-    actor_rollout_ref.actor.optim.momentum=0.95 \
-    actor_rollout_ref.actor.optim.ns_steps=5 \
-    actor_rollout_ref.actor.optim.rms_scale=0.2 \
-    actor_rollout_ref.actor.optim.muon_param_filter=hidden \
-    actor_rollout_ref.actor.optim.weight_decay=0.01 \
+    +actor_rollout_ref.actor.optim.momentum=0.95 \
+    +actor_rollout_ref.actor.optim.ns_steps=5 \
+    +actor_rollout_ref.actor.optim.rms_scale=0.2 \
+    +actor_rollout_ref.actor.optim.muon_param_filter=hidden \
+    +actor_rollout_ref.actor.optim.ns_eps=1e-7 \
+    +actor_rollout_ref.actor.optim.adamw_lr=null \
+    +actor_rollout_ref.actor.optim.adamw_betas=[0.9,0.999] \
+    +actor_rollout_ref.actor.optim.adamw_eps=1e-8 \
     actor_rollout_ref.actor.optim.lr_scheduler_type=cosine \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \

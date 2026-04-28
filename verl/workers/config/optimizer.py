@@ -305,7 +305,9 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=No
 
     optimizer_name_lower = config.optimizer.lower()
 
-    if "muon" in optimizer_name_lower and isinstance(config, MuonOptimizerConfig):
+    if "muon" in optimizer_name_lower and (
+        isinstance(config, MuonOptimizerConfig) or _is_muon_config(config)
+    ):
         return _build_muon_optimizer(parameters, config, named_parameters=named_parameters)
 
     optimizer_args = {
@@ -338,6 +340,25 @@ def build_optimizer(parameters, config: FSDPOptimizerConfig, named_parameters=No
 _MUON_EXCLUDE_PATTERNS = ("embed", "lm_head", "norm", "bias")
 
 
+def _is_muon_config(config) -> bool:
+    if isinstance(config, MuonOptimizerConfig):
+        return True
+    try:
+        target = config.get("_target_", "")
+        return "MuonOptimizerConfig" in str(target)
+    except Exception:
+        return False
+
+
+def _get_config_val(config, key, default=None):
+    if isinstance(config, MuonOptimizerConfig):
+        return getattr(config, key, default)
+    try:
+        return config.get(key, default)
+    except Exception:
+        return default
+
+
 def _should_use_muon(name: str, param: torch.nn.Parameter, param_filter: str) -> bool:
     if param.ndim < 2:
         return False
@@ -353,13 +374,13 @@ def _should_use_muon(name: str, param: torch.nn.Parameter, param_filter: str) ->
     return True
 
 
-def _build_muon_optimizer(parameters, config: MuonOptimizerConfig, named_parameters=None):
+def _build_muon_optimizer(parameters, config, named_parameters=None):
     from verl.utils.muon import MuonWithAdamW
 
     muon_params = []
     adamw_params = []
 
-    param_filter = config.muon_param_filter
+    param_filter = _get_config_val(config, "muon_param_filter", "hidden")
 
     if named_parameters is not None:
         name_to_param = {}
@@ -382,13 +403,13 @@ def _build_muon_optimizer(parameters, config: MuonOptimizerConfig, named_paramet
     return MuonWithAdamW(
         muon_params=muon_params,
         adamw_params=adamw_params,
-        lr=config.lr,
-        momentum=config.momentum,
-        ns_steps=config.ns_steps,
-        weight_decay=config.weight_decay,
-        ns_eps=config.ns_eps,
-        rms_scale=config.rms_scale,
-        adamw_lr=config.adamw_lr,
-        adamw_betas=config.adamw_betas,
-        adamw_eps=config.adamw_eps,
+        lr=_get_config_val(config, "lr", 2e-3),
+        momentum=_get_config_val(config, "momentum", 0.95),
+        ns_steps=_get_config_val(config, "ns_steps", 5),
+        weight_decay=_get_config_val(config, "weight_decay", 0.01),
+        ns_eps=_get_config_val(config, "ns_eps", 1e-7),
+        rms_scale=_get_config_val(config, "rms_scale", 0.2),
+        adamw_lr=_get_config_val(config, "adamw_lr", None),
+        adamw_betas=_get_config_val(config, "adamw_betas", (0.9, 0.999)),
+        adamw_eps=_get_config_val(config, "adamw_eps", 1e-8),
     )
