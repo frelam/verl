@@ -469,13 +469,14 @@ class FSDPEngine(BaseEngine):
 
         return module
 
-    def _build_optimizer(self, module):
+    def _build_optimizer(self, module, pre_fsdp_param_info=None):
         from verl.workers.config.optimizer import build_optimizer
 
         optimizer = build_optimizer(
             module.parameters(),
             self.optimizer_config,
             named_parameters=module.named_parameters(),
+            pre_fsdp_param_info=pre_fsdp_param_info,
         )
 
         return optimizer
@@ -584,6 +585,17 @@ class FSDPEngine(BaseEngine):
             print_model_size(module)
         log_gpu_memory_usage("After init model from HF AutoModel", logger=logger)
 
+        pre_fsdp_param_info = None
+        if not self.engine_config.forward_only:
+            from verl.workers.config.optimizer import _is_muon_config
+
+            if _is_muon_config(self.optimizer_config):
+                pre_fsdp_param_info = {id(p): (name, p.ndim) for name, p in module.named_parameters()}
+                if self.engine_config.strategy == "fsdp" and not self.engine_config.use_orig_params:
+                    self.engine_config.use_orig_params = True
+                    if self.rank == 0:
+                        print("[engine] Muon optimizer requires use_orig_params=True for FSDP1.")
+
         # Wrap model with FSDP for distributed training (sharding, mixed precision, etc.)
         log_gpu_memory_usage("Before FSDP", logger=None)
         module = self._build_fsdp_module(module)
@@ -591,7 +603,7 @@ class FSDPEngine(BaseEngine):
 
         if not self.engine_config.forward_only:
             # Initialize optimizer with model parameters and config settings
-            optimizer = self._build_optimizer(module)
+            optimizer = self._build_optimizer(module, pre_fsdp_param_info=pre_fsdp_param_info)
             # Create learning rate scheduler with warmup and decay settings
             lr_scheduler = self._build_lr_scheduler(optimizer)
         else:

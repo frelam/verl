@@ -2,7 +2,6 @@ import math
 from typing import Iterable, Optional
 
 import torch
-import torch.distributed as dist
 
 from verl.utils.muon.newton_schulz import newton_schulz
 
@@ -29,9 +28,6 @@ class Muon(torch.optim.Optimizer):
             When > 0, the update is scaled by ``rms_scale * sqrt(max(m, n))``
             to match AdamW's update RMS across different matrix shapes.
             Default 0.2 (from MoonshotAI).
-        dp_group: Process group for data-parallel communication.
-            If provided, enables distributed ZeRO-1 style Muon with
-            all-gather for orthogonalization.
     """
 
     def __init__(
@@ -43,7 +39,7 @@ class Muon(torch.optim.Optimizer):
         weight_decay: float = 0.0,
         ns_eps: float = 1e-7,
         rms_scale: float = 0.2,
-        dp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
         defaults = dict(
             lr=lr,
@@ -54,8 +50,6 @@ class Muon(torch.optim.Optimizer):
             rms_scale=rms_scale,
         )
         super().__init__(params, defaults)
-        self.dp_group = dp_group
-        self._dp_world_size = dist.get_world_size(dp_group) if dp_group is not None and dist.is_initialized() else 1
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -89,15 +83,16 @@ class Muon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
 
-                m = buf.clone()
-
-                if self._dp_world_size > 1:
-                    update = self._distributed_orthogonalize(p, m, ns_steps, ns_eps)
-                else:
-                    update = self._orthogonalize(m, ns_steps, ns_eps)
+                update = self._orthogonalize(p, buf, ns_steps, ns_eps)
 
                 if rms_scale > 0:
-                    max_dim = max(p.shape[0], p.shape[1])
+                    from torch.distributed.tensor import DTensor
+
+                    if isinstance(p, DTensor):
+                        full_shape = p._spec.shape
+                    else:
+                        full_shape = p.shape
+                    max_dim = max(full_shape[0], full_shape[1])
                     update = update * (rms_scale * math.sqrt(max_dim))
 
                 if weight_decay > 0:
@@ -108,18 +103,24 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
-    @staticmethod
-    def _orthogonalize(M: torch.Tensor, ns_steps: int, ns_eps: float) -> torch.Tensor:
-        return newton_schulz(M.float(), steps=ns_steps, eps=ns_eps).to(M.dtype)
+    def _orthogonalize(self, param, momentum, ns_steps, ns_eps):
+        from torch.distributed.tensor import DTensor
 
-    def _distributed_orthogonalize(
-        self, param: torch.nn.Parameter, momentum: torch.Tensor, ns_steps: int, ns_eps: float
-    ) -> torch.Tensor:
-        full_momentum = _all_gather_2d(momentum, self.dp_group)
+        is_dtensor = isinstance(momentum, DTensor)
+
+        if is_dtensor:
+            full_momentum = momentum.full_tensor()
+        else:
+            full_momentum = momentum
+
         full_update = newton_schulz(full_momentum.float(), steps=ns_steps, eps=ns_eps)
-        full_update = full_update.to(momentum.dtype)
+        full_update = full_update.to(full_momentum.dtype)
 
-        local_update = _get_local_shard(full_update, self.dp_group, momentum.shape)
+        if is_dtensor:
+            local_update = _reshard_update(full_update, param)
+        else:
+            local_update = full_update
+
         return local_update
 
 
@@ -130,8 +131,8 @@ class MuonWithAdamW(torch.optim.Optimizer):
     (embeddings, output heads, biases, LayerNorm, etc.).
 
     This follows the recommended practice from the Muon paper and MoonshotAI:
-    - 2D hidden-layer weights → Muon (orthogonalized momentum)
-    - Embeddings, lm_head, scalar params → AdamW
+    - 2D hidden-layer weights -> Muon (orthogonalized momentum)
+    - Embeddings, lm_head, scalar params -> AdamW
 
     Args:
         muon_params: Parameters to optimize with Muon (2D hidden-layer weights).
@@ -145,7 +146,6 @@ class MuonWithAdamW(torch.optim.Optimizer):
         adamw_lr: Learning rate for AdamW. If None, uses ``lr``.
         adamw_betas: Betas for AdamW.
         adamw_eps: Epsilon for AdamW.
-        dp_group: Process group for data-parallel communication.
     """
 
     def __init__(
@@ -161,7 +161,7 @@ class MuonWithAdamW(torch.optim.Optimizer):
         adamw_lr: Optional[float] = None,
         adamw_betas: tuple = (0.9, 0.999),
         adamw_eps: float = 1e-8,
-        dp_group: Optional[dist.ProcessGroup] = None,
+        **kwargs,
     ):
         muon_param_list = list(muon_params)
         adamw_param_list = list(adamw_params)
@@ -170,45 +170,54 @@ class MuonWithAdamW(torch.optim.Optimizer):
             raise ValueError("At least one of muon_params or adamw_params must be non-empty")
 
         defaults = dict(lr=lr, weight_decay=weight_decay)
-        super().__init__(
-            [
-                {"params": muon_param_list, "muon_enabled": True},
-                {"params": adamw_param_list, "muon_enabled": False},
-            ],
-            defaults,
-        )
 
-        self.muon = Muon(
-            muon_param_list,
-            lr=lr,
-            momentum=momentum,
-            ns_steps=ns_steps,
-            weight_decay=weight_decay,
-            ns_eps=ns_eps,
-            rms_scale=rms_scale,
-            dp_group=dp_group,
-        )
+        param_groups = []
+        if muon_param_list:
+            param_groups.append({"params": muon_param_list, "muon_enabled": True})
+        if adamw_param_list:
+            param_groups.append({"params": adamw_param_list, "muon_enabled": False})
 
-        self.adamw = torch.optim.AdamW(
-            adamw_param_list,
-            lr=adamw_lr if adamw_lr is not None else lr,
-            betas=adamw_betas,
-            eps=adamw_eps,
-            weight_decay=weight_decay,
-        )
+        if not param_groups:
+            param_groups.append({"params": [], "muon_enabled": False})
+
+        super().__init__(param_groups, defaults)
+
+        self.muon = None
+        if muon_param_list:
+            self.muon = Muon(
+                muon_param_list,
+                lr=lr,
+                momentum=momentum,
+                ns_steps=ns_steps,
+                weight_decay=weight_decay,
+                ns_eps=ns_eps,
+                rms_scale=rms_scale,
+            )
+
+        self.adamw = None
+        if adamw_param_list:
+            self.adamw = torch.optim.AdamW(
+                adamw_param_list,
+                lr=adamw_lr if adamw_lr is not None else lr,
+                betas=adamw_betas,
+                eps=adamw_eps,
+                weight_decay=weight_decay,
+            )
 
         self.param_groups = self._build_param_groups()
 
     def _build_param_groups(self):
         groups = []
-        for g in self.muon.param_groups:
-            pg = dict(g)
-            pg["muon_enabled"] = True
-            groups.append(pg)
-        for g in self.adamw.param_groups:
-            pg = dict(g)
-            pg["muon_enabled"] = False
-            groups.append(pg)
+        if self.muon is not None:
+            for g in self.muon.param_groups:
+                pg = dict(g)
+                pg["muon_enabled"] = True
+                groups.append(pg)
+        if self.adamw is not None:
+            for g in self.adamw.param_groups:
+                pg = dict(g)
+                pg["muon_enabled"] = False
+                groups.append(pg)
         return groups
 
     @torch.no_grad()
@@ -218,50 +227,41 @@ class MuonWithAdamW(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        self.muon.step()
-        self.adamw.step()
+        if self.muon is not None:
+            self.muon.step()
+        if self.adamw is not None:
+            self.adamw.step()
         return loss
 
     def zero_grad(self, set_to_none=True):
-        self.muon.zero_grad(set_to_none=set_to_none)
-        self.adamw.zero_grad(set_to_none=set_to_none)
+        if self.muon is not None:
+            self.muon.zero_grad(set_to_none=set_to_none)
+        if self.adamw is not None:
+            self.adamw.zero_grad(set_to_none=set_to_none)
 
     def state_dict(self):
-        return {
-            "muon": self.muon.state_dict(),
-            "adamw": self.adamw.state_dict(),
-        }
+        result = {}
+        if self.muon is not None:
+            result["muon"] = self.muon.state_dict()
+        if self.adamw is not None:
+            result["adamw"] = self.adamw.state_dict()
+        return result
 
     def load_state_dict(self, state_dict):
-        self.muon.load_state_dict(state_dict["muon"])
-        self.adamw.load_state_dict(state_dict["adamw"])
+        if self.muon is not None and "muon" in state_dict:
+            self.muon.load_state_dict(state_dict["muon"])
+        if self.adamw is not None and "adamw" in state_dict:
+            self.adamw.load_state_dict(state_dict["adamw"])
 
 
-def _all_gather_2d(tensor: torch.Tensor, group: Optional[dist.ProcessGroup] = None) -> torch.Tensor:
-    if group is None or not dist.is_initialized():
-        return tensor
+def _reshard_update(full_update: torch.Tensor, param) -> torch.Tensor:
+    from torch.distributed.tensor import DTensor, distribute_tensor
 
-    world_size = dist.get_world_size(group)
-    if world_size == 1:
-        return tensor
+    if not isinstance(param, DTensor):
+        return full_update
 
-    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor, group=group)
+    device_mesh = param.device_mesh
+    placements = param.placements
 
-    return torch.cat(gathered, dim=0)
-
-
-def _get_local_shard(
-    full_tensor: torch.Tensor, group: Optional[dist.ProcessGroup], local_shape: tuple
-) -> torch.Tensor:
-    if group is None or not dist.is_initialized():
-        return full_tensor
-
-    world_size = dist.get_world_size(group)
-    if world_size == 1:
-        return full_tensor
-
-    rank = dist.get_rank(group)
-    shard_size = local_shape[0]
-    start = rank * shard_size
-    return full_tensor[start : start + shard_size]
+    distributed_update = distribute_tensor(full_update, device_mesh, placements)
+    return distributed_update.to_local()
