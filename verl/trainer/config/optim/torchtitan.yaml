@@ -33,3 +33,7 @@ decay_type: linear
 
 # Minimum LR factor for cosine schedule
 min_lr_factor: 0.0
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false

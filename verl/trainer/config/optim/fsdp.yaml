@@ -51,3 +51,7 @@ warmup_style: null
 # override_optimizer_config:
 #   bf16_stochastic_round: true
 override_optimizer_config: null
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false

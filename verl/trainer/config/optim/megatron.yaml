@@ -82,3 +82,7 @@ muon_scalar_optimizer: adam
 muon_match_adamw_update_rms: False
 
 override_optimizer_config: {}
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false

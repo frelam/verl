@@ -42,6 +42,7 @@ actor_rollout_ref:
       muon_scalar_optimizer: adam
       muon_match_adamw_update_rms: false
       override_optimizer_config: {}
+      reset_optimizer_state_per_iter: false
     megatron:
       _target_: verl.workers.config.McoreEngineConfig
       param_offload: false
@@ -583,6 +584,7 @@ critic:
     muon_scalar_optimizer: adam
     muon_match_adamw_update_rms: false
     override_optimizer_config: {}
+    reset_optimizer_state_per_iter: false
   megatron:
     _target_: verl.workers.config.McoreEngineConfig
     param_offload: false

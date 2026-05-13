@@ -87,6 +87,26 @@ class BaseEngine:
         """
         raise NotImplementedError
 
+    def reset_optimizer_state(self):
+        """
+        Reset the optimizer state (e.g., momentum buffers, second-order statistics)
+        while keeping the learning rate and other hyperparameters intact.
+
+        This is useful when you want each training iteration to start with a clean
+        optimizer state, preventing momentum and other statistics from accumulating
+        across iterations.
+        """
+        if self.optimizer is None:
+            return
+        for group in self.optimizer.param_groups:
+            for p in group["params"]:
+                state = self.optimizer.state.get(p, {})
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        value.zero_()
+                    elif isinstance(value, (int, float)):
+                        state[key] = 0
+
     def lr_scheduler_step(self):
         """
         Advance the learning rate scheduler by one step.
