@@ -37,3 +37,7 @@ clip_grad: 1.0
 lr_scheduler_type: cosine
 
 override_optimizer_config: {}
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false

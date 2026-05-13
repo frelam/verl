@@ -30,6 +30,7 @@ actor_rollout_ref:
       exp_avg_dtype: fp32
       exp_avg_sq_dtype: fp32
       override_optimizer_config: {}
+      reset_optimizer_state_per_iter: false
     megatron:
       _target_: verl.workers.config.McoreEngineConfig
       param_offload: false
@@ -540,6 +541,7 @@ critic:
     exp_avg_dtype: fp32
     exp_avg_sq_dtype: fp32
     override_optimizer_config: {}
+    reset_optimizer_state_per_iter: false
   megatron:
     _target_: verl.workers.config.McoreEngineConfig
     param_offload: false

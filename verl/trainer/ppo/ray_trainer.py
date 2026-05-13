@@ -1839,6 +1839,20 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                    # reset optimizer state if configured
+                    actor_reset_optim = OmegaConf.select(
+                        self.config, "actor_rollout_ref.actor.optim.reset_optimizer_state_per_iter", default=False
+                    )
+                    if actor_reset_optim:
+                        self.actor_rollout_wg.reset_optimizer_state()
+                    if self.use_critic:
+                        critic_reset_optim = OmegaConf.select(
+                            self.config, "critic.optim.reset_optimizer_state_per_iter", default=False
+                        )
+                        if critic_reset_optim:
+                            self.critic_wg.reset_optimizer_state()
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):

@@ -525,6 +525,22 @@ class MegatronEngine(BaseEngine):
 
         return grad_norm
 
+    def reset_optimizer_state(self):
+        if self.optimizer is None:
+            return
+        if hasattr(self.optimizer, "optimizer"):
+            inner_optimizer = self.optimizer.optimizer
+        else:
+            inner_optimizer = self.optimizer
+        for group in inner_optimizer.param_groups:
+            for p in group["params"]:
+                state = inner_optimizer.state.get(p, {})
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        value.zero_()
+                    elif isinstance(value, (int, float)):
+                        state[key] = 0
+
     def lr_scheduler_step(self):
         """
         Advance the learning rate scheduler by one step.

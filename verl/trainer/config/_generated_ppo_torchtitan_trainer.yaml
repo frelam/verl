@@ -20,6 +20,7 @@ actor_rollout_ref:
       eps: 1.0e-08
       decay_type: linear
       min_lr_factor: 0.0
+      reset_optimizer_state_per_iter: false
     torchtitan:
       _target_: verl.workers.config.TorchtitanEngineConfig
       param_offload: false
@@ -158,6 +159,7 @@ actor_rollout_ref:
       eps: 1.0e-08
       decay_type: linear
       min_lr_factor: 0.0
+      reset_optimizer_state_per_iter: false
     torchtitan:
       _target_: verl.workers.config.TorchtitanEngineConfig
       param_offload: false
@@ -488,6 +490,7 @@ critic:
     eps: 1.0e-08
     decay_type: linear
     min_lr_factor: 0.0
+    reset_optimizer_state_per_iter: false
   torchtitan:
     _target_: verl.workers.config.TorchtitanEngineConfig
     param_offload: false

@@ -27,3 +27,7 @@ adamw_lr: null
 adamw_betas: [0.9, 0.999]
 adamw_eps: 1e-8
 muon_param_filter: hidden
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false
