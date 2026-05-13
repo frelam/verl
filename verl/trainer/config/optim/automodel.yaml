@@ -54,3 +54,7 @@ master_weight_dtype: null # "fp32", "bf16"
 
 # Additional optimizer kwargs (passed directly to constructor)
 override_optimizer_config: {}
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false

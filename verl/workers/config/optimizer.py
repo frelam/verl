@@ -42,6 +42,9 @@ class OptimizerConfig(BaseConfig):
         total_training_steps (int): Total training steps (must be overridden at runtime).
         weight_decay (float): Weight decay factor.
         lr_warmup_steps (Optional[int]): Number of warmup steps; None delegates to lr_warmup_steps_ratio.
+        reset_optimizer_state_per_iter (bool): If True, reset optimizer state (momentum, second-order
+            statistics, etc.) at the beginning of each training iteration. This prevents optimizer
+            state from accumulating across iterations, making each update independent.
     """
 
     _mutable_fields = {"clip_grad", "total_training_steps", "lr_warmup_steps"}
@@ -53,8 +56,8 @@ class OptimizerConfig(BaseConfig):
     lr_warmup_steps: Optional[int] = -1
     betas: tuple[float, float] = (0.9, 0.999)
     clip_grad: float = 1.0
-    # deprecate grad_clip
     grad_clip: Optional[float] = None
+    reset_optimizer_state_per_iter: bool = False
 
     def __post_init__(self):
         assert self.lr != MISSING

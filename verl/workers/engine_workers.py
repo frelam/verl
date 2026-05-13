@@ -170,6 +170,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
         """
         self.engine.initialize()
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_state(self):
+        """
+        Reset the optimizer state (momentum, second-order statistics, etc.)
+        while keeping the learning rate and other hyperparameters intact.
+        """
+        self.engine.reset_optimizer_state()
+
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
 

@@ -47,3 +47,7 @@ lr_wsd_decay_steps: null
 use_checkpoint_opt_param_scheduler: False
 
 override_optimizer_config: {}
+
+# Whether to reset optimizer state (momentum, second-order statistics, etc.)
+# at the beginning of each training iteration. Default: false.
+reset_optimizer_state_per_iter: false

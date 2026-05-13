@@ -1037,6 +1037,23 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_state(self):
+        if self.actor_optimizer is None:
+            return
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_device_id())
+        for group in self.actor_optimizer.param_groups:
+            for p in group["params"]:
+                state = self.actor_optimizer.state.get(p, {})
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        value.zero_()
+                    elif isinstance(value, (int, float)):
+                        state[key] = 0
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.actor_optimizer)
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
@@ -1699,6 +1716,23 @@ class CriticWorker(Worker, DistProfilerExtension):
             checkpoint_config=self.config.checkpoint,
             trust_remote_code=self.config.model.get("trust_remote_code", False),
         )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def reset_optimizer_state(self):
+        if self.critic_optimizer is None:
+            return
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
+        for group in self.critic_optimizer.param_groups:
+            for p in group["params"]:
+                state = self.critic_optimizer.state.get(p, {})
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        value.zero_()
+                    elif isinstance(value, (int, float)):
+                        state[key] = 0
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(self.critic_optimizer)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="critic"))
     @DistProfiler.annotate(color="cyan", role="compute_values")

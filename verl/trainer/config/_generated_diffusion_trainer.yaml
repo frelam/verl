@@ -24,6 +24,7 @@ actor_rollout_ref:
       zero_indexed_step: true
       warmup_style: null
       override_optimizer_config: null
+      reset_optimizer_state_per_iter: false
     fsdp_config:
       _target_: verl.workers.config.FSDPEngineConfig
       wrap_policy:
@@ -435,6 +436,7 @@ critic:
     zero_indexed_step: true
     warmup_style: null
     override_optimizer_config: null
+    reset_optimizer_state_per_iter: false
   model:
     fsdp_config:
       _target_: verl.workers.config.FSDPEngineConfig

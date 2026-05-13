@@ -372,6 +372,10 @@ class SFTTrainer:
 
                 tu.assign_non_tensor(data, update_lr_scheduler=True, global_token_num=batch_seqlens_ntd)
 
+                # reset optimizer state if configured
+                if self.optimizer_config.reset_optimizer_state_per_iter:
+                    self.training_client.reset_optimizer_state()
+
                 # start profile in SPMD mode
                 if global_step == self.start_profile_step:
                     self.training_client.start_profile()
