@@ -205,6 +205,10 @@ def strip_string(string):
     # remove units (on the right)
     string = remove_right_units(string)
 
+    string = re.sub(r'\\text\{([^{}]*)\}', r'\1', string)
+    string = re.sub(r'\\left\(', r'(', string)
+    string = re.sub(r'\\right\)', r')', string)
+
     # remove percentage
     string = string.replace("\\\\%", "")
     string = string.replace("\\%", "")
@@ -228,8 +232,6 @@ def strip_string(string):
     # remove spaces
     string = string.replace(" ", "")
     string = re.sub(r'\((\d+[\+\-]\d+i?)\)', r'\1', string)
-    if not re.match(r'^[a-zA-Z]+$', string):
-        string = re.sub(r'[a-z]{2,}\^?\d*$', '', string)
 
     # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1).
     # Also does a/b --> \\frac{a}{b}
@@ -241,6 +243,10 @@ def strip_string(string):
 
     # NOTE: X/Y changed to \frac{X}{Y} in dataset, but in simple cases fix in case the model output is X/Y
     string = fix_a_slash_b(string)
+
+    string = string.replace(" ", "")
+    if not re.match(r'^[a-zA-Z]+$', string):
+       string = re.sub(r'[a-z]{2,}\^?\d*$', '', string)
 
     string = string.replace('{,}', ',')
 
