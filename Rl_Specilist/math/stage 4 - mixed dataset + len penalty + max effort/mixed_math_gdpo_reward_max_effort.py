@@ -42,7 +42,7 @@ def has_repetition(text: str,
 
 
 def wait_score(text: str,
-               max_occurrences: int = 10,
+               max_occurrences: int = 30,
                max_ratio: float = 0.01,
                reward_value: float = 1.0,
                use_word_boundary: bool = True) -> float:
@@ -68,6 +68,7 @@ def wait_score(text: str,
 def _compute_score(
     solution_str,
     ground_truth,
+    data_source
 ):
     base_score = math_reward.compute_score(solution_str, ground_truth)
 
@@ -118,4 +119,4 @@ def compute_score(
     extra_info=None,
     **kwargs
 ):
-    return _compute_score(solution_str, ground_truth)
+    return _compute_score(solution_str, ground_truth, data_source)
