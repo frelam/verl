@@ -94,6 +94,8 @@ def process_gsm8k(example: dict, idx: int, split: str, max_effort_ratio: float,
     answer_raw = example.pop("answer")
 
     use_max_effort = _should_use_max_effort(idx, max_effort_ratio, seed)
+    if use_max_effort:
+        data_source = data_source + '-max-effort'
     prompt_type = "max_effort" if use_max_effort else "standard"
 
     question = make_prompt(question_raw, use_max_effort, max_effort_prompt, non_max_effort_prompt)
@@ -123,6 +125,8 @@ def process_math(example: dict, idx: int, split: str, max_effort_ratio: float,
     solution_raw = example.pop("solution")
 
     use_max_effort = _should_use_max_effort(idx, max_effort_ratio, seed)
+    if use_max_effort:
+        data_source = data_source + '-max-effort'
     prompt_type = "max_effort" if use_max_effort else "standard"
 
     question = make_prompt(problem, use_max_effort, max_effort_prompt, non_max_effort_prompt)
@@ -170,6 +174,8 @@ def process_gpqa_diamond(example: dict, idx: int, split: str, max_effort_ratio: 
     gold_choice = "ABCD"[gold_index]
 
     use_max_effort = _should_use_max_effort(idx, max_effort_ratio, seed)
+    if use_max_effort:
+        data_source = data_source + '-max-effort'
     prompt_type = "max_effort" if use_max_effort else "standard"
 
     question = make_prompt(query_prompt, use_max_effort, max_effort_prompt, non_max_effort_prompt)
@@ -191,13 +197,15 @@ def process_gpqa_diamond(example: dict, idx: int, split: str, max_effort_ratio: 
 
 def process_bbh(example: dict, idx: int, split: str, max_effort_ratio: float,
                 non_max_effort_prompt: str, max_effort_prompt: str,
-                seed: int = 42) -> dict:
+                config_name: str = "", seed: int = 42) -> dict:
     data_source = "lukaemon/bbh"
 
     question_raw = example.pop("input")
     answer_raw = example.pop("target")
 
     use_max_effort = _should_use_max_effort(idx, max_effort_ratio, seed)
+    if use_max_effort:
+        data_source = data_source + '-max-effort'
     prompt_type = "max_effort" if use_max_effort else "standard"
 
     question = make_prompt(question_raw, use_max_effort, max_effort_prompt, non_max_effort_prompt)
@@ -213,6 +221,7 @@ def process_bbh(example: dict, idx: int, split: str, max_effort_ratio: float,
             "answer": answer_raw,
             "question": question_raw,
             "prompt_type": prompt_type,
+            "bbh_config": config_name,
         },
     }
 
@@ -322,38 +331,59 @@ def download_and_process_gpqa_diamond(
     return processed_dataset
 
 
+BBH_CONFIGS = [
+    "boolean_expressions", "causal_judgement", "date_understanding",
+    "disambiguation_qa", "dyck_languages", "formal_fallacies",
+    "geometric_shapes", "hyperbaton", "logical_deduction_five_objects",
+    "logical_deduction_seven_objects", "logical_deduction_three_objects",
+    "movie_recommendation", "multistep_arithmetic_two", "navigate",
+    "object_counting", "penguins_in_a_table", "reasoning_about_colored_objects",
+    "ruin_names", "salient_translation_error_detection", "snarks",
+    "sports_understanding", "temporal_sequences",
+    "tracking_shuffled_objects_five_objects", "tracking_shuffled_objects_seven_objects",
+    "tracking_shuffled_objects_three_objects", "web_of_lies", "word_sorting",
+]
+
+
 def download_and_process_bbh(
     local_dataset_path: Optional[str] = None,
     split: str = "train",
     max_effort_ratio: float = 0.3,
     non_max_effort_prompt: str = DEFAULT_NON_MAX_EFFORT_PROMPT,
     max_effort_prompt: str = DEFAULT_MAX_EFFORT_PROMPT,
+    bbh_configs: Optional[list] = None,
     seed: int = 42,
 ) -> datasets.Dataset:
-    print(f"Loading BBH dataset ({split} split)...")
+    configs = bbh_configs if bbh_configs else BBH_CONFIGS
+    print(f"Loading BBH dataset ({split} split, {len(configs)} configs)...")
 
-    if local_dataset_path is not None:
-        dataset = datasets.load_dataset(local_dataset_path, split=split)
-    else:
-        dataset = datasets.load_dataset("lukaemon/bbh", split=split)
+    all_processed = []
+    for config_name in configs:
+        print(f"  Loading config: {config_name}...")
 
-    print(f"  Processing {len(dataset)} examples...")
+        if local_dataset_path is not None:
+            dataset = datasets.load_dataset(local_dataset_path, config_name, split=split)
+        else:
+            dataset = datasets.load_dataset("lukaemon/bbh", config_name, split=split)
 
-    def process_fn(example, idx):
-        return process_bbh(
-            example, idx, split, max_effort_ratio,
-            non_max_effort_prompt, max_effort_prompt, seed=seed,
+        def process_fn(example, idx):
+            return process_bbh(
+                example, idx, split, max_effort_ratio,
+                non_max_effort_prompt, max_effort_prompt,
+                config_name=config_name, seed=seed,
+            )
+
+        processed = dataset.map(
+            function=process_fn,
+            with_indices=True,
+            num_proc=8,
+            remove_columns=dataset.column_names,
         )
+        all_processed.append(processed)
 
-    processed_dataset = dataset.map(
-        function=process_fn,
-        with_indices=True,
-        num_proc=8,
-        remove_columns=dataset.column_names,
-    )
-
-    print(f"  Done! Processed {len(processed_dataset)} examples")
-    return processed_dataset
+    merged = concatenate_datasets(all_processed)
+    print(f"  Done! Processed {len(merged)} examples across {len(configs)} configs")
+    return merged
 
 
 def main():
@@ -425,6 +455,20 @@ def main():
         "--skip_bbh",
         action="store_true",
         help="Skip BBH dataset.",
+    )
+    parser.add_argument(
+        "--bbh_configs",
+        nargs="*",
+        default=None,
+        help="Specific BBH configs to include (default: all 27). "
+        "Example: --bbh_configs boolean_expressions causal_judgement",
+    )
+    parser.add_argument(
+        "--test_ratio",
+        type=float,
+        default=0.1,
+        help="Ratio of data held out as test set for datasets without built-in splits "
+        "(GPQA, BBH). 0 means all data goes to train. (default: 0.1)",
     )
     parser.add_argument(
         "--seed",
@@ -509,20 +553,33 @@ def main():
             max_effort_prompt=max_effort_prompt,
             seed=args.seed,
         )
-        train_datasets.append(gpqa_dataset)
-        test_datasets.append(gpqa_dataset)
+        gpqa_dataset = gpqa_dataset.shuffle(seed=args.seed)
+        if args.test_ratio > 0:
+            split_dataset = gpqa_dataset.train_test_split(test_size=args.test_ratio, seed=args.seed)
+            train_datasets.append(split_dataset["train"])
+            test_datasets.append(split_dataset["test"])
+            print(f"GPQA train/test split: {len(split_dataset['train'])}/{len(split_dataset['test'])}")
+        else:
+            train_datasets.append(gpqa_dataset)
 
     if not args.skip_bbh:
         bbh_dataset = download_and_process_bbh(
             local_dataset_path=args.bbh_path,
-            split="train",
+            split="test",
             max_effort_ratio=args.max_effort_ratio,
             non_max_effort_prompt=non_max_effort_prompt,
             max_effort_prompt=max_effort_prompt,
+            bbh_configs=args.bbh_configs,
             seed=args.seed,
         )
-        train_datasets.append(bbh_dataset)
-        test_datasets.append(bbh_dataset)
+        bbh_dataset = bbh_dataset.shuffle(seed=args.seed)
+        if args.test_ratio > 0:
+            split_dataset = bbh_dataset.train_test_split(test_size=args.test_ratio, seed=args.seed)
+            train_datasets.append(split_dataset["train"])
+            test_datasets.append(split_dataset["test"])
+            print(f"BBH train/test split: {len(split_dataset['train'])}/{len(split_dataset['test'])}")
+        else:
+            train_datasets.append(bbh_dataset)
 
     print("\n" + "=" * 60)
     print("Merging datasets...")
