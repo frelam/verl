@@ -24,7 +24,7 @@ def length_bonus(text, max_response_length: int = 4000):
     return bonus
 
 def check_thinking_format(solution_str):
-    pattern = r"⋪.*?⋫"
+    pattern = r"<think>.*?</think>"
     matches = re.findall(pattern, solution_str, re.DOTALL)
     return len(matches) == 1
 
