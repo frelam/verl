@@ -88,14 +88,14 @@ def _compute_score(
         else:
             repetition_bonus = 1.0
         wait_bonus = wait_score(solution_str)
+        if data_source.endswith("max-effort"):
+            len_bonus = 1.0
+        else:
+            len_bonus = length_bonus(solution_str)
     else:
         repetition_bonus = 0.0
         wait_bonus = 0.0
-
-    if base_score > 0 and data_source.endswith("max-effort"):
-        len_bonus = length_bonus(solution_str)
-    else:
-        len_bonuse = 0.0
+        len_bonus = 0.0
 
     # score = float(0.7 * base_score + 0.1 * format_bonus + 0.1 * repetition_bonus + 0.1 * wait_bonus)
     score = float(0.7 * base_score + 0.1 * format_bonus + 0.1 * wait_bonus + 0.1 * len_bonus)
