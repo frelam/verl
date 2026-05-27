@@ -13,10 +13,12 @@
 # limitations under the License.
 # Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
 
-from mpmath import e1
+import re
+from typing import Optional
+
 import sympy
 from latex2sympy2 import latex2sympy
-import re
+
 
 def is_math_equal(expr1: str, expr2: str) -> bool:
     try:
@@ -34,13 +36,126 @@ def compute_score(solution_str, ground_truth) -> float:
             answer = remove_boxed(string_in_last_boxed)
             if is_equiv(answer, ground_truth):
                 retval = 1.0
-    except Exception as e:
-        print(e)
+    except Exception:
+        pass
 
     return retval
 
 
 # string normalization from https://github.com/EleutherAI/lm-evaluation-harness/blob/master/lm_eval/tasks/hendrycks_math.py
+_LATEX_ENV_NAMES = frozenset(
+    {
+        "pmatrix",
+        "bmatrix",
+        "Bmatrix",
+        "vmatrix",
+        "Vmatrix",
+        "matrix",
+        "smallmatrix",
+        "array",
+        "subarray",
+        "cases",
+        "split",
+        "aligned",
+        "align",
+        "gather",
+        "multline",
+        "eqnarray",
+        "equation",
+    }
+)
+
+_MATH_ENV_PATTERN = re.compile(
+    r"\\begin\{(pmatrix|bmatrix|Bmatrix|vmatrix|Vmatrix|matrix|smallmatrix|cases|array|subarray|split)\*?\}",
+    re.IGNORECASE,
+)
+
+
+def _contains_math_environment(s: str) -> bool:
+    return _MATH_ENV_PATTERN.search(s) is not None
+
+
+def _is_latex_env_noise_answer(normalized: str) -> bool:
+    words = re.findall(r"[a-z]+", normalized.lower())
+    if not words:
+        return False
+    return all(word in _LATEX_ENV_NAMES for word in words)
+
+
+def _normalize_word_list(s: str) -> str:
+    """Normalize comma/space-separated word lists and aligned LaTeX enumerations."""
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(
+        r"\\begin\{(aligned|align|array|gather|equation)\*?\}(\[[^\]]*\])?",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\\end\{(aligned|align|array|gather|equation)\*?\}", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\[a-zA-Z]+\*?", " ", s)
+    s = s.replace("&", " ")
+    s = s.replace("\\\\", "\n")
+    s = re.sub(r"[{}()\[\];]", " ", s)
+    s = s.replace(",", " ")
+    words = re.findall(r"[a-z][a-z0-9]*", s)
+    return " ".join(words)
+
+
+def _word_lists_equivalent(str1: str, str2: str) -> bool:
+    w1 = _normalize_word_list(str1).split()
+    w2 = _normalize_word_list(str2).split()
+    if len(w1) < 3 or len(w2) < 3:
+        return False
+    return sorted(w1) == sorted(w2)
+
+
+def _looks_like_word_list(s: str) -> bool:
+    if not s:
+        return False
+    if _contains_math_environment(s):
+        return False
+    if re.search(r"\\begin\{(aligned|align|gather)", s, re.IGNORECASE):
+        return True
+    if re.search(r"\\text\{[^}]*,[^}]*\}", s):
+        return True
+    words = re.findall(r"[a-z]{3,}", s.lower())
+    if len(words) >= 3 and ("," in s or "&" in s or "\\\\" in s):
+        return True
+    if len(words) >= 3 and not re.search(r"\\frac|\\sqrt|\\boxed", s):
+        return True
+    return False
+
+
+def _is_valid_normalized_answer(normalized: str, raw_content: str) -> bool:
+    if not _is_valid_boxed_content(raw_content):
+        return False
+    if not normalized or not normalized.strip():
+        return False
+
+    alnum_chars = re.findall(r"[a-zA-Z0-9]", normalized)
+    if not alnum_chars:
+        return False
+
+    if re.match(r"^[\s\(\)\[\]\{\}>\.\\,;:+*/-]+$", normalized):
+        return False
+
+    if _is_latex_env_noise_answer(normalized):
+        return False
+
+    if len(alnum_chars) < 2:
+        stripped = normalized.strip()
+        if re.search(r"[\]\}>)(]", stripped) and not re.match(r"^[a-zA-Z0-9]$", stripped):
+            return False
+        punct_chars = re.sub(r"[a-zA-Z0-9]", "", stripped)
+        if len(punct_chars) >= len(alnum_chars):
+            return False
+
+    return True
+
+
 def is_equiv(str1, str2, verbose=False):
     if str1 is None and str2 is None:
         print("WARNING: Both None")
@@ -49,54 +164,203 @@ def is_equiv(str1, str2, verbose=False):
         return False
 
     try:
+        if _looks_like_word_list(str1) or _looks_like_word_list(str2):
+            if _word_lists_equivalent(str1, str2):
+                return True
+
         ss1 = strip_string(str1)
         ss2 = strip_string(str2)
         if verbose:
             print(ss1, ss2)
+        if ss1 == ss2:
+            return True
+
+        if _word_lists_equivalent(str1, str2):
+            return True
+
         return is_math_equal(ss1, ss2)
     except Exception:
         return str1 == str2
 
 
 def remove_boxed(s):
-    if "\\boxed " in s:
+    if s.startswith("\\boxed "):
         left = "\\boxed "
-        assert s[: len(left)] == left
-        return s[len(left) :]
+        return s[len(left) :].strip()
 
-    left = "\\boxed{"
+    for left in ("\\boxed{", "\\fbox{"):
+        if s.startswith(left):
+            assert s[-1] == "}"
+            return s[len(left) : -1]
 
-    assert s[: len(left)] == left
-    assert s[-1] == "}"
+    raise ValueError(f"Unsupported boxed format: {s[:20]!r}")
 
-    return s[len(left) : -1]
+
+def _is_valid_boxed_content(content: str) -> bool:
+    """Reject fragments produced by malformed or truncated \\boxed{...} extraction."""
+    if content is None:
+        return False
+    stripped = content.strip()
+    if not stripped:
+        return False
+    if re.match(r"^[\s\]\}]+$", stripped):
+        return False
+    if re.match(r"^\\right[\]\)]*\s*\}?\s*$", stripped):
+        return False
+    return True
+
+
+def _match_braced_segment(string: str, open_brace_idx: int):
+    """Return string[open_brace_idx : closing_brace_idx + 1] for a balanced {...} segment."""
+    if open_brace_idx < 0 or open_brace_idx >= len(string) or string[open_brace_idx] != "{":
+        return None
+
+    num_left_braces_open = 0
+    for i in range(open_brace_idx, len(string)):
+        if string[i] == "{":
+            num_left_braces_open += 1
+        elif string[i] == "}":
+            num_left_braces_open -= 1
+            if num_left_braces_open == 0:
+                return string[open_brace_idx : i + 1]
+    return None
+
+
+def _boxed_command_at(string: str, idx: int):
+    """Build a \\boxed{...} or \\boxed ... string starting at idx pointing to \\boxed."""
+    if string.startswith("\\boxed{", idx):
+        braced = _match_braced_segment(string, idx + len("\\boxed{") - 1)
+        if braced is None:
+            return None
+        return string[idx : idx + len("\\boxed{") - 1 + len(braced)]
+
+    if string.startswith("\\boxed ", idx):
+        brace_idx = string.find("{", idx)
+        if brace_idx < 0:
+            return None
+        braced = _match_braced_segment(string, brace_idx)
+        if braced is None:
+            return None
+        return string[idx : brace_idx + len(braced)]
+
+    if string.startswith("\\fbox{", idx):
+        braced = _match_braced_segment(string, idx + len("\\fbox{") - 1)
+        if braced is None:
+            return None
+        return string[idx : idx + len("\\fbox{") - 1 + len(braced)]
+
+    return None
 
 
 def last_boxed_only_string(string):
-    idx = string.rfind("\\boxed")
-    if "\\boxed " in string:
-        return "\\boxed " + string.split("\\boxed ")[-1].split("$")[0]
-    if idx < 0:
-        idx = string.rfind("\\fbox")
+    """Extract the last valid \\boxed{...} (or \\fbox{...}) expression in the string."""
+    search_end = len(string)
+    while search_end > 0:
+        idx = string.rfind("\\boxed{", 0, search_end)
+        if idx >= 0:
+            boxed = _boxed_command_at(string, idx)
+            if boxed is not None:
+                try:
+                    content = remove_boxed(boxed)
+                except Exception:
+                    content = None
+                if _is_valid_boxed_content(content):
+                    return boxed
+            search_end = idx
+            continue
+
+        idx = string.rfind("\\boxed ", 0, search_end)
+        if idx >= 0:
+            boxed = _boxed_command_at(string, idx)
+            if boxed is not None:
+                try:
+                    content = remove_boxed(boxed)
+                except Exception:
+                    content = None
+                if _is_valid_boxed_content(content):
+                    return boxed
+            search_end = idx
+            continue
+
+        break
+
+    search_end = len(string)
+    while search_end > 0:
+        idx = string.rfind("\\fbox{", 0, search_end)
         if idx < 0:
-            return None
+            break
+        boxed = _boxed_command_at(string, idx)
+        if boxed is not None:
+            try:
+                content = remove_boxed(boxed)
+            except Exception:
+                content = None
+            if _is_valid_boxed_content(content):
+                return boxed
+        search_end = idx
 
-    i = idx
-    right_brace_idx = None
-    num_left_braces_open = 0
-    while i < len(string):
-        if string[i] == "{":
-            num_left_braces_open += 1
-        if string[i] == "}":
-            num_left_braces_open -= 1
-            if num_left_braces_open == 0:
-                right_brace_idx = i
-                break
-        i += 1
+    return None
 
-    retval = None if right_brace_idx is None else string[idx : right_brace_idx + 1]
 
-    return retval
+def _finalize_extracted_answer(content: str) -> Optional[str]:
+    if not _is_valid_boxed_content(content):
+        return None
+    if _looks_like_word_list(content):
+        word_list = _normalize_word_list(content)
+        if word_list and _is_valid_normalized_answer(word_list, content):
+            return " ".join(sorted(word_list.split()))
+    normalized = strip_string(content)
+    if not _is_valid_normalized_answer(normalized, content):
+        return None
+    return normalized
+
+
+def extract_boxed_answer(string: str):
+    """Extract and normalize the answer inside the last valid \\boxed{...} in a string."""
+    boxed = last_boxed_only_string(string)
+    if boxed is None:
+        return None
+    try:
+        content = remove_boxed(boxed)
+    except Exception:
+        return None
+    return _finalize_extracted_answer(content)
+
+
+def extract_math_answer(solution_str: str):
+    """Extract a MATH reference answer from a model solution string."""
+    answer = extract_boxed_answer(solution_str)
+    if answer is not None:
+        return answer
+
+    search_end = len(solution_str)
+    while search_end > 0:
+        idx = solution_str.rfind("\\boxed{", 0, search_end)
+        if idx < 0:
+            break
+        boxed = _boxed_command_at(solution_str, idx)
+        if boxed is not None:
+            try:
+                content = remove_boxed(boxed)
+            except Exception:
+                content = None
+            if content is not None:
+                answer = _finalize_extracted_answer(content)
+                if answer is not None:
+                    return answer
+        search_end = idx
+
+    patterns = [
+        r"(?i)(?:the answer is|answer is|answer:)\s*([^\n$]+)",
+    ]
+    for pattern in patterns:
+        matches = re.findall(pattern, solution_str)
+        if matches:
+            candidate = matches[-1].strip()
+            answer = _finalize_extracted_answer(candidate)
+            if answer is not None:
+                return answer
+    return None
 
 
 def fix_fracs(string):
