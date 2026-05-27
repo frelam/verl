@@ -23,7 +23,7 @@ import datasets
 from datasets import concatenate_datasets
 
 from verl.utils.hdfs_io import copy, makedirs
-from verl.utils.reward_score.math_reward import last_boxed_only_string, remove_boxed
+from verl.utils.reward_score.math_reward import extract_math_answer
 
 
 DEFAULT_NON_MAX_EFFORT_PROMPT = (
@@ -63,10 +63,7 @@ def extract_gsm8k_solution(solution_str: str) -> str:
 
 
 def extract_math_solution(solution_str: str) -> Optional[str]:
-    try:
-        return remove_boxed(last_boxed_only_string(solution_str))
-    except Exception:
-        return None
+    return extract_math_answer(solution_str)
 
 
 def _should_use_max_effort(idx: int, max_effort_ratio: float, seed: int) -> bool:
