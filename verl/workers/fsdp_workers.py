@@ -142,6 +142,21 @@ def get_vl_model_vision_tower(vl_model_instance):
         return vl_model_instance.visual
     return None
 
+def get_audio_model_audio_encoder(audio_model_instance):
+    """
+    Util to extract Audio Encoder from an audio-capable model instance.
+    Supports Qwen2-Audio (audio_tower on top-level model),
+    Qwen2.5-Omni / Qwen3-Omni (audio_tower under thinker sub-model),
+    and future models where audio_tower may be nested under model.model.
+    """
+    if hasattr(audio_model_instance, "thinker") and hasattr(audio_model_instance.thinker, "audio_tower"):
+        return audio_model_instance.thinker.audio_tower
+    elif hasattr(audio_model_instance, "model") and hasattr(audio_model_instance.model, "audio_tower"):
+        return audio_model_instance.model.audio_tower
+    elif hasattr(audio_model_instance, "audio_tower"):
+        return audio_model_instance.audio_tower
+    return None
+
 
 @deprecated("legacy worker implementation is deprecated and will be removed in v0.8.0")
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -352,6 +367,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             AutoConfig,
             AutoModel,
             AutoModelForCausalLM,
+            AutoModelForMultimodalLM
         )
 
         try:
@@ -467,6 +483,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     actor_module_class = AutoModelForCausalLM
                 elif type(actor_model_config) in AutoModelForImageTextToText._model_mapping.keys():
                     actor_module_class = AutoModelForImageTextToText
+                elif type(actor_model_config) in AutoModelForMultimodalLM._model_mapping.keys():
+                    actor_module_class = AutoModelForMultimodalLM
                 else:
                     actor_module_class = AutoModel
 
@@ -556,6 +574,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 if self.rank == 0:
                     print("[actor model] No vision tower found.")
+        if self.config.actor.get("freeze_audio_tower", False):
+            audio_encoder = get_audio_model_audio_encoder(actor_module)
+            if audio_encoder is not None:
+                audio_encoder.requires_grad_(False)
+                self.use_orig_params = True
+                if self.rank == 0:
+                    print("[actor model] Audio encoder is set to not trainable.")
+            else:
+                if self.rank == 0:
+                    print("[actor model] No audio encoder found.")
 
         # Apply QAT before FSDP wrapping (actor only)
         if role == "actor" and self._qat_enabled:
