@@ -48,6 +48,11 @@ try:
 except ImportError:
     AutoModelForImageTextToText = AutoModelForVision2Seq
 
+try:
+    from transformers import AutoModelForMultimodalLM
+except ImportError:
+    AutoModelForMultimodalLM = None
+
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from verl.models.registry import ModelRegistry
@@ -678,6 +683,7 @@ def load_valuehead_model(local_path, torch_dtype, model_config, trust_remote_cod
 _architecture_to_auto_class = {
     "ForCausalLM": AutoModelForCausalLM,
     "ForVision2Seq": AutoModelForVision2Seq,
+    "ForConditionalGeneration": AutoModelForMultimodalLM or AutoModelForCausalLM,
     "ForTokenClassification": AutoModelForTokenClassification,
     "ForSequenceClassification": AutoModelForSequenceClassification,
 }
@@ -696,12 +702,15 @@ def get_hf_auto_model_class(hf_config):
                 actor_module_class = AutoModelForCausalLM
             case "AutoModelForImageTextToText":
                 actor_module_class = AutoModelForImageTextToText
+            case "AutoModelForMultimodalLM":
+                actor_module_class = AutoModelForMultimodalLM or AutoModel
             case _:
                 actor_module_class = AutoModel
     else:
         actor_module_class = AutoModel
-        # For VLM models, we use type to check instead of architecture
-        if type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
+        if AutoModelForMultimodalLM is not None and type(hf_config) in AutoModelForMultimodalLM._model_mapping.keys():
+            actor_module_class = AutoModelForMultimodalLM
+        elif type(hf_config) in AutoModelForImageTextToText._model_mapping.keys():
             actor_module_class = AutoModelForImageTextToText
         else:
             for key, cls in _architecture_to_auto_class.items():
