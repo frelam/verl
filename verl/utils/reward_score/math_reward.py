@@ -28,18 +28,105 @@ def is_math_equal(expr1: str, expr2: str) -> bool:
     except Exception:
         return False
 
+def is_valid_ground_truth(ground_truth) -> bool:
+    """Return False for corrupted labels such as '} )' or '] )'."""
+    if ground_truth is None:
+        return False
+    gt = str(ground_truth).strip()
+    if not gt:
+        return False
+    if _is_punctuation_only_fragment(gt):
+        return False
+    if _is_latex_env_noise_answer(gt):
+        return False
+    if len(gt) <= 2 and gt in ("}", ")", "]", "(", "{"):
+        return False
+
+    normalized = strip_string(gt)
+    if not normalized:
+        return False
+    if _is_punctuation_only_fragment(normalized):
+        return False
+    if _is_latex_env_noise_answer(normalized):
+        return False
+    return _is_valid_normalized_answer(normalized, gt)
+
+
+_ANSWER_TAIL_CHARS = 500
+
+
+def _get_answer_tail(solution_str: str) -> str:
+    text = solution_str
+    for pattern in (
+        r"(?is)<\s*response\s*>\s*(.*)$",
+        r"(?is)\bresponse\s*:\s*(.*)$",
+        r"(?is)\bfinal\s+answer\s*:\s*(.*)$",
+    ):
+        match = re.search(pattern, text)
+        if match:
+            text = match.group(1)
+            break
+    if len(text) > _ANSWER_TAIL_CHARS:
+        text = text[-_ANSWER_TAIL_CHARS :]
+    return text
+
+
+def extract_answer_from_response(solution_str: str, ground_truth: str) -> Optional[str]:
+    """Extract the model answer from boxed content or response-tail heuristics."""
+    boxed = last_boxed_only_string(solution_str)
+    if boxed is not None:
+        try:
+            return remove_boxed(boxed)
+        except Exception:
+            pass
+
+    gt = str(ground_truth).strip()
+    tail = _get_answer_tail(solution_str)
+
+    if re.match(r"^\(?[A-I]\)?$", gt, re.IGNORECASE):
+        for pattern in (
+            r"\\boxed\{\\text\{([A-I])\}\}",
+            r"\\boxed\{([A-I])\}",
+            r"\b(?:answer|choice)\s*(?:is|:)?\s*\(?([A-I])\)?",
+            r"\b([A-I])\s*[\.\)]\s*$",
+            r"\b([A-I])\s*$",
+        ):
+            matches = re.findall(pattern, tail, re.IGNORECASE)
+            if matches:
+                return matches[-1].upper()
+
+    for word in ("True", "False", "Yes", "No"):
+        if gt.lower() == word.lower():
+            matches = re.findall(rf"\b({word})\b", tail, re.IGNORECASE)
+            if matches:
+                return matches[-1]
+
+    gt_normalized = strip_string(gt)
+    if re.fullmatch(r"-?\d+\.?\d*", gt_normalized) or re.fullmatch(r"-?\d+\.?\d*%?", gt_normalized):
+        numbers = re.findall(r"-?\d+\.?\d*", tail.replace(",", ""))
+        if numbers:
+            return numbers[-1]
+
+    if re.search(r"\\frac|\\sqrt|\^|x", gt_normalized):
+        math_blocks = re.findall(r"\$([^$]+)\$", tail)
+        if math_blocks:
+            return math_blocks[-1].strip()
+
+    return None
+
+
 def compute_score(solution_str, ground_truth) -> float:
-    retval = 0.0
+    if not is_valid_ground_truth(ground_truth):
+        return 0.0
+
     try:
-        string_in_last_boxed = last_boxed_only_string(solution_str)
-        if string_in_last_boxed is not None:
-            answer = remove_boxed(string_in_last_boxed)
-            if is_equiv(answer, ground_truth):
-                retval = 1.0
+        answer = extract_answer_from_response(solution_str, ground_truth)
+        if answer is not None and is_equiv(answer, ground_truth):
+            return 1.0
     except Exception:
         pass
 
-    return retval
+    return 0.0
 
 
 # string normalization from https://github.com/EleutherAI/lm-evaluation-harness/blob/master/lm_eval/tasks/hendrycks_math.py
@@ -82,6 +169,18 @@ def _is_latex_env_noise_answer(normalized: str) -> bool:
     return all(word in _LATEX_ENV_NAMES for word in words)
 
 
+def _is_punctuation_only_fragment(s: str) -> bool:
+    """True when the string has no meaningful alphanumeric answer."""
+    if s is None:
+        return True
+    compact = re.sub(r"\s+", "", str(s))
+    if not compact:
+        return True
+    if re.fullmatch(r"[\]\}\)>(\[\{\\.\\,;:+*/_\-]+", compact):
+        return True
+    return len(re.findall(r"[a-zA-Z0-9]", compact)) == 0
+
+
 def _normalize_word_list(s: str) -> str:
     """Normalize comma/space-separated word lists and aligned LaTeX enumerations."""
     if not s:
@@ -116,6 +215,8 @@ def _looks_like_word_list(s: str) -> bool:
     if not s:
         return False
     if _contains_math_environment(s):
+        return False
+    if re.search(r"\\frac|\\sqrt|\\left|\\right", s):
         return False
     if re.search(r"\\begin\{(aligned|align|gather)", s, re.IGNORECASE):
         return True
@@ -203,11 +304,24 @@ def _is_valid_boxed_content(content: str) -> bool:
     stripped = content.strip()
     if not stripped:
         return False
+    if _is_punctuation_only_fragment(stripped):
+        return False
     if re.match(r"^[\s\]\}]+$", stripped):
         return False
     if re.match(r"^\\right[\]\)]*\s*\}?\s*$", stripped):
         return False
     return True
+
+
+def _is_valid_boxed_answer(content: str) -> bool:
+    """Validate raw boxed content and its normalized form."""
+    if not _is_valid_boxed_content(content):
+        return False
+    if _looks_like_word_list(content):
+        word_list = _normalize_word_list(content)
+        return bool(word_list) and _is_valid_normalized_answer(word_list, content)
+    normalized = strip_string(content)
+    return _is_valid_normalized_answer(normalized, content)
 
 
 def _match_braced_segment(string: str, open_brace_idx: int):
@@ -264,7 +378,7 @@ def last_boxed_only_string(string):
                     content = remove_boxed(boxed)
                 except Exception:
                     content = None
-                if _is_valid_boxed_content(content):
+                if _is_valid_boxed_answer(content):
                     return boxed
             search_end = idx
             continue
@@ -277,7 +391,7 @@ def last_boxed_only_string(string):
                     content = remove_boxed(boxed)
                 except Exception:
                     content = None
-                if _is_valid_boxed_content(content):
+                if _is_valid_boxed_answer(content):
                     return boxed
             search_end = idx
             continue
@@ -295,7 +409,7 @@ def last_boxed_only_string(string):
                 content = remove_boxed(boxed)
             except Exception:
                 content = None
-            if _is_valid_boxed_content(content):
+            if _is_valid_boxed_answer(content):
                 return boxed
         search_end = idx
 
@@ -500,6 +614,8 @@ def strip_string(string):
     # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1).
     # Also does a/b --> \\frac{a}{b}
     string = fix_fracs(string)
+    # \frac{40}7 -> \frac{40}{7} (missing braces around denominator)
+    string = re.sub(r"\\frac\{([^}]+)\}(-?\d+)", r"\\frac{\1}{\2}", string)
     string = re.sub(r'(\d+)/(\d+)', r'\\frac{\1}{\2}', string)
     # manually change 0.5 --> \frac{1}{2}
     if string == "0.5":
