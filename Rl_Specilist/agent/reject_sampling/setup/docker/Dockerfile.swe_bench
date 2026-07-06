@@ -1,0 +1,31 @@
+# SWE-bench 评测镜像
+# 用于 Open-SWE-Traces / SWE-Zero 的代码仓库级任务执行 + 测试验证
+FROM python:3.10-slim
+
+# 系统依赖
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential \
+    curl wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python 评测工具
+RUN pip install --no-cache-dir \
+    pytest \
+    "swebench>=2.0" \
+    datasets \
+    transformers \
+    "huggingface_hub>=0.20.0"
+
+# OpenHands 风格的 agent 工具（可选，失败不中断）
+RUN pip install --no-cache-dir openhands-aci 2>/dev/null || echo "openhands-aci install skipped"
+
+# 常用语言运行时（按需）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    nodejs npm \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "nodejs install skipped"
+
+WORKDIR /workspace
+
+CMD ["python3"]

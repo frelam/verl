@@ -1,0 +1,11 @@
+# SWE-bench interaction configuration
+# Loaded by verl when actor_rollout_ref.rollout.multi_turn.interaction_config_path is set
+# Maps interaction names to BaseInteraction implementations
+
+interactions:
+  - name: "swe_bench"
+    class_name: "Rl_Specilist.agent.reject_sampling.tools.swe_bench_interaction.SWEBenchInteraction"
+    config:
+      image: "reject-sft-swe:latest"
+      timeout: 120
+      workdir: "/workspace"
