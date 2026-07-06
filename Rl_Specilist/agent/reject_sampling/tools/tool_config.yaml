@@ -1,0 +1,104 @@
+# Tool configuration for reject sampling rollout.
+# This file is loaded by verl's tool registry (verl/tools/utils/tool_registry.py)
+# and maps tool names to their implementations.
+#
+# Each dataset uses a different set of tools. The run_reject_sampling.sh script
+# selects the appropriate tool_config via actor_rollout_ref.rollout.multi_turn.tool_config_path.
+
+tools:
+  # ---- ToolMind: generic executor that routes by tool name ----
+  - class_name: "Rl_Specilist.agent.reject_sampling.tools.generic_tool_executor.GenericToolExecutor"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "calculator"
+        description: >-
+          A safe calculator for arithmetic expressions. Supports +, -, *, /, **, %,
+          parentheses, and functions: sqrt, sin, cos, tan, log, log10, exp, floor,
+          ceil, factorial, gcd, abs, round, min, max. Constants: pi, e.
+        parameters:
+          type: "object"
+          properties:
+            expression:
+              type: "string"
+              description: "A mathematical expression, e.g. '2 + 3 * 4' or 'sqrt(144) + log10(1000)'"
+          required: ["expression"]
+
+  - class_name: "Rl_Specilist.agent.reject_sampling.tools.generic_tool_executor.GenericToolExecutor"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "search"
+        description: >-
+          Search the web for information. Returns relevant results.
+          Use this when you need to look up facts you don't know.
+        parameters:
+          type: "object"
+          properties:
+            query:
+              type: "string"
+              description: "The search query."
+          required: ["query"]
+
+  - class_name: "Rl_Specilist.agent.reject_sampling.tools.generic_tool_executor.GenericToolExecutor"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "code_runner"
+        description: >-
+          Execute Python code and return the output. Use for data processing,
+          calculations, or any task requiring code execution.
+        parameters:
+          type: "object"
+          properties:
+            code:
+              type: "string"
+              description: "Python code to execute."
+          required: ["code"]
+
+  - class_name: "Rl_Specilist.agent.reject_sampling.tools.generic_tool_executor.GenericToolExecutor"
+    config:
+      type: native
+    tool_schema:
+      type: "function"
+      function:
+        name: "submit_answer"
+        description: >-
+          Submit your final answer. Call this when you are confident in your solution.
+        parameters:
+          type: "object"
+          properties:
+            answer:
+              type: "string"
+              description: "Your final answer."
+            confidence:
+              type: "number"
+              description: "Confidence score (0.0-1.0)."
+          required: ["answer"]
+
+  # ---- TerminalTraj: bash tool for terminal commands ----
+  - class_name: "Rl_Specilist.agent.reject_sampling.tools.terminal_sandbox_tool.TerminalSandboxTool"
+    config:
+      type: native
+      image: "reject-sft-terminal:latest"
+      timeout: 30
+    tool_schema:
+      type: "function"
+      function:
+        name: "bash"
+        description: >-
+          Execute a bash command in a terminal environment. Returns stdout, stderr,
+          and exit code. Use this for file operations, running scripts, etc.
+        parameters:
+          type: "object"
+          properties:
+            command:
+              type: "string"
+              description: "The bash command to execute."
+          required: ["command"]
