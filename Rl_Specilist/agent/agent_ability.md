@@ -23,4 +23,4 @@ Online DPO  vs  SFT  vs Online Policy Distllision
    这会导致， reject sampling 样本效率很低， 基本上找不到好的样本。
    所以可能使用DPO， SFT要一个非常正确的样本， 但DPO只需要相对好的信息。 如果用Online DPO， 则最后能够收敛到一个比较好的位置。
 3. Online Policy Distllision会让模型收敛与另一个模型的策略， 这不是我们想要的。 我们想让模型自己学习， 虽然说可能大模型的策略更好， 但不是当前的主要目的。
-4. DPO 不要求有非常正确的Reward计算， 相比于RL， 难度更小； 速度也更快（所需要的样本数量少， 不用采样一个group； 或者不用训练value model）。
+4. DPO 不要求有非常精确的Reward计算， 可以用一个模型打分样本对（容错率高）； 速度也更快（所需要的样本数量少， 不用采样一个group； 或者不用训练value model）。
