@@ -41,6 +41,11 @@ TOTAL_EPOCHS=${TOTAL_EPOCHS:-3}
 PROJECT_NAME=${PROJECT_NAME:-agent-instruct-sft}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-agent-instruct-sft-qwen3-0.6b}
 DATA_DIR=${DATA_DIR:-$HOME/data/agent_instruct}
+# Format-only SFT: only train on format tokens (tool call markers, XML/JSON
+# structure, reasoning tags). Content tokens are masked out.
+FORMAT_ONLY=${FORMAT_ONLY:-1}
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+FORMAT_DATASET_PATH="${SCRIPT_DIR}/format_only_sft_dataset.py"
 # ---- end user-adjustable ----
 
 extra_args=()
@@ -49,6 +54,14 @@ if [ "${USE_PEFT}" = "1" ]; then
         "model.lora_rank=${LORA_RANK}"
         "model.lora_alpha=${LORA_ALPHA}"
         "model.target_modules=${LORA_TARGETS}"
+    )
+fi
+
+if [ "${FORMAT_ONLY}" = "1" ]; then
+    extra_args+=(
+        "data.custom_cls.path=${FORMAT_DATASET_PATH}"
+        "data.custom_cls.name=FormatOnlySFTDataset"
+        "data.format_only=true"
     )
 fi
 
