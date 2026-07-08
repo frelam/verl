@@ -113,6 +113,8 @@ class PolicyLossConfig(BaseConfig):
     use_offpolicy_seq_mask: bool = False
     offpolicy_seq_mask_kl_threshold: float = 3.0
     offpolicy_seq_mask_granularity: str = "token"
+    # DPO (Direct Preference Optimization) settings. Only used when loss_mode == "dpo".
+    dpo_beta: float = 0.1
 
 
 @dataclass
@@ -213,6 +215,10 @@ class ActorConfig(BaseConfig):
     # global_batch_size: global batch size
     global_batch_info: dict = field(default_factory=dict)
     qat: QATConfig = field(default_factory=QATConfig)
+    # Online DPO: runtime context populated by dp_actor.update_policy before
+    # calling the DPO loss. Carries ref_log_prob and preference_label tensors
+    # that don't fit the standard PolicyLossFn signature. Unused by other losses.
+    batch_context: dict = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate actor configuration parameters."""

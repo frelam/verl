@@ -1830,15 +1830,29 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                        if self.config.algorithm.get("use_dpo", False):
+                            # Online DPO: build chosen/rejected pairs from the multi-trajectory
+                            # batch (best_vs_worst per prompt group) instead of computing PPO
+                            # advantages. The DPO loss reads ref_log_prob (already in batch)
+                            # and preference_label (added by compute_dpo_preferences).
+                            batch = core_algos.compute_dpo_preferences(
+                                batch, reward_key="token_level_scores"
+                            )
+                            # DPO does not use advantages or critic; fill placeholders so the
+                            # downstream actor update (which expects these fields) works.
+                            batch.batch["advantages"] = torch.zeros_like(
+                                batch.batch["response_mask"], dtype=torch.float32
+                            )
+                        else:
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
 
                     # reset optimizer state if configured
                     actor_reset_optim = OmegaConf.select(
@@ -1853,8 +1867,8 @@ class RayPPOTrainer:
                         if critic_reset_optim:
                             self.critic_wg.reset_optimizer_state()
 
-                    # update critic
-                    if self.use_critic:
+                    # update critic (skipped in DPO mode — no value function needed)
+                    if self.use_critic and not self.config.algorithm.get("use_dpo", False):
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])

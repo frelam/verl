@@ -2958,3 +2958,149 @@ def compute_policy_loss_bypass_mode(
     pg_metrics.update(rollout_metrics)
 
     return pg_loss, pg_metrics
+
+
+# =============================================================================
+# Online DPO support
+# =============================================================================
+
+
+@register_policy_loss("dpo")  # type: ignore[arg-type]
+def compute_policy_loss_dpo(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compute the DPO (Direct Preference Optimization) loss for Online DPO.
+
+    The batch is expected to be in interleave order:
+    [chosen_0, rejected_0, chosen_1, rejected_1, ...].
+    ``ref_log_prob`` and ``preference_label`` are read from ``config.batch_context``
+    (populated by ``dp_actor.update_policy`` before calling this loss).
+
+    DPO loss = -log σ(β · (logπ(yw|x) - logπ_ref(yw|x) - logπ(yl|x) + logπ_ref(yl|x)))
+
+    Args:
+        old_log_prob: Unused (DPO does not use PPO ratio).
+        log_prob: Log-probabilities under current policy, shape (bsz, response_length).
+        advantages: Unused.
+        response_mask: Mask for response tokens, shape (bsz, response_length).
+        loss_agg_mode: Unused (DPO aggregates at pair level).
+        config: ActorConfig with ``batch_context`` containing ``ref_log_prob`` and
+            ``preference_label``, and ``policy_loss.dpo_beta``.
+        rollout_is_weights: Unused.
+
+    Returns:
+        (loss, metrics_dict)
+    """
+    assert config is not None
+    beta = config.policy_loss.dpo_beta
+    batch_context = getattr(config, "batch_context", {}) or {}
+    ref_log_prob = batch_context["ref_log_prob"]  # (bsz, response_length)
+    preference_label = batch_context["preference_label"]  # (bsz,) 1.0=chosen, 0.0=rejected
+
+    # Per-token log ratio: log π(θ) - log π(ref)
+    pi_logratio = log_prob - ref_log_prob  # (bsz, response_length)
+
+    # Sequence-level log ratio (sum over valid response tokens)
+    seq_logratio = (pi_logratio * response_mask).sum(dim=-1)  # (bsz,)
+
+    # Pair chosen (even indices) with rejected (odd indices) in interleave order
+    chosen_seq_logratio = seq_logratio[0::2]  # (num_pairs,)
+    rejected_seq_logratio = seq_logratio[1::2]  # (num_pairs,)
+
+    # DPO logits: β * (chosen_logratio - rejected_logratio)
+    logits = beta * (chosen_seq_logratio - rejected_seq_logratio)  # (num_pairs,)
+
+    # DPO loss: -log σ(logits)
+    loss = -torch.nn.functional.logsigmoid(logits).mean()
+
+    with torch.no_grad():
+        accuracy = (logits > 0).float().mean()
+        margin = (chosen_seq_logratio - rejected_seq_logratio).mean()
+        chosen_reward = beta * chosen_seq_logratio.mean()
+        rejected_reward = beta * rejected_seq_logratio.mean()
+
+    metrics = {
+        "actor/dpo_loss": loss.detach().item(),
+        "actor/dpo_accuracy": accuracy.item(),
+        "actor/dpo_margin": margin.item(),
+        "actor/dpo_chosen_reward": chosen_reward.item(),
+        "actor/dpo_rejected_reward": rejected_reward.item(),
+    }
+    return loss, metrics
+
+
+def compute_dpo_preferences(
+    data,
+    reward_key: str = "token_level_scores",
+    group_key: str = "uid",
+):
+    """Build chosen/rejected pairs from a multi-trajectory batch for Online DPO.
+
+    For each prompt group (identified by ``group_key``), takes the highest-scoring
+    trajectory as chosen and the lowest-scoring as rejected (best_vs_worst strategy).
+    Returns a new ``DataProto`` in interleave order
+    [chosen_0, rejected_0, chosen_1, rejected_1, ...] with a ``preference_label``
+    tensor (1.0=chosen, 0.0=rejected) added to ``batch``.
+
+    Args:
+        data: Input ``DataProto`` with N trajectories per group. Must contain:
+            - ``batch[reward_key]``: token-level reward tensor (bsz, seq_len).
+            - ``batch["response_mask"]``: response mask (bsz, seq_len).
+            - ``non_tensor_batch[group_key]``: group identifier per sample.
+        reward_key: Key for reward scores in ``data.batch``.
+        group_key: Key for group identifier in ``data.non_tensor_batch``.
+
+    Returns:
+        ``DataProto`` with paired samples in interleave order and ``preference_label``.
+    """
+    # Extract per-sample scalar score: reward is placed at the last valid token
+    # position (rest is 0), so summing (score * mask) gives the scalar score.
+    token_scores = data.batch[reward_key]  # (bsz, seq_len)
+    response_mask = data.batch["response_mask"]  # (bsz, seq_len)
+    scores = (token_scores * response_mask).sum(dim=-1)  # (bsz,)
+    scores_np = scores.detach().cpu().numpy()
+
+    uids = np.array(data.non_tensor_batch[group_key])  # (bsz,)
+    unique_uids = np.unique(uids)
+
+    chosen_indices = []
+    rejected_indices = []
+    for uid in unique_uids:
+        member_idx = np.where(uids == uid)[0]
+        if len(member_idx) < 2:
+            continue  # need at least 2 trajectories to form a pair
+        member_scores = scores_np[member_idx]
+        best_local = member_idx[int(np.argmax(member_scores))]
+        worst_local = member_idx[int(np.argmin(member_scores))]
+        if scores_np[best_local] == scores_np[worst_local]:
+            continue  # skip ties (no preference signal)
+        chosen_indices.append(int(best_local))
+        rejected_indices.append(int(worst_local))
+
+    if len(chosen_indices) == 0:
+        raise ValueError(
+            "No valid pairs for DPO: all groups have <2 samples or tied scores. "
+            "Ensure rollout.n >= 2 and the reward function produces diverse scores."
+        )
+
+    # Build interleave order: [c0, r0, c1, r1, ...]
+    pair_indices = np.empty(2 * len(chosen_indices), dtype=np.int64)
+    pair_indices[0::2] = chosen_indices
+    pair_indices[1::2] = rejected_indices
+
+    # Select paired samples (returns a new DataProto)
+    paired_data = data[pair_indices]
+
+    # Add preference_label tensor: chosen=1.0, rejected=0.0
+    num_pairs = len(chosen_indices)
+    preference_label = torch.zeros(2 * num_pairs, dtype=torch.float32)
+    preference_label[0::2] = 1.0
+    paired_data.batch["preference_label"] = preference_label
+
+    return paired_data

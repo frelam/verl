@@ -731,3 +731,8 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+    # Online DPO: when True, the trainer builds chosen/rejected pairs from rollout
+    # trajectories (best_vs_worst per prompt group) and uses the "dpo" policy loss
+    # instead of PPO advantage-based updates. Requires loss_mode == "dpo" on the
+    # actor and a reference policy (automatically enabled via need_reference_policy).
+    use_dpo: bool = False
