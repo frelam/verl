@@ -2,6 +2,37 @@
 
 从模型自身 rollout 的轨迹中选择 best/worst 样本对，用 DPO loss 直接更新策略，无需额外 reward model 或 value function。
 
+## 🆕 批量 LLM Judge 打分（v2）
+
+新增 **批量相对打分** 模式：将所有 rollout 轨迹一次性发送给 Judge 大模型（如 DeepSeek API 或本地 vLLM 部署），让 Judge 在同一批次内**比较轨迹质量**，给出相对分数。相比逐条独立打分，批量相对打分提供了更强的训练信号。
+
+**支持的功能：**
+- **批量相对打分**：Judge 同时看到所有轨迹，按相对质量排序评分
+- **可配置 System Prompt**：自定义 Judge 关注哪些评估维度
+- **多服务商支持**：DeepSeek API / OpenAI API / 本地 vLLM
+- **多维打分（GDPO）**：返回 accuracy_reward, format_reward, efficiency_reward 等多个维度
+- **滚动轮数控制**：`max_assistant_turns` / `max_user_turns` 控制 agent 最大交互轮数
+
+**快速开始：**
+```bash
+# DPO 模式（单一分数，相对比较）
+JUDGE_API_KEY=sk-xxx bash run_agent_dpo.sh toolmind 8 ~/ckpt/dpo
+
+# GDPO 模式（多维打分，解耦归一化）
+JUDGE_API_KEY=sk-xxx JUDGE_SYSTEM_PROMPT=gdpo \
+  bash run_agent_dpo.sh toolmind 8 ~/ckpt/gdpo gdpo
+
+# 自定义 System Prompt
+JUDGE_API_KEY=sk-xxx \
+  JUDGE_SYSTEM_PROMPT=./prompts/coding_judge.txt \
+  bash run_agent_dpo.sh terminaltraj 4 ~/ckpt/dpo
+
+# 本地 vLLM 部署
+JUDGE_BASE_URL=http://localhost:8000/v1 \
+  JUDGE_MODEL=Qwen3-32B \
+  bash run_agent_dpo.sh toolmind 8 ~/ckpt/dpo
+```
+
 ## 动机
 
 Reject Sampling 流程存在以下问题：
@@ -132,6 +163,67 @@ bash Rl_Specilist/agent/online_dpo/run_online_dpo.sh terminaltraj 4 ~/data/onlin
 复用 `judge_reward.py` 的 `compute_score`，但在 `DPO_MODE=1` 下行为不同：
 - 正常模式：打分 + 轨迹落盘 JSONL
 - DPO 模式：仅打分，不保存轨迹（节省磁盘 I/O）
+
+## Judge 配置说明
+
+### 环境变量
+
+Judge 行为通过环境变量控制（`run_agent_dpo.sh` 会自动设置）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `JUDGE_MODEL` | `deepseek-chat` | Judge 模型名 |
+| `JUDGE_BASE_URL` | `https://api.deepseek.com` | API 地址（支持任意 OpenAI 兼容接口） |
+| `JUDGE_API_KEY` | `$DEEPSEEK_API_KEY` | API 密钥 |
+| `JUDGE_SYSTEM_PROMPT` | `default` | `default` / `gdpo` / 文件路径 / 内联 prompt |
+| `JUDGE_SCORING_MODE` | `relative` | `relative`（批量比较）/ `absolute`（逐条独立） |
+| `JUDGE_DIMENSIONS` | — | JSON 数组，如 `'["accuracy_reward","format_reward"]'` |
+| `JUDGE_MAX_RETRIES` | `3` | API 调用最大重试次数 |
+| `JUDGE_API_TIMEOUT` | `120` | API 超时（秒） |
+
+### System Prompt 模板
+
+预设模板位于 `prompts/` 目录：
+- `prompts/coding_judge.txt` — 编程任务专用
+- `prompts/math_judge.txt` — 数学推理任务专用
+- 代码内的 `DEFAULT_SYSTEM_PROMPT` — 通用 agent 任务
+- 代码内的 `GDPO_SYSTEM_PROMPT` — 多维打分（GDPO 模式）
+
+### 滚动轮数控制
+
+Agent 的最大交互轮数通过以下参数控制（在 YAML 或命令行中设置）：
+- `actor_rollout_ref.rollout.multi_turn.max_assistant_turns`：模型最多生成多少轮回复（默认 10）
+- `actor_rollout_ref.rollout.multi_turn.max_user_turns`：最多执行多少轮工具调用（默认 10）
+- `actor_rollout_ref.rollout.multi_turn.max_tool_response_length`：工具返回内容的最大 token 数
+- `actor_rollout_ref.rollout.response_length`：rollout 总长度限制
+
+### 架构流程
+
+```
+Rollout (agent loop)
+    │
+    ├─ max_assistant_turns=10   ← 控制滚动轮数
+    ├─ max_user_turns=10
+    │
+    ▼
+收集所有轨迹 (messages, tool calls, ...)
+    │
+    ▼
+批量 Judge (LLM API)
+    │
+    ├─ system_prompt + 所有轨迹 → Judge 模型
+    ├─ 返回每个轨迹的相对分数
+    ├─ (optional) 返回多维度分数
+    │
+    ▼
+DPO/GDPO Loss 计算
+    │
+    ├─ DPO: best-vs-worst 配对
+    ├─ GDPO: 每维度独立归一化 + 加权聚合
+    │
+    ▼
+更新 Actor 权重
+```
 
 ## 训练监控
 

@@ -172,6 +172,13 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Padded log probabilities from teacher model for prompt/response tokens."""
     teacher_ids: Optional[torch.Tensor] = None
     """Padded token ids corresponding to the teacher log probabilities."""
+    # Raw trajectory data for batch-level LLM judge scoring.
+    raw_response_text: Optional[str] = None
+    """Decoded response text (set when batch judge mode is active)."""
+    raw_messages: Optional[list[dict[str, Any]]] = None
+    """Full multi-turn messages from the agent loop (for batch judge)."""
+    raw_prompt_text: Optional[str] = None
+    """Decoded prompt text (for batch judge)."""
     routed_experts: Optional[torch.Tensor] = None
     """Padded routed experts for the total tokens."""
     sampling_token_indices: Optional[torch.Tensor] = None
@@ -508,6 +515,9 @@ class AgentLoopWorker:
         self.config = config
         self.llm_client = llm_client
         self.teacher_client = teacher_client
+        # When True, per-trajectory reward is deferred to batch-level scoring
+        # after all trajectories complete. Controlled by reward.use_batch_judge.
+        self._defer_reward = config.reward.get("use_batch_judge", False)
         self.reward_loop_worker_handles = reward_loop_worker_handles
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
@@ -656,6 +666,12 @@ class AgentLoopWorker:
                 )
             )
         outputs = await asyncio.gather(*tasks)
+
+        # Batch-level reward computation (LLM judge mode):
+        # When _defer_reward is True, per-trajectory scoring was skipped.
+        # Now score all trajectories together so the judge can compare them.
+        if getattr(self, "_defer_reward", False):
+            await self._compute_batch_scores(outputs, batch.non_tensor_batch)
 
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
@@ -833,6 +849,15 @@ class AgentLoopWorker:
                 output.multi_modal_data.get("audios") if output.multi_modal_data else None
             ),
         )
+        # Extract raw trajectory data before scoring (used by batch judge mode).
+        raw_response_text: Optional[str] = None
+        raw_messages: Optional[list[dict[str, Any]]] = None
+        if getattr(self, "_defer_reward", False):
+            # Save raw trajectory so batch judge can score it later.
+            resp_ids = output.response_ids
+            raw_response_text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
+            raw_messages = output.extra_fields.get("messages") if output.extra_fields else None
+
         await self._compute_score([output], kwargs=kwargs)
         await self._compute_teacher_logprobs(
             output,
@@ -878,6 +903,8 @@ class AgentLoopWorker:
             num_turns=output.num_turns,
             metrics=output.metrics,
             extra_fields=output.extra_fields,
+            raw_response_text=raw_response_text,
+            raw_messages=raw_messages,
         )
 
     def _compute_multi_modal_inputs(self, output, input_ids) -> dict[str, torch.Tensor]:
@@ -957,7 +984,16 @@ class AgentLoopWorker:
         return position_ids
 
     async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
-        """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
+        """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1].
+
+        When ``_defer_reward`` is True (batch judge mode), this method is a no-op:
+        scores will be computed later by ``_compute_batch_scores`` after all
+        trajectories have been generated.
+        """
+        if getattr(self, "_defer_reward", False):
+            # Batch judge mode: save raw data for later batch scoring.
+            # Tools/messages are stored in extra_fields by ToolAgentLoop.
+            return
         enable_async_reward = self.reward_loop_worker_handles is not None
 
         final_output = outputs[-1]
@@ -1019,6 +1055,136 @@ class AgentLoopWorker:
                 final_output.reward_score = result["reward_score"]
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
+
+    async def _compute_batch_scores(
+        self,
+        outputs: list[_InternalAgentLoopOutput],
+        input_non_tensor_batch: dict | None = None,
+    ) -> None:
+        """Batch-level reward computation for LLM judge mode.
+
+        Sends ALL trajectories together to the LLM judge API so it can
+        produce relative scores. Scores are assigned back to each output
+        in-place.
+
+        Falls back to the reward loop workers when available and the
+        reward manager supports ``run_batch``; otherwise calls the LLM
+        judge directly from this process.
+
+        Args:
+            outputs: All trajectory outputs from this generation batch.
+            input_non_tensor_batch: Parent batch context (data_source etc.).
+        """
+        from verl.utils.reward_score.llm_judge_reward import (
+            _call_judge_batch,
+            _get_judge_config,
+        )
+
+        n = len(outputs)
+        if n == 0:
+            return
+
+        input_non_tensor_batch = input_non_tensor_batch or {}
+
+        # Collect raw trajectory data
+        trajectories = []
+        tasks = []
+        ground_truths = []
+        extra_infos = []
+
+        for i, out in enumerate(outputs):
+            # Build extra_info from available metadata
+            extra_info = {}
+            if out.raw_messages:
+                extra_info["messages"] = out.raw_messages
+            if out.extra_fields:
+                for k, v in out.extra_fields.items():
+                    if k not in extra_info:
+                        extra_info[k] = v
+            extra_info["num_turns"] = out.num_turns
+
+            # Extract task description
+            data_source = input_non_tensor_batch.get("data_source", [None] * n)
+            task = (
+                extra_info.get("question")
+                or extra_info.get("task")
+                or (str(data_source[i]) if isinstance(data_source, (list, np.ndarray)) and i < len(data_source) else "unknown")
+                or "unknown"
+            )
+
+            gt_raw = input_non_tensor_batch.get("reward_model", [{}] * n)
+            if isinstance(gt_raw, (list, np.ndarray)) and i < len(gt_raw):
+                gt_item = gt_raw[i]
+            elif isinstance(gt_raw, dict):
+                gt_item = gt_raw
+            else:
+                gt_item = {}
+            gt = str(gt_item.get("ground_truth", "") if isinstance(gt_item, dict) else "")
+
+            traj = out.raw_response_text or ""
+            trajectories.append(traj)
+            tasks.append(str(task))
+            ground_truths.append(gt)
+            extra_infos.append(extra_info)
+
+        # Get judge config from first trajectory's extra_info
+        config = _get_judge_config(extra_infos[0] if extra_infos else None)
+
+        # Try using reward loop workers for batch scoring (if available)
+        scored = False
+        if self.reward_loop_worker_handles is not None:
+            # Check if workers support batch scoring via run_batch
+            # We try sending to one worker with full batch context.
+            try:
+                worker = random.choice(self.reward_loop_worker_handles)
+                # Construct DataProto with all trajectories
+                all_prompts, all_responses, all_attention_mask = [], [], []
+                for out in outputs:
+                    all_prompts.append(out.prompt_ids)
+                    all_responses.append(out.response_ids)
+                    all_attention_mask.append(out.attention_mask)
+                batch_td = TensorDict(
+                    {
+                        "prompts": torch.nn.utils.rnn.pad_sequence(all_prompts, batch_first=True, padding_value=0),
+                        "responses": torch.nn.utils.rnn.pad_sequence(all_responses, batch_first=True, padding_value=0),
+                        "attention_mask": torch.nn.utils.rnn.pad_sequence(
+                            all_attention_mask, batch_first=True, padding_value=0
+                        ),
+                    },
+                    batch_size=n,
+                )
+                non_tensor_batch = {
+                    "data_source": np.array(tasks),
+                    "reward_model": np.array([{"ground_truth": gt} for gt in ground_truths], dtype=object),
+                    "extra_info": np.array(extra_infos, dtype=object),
+                }
+                data = DataProto(batch=batch_td, non_tensor_batch=non_tensor_batch)
+                result = await worker.compute_score_batch.remote(data)
+                # result is list of dicts with "reward_score" and "reward_extra_info"
+                for i, r in enumerate(result):
+                    if i < len(outputs):
+                        outputs[i].reward_score = r.get("reward_score", 0.0)
+                        if "reward_extra_info" in r:
+                            outputs[i].extra_fields["reward_extra_info"] = r["reward_extra_info"]
+                scored = True
+            except Exception as e:
+                logger.warning(
+                    f"Batch scoring via reward loop worker failed: {e}. "
+                    "Falling back to direct LLM judge call."
+                )
+
+        # Fallback: call LLM judge directly
+        if not scored:
+            scores = _call_judge_batch(trajectories, tasks, ground_truths, config)
+            for i, score_entry in enumerate(scores):
+                if i < len(outputs):
+                    score = float(score_entry.get("score", 0.0))
+                    outputs[i].reward_score = score
+                    reward_extra_info = {}
+                    for k, v in score_entry.items():
+                        if k not in ("score", "index"):
+                            reward_extra_info[k] = v
+                    outputs[i].extra_fields["reward_extra_info"] = reward_extra_info
 
     async def _compute_teacher_logprobs(
         self,

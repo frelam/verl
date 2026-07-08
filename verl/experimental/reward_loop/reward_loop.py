@@ -136,6 +136,12 @@ class RewardLoopWorker:
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:
+        # If the reward manager supports batch-level scoring (e.g. LLM judge),
+        # send all samples together so the judge can do relative comparison.
+        if hasattr(self.reward_manager, "run_batch"):
+            return await self.reward_manager.run_batch(data)
+
+        # Default: score each sample independently
         tasks = []
         for i in range(len(data)):
             tasks.append(asyncio.create_task(self.compute_score(data[i : i + 1])))
