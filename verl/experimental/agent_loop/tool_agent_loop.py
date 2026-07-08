@@ -200,6 +200,10 @@ class ToolAgentLoop(AgentLoopBase):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
+        # Expose the full multi-turn message history (including tool observations) so
+        # downstream reward functions (e.g. DeepSeek API judge for Online DPO) can
+        # evaluate structured trajectories rather than only decoded response text.
+        output.extra_fields["messages"] = agent_data.messages
         return output
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:

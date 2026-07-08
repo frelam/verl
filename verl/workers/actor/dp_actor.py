@@ -566,6 +566,12 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("prompts")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        # Online DPO needs ref_log_prob (for the DPO loss) and preference_label
+        # (chosen=1.0 / rejected=0.0) from the paired batch.
+        if self.config.policy_loss.get("loss_mode") == "dpo":
+            if "ref_log_prob" not in select_keys:
+                select_keys.append("ref_log_prob")
+            select_keys.append("preference_label")
         if self.config.use_keep_sampling_mask and "sampling_token_indices" in data.batch.keys():
             select_keys.append("sampling_token_indices")
         # Include pre-computed IS weights if present in batch
@@ -653,6 +659,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                    # dpo -> verl.trainer.ppo.core_algos.compute_policy_loss_dpo
+                    if loss_mode == "dpo":
+                        # Populate batch_context for the DPO loss to read ref_log_prob
+                        # and preference_label without changing PolicyLossFn signature.
+                        self.config.batch_context = {
+                            "ref_log_prob": model_inputs["ref_log_prob"],
+                            "preference_label": model_inputs["preference_label"],
+                        }
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
 
                     # Compute policy loss (any function is expected to return 2 values)
@@ -688,7 +702,9 @@ class DataParallelPPOActor(BasePPOActor):
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
 
-                    if self.config.use_kl_loss:
+                    # DPO loss already incorporates the reference policy term, so skip
+                    # the separate KL loss to avoid double-counting the ref penalty.
+                    if self.config.use_kl_loss and loss_mode != "dpo":
                         ref_log_prob = model_inputs["ref_log_prob"]
                         old_log_prob_for_kl = model_inputs.get("old_log_probs", None) if self.config.use_unbiased_kl else None
                         kld = kl_penalty(
