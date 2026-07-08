@@ -736,3 +736,21 @@ class AlgoConfig(BaseConfig):
     # instead of PPO advantage-based updates. Requires loss_mode == "dpo" on the
     # actor and a reference policy (automatically enabled via need_reference_policy).
     use_dpo: bool = False
+
+    def __post_init__(self):
+        """Validate algorithm configuration consistency."""
+        # GDPO requires per-dimension reward keys
+        if self.adv_estimator == "gdpo":
+            if not self.gdpo_reward_keys:
+                raise ValueError(
+                    "adv_estimator='gdpo' requires algorithm.gdpo_reward_keys to be set. "
+                    "The reward function must return a dict with per-dimension scores, "
+                    "e.g. gdpo_reward_keys=['accuracy_reward', 'format_reward']. "
+                    "If using a reward manager that returns a single float (e.g. 'dapo'), "
+                    "use adv_estimator='grpo' instead."
+                )
+            if self.gdpo_reward_weights is not None and len(self.gdpo_reward_weights) != len(self.gdpo_reward_keys):
+                raise ValueError(
+                    f"gdpo_reward_weights length ({len(self.gdpo_reward_weights)}) must match "
+                    f"gdpo_reward_keys length ({len(self.gdpo_reward_keys)})."
+                )

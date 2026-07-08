@@ -385,6 +385,62 @@ def apply_keep_sampling_mask(
     return masked_logits
 
 
+def sampling_indices_to_mask(
+    sampling_token_indices: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Convert sampling token indices to a boolean mask for keep_sampling_mask.
+
+    During rollout, the inference engine records the candidate token IDs from top-k/top-p
+    sampling. This function converts those indices into a boolean mask that can be used
+    with :func:`apply_keep_sampling_mask` to mask logits during training.
+
+    Args:
+        sampling_token_indices: Tensor of shape (batch_size, seq_len, num_candidates),
+            where -1 indicates padding (no candidate). May also be a nested tensor
+            of shape (batch_size, (j1, j2, ...)) with inner dim (response_len, num_candidates).
+        vocab_size: The size of the vocabulary.
+
+    Returns:
+        Boolean mask of shape (batch_size, seq_len, vocab_size), where True indicates
+        the token was in the sampling set during rollout.
+    """
+    if sampling_token_indices.is_nested:
+        # Nested tensor: convert to list, build masks per sample, then re-nest
+        nested_lists = sampling_token_indices.unbind()
+        masks = []
+        for sample_indices in nested_lists:
+            # sample_indices shape: (response_len, num_candidates)
+            valid_mask = sample_indices >= 0
+            bool_mask = torch.zeros(
+                sample_indices.shape[0], vocab_size,
+                dtype=torch.bool, device=sample_indices.device
+            )
+            # Scatter: for each valid position, set the corresponding vocab index to True
+            for t in range(sample_indices.shape[0]):
+                candidates = sample_indices[t][valid_mask[t]]
+                bool_mask[t, candidates] = True
+            masks.append(bool_mask)
+        return torch.nested.as_nested_tensor(masks)
+
+    # Dense tensor: shape (batch_size, seq_len, num_candidates)
+    batch_size, seq_len, num_candidates = sampling_token_indices.shape
+    valid_mask = sampling_token_indices >= 0  # (batch, seq_len, num_candidates)
+    bool_mask = torch.zeros(
+        batch_size, seq_len, vocab_size,
+        dtype=torch.bool, device=sampling_token_indices.device
+    )
+    # Create index for scatter
+    batch_idx = torch.arange(batch_size, device=sampling_token_indices.device)[:, None, None]
+    seq_idx = torch.arange(seq_len, device=sampling_token_indices.device)[None, :, None]
+    # Only scatter valid indices
+    indices = sampling_token_indices[valid_mask]
+    b_idx = batch_idx.expand(batch_size, seq_len, num_candidates)[valid_mask]
+    s_idx = seq_idx.expand(batch_size, seq_len, num_candidates)[valid_mask]
+    bool_mask[b_idx, s_idx, indices] = True
+    return bool_mask
+
+
 def compute_grad_norm(model: nn.Module) -> float:
     """Compute the squared L2 norm of all gradients in a model.
 

@@ -2434,7 +2434,8 @@ def compute_pf_ppo_reweight_data(
 
     resampled_data = deepcopy(data)
     resampled_data.batch = type(data.batch)(resampled_batch)
-    resampled_data.batch.batch_size = data.batch.batch_size
+    # Update batch_size to reflect the resampled number of samples
+    resampled_data.batch.batch_size = (len(sample_indices_np),)
     resampled_data.non_tensor_batch = resampled_non_tensor_batch
     resampled_data.meta_info = resampled_meta_info
 
@@ -2563,7 +2564,8 @@ def compute_reward_based_resample(
 
     resampled_data = deepcopy(data)
     resampled_data.batch = type(data.batch)(resampled_batch)
-    resampled_data.batch.batch_size = data.batch.batch_size
+    # Update batch_size to reflect the resampled number of samples
+    resampled_data.batch.batch_size = (len(sample_indices_np),)
     resampled_data.non_tensor_batch = resampled_non_tensor_batch
     resampled_data.meta_info = resampled_meta_info
 
@@ -2627,7 +2629,10 @@ def filter_groups_by_metric(
     group_counts.scatter_add_(0, group_indices, torch.ones_like(sample_values, dtype=torch.long))
     group_mean = group_value_sum / group_counts.clamp(min=1)
 
-    group_all_same = (group_mean == 0.0) | (group_mean == 1.0)
+    epsilon = 1e-6
+    group_all_zero = group_mean <= epsilon
+    group_all_one = group_mean >= (1.0 - epsilon)
+    group_all_same = group_all_zero | group_all_one
     kept_group_mask = ~group_all_same
     kept_group_indices = torch.where(kept_group_mask)[0]
 
@@ -2673,7 +2678,8 @@ def _index_data(data, indices):
 
     resampled_data = deepcopy(data)
     resampled_data.batch = type(data.batch)(resampled_batch)
-    resampled_data.batch.batch_size = data.batch.batch_size
+    # Update batch_size to reflect the resampled number of samples
+    resampled_data.batch.batch_size = (len(indices_np),)
     resampled_data.non_tensor_batch = resampled_non_tensor_batch
     resampled_data.meta_info = resampled_meta_info
 
@@ -2725,7 +2731,10 @@ def find_degenerate_groups(data, metric: str = "seq_reward", group_key: str = "u
     group_counts.scatter_add_(0, group_indices, torch.ones_like(sample_values, dtype=torch.long))
     group_mean = group_value_sum / group_counts.clamp(min=1)
 
-    degenerate_mask = (group_mean == 0.0) | (group_mean == 1.0)
+    epsilon = 1e-6
+    all_zero = group_mean <= epsilon
+    all_one = group_mean >= (1.0 - epsilon)
+    degenerate_mask = all_zero | all_one
     degenerate_group_ids = torch.where(degenerate_mask)[0]
 
     sample_is_degenerate = torch.zeros(len(sample_values), dtype=torch.bool)

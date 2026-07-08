@@ -1,5 +1,9 @@
 # 混合数学数据集处理脚本
 
+> **注意**: 本目录中的脚本与 `Rl_Specilist/math/dataset/` 中的脚本为镜像关系。
+> `Rl_Specilist/math/dataset/` 为规范源（canonical source），本目录为方便用户从
+> `examples/` 入口访问而提供。如需修改脚本，应同步更新两边。
+
 本脚本用于混合多个数学数据集，生成可直接用于verl框架训练的数据集。
 
 ## 包含的数据集

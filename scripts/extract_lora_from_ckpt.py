@@ -86,7 +86,7 @@ def clean_lora_key(key: str) -> str:
     return key
 
 
-def extract_lora(state_dict: dict, lora_alpha: int | None = None, output_dir: str = "lora_adapter"):
+def extract_lora(state_dict: dict, lora_alpha: int | None = None, output_dir: str = "lora_adapter", ckpt_dir: str | None = None):
     """
     从完整 state_dict 中提取 LoRA 权重并保存为 PEFT 适配器格式。
 
@@ -94,6 +94,8 @@ def extract_lora(state_dict: dict, lora_alpha: int | None = None, output_dir: st
         state_dict: 完整的模型 state_dict (含基础模型 + LoRA 权重)
         lora_alpha: LoRA alpha 值。如果为 None，尝试从元数据读取。
         output_dir: 输出目录
+        ckpt_dir: checkpoint 目录路径（用于加载 lora_train_meta.json）。
+            如果为 None，跳过元数据加载。
     """
     # 筛选 LoRA 相关的 key
     lora_keys = [k for k in state_dict if "lora_" in k]
@@ -127,7 +129,7 @@ def extract_lora(state_dict: dict, lora_alpha: int | None = None, output_dir: st
         print(f"  {k}: shape {lora_params[k].shape}")
 
     # 准备 LoRA 配置
-    lora_meta = load_lora_metadata(args.ckpt_dir)
+    lora_meta = load_lora_metadata(ckpt_dir) if ckpt_dir else None
 
     lora_rank = inferred_rank
     lora_alpha_val = 0
@@ -251,4 +253,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     state_dict = load_state_dict(args.ckpt_dir)
-    extract_lora(state_dict, lora_alpha=args.lora_alpha, output_dir=args.output_dir)
+    extract_lora(state_dict, lora_alpha=args.lora_alpha, output_dir=args.output_dir, ckpt_dir=args.ckpt_dir)

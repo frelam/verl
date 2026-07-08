@@ -1195,6 +1195,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     inplace_backward = True
                     if calculate_entropy:
                         inplace_backward = False
+                    # TODO: Apply keep_sampling_mask (DeepSeek-V3.2) when
+                    # actor.use_keep_sampling_mask is enabled. The mask should be
+                    # applied to logits_rmpad before logprobs_from_logits to ensure
+                    # training-inference consistency. The sampling_token_indices
+                    # tensor (shape: total_nnz_in_rmpad, num_candidates) must be
+                    # converted to a boolean mask via sampling_indices_to_mask() and
+                    # then applied via apply_keep_sampling_mask(). See
+                    # verl.utils.torch_functional for the utility functions.
                     log_probs = logprobs_from_logits(
                         logits=logits_rmpad,
                         labels=input_ids_rmpad_rolled,
