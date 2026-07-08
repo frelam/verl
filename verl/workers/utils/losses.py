@@ -88,6 +88,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    # Online DPO needs preference_label (chosen=1.0 / rejected=0.0) from the paired batch.
+    if "preference_label" in data:
+        fields.append("preference_label")
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -99,6 +102,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_agg_mode = config.loss_agg_mode
 
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+
+    # Populate batch_context for the DPO loss to read ref_log_prob and
+    # preference_label without changing PolicyLossFn signature.
+    if loss_mode == "dpo":
+        config.batch_context = {
+            "ref_log_prob": data["ref_log_prob"],
+            "preference_label": data["preference_label"],
+        }
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(
@@ -129,7 +140,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
     # add kl loss
-    if config.use_kl_loss:
+    # DPO loss already incorporates the reference policy term, so skip the separate
+    # KL loss to avoid double-counting the ref penalty.
+    if config.use_kl_loss and loss_mode != "dpo":
         ref_log_prob = data["ref_log_prob"]
         old_log_prob_for_kl = data.get("old_log_probs", None) if config.use_unbiased_kl else None
         kld = kl_penalty(

@@ -48,6 +48,10 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 # Judge threshold: trajectories with score >= this are saved for SFT
 THRESHOLD = float(os.environ.get("REJECT_SAMPLING_THRESHOLD", "0.7"))
 
+# When DPO_MODE=1, compute_score only returns the score and skips trajectory
+# saving to disk (Online DPO consumes scores in-memory, no SFT data needed).
+DPO_MODE = os.environ.get("DPO_MODE", "0") == "1"
+
 # API call config
 MAX_RETRIES = int(os.environ.get("JUDGE_MAX_RETRIES", "3"))
 RETRY_DELAY = float(os.environ.get("JUDGE_RETRY_DELAY", "1.0"))
@@ -112,12 +116,35 @@ Score guidelines:
 Output ONLY the JSON object, no other text."""
 
 
+def _format_messages_for_judge(messages: list[dict[str, Any]]) -> str:
+    """Serialize a full multi-turn message list into a readable trajectory string.
+
+    Each message is rendered as ``[role] content``. Tool observations (role=tool)
+    are included so the judge can see the actual environment feedback, which is
+    critical for evaluating agent trajectories with tool use.
+    """
+    parts = []
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        # Truncate very long tool outputs
+        if role == "tool" and len(str(content)) > 2000:
+            content = str(content)[:2000] + "...[truncated]"
+        parts.append(f"[{role}]\n{content}")
+    return "\n\n".join(parts)
+
+
 def _build_judge_prompt(
     solution_str: str,
     ground_truth: str,
     extra_info: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Build the messages for the DeepSeek judge API call."""
+    """Build the messages for the DeepSeek judge API call.
+
+    Prefers the structured multi-turn ``messages`` from ``extra_info`` (exposed by
+    ToolAgentLoop) over the decoded ``solution_str``, so the judge sees tool
+    observations and the full conversation flow.
+    """
     task = ""
     # Try to extract the original task from extra_info
     if extra_info.get("question"):
@@ -131,8 +158,15 @@ def _build_judge_prompt(
         # so use a generic description
         task = "(See agent trajectory for task context)"
 
+    # Prefer structured multi-turn messages when available (Online DPO path);
+    # fall back to decoded solution_str for legacy reject_sampling callers.
+    full_messages = extra_info.get("messages")
+    if full_messages:
+        traj = _format_messages_for_judge(full_messages)
+    else:
+        traj = solution_str
+
     # Truncate trajectory if too long
-    traj = solution_str
     if len(traj) > MAX_TRAJECTORY_TOKENS * 4:  # rough char-to-token estimate
         traj = traj[: MAX_TRAJECTORY_TOKENS * 4] + "\n...[trajectory truncated]"
 
@@ -317,13 +351,19 @@ def compute_score(
         score, is_correct, reasoning = _call_deepseek_judge(solution_str, gt_str, extra_info)
         judge_source = "deepseek"
 
-    # --- 3. Save trajectory if above threshold ---
+    # --- 3. Save trajectory if above threshold (skipped in DPO mode) ---
     saved = False
-    if score >= THRESHOLD:
+    if not DPO_MODE and score >= THRESHOLD:
         try:
             # Reconstruct full messages for SFT
             prompt_messages = extra_info.get("prompt_messages")
-            messages = _reconstruct_messages(solution_str, prompt_messages, extra_info)
+            # Prefer the full multi-turn messages from extra_info when available;
+            # otherwise fall back to reconstructing from solution_str.
+            full_messages = extra_info.get("messages")
+            if full_messages:
+                messages = full_messages
+            else:
+                messages = _reconstruct_messages(solution_str, prompt_messages, extra_info)
             tools = extra_info.get("tools", [])
             prompt_hash = hash_prompt(prompt_messages or [{"role": "user", "content": gt_str}])
 
