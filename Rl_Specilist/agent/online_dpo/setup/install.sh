@@ -152,9 +152,11 @@ elif [ -d "$MODEL_PATH" ] && ls "$MODEL_PATH"/*.safetensors &>/dev/null; then
 else
     echo "  从 HuggingFace 下载 Qwen/Qwen3-4B ..."
     mkdir -p "$MODEL_PATH"
+    export _DPO_MODEL_PATH="$MODEL_PATH"
     $PYTHON_BIN -c "
+import os
 from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3-4B', local_dir='$MODEL_PATH',
+snapshot_download('Qwen/Qwen3-4B', local_dir=os.environ['_DPO_MODEL_PATH'],
     allow_patterns=['*.json','*.safetensors','*.txt','tokenizer*','merges*'])
 " 2>&1 | tail -5
     echo "  ✅ 模型下载完成"
