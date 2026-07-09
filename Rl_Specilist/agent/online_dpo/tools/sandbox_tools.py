@@ -41,13 +41,23 @@ _workspaces: dict[str, Path] = {}
 
 
 def _ensure_workspace(agent_data: Any, base_dir: str = "/tmp/verl_sandbox") -> Path:
-    """Get or create the workspace directory for a trajectory."""
+    """Get or create the workspace directory for a trajectory.
+
+    ``request_id`` is sanitised to prevent path traversal: only
+    alphanumeric chars, hyphens, and underscores are kept.
+    """
     rid = agent_data.request_id
-    if rid not in _workspaces:
-        ws = Path(base_dir) / rid
+    # Sanitize: allow only safe path characters
+    safe = "".join(c for c in rid if c.isalnum() or c in "-_")
+    if safe != rid:
+        import hashlib
+        suffix = hashlib.sha256(rid.encode()).hexdigest()[:8]
+        safe = f"{safe}_{suffix}"
+    if safe not in _workspaces:
+        ws = Path(base_dir) / safe
         ws.mkdir(parents=True, exist_ok=True)
-        _workspaces[rid] = ws
-    return _workspaces[rid]
+        _workspaces[safe] = ws
+    return _workspaces[safe]
 
 
 def _cleanup_workspace(request_id: str) -> None:

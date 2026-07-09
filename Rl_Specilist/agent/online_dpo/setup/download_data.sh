@@ -51,12 +51,16 @@ fi
 echo ""
 echo "[1/4] 下载 HuggingFace 数据集..."
 
+export _DPO_DATA_DIR="$DATA_DIR"
+export _DPO_HF_TOKEN="${HF_TOKEN:-}"
+export _DPO_DATASETS="${DATASETS[*]}"
 $PYTHON_BIN -c "
 import os, sys
 from huggingface_hub import snapshot_download
 
-data_dir = os.path.expanduser('$DATA_DIR') + '/raw'
-datasets = dict(item.split(':')[:2] for item in '''${DATASETS[*]}'''.split())
+data_dir = os.path.expanduser(os.environ['_DPO_DATA_DIR']) + '/raw'
+hf_token = os.environ.get('_DPO_HF_TOKEN') or None
+datasets = dict(item.split(':')[:2] for item in os.environ['_DPO_DATASETS'].split())
 
 for repo_id, name in datasets.items():
     local_dir = os.path.join(data_dir, name)
@@ -65,12 +69,15 @@ for repo_id, name in datasets.items():
         continue
     print(f'  Downloading {repo_id} -> {local_dir} ...')
     try:
-        snapshot_download(repo_id=repo_id, repo_type='dataset', local_dir=local_dir)
+        kw = {'repo_id': repo_id, 'repo_type': 'dataset', 'local_dir': local_dir}
+        if hf_token:
+            kw['token'] = hf_token
+        snapshot_download(**kw)
         print(f'  [ok] {name}')
     except Exception as e:
         print(f'  [FAIL] {name}: {e}', file=sys.stderr)
 print('Done.')
-" ${HF_TOKEN:+\--hf_token "$HF_TOKEN"}
+"
 
 # ---- 2. 提取 prompt ----
 echo ""
