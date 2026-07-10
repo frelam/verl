@@ -193,7 +193,7 @@ async def _evaluate_reward(
     judge_api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("JUDGE_API_KEY")
     if judge_api_key and reward_cfg.get("use_judge", True):
         try:
-            from Rl_Specilist.agent.online_dpo.reward.llm_judge import (
+            from uni_agent.reward.llm_judge import (
                 judge_single,
                 load_judge_prompt,
             )
