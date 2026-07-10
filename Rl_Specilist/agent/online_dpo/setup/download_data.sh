@@ -121,4 +121,4 @@ ls -1 "$DATA_DIR/prompts/"*.parquet 2>/dev/null | while read -r f; do
 done
 echo ""
 echo "启动训练:"
-echo "  bash $ONLINE_DPO_DIR/run_multi_agent_dpo.sh toolmind 8 $DATA_DIR/ckpt"
+echo "  bash $ONLINE_DPO_DIR/run_hermes_gateway_dpo.sh <dataset> 8 $DATA_DIR/ckpt"

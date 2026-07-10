@@ -7,7 +7,7 @@ Provides two interfaces:
    model together for relative scoring.
 
 2. **``judge_single``** — scores a single trajectory, used by the runner
-   inline (``custom_hermes_runner._llm_judge_reward`` calls this).
+   inline (``custom_hermes_runner._evaluate_reward`` calls this).
 
 Configuration (via environment variables):
     JUDGE_MODEL       — model name (default: deepseek-chat)
@@ -89,7 +89,7 @@ async def judge_single(
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
-            f"{base_url}/chat/completions",
+            f"{base_url}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -183,7 +183,7 @@ async def judge_batch(
 
     async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(
-            f"{base_url}/chat/completions",
+            f"{base_url}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -237,21 +237,28 @@ def compute_score(
     extra_info: Any = None,
     **kwargs: Any,
 ) -> float:
-    """Verl-compatible reward function for BatchRewardManager.
+    """Verl-compatible reward function for BatchRewardManager / RewardLoopWorker.
 
-    This function is called by verl's reward manager for each trajectory.
-    Since LLM Judge requires batch context for relative scoring, this
-    returns a placeholder score.  The actual batch scoring is done in
-    the ``judge_batch`` function.
+    The runner (``custom_hermes_runner``) posts ``reward_info`` (including
+    ``reward_score``) to the Gateway session's ``reward_info_url``.  The
+    framework merges that into ``extra_info``, so this function simply reads
+    the already-computed score.
+
+    When no pre-computed score is present (e.g. validation, or non-Gateway
+    mode), this falls back to 0.0 — the caller should arrange for scoring
+    via ``judge_single`` or ``judge_batch`` upstream.
 
     Args:
         data_source: Task identifier or source.
         solution_str: The agent's response text.
         ground_truth: Optional ground truth for comparison.
-        extra_info: Additional metadata from the dataset.
+        extra_info: Additional metadata, may contain ``reward_score``.
         **kwargs: Additional verl-injected arguments.
 
     Returns:
         A reward score (0.0 - 1.0).
     """
-    return 0.0  # Placeholder; actual scoring via judge_batch or runner inline.
+    if extra_info and isinstance(extra_info, dict):
+        if "reward_score" in extra_info:
+            return float(extra_info["reward_score"])
+    return 0.0

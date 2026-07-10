@@ -15,7 +15,8 @@ Architecture::
       │     └─ Agent ← Gateway ← vLLM assistant reply
       │     └─ Agent → execute tools in workspace → observation
       │     └─ ... loop until submit_answer or max_turns ...
-      └─ Evaluate reward → POST reward_info_url
+      ├─ Evaluate reward (judge_single from reward/llm_judge.py)
+      └─ POST reward_info → Gateway session
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import logging
 import os
 import shlex
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -177,24 +179,28 @@ async def _evaluate_reward(
 ) -> dict[str, Any]:
     """Evaluate reward for the completed agent run.
 
-    Returns a dict to be posted as ``reward_info``.  The default
-    implementation captures basic diagnostics; an LLM Judge path is
-    available when ``JUDGE_API_KEY`` is set.
+    Returns a dict to be posted as ``reward_info``.  Uses ``judge_single``
+    from ``reward/llm_judge.py`` when ``DEEPSEEK_API_KEY`` / ``JUDGE_API_KEY``
+    is set; falls back to a basic exit-code heuristic otherwise.
     """
     tools_kwargs = tools_kwargs or {}
     reward_cfg = tools_kwargs.get("reward", {})
 
-    # Try LLM Judge first
     judge_api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("JUDGE_API_KEY")
     if judge_api_key and reward_cfg.get("use_judge", True):
         try:
-            return await _llm_judge_reward(
+            from Rl_Specilist.agent.online_dpo.reward.llm_judge import judge_single
+
+            rubric = reward_cfg.get("rubric")
+            result = await judge_single(
                 task=task,
-                agent_stdout=agent_stdout,
-                agent_exit_code=agent_exit_code,
-                judge_api_key=judge_api_key,
-                reward_cfg=reward_cfg,
+                agent_output=agent_stdout,
+                rubric=rubric,
             )
+            return {
+                **result,
+                "agent_exit_code": agent_exit_code,
+            }
         except Exception:
             logger.warning("LLM Judge failed; falling back to basic reward", exc_info=True)
 
@@ -204,78 +210,6 @@ async def _evaluate_reward(
         "reward_score": 1.0 if success else 0.0,
         "agent_exit_code": agent_exit_code,
         "success": success,
-    }
-
-
-async def _llm_judge_reward(
-    *,
-    task: str,
-    agent_stdout: str,
-    agent_exit_code: int,
-    judge_api_key: str,
-    reward_cfg: dict[str, Any],
-) -> dict[str, Any]:
-    """Score the agent output using an LLM Judge (DeepSeek or compatible API).
-
-    Sends the task + agent output to the Judge model, which returns a
-    score based on a scoring rubric.
-    """
-    judge_model = os.environ.get("JUDGE_MODEL", "deepseek-chat")
-    judge_base_url = os.environ.get(
-        "JUDGE_BASE_URL", "https://api.deepseek.com"
-    )
-
-    rubric = reward_cfg.get("rubric", (
-        "Evaluate whether the agent successfully completed the task. "
-        "Consider: (1) Did the agent produce the correct output? "
-        "(2) Was the approach reasonable? "
-        "(3) Did the agent use tools appropriately?\n\n"
-        "Score: 1.0 = fully correct, 0.5 = partially correct, 0.0 = incorrect."
-    ))
-
-    judge_prompt = (
-        f"## Task\n{task[:2000]}\n\n"
-        f"## Agent Output\n{agent_stdout[:3000]}\n\n"
-        f"## Instructions\n{rubric}\n\n"
-        "Respond with a JSON object: {\"score\": <0.0-1.0 float>, \"reason\": \"<brief explanation>\"}"
-    )
-
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(
-            f"{judge_base_url}/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {judge_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": judge_model,
-                "messages": [
-                    {"role": "system", "content": "You are an expert evaluator."},
-                    {"role": "user", "content": judge_prompt},
-                ],
-                "temperature": 0.0,
-                "max_tokens": 256,
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-    # Parse judge response
-    judge_text = data["choices"][0]["message"]["content"]
-    try:
-        # Try JSON parse
-        judge_result = json.loads(judge_text)
-        score = float(judge_result.get("score", 0.5))
-        reason = judge_result.get("reason", judge_text[:200])
-    except (json.JSONDecodeError, KeyError, ValueError):
-        # Fall back to heuristic
-        score = 0.5
-        reason = judge_text[:200]
-
-    return {
-        "reward_score": min(max(score, 0.0), 1.0),
-        "agent_exit_code": agent_exit_code,
-        "judge_reason": reason,
     }
 
 
