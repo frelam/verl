@@ -1,224 +1,278 @@
-# Online DPO — Uni-Agent Gateway + Verl 模型训练
+# Online DPO — Sandbox Agent + Gateway Training
 
-## 架构
-
-**Verl 训练的模型（Qwen3-4B）是 assistant。Uni-Agent Gateway 作为推理网关，捕获完整轨迹。**
+## Architecture
 
 ```
-┌─── Agent (hermes_entrypoint.py) — local workspace ─┐
-│  接收 task → 调用 Gateway → 解析 tool_calls          │
-│  执行 bash 工具 → 组装 observation → 循环             │
-│  直到 submit_answer 或 max_turns                     │
-└────────────────────────────────────────────────────┘
-           │ Hermes-format tool calls
+┌─── AKernel Sandbox (per-data-point Docker) ──────────┐
+│  Dataset specifies image per sample                   │
+│  Agent sidecar mounted at /opt/hermes-agent           │
+│  Agent runs inside sandbox, calls Gateway via tunnel  │
+│  Tools (bash, file-edit) execute in sandbox           │
+└──────────────────────────────────────────────────────┘
+           │ HTTP (tunnel: 127.0.0.1:38197)
            ▼
-┌─── Uni-Agent Gateway (FastAPI) ─────────────────────┐
-│  /v1/chat/completions                               │
-│  工具调用解析 + 轨迹捕获                              │
-│  每个 session 独立 base_url + reward_info_url        │
-└────────────────────────────────────────────────────┘
+┌─── Uni-Agent Gateway (FastAPI) ───────────────────────┐
+│  /v1/chat/completions                                 │
+│  Tool-call parsing + token-level trajectory capture   │
+│  Per-session base_url + reward_info_url               │
+└──────────────────────────────────────────────────────┘
            │ chat/completions
            ▼
-┌─── vLLM (Qwen3-4B) ────────────────────────────────┐
-│  推理引擎，每步 DPO 更新权重                          │
-└────────────────────────────────────────────────────┘
+┌─── vLLM (training model) ────────────────────────────┐
+│  Inference engine, weights updated each DPO step      │
+└──────────────────────────────────────────────────────┘
            │
            ▼
-    Runner 收集 reward → Judge 打分
+  Runner posts raw data (task, agent_output, sandbox_results)
            │
            ▼
-   best vs worst → DPO loss → 更新模型
+  custom_reward_function (uni_agent.reward.llm_judge.compute_score)
+    ├─ Sandbox test results → accuracy_reward
+    ├─ LLM judge (if configured) → process_reward
+    └─ Weighted combination → final reward_score
            │
            ▼
-   下一轮 rollout — 模型权重已更新 ✨
+  best vs worst pairing → DPO loss → model update
+           │
+           ▼
+  Next rollout — model weights updated ✨
 ```
 
-**关键组件：**
-- **Agent entrypoint** (`hermes_entrypoint.py`): 黑盒 agent，通过 Gateway 与 verl 模型交互
-- **Gateway**: 中间层，解析 Hermes 格式的 tool call，捕获完整 token 级轨迹
-- **Runner** (`custom_hermes_runner.py`): 管理 session → workspace → entrypoint → reward 全流程
-- **Judge** (`reward/llm_judge.py`): LLM judge inline 打分，结果通过 `reward_info_url` 传回 framework
-- **Online DPO**: 模型生成 → 工具执行 → 打分 → 更新 → 下次 rollout 用新权重
+**Key components:**
+
+| Component | Location | Role |
+|-----------|----------|------|
+| Sandbox runners | `uni-agent/examples/blackbox_recipes/` | Create AKernel sandbox, run agent, collect raw output |
+| Gateway | `uni-agent/uni_agent/gateway/` | Token-level trajectory capture |
+| Reward plugin | `uni_agent/uni_agent/reward/llm_judge.py` | Pluggable `compute_score` — sandbox eval + LLM judge |
+| Online DPO config | `config/agent_hermes_gateway.yaml` | Hydra config wiring everything together |
+| Judge prompts | `prompts/` + `uni_agent/reward/prompts/` | Dataset-specific scoring rubrics |
 
 ---
 
-## 快速开始
+## Quick Start
 
-### 1. 安装
+### 1. Prerequisites
 
 ```bash
-bash setup/install.sh
+# AKernel sandbox (required)
+export AKERNEL_SERVER_ADDRESS="x.x.x.x:8888"
+export AKERNEL_TOKEN="<your-token>"
+
+# LLM judge API key (optional — only needed for tasks with llm_judge scoring)
+export JUDGE_API_KEY=sk-xxx  # or DEEPSEEK_API_KEY
+
+# Model and data
+export MODEL_PATH=~/models/Qwen3-4B
+export TRAIN_DATA=~/data/online_dpo/prompts/train.parquet
+export VAL_DATA=~/data/online_dpo/prompts/val.parquet
 ```
 
-### 2. 配置环境变量
+### 2. Build Tool Images (one-time)
 
 ```bash
-export DEEPSEEK_API_KEY=sk-xxx     # Judge 打分（必须）
-export HF_TOKEN=hf_xxx              # 下载模型/数据
+# Hermes agent sidecar
+cd ~/workspace/uni-agent
+# See: examples/blackbox_recipes/hermes_agent/Dockerfile.hermes-agent-tool
+
+# Claude Code sidecar
+# See: examples/blackbox_recipes/claude_code/Dockerfile.claude-code-tool
 ```
 
-### 3. 下载数据
+### 3. Start Training
 
 ```bash
-bash setup/download_data.sh
-```
-
-### 4. 启动训练
-
-```bash
-export DEEPSEEK_API_KEY=sk-xxx
-bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/hermes-gateway
+bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/hermes-gateway-dpo
 ```
 
 ---
 
-## 配置文件
+## Per-Sample Scoring Config
 
-`config/agent_hermes_gateway.yaml` — Uni-Agent Gateway DPO Hydra config:
+Each dataset row can specify its scoring strategy via `extra_info.tools_kwargs.scoring`:
+
+```python
+# SWE-bench: sandbox test results only
+{"sandbox_eval": True}
+
+# Subjective tasks: LLM judge only
+{"sandbox_eval": False, "llm_judge": True}
+
+# Both: weighted combination
+{"sandbox_eval": True, "llm_judge": True, "sandbox_weight": 0.5}
+```
+
+The scoring is executed by `uni_agent.reward.llm_judge.compute_score` (verl `custom_reward_function` pattern). This function:
+1. Reads sandbox test results from the runner (if `sandbox_eval`)
+2. Calls the LLM judge API (if `llm_judge`)
+3. Aggregates into a final `reward_score`
+
+---
+
+## Configuration
+
+`config/agent_hermes_gateway.yaml`:
 
 ```yaml
 actor_rollout_ref:
   rollout:
-    multi_turn:
-      enable: true
-      format: hermes                     # Hermes tool call 格式
     agent:
-      num_workers: 8
       agent_loop_manager_class: uni_agent.framework.entry.AgentFrameworkRolloutAdapter
     custom:
       agent_framework:
         agent_runners:
-          custom_hermes:
-            runner_fqn: Rl_Specilist.agent.online_dpo.custom_hermes_runner.custom_hermes_runner
+          hermes_agent:
+            runner_fqn: examples.blackbox_recipes.hermes_agent.hermes_agent_runner.hermes_agent_runner
+            dispatch_mode: ray_task
+          claude_code:
+            runner_fqn: examples.blackbox_recipes.claude_code.claude_code_runner.claude_code_runner
+            dispatch_mode: ray_task
   actor:
     policy_loss:
       loss_mode: dpo
       dpo_beta: 0.1
+
+algorithm:
+  use_dpo: true
+
+reward:
+  custom_reward_function:
+    path: uni_agent.reward.llm_judge    # Pluggable scoring plugin
+    name: compute_score
 ```
 
 ---
 
-## 核心模块
+## Core Modules
 
-### `hermes_entrypoint.py` — Agent 入口
+### Sandbox Runners (`uni-agent/examples/blackbox_recipes/`)
 
-独立 Python 脚本（仅依赖 stdlib），在工作区中运行工具调用循环：
-
-- 通过环境变量 `HERMES_TASK` 接收任务
-- 调用 Gateway 的 `/v1/chat/completions`（OpenAI 兼容 API）
-- 解析 Hermes 格式的 tool call（`<tool_call>{"name": ..., "arguments": ...}</tool_call>`）
-- 通过 `subprocess` 在工作区内执行 bash 命令
-- 循环直到 `submit_answer` 或达 `max_turns` 限制
-
-```bash
-HERMES_TASK="do something" \
-HERMES_BASE_URL="http://127.0.0.1:8765/sessions/abc/v1" \
-HERMES_WORKSPACE="/tmp/verl_hermes/session-0-0" \
-AGENT_MAX_TURNS=100 \
-python hermes_entrypoint.py
-```
-
-### `custom_hermes_runner.py` — Runner
-
-Runner 契约实现，对接 Uni-Agent `AgentFramework`：
+Scoring-agnostic: they execute the agent, optionally run sandbox tests, and post raw data to the Gateway. Scoring decisions are deferred to `custom_reward_function`.
 
 ```
-Runner (custom_hermes_runner)
-  ├─ 从 raw_prompt + tools_kwargs 构建 task
-  ├─ 创建隔离 workspace /tmp/verl_hermes/<session_id>
-  ├─ 启动 hermes_entrypoint.py (subprocess)
-  │     └─ Agent → Gateway → vLLM (Qwen3-4B)
+Runner (hermes_agent_runner / claude_code_runner)
+  ├─ Create AKernel sandbox (per-sample Docker image)
+  ├─ Mount agent sidecar (/opt/hermes-agent or /opt/claude-code)
+  ├─ Run agent against Gateway
+  │     └─ Agent → Gateway → vLLM
   │     └─ Agent ← Gateway ← assistant reply
-  │     └─ Agent → 在 workspace 执行工具 → observation
-  │     └─ ... 循环 ...
-  ├─ 评估 reward (LLM Judge)
-  ├─ POST reward_info → Gateway
-  └─ 清理 workspace
+  │     └─ Agent → execute tools in sandbox
+  │     └─ ... loop until complete or max_turns ...
+  ├─ If scoring.sandbox_eval: run tests in sandbox
+  ├─ POST raw data → Gateway (task, agent_output, accuracy_reward, scoring)
+  └─ Cleanup sandbox
 ```
 
-### `reward/llm_judge.py` — Judge 打分
+### Reward Plugin (`uni_agent/uni_agent/reward/llm_judge.py`)
 
-三重接口：
+Verl-compatible `custom_reward_function`.  Called by `RewardLoopWorker` after the runner finishes.
 
-| 接口 | 用途 | 调用方 |
-|------|------|--------|
-| `compute_score()` | Verl reward loop 读取 runner 预计算分数 | RewardLoopWorker |
-| `judge_single()` | 单轨迹 inline 打分 | `custom_hermes_runner` |
-| `judge_batch()` | 批量相对打分 | 手动调用 |
+| Function | Purpose | Called by |
+|----------|---------|-----------|
+| `compute_score()` | Main entry — reads extra_info, applies scoring pipeline | RewardLoopWorker |
+| `judge_single()` | Single-trajectory LLM judge | `compute_score` |
+| `load_judge_prompt()` | Load dataset-specific rubric | `compute_score` |
 
-配置：
+Environment:
 ```bash
-export JUDGE_MODEL=deepseek-chat        # Judge 模型
+export JUDGE_MODEL=deepseek-chat        # Judge model
 export JUDGE_BASE_URL=https://api.deepseek.com
-export DEEPSEEK_API_KEY=sk-xxx          # API Key
+export JUDGE_API_KEY=sk-xxx             # API key
+export JUDGE_PROMPTS_DIR=/path/to/prompts  # Custom judge prompts dir (optional)
+```
+
+### Judge Prompts
+
+Dataset-specific scoring rubrics are loaded from:
+1. `JUDGE_PROMPTS_DIR` env var
+2. `uni_agent/reward/prompts/` (default)
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MODEL_PATH` | — | Training model path (required) |
+| `TRAIN_DATA` | — | Training data parquet (required) |
+| `VAL_DATA` | — | Validation data parquet (required) |
+| `AKERNEL_SERVER_ADDRESS` | — | AKernel sandbox server (required) |
+| `AKERNEL_TOKEN` | — | AKernel auth token (required) |
+| `N_SAMPLES` | `8` | Rollouts per prompt |
+| `AGENT_MAX_TURNS` | `100` | Max agent conversation turns |
+| `DPO_BETA` | `0.1` | DPO temperature |
+| `ACTOR_LR` | `1e-6` | Actor learning rate |
+| `GATEWAY_COUNT` | `1` | Gateway instances |
+| `NUM_AGENT_WORKERS` | `8` | Agent worker count |
+| `JUDGE_MODEL` | `deepseek-chat` | LLM judge model |
+| `JUDGE_BASE_URL` | `https://api.deepseek.com` | Judge API URL |
+| `JUDGE_API_KEY` | — | Judge API key (for llm_judge scoring) |
+| `HERMES_TOOL_IMAGE` | `...hermes-agent-tool:latest` | Hermes sidecar image |
+| `CLAUDE_TOOL_IMAGE` | `...claude-code-tool:latest` | Claude Code sidecar image |
+| `HERMES_RUN_TIMEOUT` | `3600` | Hermes agent timeout (seconds) |
+| `CLAUDE_RUN_TIMEOUT` | `3600` | Claude Code timeout (seconds) |
+
+---
+
+## Training Metrics
+
+```
+actor/dpo_loss              — DPO loss ↓
+actor/dpo_accuracy          — Preference accuracy ↑
+actor/dpo_chosen_reward     — Chosen sample reward ↑
+actor/dpo_rejected_reward   — Rejected sample reward ↓
+reward/mean_score           — Average reward ↑
 ```
 
 ---
 
-## 环境变量参考
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `MODEL_PATH` | `$HOME/models/Qwen3-4B` | 训练模型路径 |
-| `TRAIN_DATA` | `$HOME/data/online_dpo/prompts/<dataset>.parquet` | 训练数据 |
-| `N_SAMPLES` | `4` | 每个 prompt 的 rollout 数 |
-| `AGENT_MAX_TURNS` | `100` | Agent 最大对话轮数 |
-| `AGENT_TIMEOUT` | `3600` | 单个 agent 运行超时（秒） |
-| `HERMES_WORKSPACE_ROOT` | `/tmp/verl_hermes` | Workspace 根目录 |
-| `GATEWAY_COUNT` | `1` | Gateway 实例数 |
-| `MAX_CONCURRENT_SESSIONS` | `32` | 最大并发 session 数 |
-| `NUM_AGENT_WORKERS` | `8` | Agent worker 数量 |
-| `JUDGE_MODEL` | `deepseek-chat` | Judge 模型 |
-| `JUDGE_BASE_URL` | `https://api.deepseek.com` | Judge API 地址 |
-| `DEEPSEEK_API_KEY` | — | Judge API Key（必须） |
-
----
-
-## 训练监控
-
-```bash
-# WandB dashboard
-# 关键指标：
-#   actor/loss                — DPO loss ↓
-#   actor/dpo_chosen_logp     — chosen 样本 log-prob ↑
-#   actor/dpo_rejected_logp   — rejected 样本 log-prob ↓
-#   reward/mean_score         — 平均 judge 评分 ↑
-#   agent_loop/generate_sequences/mean — rollout 平均耗时
-```
-
----
-
-## 目录结构
+## Directory Structure
 
 ```
 Rl_Specilist/agent/online_dpo/
 ├── config/
-│   └── agent_hermes_gateway.yaml      # Gateway DPO + Hermes 配置
-├── hermes_entrypoint.py               # Agent 入口（stdlib only）
-├── custom_hermes_runner.py            # Runner — session/workspace/reward
+│   └── agent_hermes_gateway.yaml      # DPO training config
+├── hermes_entrypoint.py               # Hermes agent entrypoint (sandbox)
+├── claude_code_entrypoint.py          # Claude Code agent entrypoint (sandbox)
+├── custom_hermes_runner.py            # Legacy local-workspace runner
+├── custom_claude_runner.py            # Legacy local-workspace runner
+├── framework.py                       # Thin re-export of OpenAICompatibleAgentFramework
 ├── reward/
 │   ├── __init__.py
-│   └── llm_judge.py                   # Judge 打分（batch + inline）
+│   └── llm_judge.py                   # Thin re-export → uni_agent.reward.llm_judge
 ├── tests/
 │   ├── __init__.py
-│   └── test_hermes_entrypoint.py      # Hermes entrypoint 单元测试
+│   └── test_hermes_entrypoint.py
 ├── setup/
-│   ├── install.sh                     # 一键安装
-│   └── download_data.sh              # 数据下载
-├── prompts/                           # Judge prompt 模板
+│   ├── install.sh
+│   └── download_data.sh
+├── prompts/                           # Judge prompt templates
 │   ├── coding_judge.txt
-│   └── math_judge.txt
-├── run_hermes_gateway_dpo.sh          # 训练启动脚本
+│   ├── math_judge.txt
+│   └── terminal_judge.txt
+├── run_hermes_gateway_dpo.sh          # Training launch script
 └── README.md
 ```
 
+**Scoring logic lives in:** `uni_agent/uni_agent/reward/llm_judge.py`  
+**Sandbox runners live in:** `uni_agent/examples/blackbox_recipes/`
+
 ---
 
-## 注意事项
+## Adding a New Scoring Method
 
-1. **Gateway 必须先启动**：训练启动前确保 Uni-Agent Gateway 已运行
-2. **工具不可逃逸**：workspace 隔离，每个 session 独立目录，trajectory 结束后自动清理
-3. **Judge 限流**：DeepSeek API 有速率限制，注意 `train_batch_size` 设置
-4. **磁盘清理**：workspace 每 trajectory 自动清理，残留目录可通过 `rm -rf /tmp/verl_hermes/*` 手动清理
-5. **Agent timeout**：`AGENT_TIMEOUT` 超时后 agent 终止，reward 标记为失败
-6. **Gateway proxy**：Runner 自动 unset `HTTP_PROXY`/`HTTPS_PROXY`，避免干扰本地 Gateway 通信
+1. Write a new `compute_score` function following the verl contract:
+   ```python
+   def compute_score(data_source, solution_str, ground_truth, extra_info) -> dict:
+       return {"score": ..., "reward_extra_info": {...}}
+   ```
+
+2. Point the config to it:
+   ```yaml
+   reward:
+     custom_reward_function:
+       path: your_module
+       name: your_compute_score
+   ```
+
+No runner changes needed — the runner always posts raw data (task, agent_output, sandbox results). The `custom_reward_function` only needs to read `extra_info`.

@@ -177,40 +177,17 @@ async def _evaluate_reward(
     agent_exit_code: int,
     tools_kwargs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate reward for the completed agent run.
+    """Evaluate reward for the completed agent run (inline LLM judge).
 
-    Two modes (controlled by ``tools_kwargs.use_batch_judge``):
-
-    **Batch judge mode** (``use_batch_judge=True``):
-        Skips the per-sample LLM judge call and posts raw agent output
-        + task + data_source to the Gateway.  The actual scoring happens
-        later via ``judge_batch`` in the framework.
-
-    **Inline judge mode** (default):
-        Calls ``judge_single`` with a dataset-specific rubric loaded
-        from ``prompts/{data_source}_judge.txt`` when available, falling
-        back to the generic rubric.
+    Calls ``judge_single`` with a dataset-specific rubric loaded from
+    ``prompts/{data_source}_judge.txt`` when available, falling back to
+    the generic rubric.
 
     Returns a dict to be posted as ``reward_info``.
     """
     tools_kwargs = tools_kwargs or {}
     reward_cfg = tools_kwargs.get("reward", {})
     data_source = tools_kwargs.get("data_source", "")
-    use_batch_judge = tools_kwargs.get("use_batch_judge", False) or reward_cfg.get(
-        "use_batch_judge", False
-    )
-
-    # ── Batch judge mode: post raw data, skip inline scoring ──────────────
-    if use_batch_judge:
-        logger.info(
-            "Batch judge mode: deferring scoring for data_source=%r", data_source
-        )
-        return {
-            "task": task[:20000],
-            "agent_output": agent_stdout[:20000],
-            "data_source": data_source,
-            "agent_exit_code": agent_exit_code,
-        }
 
     # ── Inline judge mode ─────────────────────────────────────────────────
     judge_api_key = os.environ.get("DEEPSEEK_API_KEY") or os.environ.get("JUDGE_API_KEY")

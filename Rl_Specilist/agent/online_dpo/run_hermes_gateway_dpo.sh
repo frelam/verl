@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
-# Hermes Gateway DPO Training
+# Sandbox Agent DPO Training
 # =============================================================================
 #
-# Gateway-based blackbox agent training: the Hermes-format agent runs in a
-# local workspace, calls the Gateway for model inference, and the Gateway
-# captures full token-level trajectories.
+# Blackbox agent training with AKernel sandbox + Gateway DPO.
+# Each data point runs in its own AKernel sandbox (Docker), the agent sidecar
+# is mounted, and the agent communicates with the Gateway for LLM inference.
 #
 # Architecture:
-#   Agent (hermes_entrypoint.py) → Gateway (FastAPI) → vLLM (Qwen3-4B)
-#   Agent executes tools in workspace → loop until complete
-#   Gateway captures trajectories → Judge scores → DPO update
+#   Dataset → AKernel Sandbox (per-sample Docker) → Agent (sidecar mount)
+#          → Gateway /v1/chat/completions → vLLM
+#          → Agent executes tools inside sandbox
+#          → Gateway captures token-level trajectories
+#          → Runner posts raw data → custom_reward_function scores → DPO update
+#
+# Scoring is handled by uni_agent.reward.llm_judge.compute_score
+# (verl plugin pattern). Per-sample scoring config via tools_kwargs.scoring.
 #
 # =============================================================================
 # Usage
 # =============================================================================
 #
-#   export DEEPSEEK_API_KEY=sk-xxx
-#   bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/hermes-gateway
+#   export AKERNEL_SERVER_ADDRESS="x.x.x.x:8888"
+#   export AKERNEL_TOKEN="<token>"
+#   export JUDGE_API_KEY=sk-xxx          # optional (for llm_judge scoring)
+#   bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/hermes-gateway-dpo
 #
 # =============================================================================
 # Configuration (all overridable via env vars)
@@ -26,10 +33,14 @@
 #   MODEL_PATH           (default: $HOME/models/Qwen3-4B)
 #   TRAIN_DATA           (default: $HOME/data/online_dpo/prompts/train.parquet)
 #   VAL_DATA             (default: $HOME/data/online_dpo/prompts/val.parquet)
-#   N_SAMPLES            Rollouts per prompt (default: 4)
+#   N_SAMPLES            Rollouts per prompt (default: 8)
 #
-# --- Judge ---
-#   DEEPSEEK_API_KEY     (required)
+# --- AKernel Sandbox (required) ---
+#   AKERNEL_SERVER_ADDRESS
+#   AKERNEL_TOKEN
+#
+# --- Judge (for llm_judge scoring) ---
+#   JUDGE_API_KEY / DEEPSEEK_API_KEY
 #   JUDGE_MODEL          (default: deepseek-chat)
 #   JUDGE_BASE_URL       (default: https://api.deepseek.com)
 #
@@ -87,30 +98,29 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${PPO_MINI_BATCH_SIZE}}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
 
-# ---- Agent ----
+# ---- Agent (sandbox-based) ----
 AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-100}"
-AGENT_TIMEOUT="${AGENT_TIMEOUT:-3600}"
-HERMES_WORKSPACE_ROOT="${HERMES_WORKSPACE_ROOT:-/tmp/verl_hermes}"
 GATEWAY_COUNT="${GATEWAY_COUNT:-1}"
-MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-32}"
 NUM_AGENT_WORKERS="${NUM_AGENT_WORKERS:-8}"
 
-# ---- Claude-Code-Style Agent ----
-# Uses the same Gateway→vLLM backend as hermes, but with a richer tool set
-# and software-engineering system prompt.  No Anthropic API key needed.
-CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-3600}"
-CLAUDE_WORKSPACE_ROOT="${CLAUDE_WORKSPACE_ROOT:-/tmp/verl_claude}"
-CLAUDE_CONCURRENT_SESSIONS="${CLAUDE_CONCURRENT_SESSIONS:-16}"
+# ---- Hermes Agent (AKernel sandbox) ----
+HERMES_TOOL_IMAGE="${HERMES_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/hermes-agent-tool:latest}"
+HERMES_RUN_TIMEOUT="${HERMES_RUN_TIMEOUT:-3600}"
+HERMES_CONCURRENT_SESSIONS="${HERMES_CONCURRENT_SESSIONS:-32}"
 
-# ---- Judge ----
+# ---- Claude Code Agent (AKernel sandbox) ----
+CLAUDE_TOOL_IMAGE="${CLAUDE_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest}"
+CLAUDE_RUN_TIMEOUT="${CLAUDE_RUN_TIMEOUT:-3600}"
+CLAUDE_CONCURRENT_SESSIONS="${CLAUDE_CONCURRENT_SESSIONS:-32}"
+
+# ---- AKernel Sandbox ----
+SANDBOX_MAX_RETRIES="${SANDBOX_MAX_RETRIES:-10}"
+SWE_AGENT_EVAL_TIMEOUT="${SWE_AGENT_EVAL_TIMEOUT:-600}"
+
+# ---- Judge (inline, per-trajectory) ----
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-chat}"
 JUDGE_BASE_URL="${JUDGE_BASE_URL:-https://api.deepseek.com}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-${DEEPSEEK_API_KEY:-}}"
-# Set USE_BATCH_JUDGE=1 to enable deferred batch-level judge scoring
-# with dataset-specific prompts.  When enabled, the runner skips inline
-# judge_single and the framework calls judge_batch after all trajectories
-# are collected for relative scoring within each batch.
-USE_BATCH_JUDGE="${USE_BATCH_JUDGE:-1}"
 
 # ---- Logging ----
 PROJECT_NAME="${PROJECT_NAME:-hermes-gateway-dpo}"
@@ -128,37 +138,41 @@ if [ ! -f "$TRAIN_DATA" ]; then
     echo "ERROR: Train data not found: $TRAIN_DATA"
     exit 1
 fi
-if [ -z "$JUDGE_API_KEY" ]; then
-    echo "ERROR: DEEPSEEK_API_KEY or JUDGE_API_KEY must be set"
+if [ -z "${AKERNEL_SERVER_ADDRESS:-}" ]; then
+    echo "ERROR: AKERNEL_SERVER_ADDRESS must be set (e.g. 6.2.179.37:8888)"
     exit 1
 fi
+if [ -z "${AKERNEL_TOKEN:-}" ]; then
+    echo "ERROR: AKERNEL_TOKEN must be set"
+    exit 1
+fi
+# Judge API key is optional (only needed when tools_kwargs.scoring.llm_judge=true)
+
 # ---- Environment ----
 export DEEPSEEK_API_KEY="${JUDGE_API_KEY}"
-export JUDGE_MODEL JUDGE_BASE_URL USE_BATCH_JUDGE
-export AGENT_MAX_TURNS AGENT_TIMEOUT
-export HERMES_WORKSPACE_ROOT
+export JUDGE_MODEL JUDGE_BASE_URL
+export AGENT_MAX_TURNS
 export GATEWAY_COUNT
-# Claude-Code-style agent env vars (uses same Gateway→vLLM, no external API needed)
-export CLAUDE_TIMEOUT CLAUDE_WORKSPACE_ROOT CLAUDE_CONCURRENT_SESSIONS
+export AKERNEL_SERVER_ADDRESS AKERNEL_TOKEN
+export AKERNEL_TUNNEL_SSL_VERIFY="${AKERNEL_TUNNEL_SSL_VERIFY:-0}"
+export SWE_AGENT_EVAL_TIMEOUT
+export SANDBOX_NAME_PREFIX="${SANDBOX_NAME_PREFIX:-dpo-}"
 
 # Add uni-agent + verl to PYTHONPATH
 UNI_AGENT_ROOT="${UNI_AGENT_ROOT:-$HOME/workspace/uni-agent}"
 export PYTHONPATH="${REPO_ROOT}:${UNI_AGENT_ROOT}:${UNI_AGENT_ROOT}/verl:${PYTHONPATH:-}"
 
-mkdir -p "$HERMES_WORKSPACE_ROOT"
-mkdir -p "$CLAUDE_WORKSPACE_ROOT"
 mkdir -p "$CKPTS_DIR"
 ulimit -n 65535 2>/dev/null || true
 
 # ---- Print ----
 echo "========================================"
-echo " Multi-Agent Gateway DPO Training"
+echo " Sandbox Agent DPO Training"
 echo "========================================"
 echo " Dataset:      $dataset ($TRAIN_DATA)"
 echo " Model:        $MODEL_PATH"
 echo " Engine:       vllm (gen_tp=$GEN_TP)"
-echo " Hermes WS:    $HERMES_WORKSPACE_ROOT"
-echo " Claude WS:    $CLAUDE_WORKSPACE_ROOT"
+echo " Sandbox:      $AKERNEL_SERVER_ADDRESS"
 echo " Max turns:    $AGENT_MAX_TURNS"
 echo " N samples:    $N_SAMPLES"
 echo " Temperature:  $TEMPERATURE"
@@ -169,8 +183,7 @@ echo " Sequence:     prompt=$PROMPT_LENGTH, response=$RESPONSE_LENGTH"
 echo " Trainer:      V1 $TRAINER_MODE"
 echo " Resources:    trainer=${NNODES}x${N_GPUS_PER_NODE}, rollout=${ROLLOUT_NGPUS_PER_NODE}"
 echo " Save path:    $CKPTS_DIR"
-echo " Claude WS:    $CLAUDE_WORKSPACE_ROOT (concurrent=$CLAUDE_CONCURRENT_SESSIONS)"
-echo " Judge:       $JUDGE_MODEL (batch=$USE_BATCH_JUDGE)"
+echo " Judge:        $JUDGE_MODEL (inline, per-trajectory)"
 echo "========================================"
 
 # ---- Launch ----
@@ -226,12 +239,12 @@ python3 -m verl.trainer.main_ppo \
     "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}" \
     "actor_rollout_ref.rollout.agent.num_workers=${NUM_AGENT_WORKERS}" \
     "actor_rollout_ref.rollout.custom.agent_framework.gateway_count=${GATEWAY_COUNT}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_hermes.max_concurrent_sessions=${MAX_CONCURRENT_SESSIONS}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_hermes.runner_kwargs.agent_max_turns=${AGENT_MAX_TURNS}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_hermes.runner_kwargs.agent_timeout=${AGENT_TIMEOUT}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_claude.max_concurrent_sessions=${CLAUDE_CONCURRENT_SESSIONS}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_claude.runner_kwargs.agent_max_turns=${AGENT_MAX_TURNS}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_claude.runner_kwargs.agent_timeout=${CLAUDE_TIMEOUT}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.max_concurrent_sessions=${HERMES_CONCURRENT_SESSIONS}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.tool_image=${HERMES_TOOL_IMAGE}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.run_timeout=${HERMES_RUN_TIMEOUT}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.max_concurrent_sessions=${CLAUDE_CONCURRENT_SESSIONS}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.tool_image=${CLAUDE_TOOL_IMAGE}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.run_timeout=${CLAUDE_RUN_TIMEOUT}" \
     "actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}" \
     "actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH}" \
     "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
