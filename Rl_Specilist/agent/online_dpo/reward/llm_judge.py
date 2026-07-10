@@ -20,11 +20,65 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# ── Prompt loading ───────────────────────────────────────────────────────────
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]  # Rl_Specilist/agent/online_dpo/
+_PROMPTS_DIR = _PROJECT_ROOT / "prompts"
+
+JUDGE_PROMPT_MAP: dict[str, str | None] = {
+    # Exact matches for known data_source values
+    "math": "math_judge.txt",
+    "coding": "coding_judge.txt",
+    "terminal": "terminal_judge.txt",
+    # Fuzzy matches — data_source values from extract_prompts.py
+    "terminaltraj": "terminal_judge.txt",
+    "toolmind": None,        # no domain-specific prompt yet; uses default rubric
+    "swe_zero": "coding_judge.txt",
+    "open_swe_traces": "coding_judge.txt",
+}
+
+
+def load_judge_prompt(data_source: str) -> str | None:
+    """Load a dataset-specific judge prompt from ``prompts/``.
+
+    Args:
+        data_source: Dataset identifier (e.g. ``"terminaltraj"``, ``"math"``).
+
+    Returns:
+        The prompt text if a matching file is found, or ``None`` if no
+        domain-specific prompt is configured (caller should use the default).
+    """
+    data_source = (data_source or "").strip().lower()
+    if not data_source:
+        return None
+
+    filename = JUDGE_PROMPT_MAP.get(data_source)
+    if filename is None:
+        # Try fuzzy match: check if any known key is a substring of data_source
+        for key, fname in JUDGE_PROMPT_MAP.items():
+            if fname and key in data_source:
+                filename = fname
+                break
+
+    if filename is None:
+        logger.info("No judge prompt configured for data_source=%r; using default rubric.", data_source)
+        return None
+
+    prompt_path = _PROMPTS_DIR / filename
+    if not prompt_path.is_file():
+        logger.warning("Judge prompt file not found: %s; using default rubric.", prompt_path)
+        return None
+
+    logger.info("Loaded judge prompt for data_source=%r from %s", data_source, prompt_path)
+    return prompt_path.read_text(encoding="utf-8")
+
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
@@ -47,6 +101,7 @@ async def judge_single(
     agent_output: str,
     *,
     rubric: str | None = None,
+    system_prompt: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
@@ -57,6 +112,8 @@ async def judge_single(
         task: The original task / prompt.
         agent_output: The agent's stdout (final answer + tool logs).
         rubric: Custom scoring rubric.  If None, uses a default.
+        system_prompt: Custom system prompt for the judge model.
+            If provided, replaces the default system message.
         model: Judge model name.
         base_url: LLM Judge API base URL.
         api_key: LLM Judge API key.
@@ -87,6 +144,8 @@ async def judge_single(
         '{"score": <0.0-1.0 float>, "reason": "<brief explanation>"}'
     )
 
+    system_content = system_prompt or "You are an expert evaluator. Always respond with valid JSON."
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         resp = await client.post(
             f"{base_url}/v1/chat/completions",
@@ -97,7 +156,7 @@ async def judge_single(
             json={
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You are an expert evaluator. Always respond with valid JSON."},
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": judge_prompt},
                 ],
                 "temperature": 0.0,
@@ -129,6 +188,7 @@ async def judge_batch(
     outputs: list[str],
     *,
     rubric: str | None = None,
+    system_prompt: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
@@ -142,6 +202,8 @@ async def judge_batch(
         tasks: List of task strings.
         outputs: List of agent output strings (same length as tasks).
         rubric: Custom scoring rubric.
+        system_prompt: Custom system prompt for the judge model.
+            If provided, replaces the default system message.
         model: Judge model name.
         base_url: LLM Judge API base URL.
         api_key: LLM Judge API key.
@@ -181,6 +243,8 @@ async def judge_batch(
         '"reasons": ["<reason for sample 0>", "<reason for sample 1>", ...]}'
     )
 
+    system_content = system_prompt or "You are an expert evaluator. Always respond with valid JSON."
+
     async with httpx.AsyncClient(timeout=180.0) as client:
         resp = await client.post(
             f"{base_url}/v1/chat/completions",
@@ -191,7 +255,7 @@ async def judge_batch(
             json={
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You are an expert evaluator. Always respond with valid JSON."},
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": judge_prompt},
                 ],
                 "temperature": 0.0,
@@ -262,3 +326,93 @@ def compute_score(
         if "reward_score" in extra_info:
             return float(extra_info["reward_score"])
     return 0.0
+
+
+async def compute_score_batch(
+    data_sources: list[str],
+    solution_strs: list[str],
+    ground_truths: list[Any],
+    extra_infos: list[dict[str, Any]] | None = None,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Batch-level judge scoring compatible with ``BatchRewardManager``.
+
+    Groups trajectories by ``data_source``, loads the appropriate
+    dataset-specific judge prompt for each group, and calls
+    ``judge_batch`` for relative scoring within each group.
+
+    Args:
+        data_sources: Dataset identifiers (e.g. ``"terminaltraj"``, ``"math"``).
+        solution_strs: Agent output strings.
+        ground_truths: Ground-truth answers (unused by judge, kept for compatibility).
+        extra_infos: Per-sample metadata dicts.
+        **kwargs: Additional arguments (unused).
+
+    Returns:
+        List of dicts, each with ``score`` (float) and optional metadata.
+    """
+    extra_infos = extra_infos or [{} for _ in solution_strs]
+    n = len(solution_strs)
+    if n == 0:
+        return []
+
+    # Build task strings from extra_info
+    tasks: list[str] = []
+    for i in range(n):
+        extra = extra_infos[i] if i < len(extra_infos) else {}
+        task = (
+            extra.get("question")
+            or extra.get("task")
+            or f"Task from {data_sources[i]}"
+        )
+        tasks.append(str(task))
+
+    # Group indices by data_source
+    groups: dict[str, list[int]] = {}
+    for i, ds in enumerate(data_sources):
+        ds_key = (ds or "unknown").strip().lower()
+        groups.setdefault(ds_key, []).append(i)
+
+    # Score each group with its dataset-specific prompt
+    all_scores: list[dict[str, Any] | None] = [None] * n
+
+    for ds, indices in groups.items():
+        prompt = load_judge_prompt(ds)
+        group_tasks = [tasks[i] for i in indices]
+        group_outputs = [solution_strs[i][:12000] for i in indices]
+
+        try:
+            group_scores = await judge_batch(
+                tasks=group_tasks,
+                outputs=group_outputs,
+                rubric=prompt,  # dataset-specific prompt or None (default)
+            )
+        except Exception:
+            logger.warning(
+                "Batch judge failed for data_source=%r; assigning default scores.",
+                ds,
+                exc_info=True,
+            )
+            group_scores = [
+                {"reward_score": 0.5, "judge_reason": "batch judge API error"}
+                for _ in group_tasks
+            ]
+
+        for local_idx, score_dict in zip(indices, group_scores):
+            result = {
+                "score": float(score_dict.get("reward_score", 0.0)),
+                "judge_reasoning": str(score_dict.get("judge_reason", "")),
+                "data_source": ds,
+            }
+            # Forward any extra dimension scores
+            for key, value in score_dict.items():
+                if key not in ("reward_score", "judge_reason", "score"):
+                    result[key] = value
+            all_scores[local_idx] = result
+
+    # Ensure every position has a score
+    for i in range(n):
+        if all_scores[i] is None:
+            all_scores[i] = {"score": 0.0, "data_source": data_sources[i]}
+
+    return all_scores
