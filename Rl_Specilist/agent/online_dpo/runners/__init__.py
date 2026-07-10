@@ -1,11 +1,16 @@
 # Copyright 2025 Individual Contributor
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""This package is deprecated.  Tools live in ``../tools/``.
+"""This package is deprecated — kept for reference.
 
-The correct architecture for Online DPO is:
+The current Online DPO architecture uses Uni-Agent Gateway:
 
-    verl model (ToolAgentLoop) → sandbox tools → observations → model → ...
+    Agent (hermes_entrypoint.py) → Gateway → vLLM (Qwen3-4B)
+    Runner (custom_hermes_runner.py) manages sessions & reward
 
-Tools are registered via ``tool_config.yaml``; no custom agent loops needed.
+Tools are executed via subprocess in isolated workspaces by the agent
+entrypoint — no BaseTool registration needed.
+
+See custom_hermes_runner.py and hermes_entrypoint.py for the current
+implementation.
 """
