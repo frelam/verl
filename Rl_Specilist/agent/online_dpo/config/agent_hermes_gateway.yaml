@@ -59,27 +59,23 @@ actor_rollout_ref:
     custom:
       agent_framework:
         gateway_count: ${oc.env:GATEWAY_COUNT,1}
-        # Batch-judge framework subclass (zero uni_agent changes required).
-        # Set to empty string or omit to use the default framework.
-        framework_class_fqn: Rl_Specilist.agent.online_dpo.framework.BatchJudgeAgentFramework
         agent_runners:
-          custom_hermes:
-            runner_fqn: Rl_Specilist.agent.online_dpo.custom_hermes_runner.custom_hermes_runner
-            dispatch_mode: inline_async
-            max_concurrent_sessions: ${oc.env:MAX_CONCURRENT_SESSIONS,32}
+          hermes_agent:
+            runner_fqn: examples.blackbox_recipes.hermes_agent.hermes_agent_runner.hermes_agent_runner
+            dispatch_mode: ray_task
+            max_concurrent_sessions: ${oc.env:HERMES_CONCURRENT_SESSIONS,32}
             runner_kwargs:
-              agent_max_turns: ${oc.env:AGENT_MAX_TURNS,100}
-              agent_timeout: ${oc.env:AGENT_TIMEOUT,3600}
-          custom_claude:
-            runner_fqn: Rl_Specilist.agent.online_dpo.custom_claude_runner.custom_claude_runner
-            dispatch_mode: inline_async
-            # Claude-Code-style agent uses the same Gateway→vLLM backend as hermes,
-            # so concurrency can match.  The difference is only in the tool set
-            # and system prompt (software-engineering focused).
-            max_concurrent_sessions: ${oc.env:CLAUDE_CONCURRENT_SESSIONS,16}
+              tool_image: ${oc.env:HERMES_TOOL_IMAGE,swr.cn-east-3.myhuaweicloud.com/openyuanrong/hermes-agent-tool:latest}
+              run_timeout: ${oc.env:HERMES_RUN_TIMEOUT,3600}
+              conda_env: testbed
+          claude_code:
+            runner_fqn: examples.blackbox_recipes.claude_code.claude_code_runner.claude_code_runner
+            dispatch_mode: ray_task
+            max_concurrent_sessions: ${oc.env:CLAUDE_CONCURRENT_SESSIONS,32}
             runner_kwargs:
-              agent_max_turns: ${oc.env:AGENT_MAX_TURNS,100}
-              agent_timeout: ${oc.env:CLAUDE_TIMEOUT,3600}
+              tool_image: ${oc.env:CLAUDE_TOOL_IMAGE,swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest}
+              run_timeout: ${oc.env:CLAUDE_RUN_TIMEOUT,3600}
+              conda_env: testbed
 
   actor:
     use_dynamic_bsz: true
@@ -109,14 +105,18 @@ algorithm:
   use_dpo: ${oc.env:USE_DPO,true}
 
 reward:
-  # Gate: set USE_BATCH_JUDGE=1 to enable deferred batch-level LLM judge
-  # scoring with dataset-specific prompts.  When enabled, the runner skips
-  # per-sample judge_single and the framework calls judge_batch after all
-  # trajectories are collected.
-  use_batch_judge: ${oc.env:USE_BATCH_JUDGE,false}
+  # Scoring is handled by uni_agent.reward.llm_judge.compute_score
+  # (verl plugin pattern).  The sandbox runner posts raw data (task,
+  # agent_output, sandbox test results).  compute_score reads the
+  # per-sample scoring config and applies sandbox eval + LLM judge.
+  #
+  # Per-sample config (via tools_kwargs.scoring):
+  #   sandbox_eval=True  → accuracy_reward from sandbox tests
+  #   llm_judge=True     → process_reward from LLM judge (needs JUDGE_API_KEY)
+  #   sandbox_weight=0.5 → weight for sandbox score when both enabled
   custom_reward_function:
-    path: Rl_Specilist.agent.online_dpo.reward.llm_judge
-    name: compute_score_batch
+    path: uni_agent.reward.llm_judge
+    name: compute_score
 
 data:
   train_files: ${oc.env:TRAIN_DATA,}
