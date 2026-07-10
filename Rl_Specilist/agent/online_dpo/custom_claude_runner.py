@@ -345,7 +345,7 @@ async def _evaluate_reward(
     )
     if judge_api_key and reward_cfg.get("use_judge", True):
         try:
-            from Rl_Specilist.agent.online_dpo.reward.llm_judge import (
+            from uni_agent.reward.llm_judge import (
                 judge_single,
                 load_judge_prompt,
             )
