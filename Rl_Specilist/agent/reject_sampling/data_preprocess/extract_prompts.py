@@ -213,6 +213,11 @@ def extract_toolmind(rows: list[dict]) -> list[dict]:
             "prompt": prompt,
             "tools": tools,
             "data_source": "toolmind",
+            "agent_name": "custom_hermes",  # route to Hermes runner
+            "tools_kwargs": {
+                "data_source": "toolmind",
+                "agent_name": "custom_hermes",
+            },
             "reward_model": {
                 "style": "judge",
                 "ground_truth": ground_truth,
@@ -245,6 +250,14 @@ def extract_open_swe_traces(rows: list[dict]) -> list[dict]:
             "prompt": prompt,
             "tools": tools,
             "data_source": "open_swe_traces",
+            "agent_name": "custom_claude",  # route to Claude Code runner
+            "tools_kwargs": {
+                "data_source": "open_swe_traces",
+                "agent_name": "custom_claude",
+                "repo": row.get("repo", ""),
+                "base_commit": row.get("base_commit", row.get("instance_id", "")),
+                "instance_id": row.get("instance_id", ""),
+            },
             "reward_model": {
                 "style": "test",
                 "ground_truth": ground_truth,
@@ -279,6 +292,14 @@ def extract_swe_zero(rows: list[dict]) -> list[dict]:
             "prompt": prompt,
             "tools": [],
             "data_source": "swe_zero",
+            "agent_name": "custom_claude",  # route to Claude Code runner
+            "tools_kwargs": {
+                "data_source": "swe_zero",
+                "agent_name": "custom_claude",
+                "repo": row.get("repo", ""),
+                "base_commit": row.get("base_commit", row.get("instance_id", "")),
+                "instance_id": row.get("instance_id", ""),
+            },
             "reward_model": {
                 "style": "judge",  # execution-free, fall back to judge
                 "ground_truth": ground_truth,
@@ -313,6 +334,11 @@ def extract_terminaltraj(rows: list[dict]) -> list[dict]:
             "prompt": prompt,
             "tools": [],  # TerminalTraj uses a bash tool configured at rollout time
             "data_source": "terminaltraj",
+            "agent_name": "custom_hermes",  # route to Hermes runner
+            "tools_kwargs": {
+                "data_source": "terminaltraj",
+                "agent_name": "custom_hermes",
+            },
             "reward_model": {
                 "style": "judge",
                 "ground_truth": ground_truth,
@@ -418,6 +444,7 @@ def process_dataset(
         s = samples[0]
         print(f"\n  Sample [0]:")
         print(f"    data_source: {s['data_source']}")
+        print(f"    agent_name:  {s.get('agent_name', 'N/A')}")
         print(f"    prompt roles: {[m['role'] for m in s['prompt']]}")
         print(f"    user content (first 200 chars): {s['prompt'][-1]['content'][:200]!r}")
         print(f"    tools count: {len(s['tools'])}")

@@ -95,6 +95,13 @@ GATEWAY_COUNT="${GATEWAY_COUNT:-1}"
 MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-32}"
 NUM_AGENT_WORKERS="${NUM_AGENT_WORKERS:-8}"
 
+# ---- Claude-Code-Style Agent ----
+# Uses the same Gateway→vLLM backend as hermes, but with a richer tool set
+# and software-engineering system prompt.  No Anthropic API key needed.
+CLAUDE_TIMEOUT="${CLAUDE_TIMEOUT:-3600}"
+CLAUDE_WORKSPACE_ROOT="${CLAUDE_WORKSPACE_ROOT:-/tmp/verl_claude}"
+CLAUDE_CONCURRENT_SESSIONS="${CLAUDE_CONCURRENT_SESSIONS:-16}"
+
 # ---- Judge ----
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-chat}"
 JUDGE_BASE_URL="${JUDGE_BASE_URL:-https://api.deepseek.com}"
@@ -125,30 +132,33 @@ if [ -z "$JUDGE_API_KEY" ]; then
     echo "ERROR: DEEPSEEK_API_KEY or JUDGE_API_KEY must be set"
     exit 1
 fi
-
 # ---- Environment ----
 export DEEPSEEK_API_KEY="${JUDGE_API_KEY}"
 export JUDGE_MODEL JUDGE_BASE_URL USE_BATCH_JUDGE
 export AGENT_MAX_TURNS AGENT_TIMEOUT
 export HERMES_WORKSPACE_ROOT
 export GATEWAY_COUNT
+# Claude-Code-style agent env vars (uses same Gateway→vLLM, no external API needed)
+export CLAUDE_TIMEOUT CLAUDE_WORKSPACE_ROOT CLAUDE_CONCURRENT_SESSIONS
 
 # Add uni-agent + verl to PYTHONPATH
 UNI_AGENT_ROOT="${UNI_AGENT_ROOT:-$HOME/workspace/uni-agent}"
 export PYTHONPATH="${REPO_ROOT}:${UNI_AGENT_ROOT}:${UNI_AGENT_ROOT}/verl:${PYTHONPATH:-}"
 
 mkdir -p "$HERMES_WORKSPACE_ROOT"
+mkdir -p "$CLAUDE_WORKSPACE_ROOT"
 mkdir -p "$CKPTS_DIR"
 ulimit -n 65535 2>/dev/null || true
 
 # ---- Print ----
 echo "========================================"
-echo " Hermes Gateway DPO Training"
+echo " Multi-Agent Gateway DPO Training"
 echo "========================================"
 echo " Dataset:      $dataset ($TRAIN_DATA)"
 echo " Model:        $MODEL_PATH"
 echo " Engine:       vllm (gen_tp=$GEN_TP)"
-echo " Workspace:    $HERMES_WORKSPACE_ROOT"
+echo " Hermes WS:    $HERMES_WORKSPACE_ROOT"
+echo " Claude WS:    $CLAUDE_WORKSPACE_ROOT"
 echo " Max turns:    $AGENT_MAX_TURNS"
 echo " N samples:    $N_SAMPLES"
 echo " Temperature:  $TEMPERATURE"
@@ -159,6 +169,8 @@ echo " Sequence:     prompt=$PROMPT_LENGTH, response=$RESPONSE_LENGTH"
 echo " Trainer:      V1 $TRAINER_MODE"
 echo " Resources:    trainer=${NNODES}x${N_GPUS_PER_NODE}, rollout=${ROLLOUT_NGPUS_PER_NODE}"
 echo " Save path:    $CKPTS_DIR"
+echo " Claude WS:    $CLAUDE_WORKSPACE_ROOT (concurrent=$CLAUDE_CONCURRENT_SESSIONS)"
+echo " Judge:       $JUDGE_MODEL (batch=$USE_BATCH_JUDGE)"
 echo "========================================"
 
 # ---- Launch ----
@@ -217,6 +229,9 @@ python3 -m verl.trainer.main_ppo \
     "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_hermes.max_concurrent_sessions=${MAX_CONCURRENT_SESSIONS}" \
     "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_hermes.runner_kwargs.agent_max_turns=${AGENT_MAX_TURNS}" \
     "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_hermes.runner_kwargs.agent_timeout=${AGENT_TIMEOUT}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_claude.max_concurrent_sessions=${CLAUDE_CONCURRENT_SESSIONS}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_claude.runner_kwargs.agent_max_turns=${AGENT_MAX_TURNS}" \
+    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.custom_claude.runner_kwargs.agent_timeout=${CLAUDE_TIMEOUT}" \
     "actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}" \
     "actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH}" \
     "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
