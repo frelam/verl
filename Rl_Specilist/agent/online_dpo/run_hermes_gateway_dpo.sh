@@ -99,6 +99,11 @@ NUM_AGENT_WORKERS="${NUM_AGENT_WORKERS:-8}"
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-chat}"
 JUDGE_BASE_URL="${JUDGE_BASE_URL:-https://api.deepseek.com}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-${DEEPSEEK_API_KEY:-}}"
+# Set USE_BATCH_JUDGE=1 to enable deferred batch-level judge scoring
+# with dataset-specific prompts.  When enabled, the runner skips inline
+# judge_single and the framework calls judge_batch after all trajectories
+# are collected for relative scoring within each batch.
+USE_BATCH_JUDGE="${USE_BATCH_JUDGE:-1}"
 
 # ---- Logging ----
 PROJECT_NAME="${PROJECT_NAME:-hermes-gateway-dpo}"
@@ -123,7 +128,7 @@ fi
 
 # ---- Environment ----
 export DEEPSEEK_API_KEY="${JUDGE_API_KEY}"
-export JUDGE_MODEL JUDGE_BASE_URL
+export JUDGE_MODEL JUDGE_BASE_URL USE_BATCH_JUDGE
 export AGENT_MAX_TURNS AGENT_TIMEOUT
 export HERMES_WORKSPACE_ROOT
 export GATEWAY_COUNT

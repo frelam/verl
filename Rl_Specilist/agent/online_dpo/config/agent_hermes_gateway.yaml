@@ -59,6 +59,9 @@ actor_rollout_ref:
     custom:
       agent_framework:
         gateway_count: ${oc.env:GATEWAY_COUNT,1}
+        # Batch-judge framework subclass (zero uni_agent changes required).
+        # Set to empty string or omit to use the default framework.
+        framework_class_fqn: Rl_Specilist.agent.online_dpo.framework.BatchJudgeAgentFramework
         agent_runners:
           custom_hermes:
             runner_fqn: Rl_Specilist.agent.online_dpo.custom_hermes_runner.custom_hermes_runner
@@ -96,9 +99,14 @@ algorithm:
   use_dpo: ${oc.env:USE_DPO,true}
 
 reward:
+  # Gate: set USE_BATCH_JUDGE=1 to enable deferred batch-level LLM judge
+  # scoring with dataset-specific prompts.  When enabled, the runner skips
+  # per-sample judge_single and the framework calls judge_batch after all
+  # trajectories are collected.
+  use_batch_judge: ${oc.env:USE_BATCH_JUDGE,false}
   custom_reward_function:
     path: Rl_Specilist.agent.online_dpo.reward.llm_judge
-    name: compute_score
+    name: compute_score_batch
 
 data:
   train_files: ${oc.env:TRAIN_DATA,}
