@@ -48,6 +48,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -169,32 +170,30 @@ _ALLOWED_REPO_DOMAINS = frozenset({
 
 
 def _validate_repo_url(url: str) -> bool:
-    """Check that a repo URL points to a known, trusted code host."""
+    """Check that a repo URL points to a known, trusted code host.
+
+    Uses ``urllib.parse.urlparse`` for proper URL parsing (avoids regex
+    bypasses with userinfo, fragments, etc.).
+    """
     if not url:
         return False
-    # Allow git@, https://, and shorthand owner/repo forms
-    if "/" not in url:
-        return False
-    # Extract domain from URL-like forms
-    domain = None
-    if url.startswith("https://") or url.startswith("http://"):
-        # Parse domain from URL
-        m = re.match(r"https?://([^/]+)", url)
-        if m:
-            domain = m.group(1).lower()
-    elif url.startswith("git@"):
-        m = re.match(r"git@([^:]+)", url)
-        if m:
-            domain = m.group(1).lower()
-    else:
-        # Shorthand "owner/repo" — accept only if it looks like a sane path
+
+    # Shorthand "owner/repo" — accept only if it looks like a sane path
+    if not url.startswith("https://") and not url.startswith("http://") and not url.startswith("git@"):
         return bool(re.match(r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$", url))
 
-    if domain:
-        # Remove port if present
-        domain = domain.split(":")[0]
-        return domain in _ALLOWED_REPO_DOMAINS
-    return False
+    # git@github.com:owner/repo.git form
+    if url.startswith("git@"):
+        m = re.match(r"git@([^:]+)", url)
+        if not m:
+            return False
+        hostname = m.group(1).lower().rstrip(".")
+        return hostname.split(":")[0] in _ALLOWED_REPO_DOMAINS
+
+    # https:// or http:// — use urlparse for robust hostname extraction
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    return hostname in _ALLOWED_REPO_DOMAINS
 
 
 def _clone_repo(
