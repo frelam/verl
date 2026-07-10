@@ -1,0 +1,134 @@
+# Hermes Gateway DPO training config for custom command-line agent tasks.
+#
+# Architecture: Gateway-based blackbox agent training.
+#   verl model (Qwen3-4B) → Gateway → vLLM inference
+#   Agent entrypoint → Gateway /v1/chat/completions → trajectories captured
+#
+# Entry point: python3 -m verl.trainer.main_ppo
+# Default: single 8-GPU node, 4 GPUs trainer + 4 GPUs rollout.
+#
+# Based on uni-agent hermes_agent_megatron_v1.yaml.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+actor_rollout_ref:
+  hybrid_engine: true
+  nccl_timeout: 9600
+
+  model:
+    path: ${oc.env:MODEL_PATH,${oc.env:HOME}/models/Qwen3-4B}
+
+  rollout:
+    name: vllm
+    mode: async
+    nnodes: 1
+    n_gpus_per_node: 4
+    prompt_length: ${oc.env:PROMPT_LENGTH,4096}
+    response_length: ${oc.env:RESPONSE_LENGTH,16384}
+    max_model_len: ${oc.env:MAX_MODEL_LEN,20480}
+    temperature: ${oc.env:TEMPERATURE,0.7}
+    top_p: ${oc.env:TOP_P,1.0}
+    top_k: ${oc.env:TOP_K,-1}
+    n: ${oc.env:N_SAMPLES,4}
+    tensor_model_parallel_size: ${oc.env:GEN_TP,4}
+    gpu_memory_utilization: ${oc.env:ROLLOUT_GPU_MEM_UTIL,0.7}
+    calculate_log_probs: true
+    enable_sleep_mode: true
+    free_cache_engine: true
+    enable_chunked_prefill: true
+    max_num_batched_tokens: ${oc.env:MAX_MODEL_LEN,20480}
+    checkpoint_engine:
+      backend: nccl
+      update_weights_bucket_megabytes: ${oc.env:UPDATE_WEIGHTS_BUCKET_MB,2048}
+
+    multi_turn:
+      enable: true
+      max_parallel_calls: 1
+      format: hermes
+
+    agent:
+      num_workers: ${oc.env:NUM_AGENT_WORKERS,8}
+      agent_loop_manager_class: uni_agent.framework.entry.AgentFrameworkRolloutAdapter
+
+    custom:
+      agent_framework:
+        gateway_count: ${oc.env:GATEWAY_COUNT,1}
+        agent_runners:
+          custom_hermes:
+            runner_fqn: Rl_Specilist.agent.online_dpo.custom_hermes_runner.custom_hermes_runner
+            dispatch_mode: inline_async
+            max_concurrent_sessions: ${oc.env:MAX_CONCURRENT_SESSIONS,32}
+            runner_kwargs:
+              agent_max_turns: ${oc.env:AGENT_MAX_TURNS,100}
+              agent_timeout: ${oc.env:AGENT_TIMEOUT,3600}
+
+  actor:
+    use_dynamic_bsz: true
+    use_rollout_log_probs: true
+    ppo_mini_batch_size: ${oc.env:PPO_MINI_BATCH_SIZE,16}
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: false
+    kl_loss_coef: 0.0
+    clip_ratio_low: ${oc.env:CLIP_RATIO_LOW,0.2}
+    clip_ratio_high: ${oc.env:CLIP_RATIO_HIGH,0.28}
+    clip_ratio_c: 10.0
+    loss_agg_mode: token-mean
+    entropy_coeff: 0
+    policy_loss:
+      loss_mode: ${oc.env:LOSS_MODE,dpo}
+      dpo_beta: ${oc.env:DPO_BETA,0.1}
+    optim:
+      lr: ${oc.env:ACTOR_LR,1e-6}
+      weight_decay: 0.1
+      lr_decay_style: constant
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 1
+
+algorithm:
+  adv_estimator: grpo
+  use_dpo: ${oc.env:USE_DPO,true}
+
+reward:
+  custom_reward_function:
+    path: Rl_Specilist.agent.online_dpo.reward.llm_judge
+    name: compute_score
+
+data:
+  train_files: ${oc.env:TRAIN_DATA,}
+  val_files: ${oc.env:VAL_DATA,}
+  train_max_samples: ${oc.env:TRAIN_MAX_SAMPLES,-1}
+  val_max_samples: ${oc.env:VAL_MAX_SAMPLES,-1}
+  train_batch_size: ${oc.env:TRAIN_BATCH_SIZE,16}
+  val_batch_size: ${oc.env:VAL_BATCH_SIZE,16}
+  max_prompt_length: ${oc.env:PROMPT_LENGTH,4096}
+  max_response_length: ${oc.env:RESPONSE_LENGTH,16384}
+  return_raw_chat: true
+
+trainer:
+  use_v1: true
+  v1:
+    trainer_mode: ${oc.env:TRAINER_MODE,separate_async}
+    colocate_async:
+      num_warmup_batches: ${oc.env:NUM_WARMUP_BATCHES,1}
+    separate_async:
+      num_warmup_batches: ${oc.env:SEPARATE_NUM_WARMUP_BATCHES,1}
+      parameter_sync_step: ${oc.env:PARAMETER_SYNC_STEP,4}
+  project_name: ${oc.env:PROJECT_NAME,hermes-gateway-dpo}
+  experiment_name: ${oc.env:EXPERIMENT_NAME,hermes-dpo}
+  total_epochs: ${oc.env:TOTAL_EPOCHS,10}
+  save_freq: ${oc.env:SAVE_FREQ,10}
+  test_freq: ${oc.env:TEST_FREQ,10}
+  val_before_train: ${oc.env:VAL_BEFORE_TRAIN,true}
+  default_local_dir: ${oc.env:CKPTS_DIR,checkpoints/hermes-gateway-dpo}
+  n_gpus_per_node: ${oc.env:N_GPUS_PER_NODE,4}
+  nnodes: ${oc.env:NNODES,1}
+
+transfer_queue:
+  enable: true
