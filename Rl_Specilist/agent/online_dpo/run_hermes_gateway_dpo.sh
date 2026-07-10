@@ -3,8 +3,9 @@
 # =============================================================================
 #
 # Blackbox agent training with AKernel sandbox + Gateway DPO.
-# Each data point runs in its own AKernel sandbox (Docker), the agent sidecar
-# is mounted, and the agent communicates with the Gateway for LLM inference.
+# Each data point runs in its own AKernel sandbox (Docker), the chosen agent
+# sidecar is mounted, and the agent communicates with the Gateway for LLM
+# inference.
 #
 # Architecture:
 #   Dataset → AKernel Sandbox (per-sample Docker) → Agent (sidecar mount)
@@ -20,20 +21,28 @@
 # Usage
 # =============================================================================
 #
+#   # Single agent (no agent_name field needed in dataset):
 #   export AKERNEL_SERVER_ADDRESS="x.x.x.x:8888"
 #   export AKERNEL_TOKEN="<token>"
-#   export JUDGE_API_KEY=sk-xxx          # optional (for llm_judge scoring)
-#   bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/hermes-gateway-dpo
+#   AGENT_RUNNER=hermes bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/dpo
+#
+#   # Mixed agents (dataset must have agent_name="hermes_agent"|"claude_code"):
+#   AGENT_RUNNER=both bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/dpo
 #
 # =============================================================================
 # Configuration (all overridable via env vars)
 # =============================================================================
 #
+# --- Agent selection ---
+#   AGENT_RUNNER          hermes | claude | both  (default: hermes)
+#                         When "both", dataset rows must have an "agent_name"
+#                         field set to the runner key (hermes_agent or claude_code).
+#
 # --- Model & Data ---
-#   MODEL_PATH           (default: $HOME/models/Qwen3-4B)
-#   TRAIN_DATA           (default: $HOME/data/online_dpo/prompts/train.parquet)
-#   VAL_DATA             (default: $HOME/data/online_dpo/prompts/val.parquet)
-#   N_SAMPLES            Rollouts per prompt (default: 8)
+#   MODEL_PATH            (default: $HOME/models/Qwen3-4B)
+#   TRAIN_DATA            (default: $HOME/data/online_dpo/prompts/train.parquet)
+#   VAL_DATA              (default: $HOME/data/online_dpo/prompts/val.parquet)
+#   N_SAMPLES             Rollouts per prompt (default: 8)
 #
 # --- AKernel Sandbox (required) ---
 #   AKERNEL_SERVER_ADDRESS
@@ -41,13 +50,8 @@
 #
 # --- Judge (for llm_judge scoring) ---
 #   JUDGE_API_KEY / DEEPSEEK_API_KEY
-#   JUDGE_MODEL          (default: deepseek-chat)
-#   JUDGE_BASE_URL       (default: https://api.deepseek.com)
-#
-# --- Agent ---
-#   AGENT_MAX_TURNS      Max conversation turns (default: 100)
-#   AGENT_TIMEOUT        Max seconds per agent run (default: 3600)
-#   HERMES_WORKSPACE_ROOT Workspace base dir (default: /tmp/verl_hermes)
+#   JUDGE_MODEL           (default: deepseek-chat)
+#   JUDGE_BASE_URL        (default: https://api.deepseek.com)
 #
 # --- GPU ---
 #   Default: single 8-GPU node, 4 trainer + 4 rollout (separate_async).
@@ -65,22 +69,25 @@ nproc_per_node="${2:?}"
 save_path="${3:?}"
 shift 3 2>/dev/null || shift $#
 
+# ---- Agent selection ----
+AGENT_RUNNER="${AGENT_RUNNER:-hermes}"
+
 # ---- Model & data ----
 MODEL_PATH="${MODEL_PATH:-$HOME/models/Qwen3-4B}"
 TRAIN_DATA="${TRAIN_DATA:-$HOME/data/online_dpo/prompts/${dataset}.parquet}"
 VAL_DATA="${VAL_DATA:-$HOME/data/online_dpo/prompts/val.parquet}"
-N_SAMPLES="${N_SAMPLES:-4}"
-TEMPERATURE="${TEMPERATURE:-0.7}"
+N_SAMPLES="${N_SAMPLES:-8}"
+TEMPERATURE="${TEMPERATURE:-1.0}"
 DPO_BETA="${DPO_BETA:-0.1}"
 ACTOR_LR="${ACTOR_LR:-1e-6}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-20480}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-135168}"
 PROMPT_LENGTH="${PROMPT_LENGTH:-4096}"
-RESPONSE_LENGTH="${RESPONSE_LENGTH:-16384}"
+RESPONSE_LENGTH="${RESPONSE_LENGTH:-131072}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-${MAX_MODEL_LEN}}"
 
 # ---- Trainer ----
 TRAINER_MODE="${TRAINER_MODE:-separate_async}"
-NUM_WARMUP_BATCHES="${NUM_WARMUP_BATCHES:-1}"
-SEPARATE_NUM_WARMUP_BATCHES="${SEPARATE_NUM_WARMUP_BATCHES:-1}"
+NUM_WARMUP_BATCHES="${NUM_WARMUP_BATCHES:-4}"
 PARAMETER_SYNC_STEP="${PARAMETER_SYNC_STEP:-4}"
 
 # ---- Hardware ----
@@ -95,7 +102,7 @@ UPDATE_WEIGHTS_BUCKET_MB="${UPDATE_WEIGHTS_BUCKET_MB:-2048}"
 CLIP_RATIO_LOW="${CLIP_RATIO_LOW:-0.2}"
 CLIP_RATIO_HIGH="${CLIP_RATIO_HIGH:-0.28}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-${PPO_MINI_BATCH_SIZE}}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
 
 # ---- Agent (sandbox-based) ----
@@ -117,14 +124,14 @@ CLAUDE_CONCURRENT_SESSIONS="${CLAUDE_CONCURRENT_SESSIONS:-32}"
 SANDBOX_MAX_RETRIES="${SANDBOX_MAX_RETRIES:-10}"
 SWE_AGENT_EVAL_TIMEOUT="${SWE_AGENT_EVAL_TIMEOUT:-600}"
 
-# ---- Judge (inline, per-trajectory) ----
+# ---- Judge (inline, via custom_reward_function) ----
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-chat}"
 JUDGE_BASE_URL="${JUDGE_BASE_URL:-https://api.deepseek.com}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-${DEEPSEEK_API_KEY:-}}"
 
 # ---- Logging ----
-PROJECT_NAME="${PROJECT_NAME:-hermes-gateway-dpo}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-hermes-dpo-${dataset}-$(date '+%m%d-%H%M')}"
+PROJECT_NAME="${PROJECT_NAME:-sandbox-agent-dpo}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${AGENT_RUNNER}-dpo-${dataset}-$(date '+%m%d-%H%M')}"
 SAVE_FREQ="${SAVE_FREQ:-10}"
 TEST_FREQ="${TEST_FREQ:-10}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-10}"
@@ -139,14 +146,17 @@ if [ ! -f "$TRAIN_DATA" ]; then
     exit 1
 fi
 if [ -z "${AKERNEL_SERVER_ADDRESS:-}" ]; then
-    echo "ERROR: AKERNEL_SERVER_ADDRESS must be set (e.g. 6.2.179.37:8888)"
+    echo "ERROR: AKERNEL_SERVER_ADDRESS must be set"
     exit 1
 fi
 if [ -z "${AKERNEL_TOKEN:-}" ]; then
     echo "ERROR: AKERNEL_TOKEN must be set"
     exit 1
 fi
-# Judge API key is optional (only needed when tools_kwargs.scoring.llm_judge=true)
+case "$AGENT_RUNNER" in
+    hermes|claude|both) ;;
+    *) echo "ERROR: AGENT_RUNNER must be 'hermes', 'claude', or 'both'"; exit 1 ;;
+esac
 
 # ---- Environment ----
 export DEEPSEEK_API_KEY="${JUDGE_API_KEY}"
@@ -165,10 +175,46 @@ export PYTHONPATH="${REPO_ROOT}:${UNI_AGENT_ROOT}:${UNI_AGENT_ROOT}/verl:${PYTHO
 mkdir -p "$CKPTS_DIR"
 ulimit -n 65535 2>/dev/null || true
 
+# ---- Build runner override args ----
+# Config YAML defines both runners. For single-agent mode, delete the unused
+# runner via Hydra "~" syntax so the framework auto-selects the only remaining
+# runner (no agent_name field needed in dataset).  For "both" mode, keep both
+# runners — dataset must have an "agent_name" field.
+RUNNER_OVERRIDES=()
+case "$AGENT_RUNNER" in
+    hermes)
+        RUNNER_OVERRIDES+=(
+            "~actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.max_concurrent_sessions=${HERMES_CONCURRENT_SESSIONS}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.tool_image=${HERMES_TOOL_IMAGE}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.run_timeout=${HERMES_RUN_TIMEOUT}"
+        )
+        ;;
+    claude)
+        RUNNER_OVERRIDES+=(
+            "~actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.max_concurrent_sessions=${CLAUDE_CONCURRENT_SESSIONS}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.tool_image=${CLAUDE_TOOL_IMAGE}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.run_timeout=${CLAUDE_RUN_TIMEOUT}"
+        )
+        ;;
+    both)
+        RUNNER_OVERRIDES+=(
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.max_concurrent_sessions=${HERMES_CONCURRENT_SESSIONS}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.tool_image=${HERMES_TOOL_IMAGE}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.run_timeout=${HERMES_RUN_TIMEOUT}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.max_concurrent_sessions=${CLAUDE_CONCURRENT_SESSIONS}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.tool_image=${CLAUDE_TOOL_IMAGE}"
+            "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.run_timeout=${CLAUDE_RUN_TIMEOUT}"
+        )
+        ;;
+esac
+
 # ---- Print ----
 echo "========================================"
 echo " Sandbox Agent DPO Training"
 echo "========================================"
+echo " Agent:        $AGENT_RUNNER"
 echo " Dataset:      $dataset ($TRAIN_DATA)"
 echo " Model:        $MODEL_PATH"
 echo " Engine:       vllm (gen_tp=$GEN_TP)"
@@ -178,12 +224,14 @@ echo " N samples:    $N_SAMPLES"
 echo " Temperature:  $TEMPERATURE"
 echo " DPO beta:     $DPO_BETA"
 echo " Actor lr:     $ACTOR_LR"
-echo " Batch:        n=$N_SAMPLES, mini_bsz=$PPO_MINI_BATCH_SIZE"
 echo " Sequence:     prompt=$PROMPT_LENGTH, response=$RESPONSE_LENGTH"
 echo " Trainer:      V1 $TRAINER_MODE"
 echo " Resources:    trainer=${NNODES}x${N_GPUS_PER_NODE}, rollout=${ROLLOUT_NGPUS_PER_NODE}"
 echo " Save path:    $CKPTS_DIR"
-echo " Judge:        $JUDGE_MODEL (inline, per-trajectory)"
+echo " Judge:        $JUDGE_MODEL (via custom_reward_function)"
+if [ "$AGENT_RUNNER" = "both" ]; then
+    echo " NOTE:         Dataset must have agent_name field (hermes_agent|claude_code)"
+fi
 echo "========================================"
 
 # ---- Launch ----
@@ -212,8 +260,7 @@ python3 -m verl.trainer.main_ppo \
     +ray_kwargs.ray_init.address="auto" \
     trainer.use_v1=true \
     "trainer.v1.trainer_mode=${TRAINER_MODE}" \
-    "trainer.v1.colocate_async.num_warmup_batches=${NUM_WARMUP_BATCHES}" \
-    "trainer.v1.separate_async.num_warmup_batches=${SEPARATE_NUM_WARMUP_BATCHES}" \
+    "trainer.v1.separate_async.num_warmup_batches=${NUM_WARMUP_BATCHES}" \
     "trainer.v1.separate_async.parameter_sync_step=${PARAMETER_SYNC_STEP}" \
     transfer_queue.enable=true \
     "actor_rollout_ref.model.path=${MODEL_PATH}" \
@@ -230,7 +277,7 @@ python3 -m verl.trainer.main_ppo \
     "actor_rollout_ref.rollout.prompt_length=${PROMPT_LENGTH}" \
     "actor_rollout_ref.rollout.response_length=${RESPONSE_LENGTH}" \
     "actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN}" \
-    "actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_MODEL_LEN}" \
+    "actor_rollout_ref.rollout.max_num_batched_tokens=${MAX_NUM_BATCHED_TOKENS}" \
     "actor_rollout_ref.rollout.temperature=${TEMPERATURE}" \
     "actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=${UPDATE_WEIGHTS_BUCKET_MB}" \
     "actor_rollout_ref.rollout.nnodes=${NNODES}" \
@@ -239,12 +286,7 @@ python3 -m verl.trainer.main_ppo \
     "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}" \
     "actor_rollout_ref.rollout.agent.num_workers=${NUM_AGENT_WORKERS}" \
     "actor_rollout_ref.rollout.custom.agent_framework.gateway_count=${GATEWAY_COUNT}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.max_concurrent_sessions=${HERMES_CONCURRENT_SESSIONS}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.tool_image=${HERMES_TOOL_IMAGE}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.hermes_agent.runner_kwargs.run_timeout=${HERMES_RUN_TIMEOUT}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.max_concurrent_sessions=${CLAUDE_CONCURRENT_SESSIONS}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.tool_image=${CLAUDE_TOOL_IMAGE}" \
-    "actor_rollout_ref.rollout.custom.agent_framework.agent_runners.claude_code.runner_kwargs.run_timeout=${CLAUDE_RUN_TIMEOUT}" \
+    "${RUNNER_OVERRIDES[@]}" \
     "actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW}" \
     "actor_rollout_ref.actor.clip_ratio_high=${CLIP_RATIO_HIGH}" \
     "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}" \
@@ -266,6 +308,6 @@ python3 -m verl.trainer.main_ppo \
 
 echo ""
 echo "========================================"
-echo " Hermes Gateway DPO training complete!"
+echo " Sandbox Agent DPO training complete!"
 echo " Checkpoints: $CKPTS_DIR"
 echo "========================================"

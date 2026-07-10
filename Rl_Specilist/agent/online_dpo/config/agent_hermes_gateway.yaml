@@ -59,6 +59,10 @@ actor_rollout_ref:
     custom:
       agent_framework:
         gateway_count: ${oc.env:GATEWAY_COUNT,1}
+        # When a single runner is configured, every sample uses it.
+        # When multiple runners are configured, each dataset row must
+        # have an ``agent_name`` field matching a runner key below
+        # (e.g. ``agent_name: "hermes_agent"``).
         agent_runners:
           hermes_agent:
             runner_fqn: examples.blackbox_recipes.hermes_agent.hermes_agent_runner.hermes_agent_runner
