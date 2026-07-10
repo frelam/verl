@@ -34,8 +34,19 @@ Rl_Specilist/
 │   │
 │   ├── online_dpo/                        # Online DPO（在线偏好训练）
 │   │   ├── README.md                      # 使用指南
-│   │   ├── config/online_dpo.yaml         # DPO 训练配置
-│   │   └── run_online_dpo.sh              # 训练启动脚本
+│   │   ├── config/                        # 训练配置
+│   │   │   ├── agent_hermes_gateway.yaml  # Gateway DPO 配置（当前）
+│   │   │   ├── agent_dpo_judge.yaml       # Sandbox DPO 配置（旧）
+│   │   │   ├── agent_gdpo_judge.yaml      # Sandbox GDPO 配置（旧）
+│   │   │   ├── online_dpo.yaml            # 原始 DPO 配置（旧）
+│   │   │   └── tool_config_sandbox.yaml   # Sandbox 工具注册（旧）
+│   │   ├── hermes_entrypoint.py           # Agent 入口（当前）
+│   │   ├── custom_hermes_runner.py        # Runner（当前）
+│   │   ├── reward/llm_judge.py            # Judge 打分（当前）
+│   │   ├── run_hermes_gateway_dpo.sh      # Gateway 训练启动（当前）
+│   │   ├── run_multi_agent_dpo.sh         # Sandbox 模式（旧）
+│   │   ├── run_agent_dpo.sh               # Agent DPO（旧）
+│   │   └── run_online_dpo.sh              # 原始 online DPO（旧）
 │   │
 │   └── RL/                                # Agentic RL（多轮工具调用 GRPO）
 │       ├── README.md                      # 使用指南
@@ -137,6 +148,7 @@ Rl_Specilist/
 | `verl/trainer/config/optim/muon_fsdp.yaml` | Muon FSDP 配置模板 |
 | `verl/trainer/config/rollout/rollout.yaml` | repetition_penalty 配置 |
 | `verl/experimental/agent_loop/` | Agent 训练 loop (多轮/工具调用) |
+| `verl/utils/chat_template.py` | Chat template 初始化与系统提示提取 |
 | `verl/workers/reward_manager/dapo.py` | DAPO 动态采样 + 长度惩罚 |
 | `verl/workers/reward_manager/gdpo.py` | GDPO 多维奖励管理 |
 
@@ -166,7 +178,8 @@ Rl_Specilist/
 - Python 3.10+
 - verl 框架
 - CUDA 12.1+
-- Docker（Reject Sampling / Online DPO 的 TerminalTraj / SWE 环境）
+- Docker（Reject Sampling 的 TerminalTraj / SWE 环境）
+- Uni-Agent Gateway（Online DPO 的推理网关）
 - DeepSeek API Key（Reject Sampling / Online DPO 的 judge）
 - 8× GPU（推荐）或 4× GPU（最小）
 
