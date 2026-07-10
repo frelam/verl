@@ -70,6 +70,16 @@ actor_rollout_ref:
             runner_kwargs:
               agent_max_turns: ${oc.env:AGENT_MAX_TURNS,100}
               agent_timeout: ${oc.env:AGENT_TIMEOUT,3600}
+          custom_claude:
+            runner_fqn: Rl_Specilist.agent.online_dpo.custom_claude_runner.custom_claude_runner
+            dispatch_mode: inline_async
+            # Claude-Code-style agent uses the same Gateway→vLLM backend as hermes,
+            # so concurrency can match.  The difference is only in the tool set
+            # and system prompt (software-engineering focused).
+            max_concurrent_sessions: ${oc.env:CLAUDE_CONCURRENT_SESSIONS,16}
+            runner_kwargs:
+              agent_max_turns: ${oc.env:AGENT_MAX_TURNS,100}
+              agent_timeout: ${oc.env:CLAUDE_TIMEOUT,3600}
 
   actor:
     use_dynamic_bsz: true
