@@ -11,7 +11,6 @@
 │  直到 submit_answer 或 max_turns                     │
 └────────────────────────────────────────────────────┘
            │ Hermes-format tool calls
-           │ (Gateway 侧解析 tool_parser: hermes)
            ▼
 ┌─── Uni-Agent Gateway (FastAPI) ─────────────────────┐
 │  /v1/chat/completions                               │
@@ -25,7 +24,7 @@
 └────────────────────────────────────────────────────┘
            │
            ▼
-    Runner 收集 reward → Judge 打分 (batch + inline)
+    Runner 收集 reward → Judge 打分
            │
            ▼
    best vs worst → DPO loss → 更新模型
@@ -34,12 +33,12 @@
    下一轮 rollout — 模型权重已更新 ✨
 ```
 
-**关键点：**
-- **Agent entrypoint** = 黑盒 agent，通过 Gateway 与 verl 模型交互
-- **Gateway** = 中间层，解析 Hermes 格式的 tool call，捕获完整 token 级轨迹
-- **Runner** = `custom_hermes_runner.py`，管理 session → workspace → entrypoint → reward 全流程
-- **Judge** = 双重模式：runner 侧 inline 打分（单轨迹）+ BatchRewardManager 批量打分
-- **Online DPO**：模型生成 → 工具执行 → 打分 → 更新 → 下次 rollout 用新权重
+**关键组件：**
+- **Agent entrypoint** (`hermes_entrypoint.py`): 黑盒 agent，通过 Gateway 与 verl 模型交互
+- **Gateway**: 中间层，解析 Hermes 格式的 tool call，捕获完整 token 级轨迹
+- **Runner** (`custom_hermes_runner.py`): 管理 session → workspace → entrypoint → reward 全流程
+- **Judge** (`reward/llm_judge.py`): LLM judge inline 打分，结果通过 `reward_info_url` 传回 framework
+- **Online DPO**: 模型生成 → 工具执行 → 打分 → 更新 → 下次 rollout 用新权重
 
 ---
 
@@ -64,26 +63,18 @@ export HF_TOKEN=hf_xxx              # 下载模型/数据
 bash setup/download_data.sh
 ```
 
-### 4. 启动训练（Gateway 模式）
+### 4. 启动训练
 
 ```bash
-# 使用 Uni-Agent Gateway + Hermes entrypoint
+export DEEPSEEK_API_KEY=sk-xxx
 bash run_hermes_gateway_dpo.sh <dataset> 8 ~/ckpt/hermes-gateway
-```
-
-**旧模式（sandbox 工具，已弃用）：**
-```bash
-# sandbox 工具模式 — 保留作为参考
-bash run_multi_agent_dpo.sh toolmind 8 ~/data/online_dpo/ckpt
 ```
 
 ---
 
 ## 配置文件
 
-### Gateway 训练配置（推荐）
-
-`config/agent_hermes_gateway.yaml` — Uni-Agent Gateway DPO Hydra config
+`config/agent_hermes_gateway.yaml` — Uni-Agent Gateway DPO Hydra config:
 
 ```yaml
 actor_rollout_ref:
@@ -105,23 +96,11 @@ actor_rollout_ref:
       dpo_beta: 0.1
 ```
 
-### Sandbox 工具配置（旧模式）
-
-`config/tool_config_sandbox.yaml` — BaseTool 子类注册
-
-```yaml
-tools:
-  - class_name: "....SandboxBashTool"
-  - class_name: "....SandboxReadTool"
-  - class_name: "....SandboxWriteTool"
-  - class_name: "....SandboxSubmitTool"
-```
-
 ---
 
 ## 核心模块
 
-### 1. `hermes_entrypoint.py` — Agent 入口
+### `hermes_entrypoint.py` — Agent 入口
 
 独立 Python 脚本（仅依赖 stdlib），在工作区中运行工具调用循环：
 
@@ -139,7 +118,7 @@ AGENT_MAX_TURNS=100 \
 python hermes_entrypoint.py
 ```
 
-### 2. `custom_hermes_runner.py` — Runner
+### `custom_hermes_runner.py` — Runner
 
 Runner 契约实现，对接 Uni-Agent `AgentFramework`：
 
@@ -152,19 +131,20 @@ Runner (custom_hermes_runner)
   │     └─ Agent ← Gateway ← assistant reply
   │     └─ Agent → 在 workspace 执行工具 → observation
   │     └─ ... 循环 ...
-  ├─ 评估 reward (LLM Judge inline 或 basic)
+  ├─ 评估 reward (LLM Judge)
   ├─ POST reward_info → Gateway
   └─ 清理 workspace
 ```
 
-### 3. `reward/llm_judge.py` — Judge 打分
+### `reward/llm_judge.py` — Judge 打分
 
-双重接口：
+三重接口：
 
 | 接口 | 用途 | 调用方 |
 |------|------|--------|
-| `judge_single(task, agent_output)` | 单轨迹 inline 打分 | `custom_hermes_runner` |
-| `compute_score(data_sources, ...)` | 批量打分（BatchRewardManager） | verl reward loop |
+| `compute_score()` | Verl reward loop 读取 runner 预计算分数 | RewardLoopWorker |
+| `judge_single()` | 单轨迹 inline 打分 | `custom_hermes_runner` |
+| `judge_batch()` | 批量相对打分 | 手动调用 |
 
 配置：
 ```bash
@@ -213,55 +193,26 @@ export DEEPSEEK_API_KEY=sk-xxx          # API Key
 ```
 Rl_Specilist/agent/online_dpo/
 ├── config/
-│   ├── agent_hermes_gateway.yaml     # Gateway DPO + Hermes 配置 ★
-│   ├── agent_dpo_judge.yaml          # Sandbox DPO + batch judge（旧）
-│   ├── agent_gdpo_judge.yaml         # Sandbox GDPO + batch judge（旧）
-│   ├── online_dpo.yaml               # 原始 online DPO 配置（旧）
-│   └── tool_config_sandbox.yaml      # Sandbox 工具注册（旧）
-├── hermes_entrypoint.py              # Agent 入口（stdlib only）★
-├── custom_hermes_runner.py           # Runner — session/workspace/reward ★
+│   └── agent_hermes_gateway.yaml      # Gateway DPO + Hermes 配置
+├── hermes_entrypoint.py               # Agent 入口（stdlib only）
+├── custom_hermes_runner.py            # Runner — session/workspace/reward
 ├── reward/
 │   ├── __init__.py
-│   └── llm_judge.py                  # Judge 打分（batch + inline）★
+│   └── llm_judge.py                   # Judge 打分（batch + inline）
 ├── tests/
 │   ├── __init__.py
-│   └── test_hermes_entrypoint.py     # Hermes entrypoint 单元测试 ★
-├── tools/
-│   ├── __init__.py
-│   └── sandbox_tools.py              # BaseTool 子类（旧模式）
-├── runners/
-│   ├── __init__.py                   # 已弃用 — 旧 agent loop runner
-│   └── test_smoke.py                 # 冒烟测试
+│   └── test_hermes_entrypoint.py      # Hermes entrypoint 单元测试
 ├── setup/
-│   ├── install.sh                    # 一键安装
-│   └── download_data.sh             # 数据下载
-├── prompts/                          # Judge prompt 模板
+│   ├── install.sh                     # 一键安装
+│   └── download_data.sh              # 数据下载
+├── prompts/                           # Judge prompt 模板
 │   ├── coding_judge.txt
 │   └── math_judge.txt
-├── run_hermes_gateway_dpo.sh         # Gateway 训练启动脚本 ★
-├── run_multi_agent_dpo.sh            # Sandbox 模式训练（旧）
-├── run_agent_dpo.sh                  # Agent DPO（旧）
-├── run_online_dpo.sh                 # 原始 online DPO（旧）
+├── run_hermes_gateway_dpo.sh          # 训练启动脚本
 └── README.md
 ```
 
-★ = 新架构核心文件
-
 ---
-
-## 新旧架构对比
-
-| 维度 | 旧架构（Sandbox） | 新架构（Uni-Agent Gateway） |
-|------|-------------------|---------------------------|
-| Agent 入口 | verl `ToolAgentLoop` | `hermes_entrypoint.py`（独立脚本） |
-| 推理网关 | vLLM 直接调用 | Gateway → vLLM |
-| 工具执行 | `BaseTool` 子类（`tools/sandbox_tools.py`） | `subprocess` 直接执行 |
-| 工具注册 | `tool_config_sandbox.yaml` | 不需要（agent 自行管理） |
-| 轨迹捕获 | verl 内部 | Gateway 捕获完成 token 级轨迹 |
-| Runner | `ToolAgentLoop` | `custom_hermes_runner.py`（AgentFramework） |
-| Judge | 仅 batch（`BatchRewardManager`） | batch + inline 双模式 |
-| 配置 | `agent_dpo_judge.yaml` | `agent_hermes_gateway.yaml` |
-| 启动 | `run_multi_agent_dpo.sh` | `run_hermes_gateway_dpo.sh` |
 
 ## 注意事项
 
