@@ -148,7 +148,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
 
     async def _agent_loop_postprocess(
-        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, global_step=None, rollout_n=0, **kwargs
     ) -> None:
         """Put agent loop outputs into TransferQueue."""
         uid, session_id = kwargs["uid"], kwargs["session_id"]
@@ -167,6 +167,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             response_ids=final_output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
+            global_step=global_step if global_step is not None else kwargs.get("global_steps"),
+            rollout_n=rollout_n if rollout_n else session_id,
         )
 
         if final_output.reward_score is not None:

@@ -52,19 +52,24 @@ class DistillationLossSettings(BaseConfig):
         names (str | list[str]): Name(s) to register the distillation loss function under.
         use_topk (bool): Whether the loss function uses top-k log probabilities.
         use_estimator (bool): Whether the loss function uses single-sample KL estimators.
+        use_full_vocab (bool): Whether the loss function rebuilds full-vocab teacher logits
+            from exported pre-lm_head hidden states (forward_kl_full_vocab /
+            reverse_kl_full_vocab).
     """
 
     names: str | list[str] = field(default_factory=list)
     use_topk: bool = False
     use_estimator: bool = False
+    use_full_vocab: bool = False
 
     _mutable_fields = {"names"}
 
     def __post_init__(self):
         self.names = [self.names] if isinstance(self.names, str) else self.names
-        if sum([self.use_topk, self.use_estimator]) != 1:
+        if sum([self.use_topk, self.use_estimator, self.use_full_vocab]) != 1:
             raise ValueError(
-                f"Expected only one of use_estimator, use_topk, but got {self.use_estimator=}, {self.use_topk=}."
+                f"Expected only one of use_estimator, use_topk, use_full_vocab, but got "
+                f"{self.use_estimator=}, {self.use_topk=}, {self.use_full_vocab=}."
             )
 
 
@@ -162,6 +167,51 @@ def compute_topk_loss(
     return outputs
 
 
+def compute_full_vocab_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    data: TensorDict,
+    student_logits: torch.Tensor,
+    data_format: str,
+    reverse: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Compute the full-vocab KL in the logits processor.
+
+    Dispatches to the Megatron / FSDP entry, which fetches the teacher hidden
+    states referenced by ``data["teacher_full_vocab_artifact"]`` from
+    TransferQueue, rebuilds teacher logits with the frozen teacher lm_head
+    (vocab-sharded like the student's), and returns per-token KL.
+
+    Returns:
+    - distillation_losses: (bsz, seqlen/cp_size)
+    - teacher_hidden_norm: (bsz, seqlen/cp_size)
+    - teacher_hidden_coverage: (bsz, seqlen/cp_size)
+    """
+    match config.strategy:
+        # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
+        case "fsdp" | "veomni":
+            from verl.trainer.distillation.fsdp.full_vocab_kl import compute_full_vocab_kl
+        case "megatron":
+            from verl.trainer.distillation.megatron.full_vocab_kl import compute_full_vocab_kl
+        case _:
+            raise NotImplementedError(f"Unsupported strategy: {config.strategy=}")
+
+    outputs = compute_full_vocab_kl(
+        student_logits=student_logits,
+        data=data,
+        config=config,
+        distillation_config=distillation_config,
+        data_format=data_format,
+        reverse=reverse,
+    )
+
+    expected_shape = student_logits.shape[:2]
+    for k, v in outputs.items():
+        assert v.shape == expected_shape, f"Expected shape {expected_shape}, but got {v.shape} for {k=}."
+
+    return outputs
+
+
 def distillation_ppo_loss(
     config: ActorConfig,
     distillation_config: Optional[DistillationConfig],
@@ -202,6 +252,12 @@ def distillation_ppo_loss(
 
     # Called as logits processor
     if student_logits is not None:
+        loss_settings = distillation_config.distillation_loss.loss_settings
+        if loss_settings.use_full_vocab:
+            reverse = distillation_config.distillation_loss.loss_mode == "reverse_kl_full_vocab"
+            return compute_full_vocab_loss(
+                config, distillation_config, data, student_logits, data_format, reverse=reverse
+            )
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
     # Called as final policy loss
@@ -365,6 +421,74 @@ def compute_forward_kl_topk(
     distillation_losses = distillation_losses.clamp_min(0.0)
 
     return distillation_losses, distillation_metrics
+
+
+def _finalize_full_vocab_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Shared finalize for the full-vocab KL losses.
+
+    The per-token KL has already been computed in the logits processor; here we
+    unpad it, mask to the response region, clamp numerical residue, and emit
+    hidden-state diagnostics (export-misalignment sentinels).
+    """
+    distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
+    teacher_hidden_norm = no_padding_2_padding(model_output["teacher_hidden_norm"], data)
+    teacher_hidden_coverage = no_padding_2_padding(model_output["teacher_hidden_coverage"], data)
+    if data["response_mask"].is_nested:
+        response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
+    else:
+        response_mask_bool = data["response_mask"].bool()
+    assert distillation_losses.shape == response_mask_bool.shape, (
+        f"distillation_losses shape {distillation_losses.shape} does not match response_mask "
+        f"{response_mask_bool.shape}"
+    )
+
+    norms = teacher_hidden_norm[response_mask_bool]
+    coverage = teacher_hidden_coverage[response_mask_bool]
+    distillation_metrics = {
+        # Norm of the exported teacher hidden states over response tokens: a
+        # sudden drop / zero norm flags a misaligned or missing TQ export.
+        "distillation/teacher_hidden_norm": norms.mean().item() if norms.numel() else 0.0,
+        "distillation/teacher_hidden_norm_min": Metric(AggregationType.MIN, norms.min()),
+        "distillation/teacher_hidden_norm_max": Metric(AggregationType.MAX, norms.max()),
+        # Fraction of response tokens that carried a full-vocab artifact (1.0 when healthy).
+        "distillation/teacher_hidden_coverage": coverage.mean().item() if coverage.numel() else 0.0,
+    }
+
+    # fp32 accumulation residue can push the KL slightly below zero.
+    distillation_losses = distillation_losses.clamp_min(0.0)
+
+    return distillation_losses, distillation_metrics
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["forward_kl_full_vocab"], use_full_vocab=True)
+)  # type: ignore[arg-type]
+def compute_forward_kl_full_vocab(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Forward KL over the full vocabulary, KL(p_T||p_S), from exported teacher hidden states."""
+    return _finalize_full_vocab_loss(config, distillation_config, model_output, data)
+
+
+@register_distillation_loss(
+    DistillationLossSettings(names=["reverse_kl_full_vocab"], use_full_vocab=True)
+)  # type: ignore[arg-type]
+def compute_reverse_kl_full_vocab(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Reverse KL over the full vocabulary, KL(p_S||p_T), from exported teacher hidden states."""
+    return _finalize_full_vocab_loss(config, distillation_config, model_output, data)
 
 
 @register_distillation_loss(

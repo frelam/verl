@@ -54,6 +54,48 @@ distillation_loss:
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
 
+  # ---------------- Full-vocabulary KL (loss_mode=forward_kl_full_vocab / reverse_kl_full_vocab) ----------------
+  # The teacher exports pre-lm_head hidden states to TransferQueue; the student rebuilds
+  # full-vocab teacher logits on the fly with the frozen teacher lm_head (vocab-sharded
+  # like the student's), so the [N, V] teacher logits are never materialized.
+
+  # Tokens per chunk along (B*T) inside the full-vocab KL, bounding the [chunk, C]
+  # online-softmax buffers. Main peak-memory knob.
+  full_vocab_chunk_tokens: 4096
+
+  # Vocab rows per chunk streamed through the lm_head matmul, bounding the
+  # [chunk_tokens, C] logit tile.
+  full_vocab_chunk_vocab: 8192
+
+  # Checkpoint to load the teacher lm_head from. null -> the teacher's model_path.
+  # Ambiguous with multiple teachers (leave null there).
+  full_vocab_lm_head_checkpoint: null
+
+  # Name of the lm_head weight in the checkpoint. "auto" reads embed_tokens when the
+  # teacher ties word embeddings, otherwise lm_head.
+  full_vocab_lm_head_layer: "auto"
+
+  # TransferQueue partition prefix isolating this run's hidden-state partitions from
+  # other runs sharing the same TQ cluster. null -> VERL_FULL_VOCAB_EXPERIMENT_NAME
+  # env var, then "default_exp".
+  full_vocab_experiment_name: null
+
+  # Teacher lm_head residency: "cpu" keeps sharded weights in pinned host memory and
+  # streams vocab chunks to the device on demand (recommended for multi-teacher MOPD);
+  # "gpu" keeps shards resident on the accelerator under an LRU bound.
+  full_vocab_lm_head_residency: "cpu"
+
+  # Max number of teacher lm_head shards simultaneously resident on the accelerator when
+  # full_vocab_lm_head_residency="gpu" (LRU eviction beyond this limit).
+  full_vocab_max_resident_teachers: 1
+
+  # Max tokens computed per teacher pass; null -> bounded only by the micro-batch size
+  # and full_vocab_chunk_tokens.
+  full_vocab_max_tokens_per_pass: null
+
+  # Temperature applied to both teacher and student logits in the KL.
+  kd_temperature: 1.0
+
 
 # Number of GPUs per node in the distillation teacher resource pool
 n_gpus_per_node: 8

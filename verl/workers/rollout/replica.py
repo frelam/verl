@@ -99,10 +99,14 @@ class RolloutReplica(ABC):
         is_reward_model: bool = False,
         is_teacher_model: bool = False,
         name_suffix: str = "",
+        full_vocab_export_config: Optional[dict] = None,
     ) -> None:
         self.replica_rank = replica_rank
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = model_config
+        # Full-vocab KL distillation: teacher-only hidden-state export config
+        # ({"enabled": bool, "prefix": str}); forwarded to the per-node servers.
+        self.full_vocab_export_config = full_vocab_export_config
 
         self.world_size = (
             self.config.tensor_model_parallel_size

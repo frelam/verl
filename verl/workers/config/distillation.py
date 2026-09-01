@@ -81,6 +81,39 @@ class DistillationLossConfig(BaseConfig):
     # overhead (saved-tensor total stays constant either way).
     chunked_topk_chunk_size: int = 4096
 
+    # Full-vocabulary KL (loss_mode='forward_kl_full_vocab' / 'reverse_kl_full_vocab'):
+    # the teacher exports pre-lm_head hidden states and the student rebuilds
+    # full-vocab teacher logits on the fly with the frozen teacher lm_head.
+    # Tokens per chunk along (B*T) when computing the full-vocab KL, bounding
+    # the [chunk, C] online-softmax buffers.
+    full_vocab_chunk_tokens: int = 4096
+    # Vocab-rows per chunk streamed through the lm_head matmul, bounding the
+    # [chunk_tokens, C] logit tile (the [N, V] logits are never materialized).
+    full_vocab_chunk_vocab: int = 8192
+    # Checkpoint to load the teacher lm_head from. None -> load from the
+    # teacher's model_path.
+    full_vocab_lm_head_checkpoint: Optional[str] = None
+    # Name of the lm_head weight in the checkpoint. "auto" reads embed_tokens
+    # when the teacher ties word embeddings, otherwise lm_head.
+    full_vocab_lm_head_layer: str = "auto"
+    # TransferQueue partition prefix isolating this run's hidden-state
+    # partitions from other runs sharing the same TQ cluster. None -> fall back
+    # to the VERL_FULL_VOCAB_EXPERIMENT_NAME env var, then "default_exp".
+    full_vocab_experiment_name: Optional[str] = None
+    # Teacher lm_head residency: "cpu" keeps the sharded weight in pinned host
+    # memory and streams vocab chunks to the device on demand (recommended for
+    # multi-teacher MOPD); "gpu" keeps shards resident on the accelerator.
+    full_vocab_lm_head_residency: str = "cpu"
+    # Maximum number of teacher lm_head shards simultaneously resident on the
+    # accelerator when full_vocab_lm_head_residency="gpu" (LRU eviction beyond
+    # this limit). Bounds the multi-teacher GPU footprint.
+    full_vocab_max_resident_teachers: int = 1
+    # Maximum tokens computed per teacher pass; None -> bounded only by the
+    # micro-batch size and full_vocab_chunk_tokens.
+    full_vocab_max_tokens_per_pass: Optional[int] = None
+    # Temperature applied to both teacher and student logits in the KL.
+    kd_temperature: float = 1.0
+
     use_policy_gradient: bool = True
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
@@ -122,6 +155,36 @@ class DistillationLossConfig(BaseConfig):
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
             )
+
+        if self.loss_settings.use_full_vocab:
+            if self.full_vocab_chunk_tokens <= 0:
+                raise ValueError(
+                    f"full_vocab_chunk_tokens must be > 0 when the distillation loss uses full-vocab "
+                    f"KL, but got {self.full_vocab_chunk_tokens}."
+                )
+            if self.full_vocab_chunk_vocab <= 0:
+                raise ValueError(
+                    f"full_vocab_chunk_vocab must be > 0 when the distillation loss uses full-vocab "
+                    f"KL, but got {self.full_vocab_chunk_vocab}."
+                )
+            if self.full_vocab_lm_head_residency not in ("cpu", "gpu"):
+                raise ValueError(
+                    f"full_vocab_lm_head_residency must be 'cpu' or 'gpu', got "
+                    f"{self.full_vocab_lm_head_residency!r}."
+                )
+            if self.full_vocab_max_resident_teachers < 1:
+                raise ValueError(
+                    f"full_vocab_max_resident_teachers must be >= 1, got "
+                    f"{self.full_vocab_max_resident_teachers}."
+                )
+            if self.kd_temperature <= 0:
+                raise ValueError(f"kd_temperature must be > 0, got {self.kd_temperature}.")
+            if self.use_policy_gradient:
+                raise NotImplementedError(
+                    "Full-vocab KL distillation is a supervised loss over the whole vocabulary; "
+                    "use_policy_gradient=True (which only backprops through the sampled token's "
+                    "logprob) is not supported. Set distillation_loss.use_policy_gradient=False."
+                )
 
 
 @dataclass
@@ -169,7 +232,9 @@ class DistillationTeacherModelConfig(BaseConfig):
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
-    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+    def validate_and_prepare_for_distillation(
+        self, use_topk: bool, topk: Optional[int], use_full_vocab: bool = False
+    ) -> None:
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
         student_prompt_length = self.inference.prompt_length
@@ -183,7 +248,47 @@ class DistillationTeacherModelConfig(BaseConfig):
             )
         self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
         self.inference.response_length = 1
-        self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+        if use_full_vocab:
+            # Full-vocab mode uses prompt_logprobs=0 and exports hidden states instead of
+            # top-k logprobs, so the max_logprobs >= topk check does not apply.
+            self._validate_full_vocab_inference()
+        else:
+            self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+
+    def _validate_full_vocab_inference(self) -> None:
+        # Hidden-state export is implemented for vLLM teacher servers only.
+        if self.inference.name != "vllm":
+            raise NotImplementedError(
+                f"Full-vocab distillation exports teacher hidden states, which is implemented for "
+                f"the vLLM backend only, but teacher {self.key!r} uses {self.inference.name!r}."
+            )
+        # Full-vocab KL exports per-request hidden states; exactly one request per engine
+        # forward keeps the exported hidden states aligned with the request.
+        if self.inference.max_num_seqs != 1:
+            raise ValueError(
+                "Full-vocab distillation requires the teacher inference engine to process one request "
+                f"at a time, but got max_num_seqs={self.inference.max_num_seqs}. Please set "
+                "distillation.teacher_models.<name>.inference.max_num_seqs=1."
+            )
+        if self.inference.enable_chunked_prefill:
+            raise ValueError(
+                "Full-vocab distillation requires chunked prefill to be disabled so that each teacher "
+                "forward contains exactly one complete request, but got enable_chunked_prefill=True. "
+                "Please set distillation.teacher_models.<name>.inference.enable_chunked_prefill=false."
+            )
+        if self.inference.max_num_batched_tokens < self.inference.max_model_len:
+            # On vLLM v1, enable_chunked_prefill=False does NOT stop the scheduler from
+            # splitting a prompt longer than max_num_batched_tokens into multiple prefill
+            # steps. The hidden-state capture keeps only the last forward, so a chunked
+            # prefill silently exports just the tail chunk of the sample.
+            raise ValueError(
+                "Full-vocab distillation requires the teacher prefill to run in a single "
+                f"forward, but max_num_batched_tokens={self.inference.max_num_batched_tokens} < "
+                f"max_model_len={self.inference.max_model_len}: longer samples would be chunked "
+                "and only the tail chunk's hidden states would be captured. Please set "
+                "distillation.teacher_models.<name>.inference.max_num_batched_tokens >= "
+                "max_model_len."
+            )
 
     def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
         if not use_topk:
@@ -276,6 +381,7 @@ class DistillationConfig(BaseConfig):
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
+                use_full_vocab=self.distillation_loss.loss_settings.use_full_vocab,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

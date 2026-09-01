@@ -130,8 +130,10 @@ def _check_dcp_unsupported_features(engine_config, model_config, tf_config=None,
             raise NotImplementedError("Dynamic CP router replay requires moe_router_fusion=False")
 
     if batch is not None:
-        if tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False) or tu.get_non_tensor_data(
-            batch, key="distillation_only", default=False
+        if (
+            tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+            or tu.get_non_tensor_data(batch, key="distillation_only", default=False)
+            or tu.get_non_tensor_data(batch, key="distillation_use_full_vocab", default=False)
         ):
             raise NotImplementedError("Dynamic CP does not support distillation")
 
@@ -832,7 +834,11 @@ class MegatronEngine(BaseEngine):
         return torch.tensor(input_ids.numel(), device=input_ids.device)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
-        self._distillation_use_topk_active = tu.get_non_tensor_data(data, key="distillation_use_topk", default=False)
+        # Both distillation paths leave large fp32 vocab buffers alive until
+        # backward ends; flag them so optimizer_step can empty the cache first.
+        self._distillation_use_topk_active = tu.get_non_tensor_data(
+            data, key="distillation_use_topk", default=False
+        ) or tu.get_non_tensor_data(data, key="distillation_use_full_vocab", default=False)
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
 
         _check_dcp_unsupported_features(self.engine_config, self.model_config, batch=data)
@@ -1192,6 +1198,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
+        distillation_use_full_vocab: bool = False,
     ):
         assert logits.shape[:2] == label.shape[:2]
         # avoid non-positive temperature such as padding
@@ -1223,8 +1230,11 @@ class MegatronEngineWithLMHead(MegatronEngine):
         else:
             logits_bak = logits
 
-        # logits_processor_func return tensors with shape (1, total_nnz/cp_size)
-        if distillation_use_topk:
+        # logits_processor_func return tensors with shape (1, total_nnz/cp_size).
+        # distillation_ppo_loss dispatches internally: top-k vs full-vocab is
+        # decided by the registered loss settings, so both flags funnel through
+        # the same call (they are mutually exclusive by config validation).
+        if distillation_use_topk or distillation_use_full_vocab:
             ret.update(logits_processor_func(student_logits=logits_bak, data=batch, data_format=data_format))
         if not distillation_only:
             ret["log_probs"] = vocab_parallel_log_probs_from_logits(logits_bak, label)
@@ -1248,6 +1258,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_entropy = tu.get_non_tensor_data(batch, key="calculate_entropy", default=False)
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
+        distillation_use_full_vocab = tu.get_non_tensor_data(batch, key="distillation_use_full_vocab", default=False)
         distillation_only = tu.get_non_tensor_data(batch, key="distillation_only", default=False)
         pad_to_length_bucket = (
             self.engine_config.pad_to_length_bucket
@@ -1257,8 +1268,19 @@ class MegatronEngineWithLMHead(MegatronEngine):
 
         if pad_to_length_bucket is not None and distillation_use_topk:
             raise RuntimeError("pad_to_length is not supported with top-K distillation")
+        if pad_to_length_bucket is not None and distillation_use_full_vocab:
+            raise RuntimeError("pad_to_length is not supported with full-vocab distillation")
         if pad_to_length_bucket is not None and self.enable_routing_replay:
             raise RuntimeError("pad_to_length is not supported with router replay")
+
+        if distillation_use_full_vocab and use_fused_kernels:
+            raise ValueError(
+                "distillation_use_full_vocab=True is not supported with use_fused_kernels=True: "
+                "fused kernels bypass the logits processor where the full-vocabulary KL loss is "
+                "computed, so the distillation loss would be silently skipped. Set "
+                "actor_rollout_ref.actor.use_fused_kernels=False or use a non full-vocab "
+                "distillation loss."
+            )
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1357,6 +1379,7 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 logits_processor_func=logits_processor_func,
                 batch=batch,
                 data_format=data_format,
+                distillation_use_full_vocab=distillation_use_full_vocab,
             )
 
             response_attention_mask = None

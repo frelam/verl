@@ -139,3 +139,47 @@ class AsyncTeacherLLMServerManager:
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs
+
+    async def compute_teacher_full_vocab_single(
+        self,
+        sequence_ids: list[int],
+        *,
+        step: int,
+        uid: str,
+        routing_key: Optional[str] = None,
+        multi_modal_data: Optional[dict[str, Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Export one sequence's teacher pre-lm_head hidden states to TransferQueue.
+
+        The teacher server captures the hidden states during its prefill-only forward
+        (``prompt_logprobs=0`` still runs the LogitsProcessor per position, which drives
+        the capture hook), writes them to TransferQueue, and returns the lightweight
+        artifact metadata dict that travels with the batch to the student loss.
+
+        Fail-loud: a missing artifact raises — silently skipping the sample would
+        silently disable distillation for it.
+        """
+        multi_modal_data = multi_modal_data or {}
+        teacher_key = self._resolve_teacher_key(routing_key)
+        teacher_model_config = self.teacher_model_configs[teacher_key]
+        client = self.teacher_client[teacher_key]
+        teacher_output = await client.generate(
+            request_id=uuid4().hex,
+            prompt_ids=sequence_ids,
+            sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+            audio_data=multi_modal_data.get("audios"),
+            mm_processor_kwargs=mm_processor_kwargs,
+            full_vocab={"teacher_name": teacher_key, "step": int(step), "uid": str(uid)},
+        )
+        artifact = teacher_output.extra_fields.get("teacher_full_vocab_artifact")
+        if not isinstance(artifact, dict):
+            raise RuntimeError(
+                f"teacher {teacher_key!r} returned no teacher_full_vocab_artifact for uid={uid!r} "
+                f"(step={step}, seq_len={len(sequence_ids)}): the hidden-state export failed on the "
+                "teacher server. Check that the teacher replicas were started with "
+                "full_vocab_export_config enabled."
+            )
+        return artifact

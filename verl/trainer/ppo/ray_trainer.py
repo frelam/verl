@@ -1341,11 +1341,16 @@ class RayPPOTrainer:
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_use_full_vocab = (
+            self.distillation_config.distillation_loss.loss_settings.use_full_vocab
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
             distillation_only = (
-                distillation_use_topk
+                (distillation_use_topk or distillation_use_full_vocab)
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
@@ -1358,6 +1363,7 @@ class RayPPOTrainer:
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
+            distillation_use_full_vocab=distillation_use_full_vocab,
             distillation_only=distillation_only,
             global_batch_size=ppo_mini_batch_size,
             mini_batch_size=ppo_mini_batch_size,
@@ -1367,6 +1373,10 @@ class RayPPOTrainer:
             compute_loss=True,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        if distillation_use_full_vocab:
+            # The teacher hidden states of this step have been consumed by the actor
+            # update; release the step's TransferQueue partitions (best-effort).
+            self._clear_full_vocab_hidden_step()
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
         # modify key name
@@ -1374,6 +1384,27 @@ class RayPPOTrainer:
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output
+
+    def _clear_full_vocab_hidden_step(self) -> None:
+        """Release this step's full-vocab teacher hidden-state partitions (best-effort).
+
+        Every teacher's partition for the current global step is cleared once the actor
+        update has consumed the hidden states. Failures only log inside ``clear_step`` —
+        a stale partition wastes TransferQueue storage but must not abort training.
+        """
+        import logging
+
+        from verl.trainer.distillation import full_vocab_tq
+
+        loss_config = self.distillation_config.distillation_loss
+        prefix = full_vocab_tq.resolve_partition_prefix(getattr(loss_config, "full_vocab_experiment_name", None))
+        for teacher_name in self.distillation_config.teacher_models:
+            cleared = full_vocab_tq.clear_step(prefix, teacher_name, self.global_steps)
+            if cleared:
+                logging.getLogger(__name__).info(
+                    f"cleared {cleared} full-vocab hidden entries "
+                    f"(teacher={teacher_name!r}, step={self.global_steps})"
+                )
 
     def _update_critic(self, batch: DataProto) -> DataProto:
         batch_td = batch.to_tensordict()

@@ -86,6 +86,12 @@ class TeacherModelManager:
             }
         )
         name_suffix = (teacher_model_config.key or "").replace("/", "_")
+        full_vocab_export_config = self._build_full_vocab_export_config()
+        # Only vLLM replicas accept (and need) the export config; full-vocab distillation
+        # is validated to be vLLM-only, so a non-None config always pairs with vLLM.
+        export_kwargs = (
+            {"full_vocab_export_config": full_vocab_export_config} if full_vocab_export_config is not None else {}
+        )
         self.rollout_replicas = [
             rollout_replica_class(
                 replica_rank=replica_rank,
@@ -94,6 +100,7 @@ class TeacherModelManager:
                 gpus_per_node=gpus_per_node,
                 is_teacher_model=True,
                 name_suffix=name_suffix,
+                **export_kwargs,
             )
             for replica_rank in range(num_replicas)
         ]
@@ -108,6 +115,22 @@ class TeacherModelManager:
         )
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+
+    def _build_full_vocab_export_config(self) -> dict | None:
+        """Derive the teacher-server hidden-state export config for full-vocab distillation.
+
+        Returns ``{"enabled": True, "prefix": ...}`` when the distillation loss rebuilds
+        full-vocab teacher logits from exported hidden states, else ``None`` (regular
+        teacher server without the capture RPCs). The prefix must match the student's —
+        both sides resolve it from the same distillation config.
+        """
+        loss_config = self.distillation_config.distillation_loss
+        if not loss_config.loss_settings.use_full_vocab:
+            return None
+        from verl.trainer.distillation.full_vocab_tq import resolve_partition_prefix
+
+        prefix = resolve_partition_prefix(getattr(loss_config, "full_vocab_experiment_name", None))
+        return {"enabled": True, "prefix": prefix}
 
     def _validate_replica_node_alignment(self, replica_pools, per_replica_world_size, gpus_per_node):
         """Verify that each replica occupies the expected number of nodes.

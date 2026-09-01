@@ -155,6 +155,12 @@ class AgentLoopOutput(BaseModel):
             output["teacher_ids"] = teacher_ids
         if teacher_logprobs is not None:
             output["teacher_logprobs"] = teacher_logprobs
+        # Full-vocab distillation: the per-sample hidden-state artifact is a plain
+        # metadata dict; lift it to a top-level (non-tensor) batch column so it
+        # survives micro-batch splitting like teacher_ids/teacher_logprobs do.
+        teacher_full_vocab_artifact = extra_fields.pop("teacher_full_vocab_artifact", None)
+        if teacher_full_vocab_artifact is not None:
+            output["teacher_full_vocab_artifact"] = teacher_full_vocab_artifact
         return output
 
 
@@ -483,6 +489,7 @@ class AgentLoopWorker:
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
+        self.distillation_use_full_vocab = False
         if self.distillation_enabled:
             from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager
 
@@ -490,6 +497,9 @@ class AgentLoopWorker:
             self.teacher_server_manager = AsyncTeacherLLMServerManager(
                 config=config,
                 teacher_client=teacher_client,
+            )
+            self.distillation_use_full_vocab = (
+                self.teacher_server_manager.distillation_loss_config.loss_settings.use_full_vocab
             )
 
         # Load tools once per worker; each trajectory just reuses self.tools.
@@ -662,7 +672,13 @@ class AgentLoopWorker:
                 tools=ToolListWrap(self.tools),
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            return await self._agent_loop_postprocess(
+                output,
+                trajectory["validate"],
+                global_step=trajectory["step"],
+                rollout_n=trajectory["rollout_n"],
+                **kwargs,
+            )
 
     def _pad_token_ids(
         self,
@@ -695,7 +711,9 @@ class AgentLoopWorker:
                 padded["attention_mask"] = padded["attention_mask"].unsqueeze(0)
         return padded
 
-    async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+    async def _agent_loop_postprocess(
+        self, output, validate, global_step=None, rollout_n=0, **kwargs
+    ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -796,6 +814,8 @@ class AgentLoopWorker:
             response_ids=output.response_ids,
             validate=validate,
             sample_kwargs=kwargs,
+            global_step=global_step,
+            rollout_n=rollout_n,
         )
         teacher_ids, teacher_logprobs = (
             output.extra_fields.pop("teacher_ids", None),
@@ -998,6 +1018,38 @@ class AgentLoopWorker:
                 final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
             final_output.metrics.compute_score = timing["compute_score"]
 
+    def _resolve_full_vocab_step_uid(
+        self,
+        sample_kwargs: Optional[dict[str, Any]],
+        global_step: Optional[int],
+        rollout_n: int,
+    ) -> tuple[int, str]:
+        """Resolve the (step, uid) coordinates of one sample's full-vocab TQ entry.
+
+        The step partitions the hidden-state storage so the trainer can release a whole
+        step at once; ``global_step`` comes from the trajectory info (classic path) or
+        the per-sample batch fields (TQ path), and falls back to a per-worker monotonic
+        counter when neither exists. The uid folds in the rollout-n index and a random
+        suffix so sibling rollouts of the same prompt never overwrite each other's key.
+        """
+        step = global_step
+        if step is None and sample_kwargs is not None:
+            step = sample_kwargs.get("global_steps")
+        if step is None or (isinstance(step, (int, float)) and int(step) < 0):
+            if not hasattr(self, "_full_vocab_step_counter"):
+                self._full_vocab_step_counter = 0
+            step = self._full_vocab_step_counter
+            self._full_vocab_step_counter += 1
+        step = int(step)
+
+        base_uid = None
+        if sample_kwargs is not None:
+            base_uid = sample_kwargs.get("uid")
+        base_uid = str(base_uid) if base_uid is not None else uuid4().hex
+        # Fold the rollout-n index in: n>1 rollouts of one prompt share the dataset uid.
+        uid = f"{base_uid}_rn{int(rollout_n)}_{uuid4().hex[:8]}"
+        return step, uid
+
     async def _compute_teacher_logprobs(
         self,
         output: AgentLoopOutput,
@@ -1005,6 +1057,8 @@ class AgentLoopWorker:
         response_ids: list[int],
         validate: bool,
         sample_kwargs: Optional[dict[str, Any]] = None,
+        global_step: Optional[int] = None,
+        rollout_n: int = 0,
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
@@ -1014,6 +1068,20 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            if self.distillation_use_full_vocab:
+                # Full-vocab path: the teacher exports pre-lm_head hidden states to
+                # TransferQueue; only the lightweight artifact rides with the batch.
+                step, uid = self._resolve_full_vocab_step_uid(sample_kwargs, global_step, rollout_n)
+                artifact = await self.teacher_server_manager.compute_teacher_full_vocab_single(
+                    sequence_ids=prompt_ids + response_ids,
+                    step=step,
+                    uid=uid,
+                    routing_key=routing_key,
+                    multi_modal_data=output.multi_modal_data,
+                    mm_processor_kwargs=output.mm_processor_kwargs,
+                )
+                output.extra_fields["teacher_full_vocab_artifact"] = artifact
+                return
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,

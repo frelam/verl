@@ -1743,17 +1743,23 @@ class PPOTrainer(ABC):
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
+        distillation_use_full_vocab = (
+            self.distillation_config.distillation_loss.loss_settings.use_full_vocab
+            if is_distillation_enabled(self.config.get("distillation"))
+            else False
+        )
         distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
         if is_distillation_enabled(self.config.get("distillation")):
             distillation_loss_cfg = self.distillation_config.distillation_loss
             distillation_only = (
-                distillation_use_topk
+                (distillation_use_topk or distillation_use_full_vocab)
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
+            "distillation_use_full_vocab": distillation_use_full_vocab,
             "distillation_only": distillation_only,
             "global_batch_size": ppo_mini_batch_size,
             "mini_batch_size": ppo_mini_batch_size,
@@ -1765,12 +1771,54 @@ class PPOTrainer(ABC):
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+        if distillation_use_full_vocab:
+            # The teacher hidden states consumed by this actor update can be released
+            # from TransferQueue (best-effort; see _clear_full_vocab_hidden).
+            self._clear_full_vocab_hidden(batch)
         output = rename_dict(output["metrics"], "actor/")
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
 
         return batch
+
+    def _clear_full_vocab_hidden(self, batch: KVBatchMeta) -> None:
+        """Release full-vocab teacher hidden-state partitions consumed by this update (best-effort).
+
+        - sync trainer: sampling is on-policy, so this batch holds every trajectory of its
+          generation step(s) and those partitions are fully consumed now.
+        - async trainer: a generation step's trajectories may span several sampled batches,
+          so a step's partition is released only once it aged beyond
+          ``2 * max_off_policy_threshold`` — under ``drop`` its leftover samples have been
+          evicted, under ``wait`` they have been drained by the staleness block. Clearing is
+          idempotent per (teacher, step) via ``self._full_vocab_cleared_steps``.
+
+        Failures only log inside ``clear_step`` — a stale partition wastes TransferQueue
+        storage but must not abort training.
+        """
+        from verl.trainer.distillation import full_vocab_tq
+
+        if not hasattr(self, "_full_vocab_cleared_steps"):
+            self._full_vocab_cleared_steps: set[int] = set()
+
+        if self.trainer_mode == "sync":
+            steps = {int(tag.get("global_steps", self.global_steps)) for tag in batch.tags} or {self.global_steps}
+        else:
+            cutoff = self.global_steps - 2 * self.replay_buffer.max_off_policy_threshold
+            steps = {s for s in range(0, cutoff + 1) if s not in self._full_vocab_cleared_steps}
+
+        steps -= self._full_vocab_cleared_steps
+        if not steps:
+            return
+
+        loss_config = self.distillation_config.distillation_loss
+        prefix = full_vocab_tq.resolve_partition_prefix(getattr(loss_config, "full_vocab_experiment_name", None))
+        for step in sorted(steps):
+            for teacher_name in self.distillation_config.teacher_models:
+                cleared = full_vocab_tq.clear_step(prefix, teacher_name, step)
+                if cleared:
+                    logger.info(f"cleared {cleared} full-vocab hidden entries (teacher={teacher_name!r}, step={step})")
+            self._full_vocab_cleared_steps.add(step)
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
         # 1. collect necessary fields from TransferQueue for computing metrics

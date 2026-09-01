@@ -1139,15 +1139,30 @@ class EngineTrainModeCtx(BaseEngineCtx):
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict):
-        if self.pad_to_length and tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False):
-            # Every top-K path re-derives the teacher tensors' layout from the *unpadded* packed
-            # length and slices them with the Ulysses rule only, which does not know about the
-            # static pad, so teacher and student token streams would silently misalign.
+        distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        distillation_use_full_vocab = tu.get_non_tensor_data(
+            data=micro_batch, key="distillation_use_full_vocab", default=False
+        )
+        if self.pad_to_length and (distillation_use_topk or distillation_use_full_vocab):
+            # Every distillation path re-derives the teacher tensors' layout from the *unpadded*
+            # packed length (top-K) or from the per-sample export metadata (full-vocab) and slices
+            # them with the Ulysses rule only, which does not know about the static pad, so teacher
+            # and student token streams would silently misalign.
             raise RuntimeError(
-                "pad_to_length is not supported with top-K distillation: the teacher tensors are "
+                "pad_to_length is not supported with distillation: the teacher tensors are "
                 "sliced with the Ulysses pad rule, which does not know about the static pad. "
                 "Disable pad_to_length for distillation runs."
             )
+        if distillation_use_full_vocab:
+            use_fused_kernels_ = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
+            if use_fused_kernels_:
+                raise ValueError(
+                    "distillation_use_full_vocab=True is not supported with use_fused_kernels=True: "
+                    "fused kernels bypass the logits processor where the full-vocabulary KL loss is "
+                    "computed, so the distillation loss would be silently skipped. Set "
+                    "actor_rollout_ref.actor.use_fused_kernels=False or use a non full-vocab "
+                    "distillation loss."
+                )
 
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1334,6 +1349,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="calculate_sum_pi_squared", default=False
         )
         distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+        distillation_use_full_vocab = tu.get_non_tensor_data(
+            data=micro_batch, key="distillation_use_full_vocab", default=False
+        )
         distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
 
         if calculate_sum_pi_squared and use_fused_kernels:
@@ -1404,8 +1422,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             self.compute_entropy_from_logits, logits_rmpad
                         )
 
-                # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
-                if distillation_use_topk:
+                # logits_processor_func return tensors with shape (1, total_nnz/sp_size).
+                # distillation_ppo_loss dispatches internally: top-k vs full-vocab is decided
+                # by the registered loss settings, so both flags funnel through the same call
+                # (they are mutually exclusive by config validation).
+                if distillation_use_topk or distillation_use_full_vocab:
                     outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
@@ -1504,7 +1525,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # (log_probs is also not gathered) and pad_size is only
                     # populated in output_args along the use_remove_padding=True
                     # path of prepare_model_inputs.
-                    if distillation_use_topk:
+                    if distillation_use_topk or distillation_use_full_vocab:
                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                         for k, v in outputs.items():
                             v = v.squeeze(0)
