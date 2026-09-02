@@ -1,0 +1,7 @@
+# Custom agent loop registration for tool-use RL.
+# Usage:
+#   actor_rollout_ref.rollout.mode=async
+#   actor_rollout_ref.rollout.agent.default_agent_loop=tool_rl_agent
+#   actor_rollout_ref.rollout.agent.agent_loop_config_path=examples/tool_rl/agent_loop_config.yaml
+- name: tool_rl_agent
+  _target_: examples.tool_rl.tool_rl_agent_loop.ToolRLAgentLoop
