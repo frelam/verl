@@ -26,6 +26,11 @@
 #                                    per sample; val files always fixed)
 #   TOOL_RL_HINT_EMPTY_PROB=0.25     probability of the empty (no-hint) variant
 #   TOOL_RL_HINT_SEED=42             base seed for hint sampling
+#   TOOL_RL_FILTER_GROUPS=1          DAPO group filtering on the V1 trainer:
+#                                    drop groups whose reward metric is uniform
+#                                    (all-zero / all-one) across the rollout group
+#                                    and refill with fresh prompts. Requires
+#                                    trainer.use_v1=true (on by default below).
 #
 # Cov-KL entropy control (PRIME-RL "Entropy-Mechanism-of-RL"):
 #   - Computed on the actor forward pass (policy_loss.loss_mode=kl_cov).
@@ -70,6 +75,12 @@ rollout_n=${ROLLOUT_N:-16}
 total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:-20}
 test_freq=${TEST_FREQ:-5}
+
+# V1 trainer + DAPO group filtering (drop all-zero / all-one reward groups).
+# Filtering requires the V1 trainer; disable filtering only if you also set
+# trainer.use_v1=false.
+use_v1=${TOOL_RL_USE_V1:-1}
+filter_groups=${TOOL_RL_FILTER_GROUPS:-1}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -154,6 +165,7 @@ REWARD=(
 )
 
 TRAINER=(
+    trainer.use_v1=$([ "$use_v1" = "1" ] && echo true || echo false)
     trainer.balance_batch=True
     trainer.logger='["console","wandb"]'
     trainer.project_name=${PROJECT_NAME}
@@ -165,6 +177,21 @@ TRAINER=(
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
 )
+
+# DAPO group filtering on the V1 trainer: drop groups whose reward metric is
+# uniform (all-zero / all-one) across the rollout group, refill with fresh
+# prompts. ``metric=score`` reads the per-sample ``score`` returned by
+# ``compute_score`` (naive reward manager -> reward_extra_info).
+if [ "$filter_groups" = "1" ] && [ "$use_v1" != "1" ]; then
+    echo "TOOL_RL_FILTER_GROUPS=1 requires the V1 trainer; set TOOL_RL_USE_V1=1 (or disable filtering)." >&2
+    exit 1
+fi
+if [ "$filter_groups" = "1" ]; then
+    DATA+=(
+        algorithm.filter_groups.enable=true
+        algorithm.filter_groups.metric=score
+    )
+fi
 
 ########################### launch ###########################
 python3 -m verl.trainer.main_ppo \
