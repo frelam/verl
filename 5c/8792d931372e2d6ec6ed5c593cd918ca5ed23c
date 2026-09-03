@@ -1,0 +1,35 @@
+examples/tool_rl/prepare_data.py
+  s_b0f70799613ddf::t_398146699d293c 895-901,1469
+  s_b0f70799613ddf::t_b4bf86461ab030 892-894
+  s_b0f70799613ddf::t_3c6cc2e9d1fd73 902
+  s_b0f70799613ddf::t_a544e31d552dbd 1466-1468
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "5c8792d931372e2d6ec6ed5c593cd918ca5ed23c",
+  "prompts": {},
+  "sessions": {
+    "s_b0f70799613ddf": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a97dd4e3286b8e10f3d63a2",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "operation_id": "6a97edcb3286b8e10f3d65f8",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "session_id": "6a97dd4e3286b8e10f3d63a2",
+        "tool_type": "builtin",
+        "dedupe_key": "6a97dd4e3286b8e10f3d63a2:6a97edcb3286b8e10f3d65f8:afterEdit:d9beefaa",
+        "external_session_id": "6a97dd4e3286b8e10f3d63a2",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit",
+        "source_scene": "agent",
+        "tool_use_id": "6a97edcb3286b8e10f3d65f8"
+      }
+    }
+  }
+}
