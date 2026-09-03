@@ -1,0 +1,44 @@
+examples/tool_rl/reward/test_tool_rl_reward.py
+  s_8d3224c3499da5::t_0d5707823655d5 1-261
+examples/tool_rl/run_qwen3_4b_tool_rl_grpo.sh
+  s_8d3224c3499da5::t_1403499b303cce 17-22
+  s_8d3224c3499da5::t_3a4ab310d6796c 64-68
+examples/tool_rl/reward/tool_rl_reward.py
+  s_8d3224c3499da5::t_5afb9740758af3 67-68
+  s_8d3224c3499da5::t_c33bfded5f5378 211-214,216-231
+  s_8d3224c3499da5::t_3cd3fc5091c331 22-24,26,34-52
+  s_8d3224c3499da5::t_56c3d165b6bea5 86-91
+  s_8d3224c3499da5::t_6a760ae5c684b7 243,246-247,257
+  s_8d3224c3499da5::t_1abaa0268405a0 53
+examples/tool_rl/reward/abstention.py
+  s_8d3224c3499da5::t_20656f684148b7 1-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "ece2fd7586dc500ad70673a91d4f60b1bd934a05",
+  "prompts": {},
+  "sessions": {
+    "s_8d3224c3499da5": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a98cabd3286b8e10f3d66bb",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "operation_id": "6a98d8403286b8e10f3d6753",
+        "session_id": "6a98cabd3286b8e10f3d66bb",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "edit_kind": "file_edit",
+        "external_session_id": "6a98cabd3286b8e10f3d66bb",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_type": "builtin",
+        "tool_use_id": "6a98d8403286b8e10f3d6753",
+        "source_scene": "agent",
+        "dedupe_key": "6a98cabd3286b8e10f3d66bb:6a98d8403286b8e10f3d6753:afterEdit:d9beefaa"
+      }
+    }
+  }
+}
