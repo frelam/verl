@@ -57,7 +57,9 @@ class ToolRLHintDataset(RLHFDataset):
         self._hint_empty_prob = cfg["empty_prob"]
         self._hint_seed = cfg["seed"]
         # Distinct RNG streams per process (dataloader workers fork after init).
-        self._hint_rng = random.Random((self._hint_seed, os.getpid()))
+        # random.Random only accepts None/int/float/str/bytes seeds, so fold
+        # the pid into a string instead of passing a (seed, pid) tuple.
+        self._hint_rng = random.Random(f"{self._hint_seed}:{os.getpid()}")
 
         if self._hint_mode == "random" and self._looks_like_val_files():
             self._hint_mode = "fixed"
