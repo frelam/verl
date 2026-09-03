@@ -14,6 +14,12 @@
 # Optional env knobs:
 #   TOOL_RL_MASK_FAILED_CALLS=1      mask tokens of incorrect tool calls
 #   TOOL_RL_REWARD_WEIGHTS='{"tool_correctness":0.6,"format":0.2,"tool_call":0.2}'
+#   TOOL_RL_HINT_MODE=random         off (default) | random | fixed
+#                                    inject a random system-prompt hint variant
+#                                    per sample per epoch (fixed = deterministic
+#                                    per sample; val files always fixed)
+#   TOOL_RL_HINT_EMPTY_PROB=0.25     probability of the empty (no-hint) variant
+#   TOOL_RL_HINT_SEED=42             base seed for hint sampling
 
 set -xeuo pipefail
 
@@ -60,6 +66,10 @@ DATA=(
     # Per-sample tool schemas are injected at rollout time and are not counted
     # by the dataset-side length filter, so keep filtering off here.
     data.filter_overlong_prompts=False
+    # Custom dataset: randomized system-prompt hint injection per epoch
+    # (transparent pass-through unless TOOL_RL_HINT_MODE is set).
+    data.custom_cls.path="$REPO_ROOT/examples/tool_rl/tool_rl_dataset.py"
+    data.custom_cls.name=ToolRLHintDataset
 )
 
 MODEL=(
