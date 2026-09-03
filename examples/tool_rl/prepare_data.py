@@ -865,12 +865,17 @@ def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
 
         gt_names = {c["name"] for c in gt}
         # Hard distractors first: same-field tools (similar functionality).
-        same_field: list[dict[str, Any]] = []
+        # Dedup by name — several GT tools may share one field, which would
+        # otherwise add the field's tools once per GT tool (duplicates could
+        # both be sampled, declaring the same tool twice in the prompt).
+        same_field: dict[str, dict[str, Any]] = {}
         for name in gt_names:
             field = next((f for f, names in fields.items() if name in names), None)
             if field:
-                same_field.extend(schemas[n] for n in fields[field] if n in schemas)
-        distractors = _pick_distractors(same_field, gt_names, _N_DISTRACTORS, rng)
+                for n in fields[field]:
+                    if n in schemas:
+                        same_field.setdefault(n, schemas[n])
+        distractors = _pick_distractors(list(same_field.values()), gt_names, _N_DISTRACTORS, rng)
         if len(distractors) < _N_DISTRACTORS:
             distractors += _pick_distractors(
                 pool, gt_names | {d["name"] for d in distractors},
@@ -1477,8 +1482,43 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
     import pandas as pd
 
     df = pd.DataFrame(rows)
+    if df.empty:
+        # Keep the schema so an empty val split is still loadable.
+        df = df.reindex(columns=["data_source", "prompt", "tools", "reward_model", "extra_info"])
     df.to_parquet(path, index=False)
     logger.info("Wrote %d rows → %s", len(df), path)
+
+
+# ============================================================================
+# Train/val split (conversation-group aware)
+# ============================================================================
+
+def _split_group_key(task: dict[str, Any]) -> str:
+    """Conversation-level group key for leakage-free train/val splitting.
+
+    ToolACE ids look like ``toolace-3-t1`` (turn 1 of conversation 3) and
+    API-Bank augments append ``-c<N>``; turns of one conversation must stay
+    in the same split, otherwise near-duplicate context leaks into val.
+    """
+    tid = str(task.get("metadata", {}).get("task_id", ""))
+    return re.sub(r"-[tc]\d+$", "", tid)
+
+
+def group_aware_split(
+    tasks: list[dict[str, Any]], n_val: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split *tasks* into (train, val) without splitting a conversation."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for t in tasks:
+        groups.setdefault(_split_group_key(t), []).append(t)
+    val_tasks: list[dict[str, Any]] = []
+    train_tasks: list[dict[str, Any]] = []
+    for group in groups.values():
+        if len(val_tasks) + len(group) <= n_val:
+            val_tasks.extend(group)
+        else:
+            train_tasks.extend(group)
+    return train_tasks, val_tasks
 
 
 # ============================================================================
@@ -1603,12 +1643,14 @@ def main():
     rng.shuffle(all_tasks)
 
     n_val = min(args.val_samples, max(0, len(all_tasks) // 10))
-    val_tasks = all_tasks[:n_val]
-    train_tasks = all_tasks[n_val:]
+    # Split by conversation group: turns of one ToolACE/API-Bank
+    # conversation must not straddle train/val (near-duplicate leakage).
+    train_tasks, val_tasks = group_aware_split(all_tasks, n_val)
 
     write_parquet(to_verl_rows(train_tasks), output_dir / "train.parquet")
-    if val_tasks:
-        write_parquet(to_verl_rows(val_tasks), output_dir / "val.parquet")
+    # Always write val.parquet — even when empty — so smoke runs with tiny
+    # datasets don't crash the training script on a missing file.
+    write_parquet(to_verl_rows(val_tasks), output_dir / "val.parquet")
 
     logger.info("Done! train=%d val=%d → %s", len(train_tasks), len(val_tasks), output_dir)
     for src in sorted(set(t["metadata"]["source"] for t in all_tasks)):

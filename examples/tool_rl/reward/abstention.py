@@ -15,8 +15,16 @@ with keyword and structure rules.
 
 Classification (first match wins)
 ---------------------------------
-1. ``NO_VALID_TOOLS`` — capability/tool negation lexicon matches anywhere
-   ("I don't have access to ...", "no suitable tool ...", "unable to ...").
+1. ``NO_VALID_TOOLS`` — capability/tool negation lexicon matches. Tool-
+   explicit phrases ("no suitable tool ...", "none of the tools ...",
+   "don't have access to ...") match bare; *generic* negations ("I can't
+   ...", "unable to ...", "not able to help ...") additionally require a
+   tool/capability/data-access context word within the same sentence.
+   Without that guard the cheapest reward hack in keyword mode — a hedged
+   guess like "I can't be sure, but the answer is 42" — would score full
+   marks.  The trade-off is recall: context-free refusals ("I can't help
+   with that") now fall to ``GUESS`` (0.4 instead of 1.0), pushing the
+   policy towards explicit, tool-grounded abstention phrasing.
 2. ``REQUEST_INFO``   — the reply contains a *genuine* question (a ``?``
    that is not a follow-up courtesy like "let me know if ...") together
    with a clarification / wh- lexicon hit.
@@ -73,20 +81,34 @@ def strip_non_reply(text: str) -> str:
 # ============================================================================
 
 # Class B — capability / tool negation.
+#
+# Tool/capability/data-access context that must accompany a *generic*
+# negation for it to count as a capability abstention (same-sentence
+# 80-char window).  Tool-explicit phrases below match bare.
+_CAP_CTX = (
+    r"(?:tools?|access|ability|capable|capability|capacity|means|permission"
+    r"|authori[sz]ed|apis?|databases?|brows(?:e|ing)|internet|web"
+    r"|real[-\s]?time|retriev(?:e|al)|fetch|search)"
+)
+
 _NEGATION_RES = [
     re.compile(p, re.IGNORECASE)
     for p in (
+        # Generic first-person negation — capability context required.
         r"\bi\s*(?:do\s+not|don't|cannot|can't|can\s+not|am\s+unable"
-        r"|'m\s+unable|am\s+not\s+able|'m\s+not\s+able)\b",
-        r"\bunable\s+to\b",
+        r"|'m\s+unable|am\s+not\s+able|'m\s+not\s+able)\b"
+        r"[^.?!]{0,80}?\b" + _CAP_CTX + r"\b",
+        r"\bunable\s+to\b[^.?!]{0,80}?\b" + _CAP_CTX + r"\b",
+        # Tool-explicit phrases — match bare.
         r"\bno\s+(?:suitable|available|appropriate|matching|relevant|adequate)\s+tools?\b",
         r"\bnone\s+of\s+the\s+(?:available\s+|provided\s+|declared\s+)?tools?\b",
         r"\b(?:do\s+not|don't|does\s+not|doesn't)\s+have\s+"
         r"(?:access\s+to|the\s+(?:ability|capability|capacity|means)\s+to"
         r"|a\s+(?:suitable|relevant)\s+tool)\b",
         r"\bbeyond\s+my\s+(?:capabilities|ability|scope)\b",
-        r"\bnot\s+(?:able|possible)\s+to\s+(?:help|assist|answer|complete|fulfil|fulfill|perform)\b",
-        r"\bno\s+(?:way|means)\s+to\b",
+        r"\bnot\s+(?:able|possible)\s+to\s+(?:help|assist|answer|complete|fulfil|fulfill|perform)\b"
+        r"[^.?!]{0,80}?\b" + _CAP_CTX + r"\b",
+        r"\bno\s+(?:way|means)\s+to\b[^.?!]{0,80}?\b" + _CAP_CTX + r"\b",
     )
 ]
 

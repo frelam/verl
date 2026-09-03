@@ -259,3 +259,121 @@ def test_positive_label_match_untouched(keyword_mode):
     assert res["abstention_class"] == -1
     assert res["tool_correctness"] == 1.0
     assert res["score"] == pytest.approx(1.0)
+
+
+# ============================================================================
+# Regression: hedged guesses must not be rewarded as abstentions
+# ============================================================================
+
+def test_classify_hedged_guess_is_guess():
+    # A hedge ("I can't be sure") followed by a fabricated answer is the
+    # cheapest reward hack — it must NOT count as a capability abstention.
+    assert classify_abstention(
+        _think_text("I can't be sure, but the answer is 42.")
+    ) is AbstentionClass.GUESS
+    assert classify_abstention(
+        _think_text("I'm not able to help directly, but the answer is probably 42.")
+    ) is AbstentionClass.GUESS
+
+
+def test_classify_negation_with_capability_context():
+    assert classify_abstention(
+        _think_text("I'm unable to answer without access to a weather API.")
+    ) is AbstentionClass.NO_VALID_TOOLS
+
+
+def test_keyword_hedged_guess_scores_as_guess(keyword_mode):
+    res = compute_score(
+        "tool_rl",
+        _think_text("I can't be sure, but the answer is 42."),
+        "",
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.GUESS)
+    assert res["tool_correctness"] == 0.0
+    assert res["score"] == pytest.approx(0.4)
+
+
+# ============================================================================
+# Regression: JSON inside <think> is reasoning, not an emitted call
+# ============================================================================
+
+def test_json_in_think_not_treated_as_call(keyword_mode):
+    # Discussing a JSON call inside <think> and then correctly abstaining
+    # must not be punished as a spurious call.
+    resp = (
+        '<think>I could call {"name": "get_weather", "arguments": {"city": "Paris"}} '
+        "but I have no real-time data.</think>\n"
+        "I don't have access to real-time weather data."
+    )
+    res = compute_score("tool_rl", resp, "", _extra_info())
+    assert res["abstention_class"] == int(AbstentionClass.NO_VALID_TOOLS)
+    assert res["tool_correctness"] == 1.0
+    assert res["tool_call_format"] == 1.0
+    assert res["format_compliance"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_json_call_after_think_still_counts(keyword_mode):
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = (
+        "<think>The user wants the weather in Paris.</think>\n"
+        '{"name": "get_weather", "arguments": {"city": "Paris"}}'
+    )
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+# ============================================================================
+# Regression: inline JSON <tool_call> — key order must not matter
+# ============================================================================
+
+def test_inline_json_call_reordered_keys(keyword_mode):
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = (
+        "<think>Let me check the weather.</think>\n"
+        '<tool_call>\n{"arguments": {"city": "Paris"}, "name": "get_weather"}\n</tool_call>'
+    )
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["tool_correctness"] == 1.0
+    assert res["format_compliance"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+# ============================================================================
+# Regression: conversation groups must not straddle train/val
+# ============================================================================
+
+def test_split_group_key():
+    from examples.tool_rl.prepare_data import _split_group_key
+
+    assert _split_group_key({"metadata": {"task_id": "toolace-3-t1"}}) == "toolace-3"
+    assert _split_group_key({"metadata": {"task_id": "apibank-weather-c2"}}) == "apibank-weather"
+    assert _split_group_key({"metadata": {"task_id": "multi_turn_sql_5-t0"}}) == "multi_turn_sql_5"
+    assert _split_group_key({"metadata": {"task_id": "apigen-7"}}) == "apigen-7"
+
+
+def test_group_aware_split_keeps_conversations_together():
+    from examples.tool_rl.prepare_data import group_aware_split
+
+    tasks = [
+        {"metadata": {"task_id": "toolace-0-t0"}},
+        {"metadata": {"task_id": "toolace-0-t1"}},
+        {"metadata": {"task_id": "apibank-x-c0"}},
+        {"metadata": {"task_id": "apibank-x-c1"}},
+        {"metadata": {"task_id": "apigen-3"}},
+    ]
+    train, val = group_aware_split(tasks, n_val=2)
+    val_ids = {t["metadata"]["task_id"] for t in val}
+    train_ids = {t["metadata"]["task_id"] for t in train}
+    for prefix in ("toolace-0", "apibank-x"):
+        in_val = any(i.startswith(prefix) for i in val_ids)
+        in_train = any(i.startswith(prefix) for i in train_ids)
+        assert not (in_val and in_train), f"{prefix} straddles train/val"
+    assert len(val) <= 2
+    assert len(train) + len(val) == 5

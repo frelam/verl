@@ -45,9 +45,11 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 _THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_THINK_RE = re.compile(r"<think>.*$", re.DOTALL | re.IGNORECASE)
 
 # A raw ``<think>`` opener — used to detect an unclosed think block.
 _OPENING_RE = re.compile(r"<think>", re.IGNORECASE)
+_CLOSE_TAG_RE = re.compile(r"</think>", re.IGNORECASE)
 
 
 def _check_strict_format(text: str) -> bool:
@@ -80,11 +82,6 @@ _FUNCTION_NAME_RE = re.compile(r"<function=(\w[\w.]*)>")
 _PARAM_RE = re.compile(
     r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL,
 )
-# Inline JSON style: <tool_call>\n"name": NAME, "arguments": {...}\n</tool_call>
-_INLINE_CALL_RE = re.compile(
-    r'^\s*"name"\s*:\s*"([\w.]*)",\s*"arguments"\s*:\s*(\{.*\})\s*$',
-    re.DOTALL,
-)
 
 
 def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
@@ -114,6 +111,32 @@ def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
     return results
 
 
+def _strip_think_blocks(text: str) -> str:
+    """Remove ``<think>`` blocks (closed and unclosed) from *text*."""
+    return _UNCLOSED_THINK_RE.sub(" ", _THINK_RE.sub(" ", text))
+
+
+def _think_block_spans(text: str) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` spans of think blocks (closed and unclosed)."""
+    spans = [m.span() for m in _THINK_RE.finditer(text)]
+    for m in _UNCLOSED_THINK_RE.finditer(text):
+        if not any(s <= m.start() < e for s, e in spans):
+            spans.append(m.span())
+    return spans
+
+
+def _parse_inline_json_call(block: str) -> dict[str, Any] | None:
+    """Parse an inline-JSON ``<tool_call>`` block (``{"name": …, "arguments": {…}}``)."""
+    try:
+        obj = json.loads(block.strip())
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+        return None
+    args = obj.get("arguments")
+    return {"name": obj["name"], "arguments": args if isinstance(args, dict) else {}}
+
+
 # ============================================================================
 # Tool call parsing — Qwen XML format
 # ============================================================================
@@ -130,32 +153,28 @@ def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
     for tc_match in _TOOL_CALL_BLOCK_RE.finditer(text):
         block = tc_match.group(1)
         func_match = _FUNCTION_NAME_RE.search(block)
-        inline_match = _INLINE_CALL_RE.search(block)
-        if not func_match and not inline_match:
+        if func_match:
+            args: dict[str, Any] = {}
+            for pm in _PARAM_RE.finditer(block):
+                pname = pm.group(1)
+                pval = pm.group(2).strip()
+                try:
+                    pval = json.loads(pval)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                args[pname] = pval
+            calls.append({"name": func_match.group(1), "arguments": args})
             continue
-        func_name = func_match.group(1) if func_match else inline_match.group(1)
+        # Inline JSON style: <tool_call>\n{"name": NAME, "arguments": {...}}\n</tool_call>
+        # Parse as JSON so key order / extra whitespace don't matter.
+        inline_call = _parse_inline_json_call(block)
+        if inline_call is not None:
+            calls.append(inline_call)
 
-        args: dict[str, Any] = {}
-        for pm in _PARAM_RE.finditer(block):
-            pname = pm.group(1)
-            pval = pm.group(2).strip()
-            try:
-                pval = json.loads(pval)
-            except (json.JSONDecodeError, TypeError):
-                pass
-            args[pname] = pval
-
-        if inline_match and not args:
-            try:
-                args = json.loads(inline_match.group(2))
-            except (json.JSONDecodeError, TypeError):
-                args = {}
-
-        calls.append({"name": func_name, "arguments": args})
-
-    # Fallback: JSON format
+    # Fallback: JSON format — but ignore JSON discussed inside <think>
+    # blocks: that is reasoning about calls, not emitted calls.
     if not calls:
-        for obj in _extract_json_tool_calls(text):
+        for obj in _extract_json_tool_calls(_strip_think_blocks(text)):
             if obj not in calls:
                 calls.append(obj)
 
@@ -231,7 +250,12 @@ def _get_agent_text(trajectory: list[dict[str, Any]]) -> str:
 
 
 def _find_json_tool_call_spans(text: str) -> list[tuple[int, int]]:
-    """Return ``(start, end)`` spans of ``{"name": …}`` objects in *text*."""
+    """Return ``(start, end)`` spans of ``{"name": …}`` objects in *text*.
+
+    Spans that fall inside a think block are excluded — JSON discussed in
+    reasoning is not an emitted call.
+    """
+    think_spans = _think_block_spans(text)
     spans: list[tuple[int, int]] = []
     depth = 0
     start = -1
@@ -243,7 +267,8 @@ def _find_json_tool_call_spans(text: str) -> list[tuple[int, int]]:
         elif ch == "}":
             depth -= 1
             if depth == 0 and start >= 0:
-                spans.append((start, i + 1))
+                if not any(s <= start < e for s, e in think_spans):
+                    spans.append((start, i + 1))
                 start = -1
     return spans
 
@@ -251,11 +276,12 @@ def _find_json_tool_call_spans(text: str) -> list[tuple[int, int]]:
 def _xml_tool_call_spans(text: str) -> list[tuple[int, int]]:
     """Return ``(start, end)`` spans of *valid* ``<tool_call>`` blocks.
 
-    A block is valid only when it declares a function via ``<function=...>``.
+    A block is valid when it declares a function via ``<function=...>`` or
+    carries a parseable inline-JSON call.
     """
     spans: list[tuple[int, int]] = []
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
-        if _FUNCTION_NAME_RE.search(m.group(1)) or _INLINE_CALL_RE.search(m.group(1)):
+        if _FUNCTION_NAME_RE.search(m.group(1)) or _parse_inline_json_call(m.group(1)) is not None:
             spans.append((m.start(), m.end()))
     return spans
 
