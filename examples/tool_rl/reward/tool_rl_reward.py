@@ -140,11 +140,26 @@ def _to_list(value: Any) -> list:
 
 
 def _to_dict_list(value: Any) -> list[dict[str, Any]]:
-    """Normalise a (possibly numpy) list of tool-call/tool-schema dicts."""
+    """Normalise a (possibly numpy / JSON-string) list of dicts.
+
+    ``ground_truth_calls`` is stored in the parquet as a JSON string (mixed
+    argument value types across datasets prevent a native struct column), so
+    strings are parsed back here.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
     result = []
     for item in _to_list(value):
         if hasattr(item, "tolist"):
             item = item.tolist()
+        if isinstance(item, str):
+            try:
+                item = json.loads(item)
+            except json.JSONDecodeError:
+                continue
         if isinstance(item, dict):
             result.append(dict(item))
     return result

@@ -2,8 +2,8 @@
 """Download and prepare tool-use datasets for Qwen3-4B GRPO training in verl.
 
 Ported from slime ``examples/tool_rl/data/download_data.py``. Downloads
-APIGen, ToolACE and Hammer and converts them to verl's parquet schema
-used by ``verl.utils.dataset.RLHFDataset``.
+APIGen, ToolACE, Hammer, API-Bank and Seal-Tools and converts them to
+verl's parquet schema used by ``verl.utils.dataset.RLHFDataset``.
 
 BFCL is excluded from the default dataset mix: its samples overlap with
 the BFCL benchmark, so training on them risks evaluation data leakage.
@@ -37,11 +37,14 @@ Usage
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
 import random
 import re
 import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +67,14 @@ _DEFAULT_MAX = 5000
 _SEED = 42
 _DATA_SOURCE = "tool_rl"
 # BFCL is intentionally absent (evaluation-leakage risk, see module docstring).
-_DEFAULT_DATASETS = ["apigen", "toolace", "hammer"]
+_DEFAULT_DATASETS = ["apigen", "toolace", "hammer", "apibank", "sealtools"]
+
+# Distractor tools added to API-Bank / Seal-Tools samples so the task stays
+# a tool-*selection* problem (their raw format only names the correct API).
+_N_DISTRACTORS = 5
+
+# Local download cache (GitHub raw files); avoids re-downloading on reruns.
+_CACHE_DIR = Path.home() / ".cache" / "tool_rl"
 
 # Generic system prompt used for all samples. Tool schemas are NOT embedded
 # here — they travel in the sample's ``tools`` field and are rendered by the
@@ -494,6 +504,400 @@ def _parse_bfcl(raw: dict, category: str) -> list[dict]:
                     history.append({"role": "assistant", "content": content[:500]})
 
     return results
+
+
+# ============================================================================
+# GitHub raw download helpers (API-Bank / Seal-Tools)
+# ============================================================================
+
+def _download(url: str, dest: Path, timeout: int = 120, retries: int = 3) -> Path | None:
+    """Download ``url`` to ``dest`` (skipped if already cached)."""
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                data = resp.read()
+            dest.write_bytes(data)
+            return dest
+        except Exception as e:
+            if attempt == retries - 1:
+                logger.warning("Download failed %s: %s", url, e)
+                return None
+    return None
+
+
+def _github_tree(repo: str, branch: str = "main") -> list[str]:
+    """List all blob paths of a GitHub repo (cached in ``_CACHE_DIR``)."""
+    cache = _CACHE_DIR / f"tree-{repo.replace('/', '-')}.json"
+    url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
+    path = _download(url, cache, timeout=180)
+    if path is None:
+        return []
+    try:
+        tree = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    return [t["path"] for t in tree.get("tree", []) if t.get("type") == "blob"]
+
+
+def _fetch_raw(repo: str, relpath: str, branch: str = "main",
+               timeout: int = 120) -> str | None:
+    """Fetch one raw file from GitHub (cached in ``_CACHE_DIR``)."""
+    cache = _CACHE_DIR / "raw" / repo / relpath
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{relpath}"
+    path = _download(url, cache, timeout=timeout)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _fetch_raw_many(repo: str, relpaths: list[str], branch: str = "main",
+                    workers: int = 12) -> dict[str, str]:
+    """Fetch many small raw files concurrently; skips failures."""
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = pool.map(lambda p: (p, _fetch_raw(repo, p, branch)), relpaths)
+        for p, text in results:
+            if text is not None:
+                out[p] = text
+    return out
+
+
+def _pick_distractors(pool: list[dict[str, Any]], exclude: set[str],
+                      n: int, rng: random.Random) -> list[dict[str, Any]]:
+    """Sample up to ``n`` tool schemas whose names are not in ``exclude``."""
+    candidates = [t for t in pool if t.get("name") not in exclude]
+    rng.shuffle(candidates)
+    return candidates[:n]
+
+
+# ============================================================================
+# API-Bank loader (multi-turn dialogues → single-turn samples)
+# ============================================================================
+#
+# API-Bank (AlibabaResearch/DAMO-ConvAI, ``api-bank/``) defines its APIs as
+# Python classes with ``description`` and ``input_parameters`` class
+# attributes (``api-bank/apis/*.py``), and multi-turn dialogues in
+# ``lv1-lv2-samples/level-1-given-desc/*.jsonl``.  Each dialogue line is one
+# turn: ``{"role": "User"|"AI", "text": ...}`` or
+# ``{"role": "API", "api_name": ..., "param_dict": ..., "result": ...}``.
+#
+# Only the pure level-1 dialogues (single target API, description given) are
+# used; level-2/3 samples rely on ToolSearcher / multi-API chains.  Every API
+# turn becomes one single-turn sample: the preceding User/AI turns form the
+# prompt (earlier API results are wrapped as ``<tool_response>`` user turns,
+# like ToolACE), the API call is the ground truth.  A few distractor schemas
+# from other APIs keep tool selection non-trivial.
+
+_API_BANK_REPO = "AlibabaResearch/DAMO-ConvAI"
+_API_BANK_TYPE_MAP = {
+    "str": "string", "int": "integer", "float": "number",
+    "bool": "boolean", "list": "array", "dict": "object",
+}
+
+
+def _parse_apibank_api_py(source: str) -> dict[str, Any] | None:
+    """Extract a tool schema from an API-Bank API class definition."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        description = ""
+        input_params: dict[str, Any] = {}
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id == "description":
+                try:
+                    description = ast.literal_eval(stmt.value)
+                except (ValueError, SyntaxError):
+                    pass
+            elif target.id == "input_parameters":
+                try:
+                    input_params = ast.literal_eval(stmt.value)
+                except (ValueError, SyntaxError):
+                    pass
+        if not description and not input_params:
+            continue
+        properties = {}
+        for pname, pinfo in (input_params or {}).items():
+            if not isinstance(pinfo, dict):
+                continue
+            ptype = _API_BANK_TYPE_MAP.get(
+                str(pinfo.get("type", "str")).lower(), "string",
+            )
+            properties[pname] = {
+                "type": ptype,
+                "description": str(pinfo.get("description", "")),
+            }
+        return {
+            "name": node.name,
+            "description": str(description),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": sorted(properties),
+            },
+        }
+    return None
+
+
+def load_apibank(max_samples: int) -> list[dict[str, Any]]:
+    """Load API-Bank level-1 dialogues as single-turn samples."""
+    logger.info("Loading API-Bank (%s)...", _API_BANK_REPO)
+    files = _github_tree(_API_BANK_REPO)
+    if not files:
+        logger.warning("API-Bank: repo tree unavailable")
+        return []
+
+    api_py_files = [
+        f for f in files
+        if re.fullmatch(r"api-bank/apis/\w+\.py", f)
+        and not f.endswith(("__init__.py", "api.py", "tool_search.py"))
+    ]
+    dialogue_files = [
+        f for f in files
+        if f.startswith("api-bank/lv1-lv2-samples/level-1-given-desc/")
+        and re.search(r"-level-1-\d+\.jsonl$", f)
+    ]
+    logger.info(
+        "API-Bank: %d API definitions, %d level-1 dialogues",
+        len(api_py_files), len(dialogue_files),
+    )
+
+    schemas: dict[str, dict[str, Any]] = {}
+    for path, source in _fetch_raw_many(_API_BANK_REPO, api_py_files).items():
+        schema = _parse_apibank_api_py(source)
+        if schema:
+            schemas[schema["name"]] = schema
+    logger.info("API-Bank: parsed %d tool schemas", len(schemas))
+    if not schemas:
+        return []
+
+    rng = random.Random(_SEED)
+    pool = list(schemas.values())
+    tasks: list[dict[str, Any]] = []
+
+    for path, text in sorted(_fetch_raw_many(_API_BANK_REPO, dialogue_files).items()):
+        if len(tasks) >= max_samples:
+            break
+        turns = []
+        for line in text.splitlines():
+            try:
+                turns.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        history: list[dict] = []
+        n_calls = 0
+        for turn in turns:
+            if len(tasks) >= max_samples:
+                break
+            role = turn.get("role")
+            if role == "User":
+                history.append({"role": "user", "content": str(turn.get("text", ""))})
+            elif role == "AI":
+                history.append({"role": "assistant", "content": str(turn.get("text", ""))[:800]})
+            elif role == "API":
+                api_name = turn.get("api_name", "")
+                params = turn.get("param_dict") or {}
+                result = turn.get("result") or {}
+                if api_name in schemas and isinstance(params, dict):
+                    # Truncate long history, but keep the conversation
+                    # starting on a user turn (drop leading assistant /
+                    # tool_response fragments left by the cut).
+                    ctx = [dict(h) for h in history[-8:]]
+                    while ctx and ctx[0]["role"] != "user":
+                        ctx.pop(0)
+                    if not ctx:
+                        continue
+                    messages = [{"role": "system", "content": _GENERIC_TOOL_SYSTEM}]
+                    messages.extend(ctx)
+                    if any(m["role"] == "user" for m in messages):
+                        messages = _prepend_instruction(messages)
+                        gt = [{"name": api_name, "arguments": params}]
+                        gt_names = {api_name}
+                        tools = [schemas[api_name]] + _pick_distractors(
+                            pool, gt_names, _N_DISTRACTORS, rng,
+                        )
+                        rng.shuffle(tools)
+                        n_calls += 1
+                        tasks.append({
+                            "messages": messages,
+                            "tools": _normalize_tools(tools),
+                            "label": _format_gt(gt),
+                            "metadata": _make_meta(
+                                "apibank",
+                                f"apibank-{Path(path).stem}-c{n_calls}",
+                                tools, gt,
+                            ),
+                        })
+                # Inject the API result so later calls in the same dialogue
+                # (e.g. token-dependent ones) stay grounded.
+                output = result.get("output") if isinstance(result, dict) else result
+                history.append({
+                    "role": "user",
+                    "content": f"<tool_response>\n{json.dumps(output, ensure_ascii=False)[:500]}\n</tool_response>",
+                })
+
+    logger.info("API-Bank: %d single-turn samples", len(tasks))
+    return tasks
+
+
+# ============================================================================
+# Seal-Tools loader (single-turn query + calling, tools from tool.jsonl)
+# ============================================================================
+#
+# Seal-Tools (fairyshine/Seal-Tools, ``Seal-Tools_Dataset/``) provides ~4k
+# tool schemas in ``tool.jsonl`` (``api_name``/``api_description``/
+# ``parameters``/``required``/``field``) and single-turn training queries in
+# ``train.jsonl`` (``{"id", "query", "calling": [{"api", "parameters",
+# "responses"}]}``).  Samples whose call parameters reference another call's
+# output (``"API_call_N"``, nested calls) are dropped — the pipeline is
+# single-turn with no execution.  Distractors are drawn from the same
+# ``field`` first (hard, same-category negatives), then the global pool.
+
+_SEAL_TOOLS_REPO = "fairyshine/Seal-Tools"
+_SEAL_TOOLS_TYPE_MAP = {
+    "str": "string", "int": "integer", "float": "number",
+    "bool": "boolean", "list": "array", "dict": "object",
+}
+
+
+def _sealtools_schema(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert one ``tool.jsonl`` entry to a normalised tool schema."""
+    name = raw.get("api_name", "")
+    if not name:
+        return None
+    properties = {}
+    for pname, pinfo in (raw.get("parameters") or {}).items():
+        if not isinstance(pinfo, dict):
+            continue
+        ptype = _SEAL_TOOLS_TYPE_MAP.get(
+            str(pinfo.get("type", "str")).lower(), "string",
+        )
+        properties[pname] = {
+            "type": ptype,
+            "description": str(pinfo.get("description", "")),
+        }
+    return {
+        "name": name,
+        "description": str(raw.get("api_description", "")),
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": sorted(raw.get("required") or properties),
+        },
+    }
+
+
+def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
+    """Load Seal-Tools train split as single-turn samples."""
+    logger.info("Loading Seal-Tools (%s)...", _SEAL_TOOLS_REPO)
+    tool_text = _fetch_raw(
+        _SEAL_TOOLS_REPO, "Seal-Tools_Dataset/tool.jsonl", branch="master",
+        timeout=300,
+    )
+    train_text = _fetch_raw(
+        _SEAL_TOOLS_REPO, "Seal-Tools_Dataset/train.jsonl", branch="master",
+        timeout=600,
+    )
+    if not tool_text or not train_text:
+        logger.warning("Seal-Tools: download failed")
+        return []
+
+    schemas: dict[str, dict[str, Any]] = {}
+    fields: dict[str, list[str]] = {}
+    for line in tool_text.splitlines():
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        schema = _sealtools_schema(raw)
+        if schema:
+            schemas[schema["name"]] = schema
+            fields.setdefault(str(raw.get("field", "")), []).append(schema["name"])
+    logger.info("Seal-Tools: %d tools in %d fields", len(schemas), len(fields))
+
+    rng = random.Random(_SEED)
+    pool = list(schemas.values())
+    tasks: list[dict[str, Any]] = []
+    n_nested = 0
+
+    for line in train_text.splitlines():
+        if len(tasks) >= max_samples:
+            break
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        query = sample.get("query", "")
+        calling = sample.get("calling") or []
+        if not query or not calling:
+            continue
+
+        gt = []
+        nested = False
+        for call in calling:
+            api = call.get("api", "")
+            params = call.get("parameters") or {}
+            if api not in schemas or not isinstance(params, dict):
+                nested = True
+                break
+            if any(isinstance(v, str) and "API_call" in v for v in params.values()):
+                nested = True
+                break
+            gt.append({"name": api, "arguments": params})
+        if nested or not gt:
+            n_nested += 1
+            continue
+
+        gt_names = {c["name"] for c in gt}
+        # Hard distractors first: same-field tools (similar functionality).
+        same_field: list[dict[str, Any]] = []
+        for name in gt_names:
+            field = next((f for f, names in fields.items() if name in names), None)
+            if field:
+                same_field.extend(schemas[n] for n in fields[field] if n in schemas)
+        distractors = _pick_distractors(same_field, gt_names, _N_DISTRACTORS, rng)
+        if len(distractors) < _N_DISTRACTORS:
+            distractors += _pick_distractors(
+                pool, gt_names | {d["name"] for d in distractors},
+                _N_DISTRACTORS - len(distractors), rng,
+            )
+        tools = [schemas[n] for n in sorted(gt_names)] + distractors
+        rng.shuffle(tools)
+
+        messages = _prepend_instruction([
+            {"role": "system", "content": _GENERIC_TOOL_SYSTEM},
+            {"role": "user", "content": query},
+        ])
+        tasks.append({
+            "messages": messages,
+            "tools": _normalize_tools(tools),
+            "label": _format_gt(gt),
+            "metadata": _make_meta(
+                "sealtools", str(sample.get("id", f"sealtools-{len(tasks)}")),
+                tools, gt,
+            ),
+        })
+
+    logger.info(
+        "Seal-Tools: %d samples (dropped %d nested/unresolvable)",
+        len(tasks), n_nested,
+    )
+    return tasks
 
 
 # ============================================================================
@@ -944,11 +1348,54 @@ def strip_tool_declarations(tasks: list[dict], ratio: float, rng: random.Random)
 
 def trim_negatives(
     tasks: list[dict], neg_ratio: float, rng: random.Random,
+    top_up: bool = True,
 ) -> list[dict]:
-    """Randomly drop negatives so neg/(neg+pos) ≈ ``neg_ratio``."""
+    """Adjust the negative share so neg/(neg+pos) ≈ ``neg_ratio``.
+
+    Excess negatives are randomly dropped.  When negatives fall short of the
+    target (e.g. after adding positive-heavy datasets), the deficit is filled
+    by converting untouched positive samples with ``desc_replace`` — the
+    declared tools no longer fit the query, so the label becomes empty.
+    """
     n_neg = sum(_is_negative(t) for t in tasks)
     n_pos = len(tasks) - n_neg
     target = round(n_pos * neg_ratio / max(1e-9, 1.0 - neg_ratio))
+
+    # Top-up: converting a positive into a negative shrinks n_pos, so the
+    # fixed-point target is simply neg_ratio * total (total is unchanged).
+    topup_target = round(len(tasks) * neg_ratio)
+    if n_neg < topup_target and top_up:
+        # Eligible donors: positive samples whose label tool(s) appear in the
+        # prompt (required by desc_replace), not already augmented.
+        donors = [
+            i for i, t in enumerate(tasks)
+            if not _is_negative(t)
+            and isinstance(t.get("metadata", {}).get("ground_truth"), list)
+            and t["metadata"]["ground_truth"]
+            and not t.get("metadata", {}).get("augmented")
+        ]
+        rng.shuffle(donors)
+        topped = 0
+        for i in donors:
+            if n_neg >= topup_target:
+                break
+            if _augment_desc_replace(tasks[i], rng) is not None:
+                n_neg += 1
+                topped += 1
+        if topped:
+            logger.info(
+                "Topped up %d negatives via desc_replace (deficit %d)",
+                topped, topup_target - n_neg,
+            )
+        if n_neg < topup_target:
+            logger.warning(
+                "Negative deficit %d remains (no more convertible positives)",
+                topup_target - n_neg,
+            )
+        # Recompute the trim target against the reduced positive count.
+        n_pos = len(tasks) - n_neg
+        target = round(n_pos * neg_ratio / max(1e-9, 1.0 - neg_ratio))
+
     if n_neg <= target:
         logger.info(
             "Negatives: %d/%d (%.1f%%), target %.0f%% — keeping all",
@@ -1011,7 +1458,15 @@ def to_verl_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "task_id": meta.get("task_id", f"task-{i}"),
                 "source": meta.get("source", "unknown"),
                 "tools": tools,
-                "ground_truth_calls": meta.get("ground_truth"),
+                # Stored as a JSON string: argument keys recur across
+                # datasets with different value types (e.g. after
+                # param_rename), which breaks pyarrow's struct type
+                # unification at parquet write time.  The reward's
+                # ``_to_dict_list`` parses the string back.
+                "ground_truth_calls": (
+                    json.dumps(meta["ground_truth"], ensure_ascii=False)
+                    if meta.get("ground_truth") is not None else None
+                ),
                 "augmented": meta.get("augmented", ""),
             },
         })
@@ -1059,7 +1514,15 @@ def main():
         type=float,
         default=0.25,
         help="Target fraction of negative (no-tool-needed) samples in the "
-        "final mix; excess negatives are randomly dropped. 0 disables.",
+        "final mix; excess negatives are randomly dropped, deficits are "
+        "filled by converting positives via desc_replace (see "
+        "--no-neg-topup). 0 disables.",
+    )
+    parser.add_argument(
+        "--no-neg-topup",
+        action="store_true",
+        help="Disable topping up negatives via desc_replace when the "
+        "negative share falls short of --neg-ratio.",
     )
     parser.add_argument(
         "--no-tool-neg-ratio",
@@ -1077,7 +1540,8 @@ def main():
              else [n.strip() for n in args.datasets.split(",")])
 
     loaders = {"apigen": load_apigen, "toolace": load_toolace,
-               "hammer": load_hammer, "bfcl": load_bfcl}
+               "hammer": load_hammer, "bfcl": load_bfcl,
+               "apibank": load_apibank, "sealtools": load_sealtools}
 
     all_tasks = []
     for name in names:
@@ -1130,7 +1594,10 @@ def main():
             n_stripped,
         )
     if args.neg_ratio > 0:
-        all_tasks = trim_negatives(all_tasks, args.neg_ratio, random.Random(args.seed))
+        all_tasks = trim_negatives(
+            all_tasks, args.neg_ratio, random.Random(args.seed),
+            top_up=not args.no_neg_topup,
+        )
 
     rng = random.Random(args.seed)
     rng.shuffle(all_tasks)
