@@ -2,8 +2,12 @@
 """Download and prepare tool-use datasets for Qwen3-4B GRPO training in verl.
 
 Ported from slime ``examples/tool_rl/data/download_data.py``. Downloads
-APIGen, ToolACE, Hammer, BFCL and converts them to verl's parquet schema
+APIGen, ToolACE and Hammer and converts them to verl's parquet schema
 used by ``verl.utils.dataset.RLHFDataset``.
+
+BFCL is excluded from the default dataset mix: its samples overlap with
+the BFCL benchmark, so training on them risks evaluation data leakage.
+The loader remains available via ``--datasets bfcl``.
 
 Since the LLM-judge (RM) reward mode is not migrated, samples **without**
 structured ground-truth tool calls are dropped by default
@@ -59,6 +63,16 @@ _INSTRUCTION = (
 _DEFAULT_MAX = 5000
 _SEED = 42
 _DATA_SOURCE = "tool_rl"
+# BFCL is intentionally absent (evaluation-leakage risk, see module docstring).
+_DEFAULT_DATASETS = ["apigen", "toolace", "hammer"]
+
+# Generic system prompt used for all samples. Tool schemas are NOT embedded
+# here — they travel in the sample's ``tools`` field and are rendered by the
+# chat template at rollout time (avoids double declaration).
+_GENERIC_TOOL_SYSTEM = (
+    "You are a helpful assistant with access to tools. "
+    "Use them when needed to answer user queries accurately."
+)
 
 
 # ============================================================================
@@ -173,7 +187,7 @@ def load_apigen(max_samples: int) -> list[dict[str, Any]]:
             answers = []
 
         messages = _prepend_instruction([
-            {"role": "system", "content": "You are a helpful assistant with access to tools. Use them when needed to answer user queries accurately."},
+            {"role": "system", "content": _GENERIC_TOOL_SYSTEM},
             {"role": "user", "content": query},
         ])
 
@@ -226,7 +240,10 @@ def load_toolace(max_samples: int) -> list[dict[str, Any]]:
             value = str(turn.get("value", ""))
 
             if role == "user":
-                messages = [{"role": "system", "content": system}]
+                # Do NOT keep ToolACE's original system text: it embeds the
+                # tool schemas as JSON, which the chat template would render
+                # a second time from the sample's ``tools`` field.
+                messages = [{"role": "system", "content": _GENERIC_TOOL_SYSTEM}]
                 for h in history[-8:]:
                     messages.append(dict(h))
                 messages.append({"role": "user", "content": value})
@@ -252,7 +269,13 @@ def load_toolace(max_samples: int) -> list[dict[str, Any]]:
             elif role == "assistant":
                 history.append({"role": "assistant", "content": value[:800]})
             elif role == "tool":
-                history.append({"role": "tool", "content": value[:500]})
+                # Qwen chat templates carry tool results inside a user turn
+                # wrapped in <tool_response>; a raw "tool" role may be
+                # silently dropped when the template is applied.
+                history.append({
+                    "role": "user",
+                    "content": f"<tool_response>\n{value[:500]}\n</tool_response>",
+                })
 
             if len(tasks) >= max_samples:
                 break
@@ -887,6 +910,63 @@ def augment_tasks(
 
 
 # ============================================================================
+# Negative-sample mix control
+# ============================================================================
+
+def _is_negative(task: dict) -> bool:
+    """Label says "no tools needed" (``[]`` — not to be confused with no label)."""
+    gt = task.get("metadata", {}).get("ground_truth")
+    return isinstance(gt, list) and not gt
+
+
+def strip_tool_declarations(tasks: list[dict], ratio: float, rng: random.Random) -> int:
+    """Blank the tool list of a fraction of *original* negatives.
+
+    Produces the "no tools declared" negative type: the prompt offers no
+    tools at all, so the correct behaviour is to say so / ask for info.
+    Only untouched negatives are eligible — ``desc_replace`` samples keep
+    their (now unsuitable) declarations by design.  Both tool copies
+    (``task["tools"]`` and ``task["metadata"]["tools"]``) are blanked so
+    ``to_verl_rows`` emits an empty list.
+    """
+    idx = [
+        i for i, t in enumerate(tasks)
+        if _is_negative(t) and not t.get("metadata", {}).get("augmented")
+    ]
+    rng.shuffle(idx)
+    target = round(len(idx) * ratio)
+    for i in idx[:target]:
+        tasks[i]["tools"] = []
+        tasks[i]["metadata"]["tools"] = []
+        tasks[i]["metadata"]["augmented"] = "no_tools"
+    return min(target, len(idx))
+
+
+def trim_negatives(
+    tasks: list[dict], neg_ratio: float, rng: random.Random,
+) -> list[dict]:
+    """Randomly drop negatives so neg/(neg+pos) ≈ ``neg_ratio``."""
+    n_neg = sum(_is_negative(t) for t in tasks)
+    n_pos = len(tasks) - n_neg
+    target = round(n_pos * neg_ratio / max(1e-9, 1.0 - neg_ratio))
+    if n_neg <= target:
+        logger.info(
+            "Negatives: %d/%d (%.1f%%), target %.0f%% — keeping all",
+            n_neg, len(tasks), 100 * n_neg / max(1, len(tasks)), 100 * neg_ratio,
+        )
+        return tasks
+    neg_idx = [i for i, t in enumerate(tasks) if _is_negative(t)]
+    rng.shuffle(neg_idx)
+    drop = set(neg_idx[target:])
+    kept = [t for i, t in enumerate(tasks) if i not in drop]
+    logger.info(
+        "Trimmed negatives %d → %d (%.1f%% of %d samples)",
+        n_neg, target, 100 * target / len(kept), len(kept),
+    )
+    return kept
+
+
+# ============================================================================
 # Validation
 # ============================================================================
 
@@ -953,7 +1033,10 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Download tool-use datasets for Qwen3-4B RL (verl)")
     parser.add_argument("-o", "--output-dir", required=True)
-    parser.add_argument("--datasets", default="all")
+    parser.add_argument("--datasets", default=",".join(_DEFAULT_DATASETS),
+                        help="Comma-separated list, or 'all' (= the default "
+                        "mix). BFCL is excluded by default (leakage risk); "
+                        "pass it explicitly to include it.")
     parser.add_argument("--max-samples", type=int, default=_DEFAULT_MAX)
     parser.add_argument("--seed", type=int, default=_SEED)
     parser.add_argument("--val-samples", type=int, default=256,
@@ -971,12 +1054,26 @@ def main():
         help="Fraction of positive samples to perturb for robustness "
         "(tool/param renames, negative samples, default shuffle). 0 disables.",
     )
+    parser.add_argument(
+        "--neg-ratio",
+        type=float,
+        default=0.25,
+        help="Target fraction of negative (no-tool-needed) samples in the "
+        "final mix; excess negatives are randomly dropped. 0 disables.",
+    )
+    parser.add_argument(
+        "--no-tool-neg-ratio",
+        type=float,
+        default=0.10,
+        help="Fraction of original negatives stripped of tool declarations "
+        "('no tools declared' negative type). 0 disables.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    names = (["apigen", "toolace", "hammer", "bfcl"] if args.datasets == "all"
+    names = (list(_DEFAULT_DATASETS) if args.datasets == "all"
              else [n.strip() for n in args.datasets.split(",")])
 
     loaders = {"apigen": load_apigen, "toolace": load_toolace,
@@ -1020,6 +1117,20 @@ def main():
     if not all_tasks:
         logger.error("No labeled samples left after filtering.")
         sys.exit(1)
+
+    # Negative-sample shaping: first strip tool declarations from a small
+    # fraction of negatives ("no tools declared" type), then trim the
+    # overall negative share to the target ratio.
+    if args.no_tool_neg_ratio > 0:
+        n_stripped = strip_tool_declarations(
+            all_tasks, args.no_tool_neg_ratio, random.Random(args.seed),
+        )
+        logger.info(
+            "Stripped tool declarations from %d negatives (no-tools type)",
+            n_stripped,
+        )
+    if args.neg_ratio > 0:
+        all_tasks = trim_negatives(all_tasks, args.neg_ratio, random.Random(args.seed))
 
     rng = random.Random(args.seed)
     rng.shuffle(all_tasks)
