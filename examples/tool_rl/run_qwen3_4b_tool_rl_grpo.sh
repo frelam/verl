@@ -69,6 +69,11 @@ export TOOL_RL_ABSTAIN_MODE=${TOOL_RL_ABSTAIN_MODE:-keyword}
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
+    # Sync/on-policy: reuse the rollout generation-time log probs directly as
+    # old_log_probs, skipping the extra actor forward pass (remember rollout
+    # temperature is 1.0 so the two match). Disable if you switch to async /
+    # stale-checkpoint rollouts.
+    algorithm.rollout_correction.bypass_mode=True
     data.train_files="$train_files"
     data.val_files="$val_files"
     data.train_batch_size=${train_batch_size}
@@ -109,6 +114,9 @@ ROLLOUT=(
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+    # Store the generation-time log probs in the batch so bypass mode can use
+    # them directly as old_log_probs (see algorithm.rollout_correction.bypass_mode).
+    actor_rollout_ref.rollout.calculate_log_probs=True
     # custom single-turn tool agent loop (per-sample tools + optional masking)
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_rl_agent
     actor_rollout_ref.rollout.agent.agent_loop_config_path="$REPO_ROOT/examples/tool_rl/agent_loop_config.yaml"
