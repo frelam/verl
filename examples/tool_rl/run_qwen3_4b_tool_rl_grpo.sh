@@ -26,6 +26,16 @@
 #                                    per sample; val files always fixed)
 #   TOOL_RL_HINT_EMPTY_PROB=0.25     probability of the empty (no-hint) variant
 #   TOOL_RL_HINT_SEED=42             base seed for hint sampling
+#
+# Cov-KL entropy control (PRIME-RL "Entropy-Mechanism-of-RL"):
+#   - Computed on the actor forward pass (policy_loss.loss_mode=kl_cov).
+#   - This REQUIRES the standard 3-pass forward, so it is mutually exclusive
+#     with algorithm.rollout_correction.bypass_mode (which reuses generation
+#     log probs as old_log_probs and forces loss_mode=bypass_mode). Hence the
+#     script defaults to bypass_mode=False. Set TOOL_RL_BYPASS_MODE=1 to go
+#     back to the cheaper bypass path (and give up the Cov-KL KL penalty).
+#   TOOL_RL_COV_KL_RATIO=0.0002   ratio of top tokens selected for the KL penalty
+#   TOOL_RL_PPO_KL_COEF=1.0       coefficient of the KL penalty term in the loss
 
 set -xeuo pipefail
 
@@ -46,6 +56,12 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
+
+# Cov-KL entropy control (mutually exclusive with bypass_mode, see header)
+cov_kl_ratio=${TOOL_RL_COV_KL_RATIO:-0.0002}
+ppo_kl_coef=${TOOL_RL_PPO_KL_COEF:-1.0}
+# 1 => keep the original bypass path (no Cov-KL); 0 (default) => Cov-KL
+use_bypass=${TOOL_RL_BYPASS_MODE:-0}
 
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.65}
@@ -71,9 +87,12 @@ DATA=(
     algorithm.use_kl_in_reward=False
     # Sync/on-policy: reuse the rollout generation-time log probs directly as
     # old_log_probs, skipping the extra actor forward pass (remember rollout
-    # temperature is 1.0 so the two match). Disable if you switch to async /
-    # stale-checkpoint rollouts.
-    algorithm.rollout_correction.bypass_mode=True
+    # temperature is 1.0 so the two match). We default to bypass_mode=False
+    # though, because Cov-KL (policy_loss.loss_mode=kl_cov) forces the standard
+    # 3-pass forward and bypass_mode would override loss_mode back to
+    # "bypass_mode". Set TOOL_RL_BYPASS_MODE=1 to take the cheap bypass path
+    # and give up the Cov-KL KL penalty.
+    algorithm.rollout_correction.bypass_mode=$([ "$use_bypass" = "1" ] && echo True || echo False)
     data.train_files="$train_files"
     data.val_files="$val_files"
     data.train_batch_size=${train_batch_size}
@@ -101,6 +120,12 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
+    # Cov-KL entropy control (PRIME-RL): KL penalty on the tokens with the
+    # largest covariance between per-token advantage and log prob, preventing
+    # entropy collapse. Active only when bypass_mode=False (see DATA header).
+    actor_rollout_ref.actor.policy_loss.loss_mode=kl_cov
+    actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${cov_kl_ratio}
+    actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${ppo_kl_coef}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )
