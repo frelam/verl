@@ -14,6 +14,12 @@
 # Optional env knobs:
 #   TOOL_RL_MASK_FAILED_CALLS=1      mask tokens of incorrect tool calls
 #   TOOL_RL_REWARD_WEIGHTS='{"tool_correctness":0.6,"format":0.2,"tool_call":0.2}'
+#   TOOL_RL_ABSTAIN_MODE=keyword     off (default) | keyword
+#                                    rule-based shaping for no-tool samples:
+#                                    request-more-info / no-valid-tools call 1.0,
+#                                    guess & spurious calls 0 (Dim 1/Dim 3).
+#                                    On by default; set TOOL_RL_ABSTAIN_MODE=off
+#                                    to restore the legacy behaviour.
 #   TOOL_RL_HINT_MODE=random         off (default) | random | fixed
 #                                    inject a random system-prompt hint variant
 #                                    per sample per epoch (fixed = deterministic
@@ -54,6 +60,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PROJECT_NAME=${PROJECT_NAME:-verl_tool_rl}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_tool_rl_grpo_vllm_fsdp_$(date +%Y%m%d_%H%M)}
 ########################### end user-adjustable ###########################
+
+# Rule-based abstention shaping (see reward/abstention.py). On by default;
+# the reward function reads this at compute time, so exporting it before
+# launching the trainer is sufficient.
+export TOOL_RL_ABSTAIN_MODE=${TOOL_RL_ABSTAIN_MODE:-keyword}
 
 DATA=(
     algorithm.adv_estimator=grpo

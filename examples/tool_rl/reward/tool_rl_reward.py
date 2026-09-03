@@ -19,15 +19,37 @@ Dim 1 — rule-based, order-independent matching against ground-truth labels:
   - Tool name match  → 0.5  (binary per label call)
   - Param content    → 0.5  (value match per label param)
   Calling a tool not declared in the prompt incurs ``-0.1`` per call on
-  Dim 1, floored at 0.0.
+  Dim 1. The penalty always stacks on the (possibly negative) match score —
+  flooring at 0.0 would invert the ordering: an undeclared call would
+  outscore a declared-but-unneeded one.
 
-Dim 2 — Verifier (format):
+Dim 2 — Verifier (format, answer-agnostic):
   0.6 if all tool_calls after reasoning + 0.4 × count/N for think before
   each call.
 
 Dim 3 — Verifier (tool call format vs label):
   1/N per label call completely matched (name + param names + param types);
   full score when the label has no tool calls.
+
+No-tool behaviour shaping (``TOOL_RL_ABSTAIN_MODE=keyword``)
+------------------------------------------------------------
+When the label needs no tools (``ground_truth_calls == []``), Dim 1 and
+Dim 3 are reshaped by the rule-based abstention classifier
+(``reward/abstention.py`` — no reward model involved):
+
+============================  ======  ======
+Behaviour                     Dim 1   Dim 3
+============================  ======  ======
+request more info             1.0     1.0
+declare no valid tools        1.0     1.0
+guess a direct answer         0.0     1.0
+spurious call (declared)      0.0     0.0
+spurious call (undeclared)    -0.1×n  0.0
+============================  ======  ======
+
+Dim 2 is untouched (format compliance is answer-agnostic). With the
+default weights this yields: clarify/declare 1.0 > guess 0.4 > spurious
+call 0.2 > undeclared spurious call 0.14.
 
 verl integration
 ----------------
@@ -42,6 +64,8 @@ Per-sample fields travel in the dataset's ``extra_info`` column:
 Optional knobs (env vars):
 - ``TOOL_RL_REWARD_WEIGHTS`` — JSON dict overriding dimension weights,
   e.g. ``'{"tool_correctness": 0.6, "format": 0.2, "tool_call": 0.2}'``.
+- ``TOOL_RL_ABSTAIN_MODE`` — ``off`` (default) | ``keyword``; enables the
+  no-tool behaviour shaping described above.
 """
 
 from __future__ import annotations
@@ -59,6 +83,12 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[3])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from examples.tool_rl.reward.abstention import (  # noqa: E402
+    ABSTENTION_NOT_APPLICABLE,
+    AbstentionClass,
+    abstain_mode_from_env,
+    classify_abstention,
+)
 from examples.tool_rl.reward.verifier import (  # noqa: E402
     compute_verifier_scores,
     match_tool_calls_against_label,
@@ -178,10 +208,27 @@ def compute_score(
     name_score, param_score = match_tool_calls_against_label(output_calls, parsed_gt)
     tool_correctness = 0.5 * name_score + 0.5 * param_score
 
-    # Dim 1 undeclared-tool penalty: -0.1 per undeclared call, floored at 0.
+    # Dim 1 undeclared-tool penalty: -0.1 per undeclared call. It must
+    # ALWAYS stack on the match score — the old conditional floor
+    # (max(0.0, ...)) inverted the ordering: an undeclared call (floored
+    # to 0.0) outscored a declared-but-unneeded call (-0.1).
     undeclared_penalty = undeclared_tool_penalty(output_calls, available_tools)
-    if undeclared_penalty > 0:
-        tool_correctness = max(0.0, tool_correctness - undeclared_penalty)
+    tool_correctness -= undeclared_penalty
+
+    # ── No-tool-label behaviour shaping (keyword mode) ──
+    # Dim 2 stays answer-agnostic; only Dim 1 / Dim 3 are reshaped.
+    abstention_class = ABSTENTION_NOT_APPLICABLE
+    if abstain_mode_from_env() == "keyword" and expects_no_tools:
+        if output_calls:
+            # Spurious call: Dim 1 = 0 (undeclared calls still subtract
+            # 0.1 each), Dim 3 = 0.
+            tool_correctness = -undeclared_penalty
+            tool_call_score = 0.0
+            abstention_class = AbstentionClass.SPURIOUS_CALL
+        else:
+            cls = classify_abstention(solution_str)
+            abstention_class = cls
+            tool_correctness = 0.0 if cls is AbstentionClass.GUESS else 1.0
 
     # ── Weighted sum (negatives allowed so blind guessing scores < 0) ──
     total = (
@@ -193,9 +240,11 @@ def compute_score(
 
     logger.info(
         "[tool_rl] %s: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
-        "format=%.3f tool_call=%.3f",
+        "format=%.3f tool_call=%.3f abstention=%s",
         task_id, total, tool_correctness, name_score, param_score,
         format_score, tool_call_score,
+        AbstentionClass(abstention_class).name
+        if abstention_class != ABSTENTION_NOT_APPLICABLE else "n/a",
     )
 
     return {
@@ -205,4 +254,5 @@ def compute_score(
         "param_content_score": param_score,
         "format_compliance": format_score,
         "tool_call_format": tool_call_score,
+        "abstention_class": int(abstention_class),
     }
