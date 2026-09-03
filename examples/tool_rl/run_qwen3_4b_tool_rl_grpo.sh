@@ -32,7 +32,7 @@ set -xeuo pipefail
 ########################### user-adjustable ###########################
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-16}
 
 DATA_DIR=${DATA_DIR:-$HOME/data/tool_rl}
 train_files="['$DATA_DIR/train.parquet']"
@@ -47,9 +47,9 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
 
-rollout_tp=${ROLLOUT_TP:-2}
-rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.6}
-rollout_n=${ROLLOUT_N:-8}
+rollout_tp=${ROLLOUT_TP:-1}
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.65}
+rollout_n=${ROLLOUT_N:-16}
 
 total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:-20}
