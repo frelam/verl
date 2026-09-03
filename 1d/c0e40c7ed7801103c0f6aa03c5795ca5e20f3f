@@ -1,0 +1,32 @@
+examples/tool_rl/tool_rl_dataset.py
+  s_eef505579d914d::t_ad379999f3ee95 60-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "1dc0e40c7ed7801103c0f6aa03c5795ca5e20f3f",
+  "prompts": {},
+  "sessions": {
+    "s_eef505579d914d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9962ab470a267b69e5b03d",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "edit_kind": "file_edit",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6a9962ab470a267b69e5b03d:6a996365470a267b69e5b051:afterEdit:68ee5f60",
+        "source_scene": "agent",
+        "external_session_id": "6a9962ab470a267b69e5b03d",
+        "session_id": "6a9962ab470a267b69e5b03d",
+        "tool_type": "builtin",
+        "tool_use_id": "6a996365470a267b69e5b051",
+        "operation_id": "6a996365470a267b69e5b051",
+        "tool_id": "icube:applyChatSnapshotPatch"
+      }
+    }
+  }
+}
