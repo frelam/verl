@@ -41,6 +41,13 @@
 #     back to the cheaper bypass path (and give up the Cov-KL KL penalty).
 #   TOOL_RL_COV_KL_RATIO=0.0002   ratio of top tokens selected for the KL penalty
 #   TOOL_RL_PPO_KL_COEF=1.0       coefficient of the KL penalty term in the loss
+#
+# Ref KL loss (KL(policy || ref) added to the actor loss, GRPO-style):
+#   TOOL_RL_REF_KL=1              on by default; set to 0 to skip the extra
+#                                 ref forward pass. The ref policy worker is
+#                                 created automatically when enabled.
+#   REF_KL_COEF=0.001             ref KL loss coefficient
+#   REF_KL_TYPE=low_var_kl        kl | abs | mse | low_var_kl | full
 
 set -xeuo pipefail
 
@@ -61,6 +68,12 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
 
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
+
+# Ref KL loss: KL(policy || ref) on response tokens, added to the actor loss.
+# 1 (default) => ref worker + extra ref forward; 0 => disabled.
+use_ref_kl=${TOOL_RL_REF_KL:-1}
+ref_kl_coef=${REF_KL_COEF:-0.001}
+ref_kl_type=${REF_KL_TYPE:-low_var_kl}
 
 # Cov-KL entropy control (mutually exclusive with bypass_mode, see header)
 cov_kl_ratio=${TOOL_RL_COV_KL_RATIO:-0.0002}
@@ -129,7 +142,11 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
-    actor_rollout_ref.actor.use_kl_loss=False
+    # Ref KL loss: the ref policy worker is created automatically when
+    # use_kl_loss=True (adds one extra ref forward pass per batch).
+    actor_rollout_ref.actor.use_kl_loss=$([ "$use_ref_kl" = "1" ] && echo True || echo False)
+    actor_rollout_ref.actor.kl_loss_coef=${ref_kl_coef}
+    actor_rollout_ref.actor.kl_loss_type=${ref_kl_type}
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
     # Cov-KL entropy control (PRIME-RL): KL penalty on the tokens with the
     # largest covariance between per-token advantage and log prob, preventing
