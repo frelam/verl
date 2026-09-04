@@ -277,6 +277,11 @@ if [ "$hard_replay" = "1" ]; then
         # prefix fails with "Key ... is not in struct". `+` force-adds them.
         "+trainer.v1.sampler.sampler_kwargs={filter_metric: score, train_batch_size: ${train_batch_size}, medium_interval: ${replay_medium_interval}, hard_interval: ${replay_hard_interval}, medium_threshold: ${replay_medium_threshold}, zero_threshold: ${replay_zero_threshold}, max_replays: ${replay_max}, max_replay_fraction: ${replay_max_fraction}}"
         data.dataloader_num_workers=0
+        # The custom sampler owns DAPO filtering, so the framework's automatic
+        # "exact refill => gen_batch_size=1" override (which only triggers on
+        # algorithm.filter_groups.enable) does not apply. Force single-prompt
+        # dataloader fetches here or refill_fn(k) crashes for k % 128 != 0.
+        data.gen_batch_size=1
         # Multi-node: shell exports only reach Ray actors when ray.init spawns the
         # cluster locally; on a pre-existing cluster the raylets are already up,
         # so forward the dataset-side toggles through the job runtime env as well.

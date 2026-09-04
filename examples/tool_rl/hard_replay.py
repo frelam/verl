@@ -52,11 +52,20 @@ passed via ``sampler_kwargs``)::
     +trainer.v1.sampler.sampler_kwargs={filter_metric: score, train_batch_size: 256, medium_interval: 10,
         hard_interval: 20}
     data.dataloader_num_workers=0
+    # REQUIRED: exact-count refills need single-prompt dataloader fetches. The
+    # framework only forces this for the built-in filter_groups path; with a
+    # custom sampler it must be set explicitly, otherwise refill_fn(k) raises
+    # "num_prompts must be a positive multiple of gen_batch_size" for any k
+    # that is not a multiple of data.gen_batch_size.
+    data.gen_batch_size=1
     # dataset side env: TOOL_RL_HARD_REPLAY=1, TOOL_RL_REPLAY_RATIO=1.0
 """
 
-from __future__ import annotations
-
+# NOTE: no `from __future__ import annotations` here — verl's load_module()
+# execs this file without registering it in sys.modules, and @dataclass
+# resolves *string* annotations via sys.modules[cls.__module__].__dict__,
+# which then crashes with AttributeError on NoneType.  Keep all annotations
+# runtime-evaluable (they are: py>=3.10 syntax, no forward references).
 import copy
 import hashlib
 import json
