@@ -96,14 +96,18 @@ DATA_DIR=${DATA_DIR:-$HOME/data/tool_rl}
 train_files="['$DATA_DIR/train.parquet']"
 val_files="['$DATA_DIR/val.parquet']"
 
-train_batch_size=${TRAIN_BATCH_SIZE:-256}
+train_batch_size=${TRAIN_BATCH_SIZE:-128}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
 max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
 max_response_length=${MAX_RESPONSE_LENGTH:-4096}
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}
 
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
+# Asymmetric clipping: keep the lower bound fixed and raise the upper bound so
+# tokens with positive advantage (ratio > 1) can take a slightly larger step.
+clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
+clip_ratio_high=${CLIP_RATIO_HIGH:-0.4}
 
 # Ref KL loss: KL(policy || ref) on response tokens, added to the actor loss.
 # 1 (default) => ref worker + extra ref forward; 0 => disabled.
@@ -133,7 +137,7 @@ filter_groups=${TOOL_RL_FILTER_GROUPS:-1}
 
 # Tiered hard-sample replay (V1 only): pool low-pass-rate groups and re-roll
 # them on per-tier step intervals (medium: every ~10 steps, hard: every ~20).
-hard_replay=${TOOL_RL_HARD_REPLAY:-0}
+hard_replay=${TOOL_RL_HARD_REPLAY:-1}
 replay_ratio=${TOOL_RL_REPLAY_RATIO:-1.0}
 replay_max=${TOOL_RL_REPLAY_MAX:-0}
 replay_medium_interval=${TOOL_RL_REPLAY_MEDIUM_INTERVAL:-10}
@@ -195,6 +199,11 @@ ACTOR=(
     actor_rollout_ref.actor.kl_loss_coef=${ref_kl_coef}
     actor_rollout_ref.actor.kl_loss_type=${ref_kl_type}
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
+    # Asymmetric PPO clipping: lower bound stays at the default 0.2, upper
+    # bound raised (CLIP_RATIO_HIGH) so positive-advantage tokens can take a
+    # slightly larger step.
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
     # Cov-KL entropy control (PRIME-RL): KL penalty on the tokens with the
     # largest covariance between per-token advantage and log prob, preventing
     # entropy collapse. Active only when bypass_mode=False (see DATA header).
