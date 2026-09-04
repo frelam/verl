@@ -47,7 +47,9 @@ passed via ``sampler_kwargs``)::
 
     trainer.v1.sampler.custom_sampler.path=examples/tool_rl/hard_replay.py
     trainer.v1.sampler.custom_sampler.name=HardReplaySampler
-    trainer.v1.sampler.sampler_kwargs={filter_metric: score, train_batch_size: 256, medium_interval: 10,
+    # the `+` prefix is required: the yaml default `sampler_kwargs: {}` is an
+    # empty dict, which OmegaConf marks as struct and rejects key merges
+    +trainer.v1.sampler.sampler_kwargs={filter_metric: score, train_batch_size: 256, medium_interval: 10,
         hard_interval: 20}
     data.dataloader_num_workers=0
     # dataset side env: TOOL_RL_HARD_REPLAY=1, TOOL_RL_REPLAY_RATIO=1.0
