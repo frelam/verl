@@ -105,8 +105,12 @@ def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
                 except (json.JSONDecodeError, TypeError):
                     start = -1
                     continue
-                if isinstance(obj, dict) and "name" in obj:
-                    results.append(obj)
+                if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+                    args = obj.get("arguments")
+                    results.append({
+                        "name": obj["name"],
+                        "arguments": args if isinstance(args, dict) else {},
+                    })
                 start = -1
     return results
 
