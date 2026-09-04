@@ -280,6 +280,7 @@ if [ "$hard_replay" = "1" ]; then
         # Multi-node: shell exports only reach Ray actors when ray.init spawns the
         # cluster locally; on a pre-existing cluster the raylets are already up,
         # so forward the dataset-side toggles through the job runtime env as well.
+        # Values are coerced to str in main_ppo before ray.init (Ray requires str).
         "+ray_kwargs.ray_init.runtime_env.env_vars.TOOL_RL_HARD_REPLAY=1"
         "+ray_kwargs.ray_init.runtime_env.env_vars.TOOL_RL_REPLAY_RATIO=${replay_ratio}"
     )
