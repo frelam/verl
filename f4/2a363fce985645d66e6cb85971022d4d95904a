@@ -1,0 +1,32 @@
+examples/tool_rl/reward/verifier.py
+  s_2bf62cb88c75ba::t_a21608a9d844eb 108-113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "f42a363fce985645d66e6cb85971022d4d95904a",
+  "prompts": {},
+  "sessions": {
+    "s_2bf62cb88c75ba": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9a1efd470a267b69e5b331",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_type": "builtin",
+        "client_type": "ide",
+        "session_id": "6a9a1efd470a267b69e5b331",
+        "external_session_id": "6a9a1efd470a267b69e5b331",
+        "dedupe_key": "6a9a1efd470a267b69e5b331:6a9a1f5c470a267b69e5b348:afterEdit:5d9ea0fc",
+        "source_scene": "agent",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "operation_id": "6a9a1f5c470a267b69e5b348",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit",
+        "tool_use_id": "6a9a1f5c470a267b69e5b348"
+      }
+    }
+  }
+}
