@@ -31,6 +31,42 @@
 #                                    (all-zero / all-one) across the rollout group
 #                                    and refill with fresh prompts. Requires
 #                                    trainer.use_v1=true (on by default below).
+#   TOOL_RL_HARD_REPLAY=1            tiered hard-sample replay on the V1 trainer
+#                                    (default off): like FILTER_GROUPS, uniform
+#                                    groups are filtered, but groups whose pass
+#                                    rate (fraction of rollouts with score > 0)
+#                                    is below 0.5 are additionally pooled and
+#                                    re-rolled in later steps, so the model gets
+#                                    another shot at difficult prompts once it
+#                                    improves. Two tiers with separate replay
+#                                    intervals: "medium" (1% < pass rate < 50%)
+#                                    replays every TOOL_RL_REPLAY_MEDIUM_INTERVAL
+#                                    steps and also contributes gradient
+#                                    normally; "hard" (pass rate <= 1%, incl.
+#                                    all-zero) replays every
+#                                    TOOL_RL_REPLAY_HARD_INTERVAL steps. A
+#                                    replayed group reaching pass rate >= 50%
+#                                    graduates out of the pool; a hard group
+#                                    that improves becomes "medium".
+#                                    Supersedes TOOL_RL_FILTER_GROUPS (the
+#                                    custom sampler owns filtering) and forces
+#                                    data.dataloader_num_workers=0 (the pool
+#                                    lives in the trainer driver process).
+#   TOOL_RL_REPLAY_RATIO=1.0         per-fetch throttle on drawing a DUE pooled
+#                                    sample instead of a fresh one (due-ness is
+#                                    decided by the tier intervals)
+#   TOOL_RL_REPLAY_MEDIUM_INTERVAL=10  global steps between replays of "medium"
+#                                    tier samples (1% < pass rate < 50%)
+#   TOOL_RL_REPLAY_HARD_INTERVAL=20  global steps between replays of "hard"
+#                                    tier samples (pass rate <= 1%)
+#   TOOL_RL_REPLAY_MEDIUM_THRESHOLD=0.5  pass rate at/above which a sample is
+#                                    never pooled (graduation threshold)
+#   TOOL_RL_REPLAY_ZERO_THRESHOLD=0.01  pass rate at/below which a sample counts
+#                                    as "hard" (0.01 = effectively all-zero)
+#   TOOL_RL_REPLAY_MAX=0             give up on a pooled sample after this many
+#                                    replays (0 = replay forever)
+#   TOOL_RL_REPLAY_MAX_FRACTION=0.2  hard cap on replays per training step, as a
+#                                    fraction of the train batch size (0 = no cap)
 #
 # Cov-KL entropy control (PRIME-RL "Entropy-Mechanism-of-RL"):
 #   - Computed on the actor forward pass (policy_loss.loss_mode=kl_cov).
@@ -94,6 +130,17 @@ test_freq=${TEST_FREQ:-5}
 # trainer.use_v1=false.
 use_v1=${TOOL_RL_USE_V1:-1}
 filter_groups=${TOOL_RL_FILTER_GROUPS:-1}
+
+# Tiered hard-sample replay (V1 only): pool low-pass-rate groups and re-roll
+# them on per-tier step intervals (medium: every ~10 steps, hard: every ~20).
+hard_replay=${TOOL_RL_HARD_REPLAY:-0}
+replay_ratio=${TOOL_RL_REPLAY_RATIO:-1.0}
+replay_max=${TOOL_RL_REPLAY_MAX:-0}
+replay_medium_interval=${TOOL_RL_REPLAY_MEDIUM_INTERVAL:-10}
+replay_hard_interval=${TOOL_RL_REPLAY_HARD_INTERVAL:-20}
+replay_medium_threshold=${TOOL_RL_REPLAY_MEDIUM_THRESHOLD:-0.5}
+replay_zero_threshold=${TOOL_RL_REPLAY_ZERO_THRESHOLD:-0.01}
+replay_max_fraction=${TOOL_RL_REPLAY_MAX_FRACTION:-0.2}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -199,11 +246,32 @@ TRAINER=(
 # uniform (all-zero / all-one) across the rollout group, refill with fresh
 # prompts. ``metric=score`` reads the per-sample ``score`` returned by
 # ``compute_score`` (naive reward manager -> reward_extra_info).
-if [ "$filter_groups" = "1" ] && [ "$use_v1" != "1" ]; then
-    echo "TOOL_RL_FILTER_GROUPS=1 requires the V1 trainer; set TOOL_RL_USE_V1=1 (or disable filtering)." >&2
+if { [ "$filter_groups" = "1" ] || [ "$hard_replay" = "1" ]; } && [ "$use_v1" != "1" ]; then
+    echo "TOOL_RL_FILTER_GROUPS=1 / TOOL_RL_HARD_REPLAY=1 require the V1 trainer; set TOOL_RL_USE_V1=1 (or disable them)." >&2
     exit 1
 fi
-if [ "$filter_groups" = "1" ]; then
+if [ "$hard_replay" = "1" ]; then
+    # Hard replay supersedes the built-in filter_groups: the custom sampler
+    # owns filtering (same metric) AND exports low-pass-rate groups to the
+    # tiered replay pool. The framework does not inject algorithm.filter_groups
+    # into custom samplers, so the DAPO + tier knobs go through sampler_kwargs.
+    # The dataset side (ToolRLHintDataset) reads TOOL_RL_HARD_REPLAY /
+    # TOOL_RL_REPLAY_RATIO and needs the pool in-process, hence
+    # dataloader_num_workers=0.
+    export TOOL_RL_HARD_REPLAY=1
+    export TOOL_RL_REPLAY_RATIO=${replay_ratio}
+    DATA+=(
+        trainer.v1.sampler.custom_sampler.path="$REPO_ROOT/examples/tool_rl/hard_replay.py"
+        trainer.v1.sampler.custom_sampler.name=HardReplaySampler
+        "trainer.v1.sampler.sampler_kwargs={filter_metric: score, train_batch_size: ${train_batch_size}, medium_interval: ${replay_medium_interval}, hard_interval: ${replay_hard_interval}, medium_threshold: ${replay_medium_threshold}, zero_threshold: ${replay_zero_threshold}, max_replays: ${replay_max}, max_replay_fraction: ${replay_max_fraction}}"
+        data.dataloader_num_workers=0
+        # Multi-node: shell exports only reach Ray actors when ray.init spawns the
+        # cluster locally; on a pre-existing cluster the raylets are already up,
+        # so forward the dataset-side toggles through the job runtime env as well.
+        "+ray_kwargs.ray_init.runtime_env.env_vars.TOOL_RL_HARD_REPLAY=1"
+        "+ray_kwargs.ray_init.runtime_env.env_vars.TOOL_RL_REPLAY_RATIO=${replay_ratio}"
+    )
+elif [ "$filter_groups" = "1" ]; then
     DATA+=(
         algorithm.filter_groups.enable=true
         algorithm.filter_groups.metric=score
