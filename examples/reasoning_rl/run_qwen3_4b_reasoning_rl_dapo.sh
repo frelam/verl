@@ -9,9 +9,10 @@
 #   python examples/reasoning_rl/scripts/mix.py --input_dir $DATA_DIR_RAW -o $DATA_DIR/train.parquet
 #
 # DAPO switches (DESIGN.md section 8):
-#   - clip-higher (clip_ratio_high=0.28)              ON  (keeps low-prob exploration tokens)
+#   - clip-higher (clip_ratio_high=0.4)              ON  (keeps low-prob exploration tokens)
 #   - dynamic sampling / filter_groups (metric=score) ON  (owned by the hard-replay sampler)
 #   - token-level policy gradient loss                ON  (loss_agg_mode=token-mean)
+#   - entropy anti-collapse (kl_cov policy loss)      ON  (KL-penalizes top-covariance tokens)
 #   - overlong reward shaping                         OFF (this stage)
 #   - length penalty                                  OFF (recall first)
 #   - rollout n=16, temperature=1.0; response length curriculum 8k -> 16k -> 24k
@@ -48,15 +49,28 @@ val_files="['$DATA_DIR/val.parquet']"
 
 train_batch_size=${TRAIN_BATCH_SIZE:-256}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
-max_prompt_length=${MAX_PROMPT_LENGTH:-4096}   # code prompts need up to 4k (DESIGN.md section 8)
-max_response_length=${MAX_RESPONSE_LENGTH:-8192} # curriculum: 8192 -> 16384 -> 24576
-ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}
+# Dataset prompt caps are far below ceiling (math ~2k, code up to ~4k per DESIGN.md
+# section 8); 16384 is a generous safety ceiling so nothing gets truncated.
+max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
+# response curriculum: 8192 -> 16384 -> 24576 -> 32768 (raise between runs).
+max_response_length=${MAX_RESPONSE_LENGTH:-32768}
+# dynamic-bsz packing budget MUST cover the longest single (prompt+response) sequence
+# or the tail gets dropped. Default = max_prompt + max_response; tune down only if
+# you know the real dataset max and hit GPU memory limits.
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((max_prompt_length + max_response_length))}
 
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
-# clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO).
+# clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO). 0.4 keeps
+# even low-prob exploration tokens from being over-clipped.
 clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
-clip_ratio_high=${CLIP_RATIO_HIGH:-0.28}
+clip_ratio_high=${CLIP_RATIO_HIGH:-0.4}
+
+# kl_cov (PRIME-RL): applies a KL penalty to the top-(kl_cov_ratio) tokens with the
+# largest covariance between advantages and log-probs, preventing entropy collapse.
+# ppo_kl_coef is the strength of that KL penalty; raise it if entropy collapses early.
+kl_cov_ratio=${KL_COV_RATIO:-0.0002}
+kl_cov_coef=${KL_COV_COEF:-0.1}
 
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.65}
@@ -117,6 +131,11 @@ ACTOR=(
     actor_rollout_ref.actor.clip_ratio_c=10.0
     # token-level policy gradient loss (DAPO).
     actor_rollout_ref.actor.loss_agg_mode=token-mean
+    # kl_cov policy loss: KL-penalize the top-covariance tokens to stop entropy
+    # from collapsing (reinforces entropy_coeff=0 above).
+    actor_rollout_ref.actor.policy.loss_mode=kl_cov
+    actor_rollout_ref.actor.policy.kl_cov_ratio=${kl_cov_ratio}
+    actor_rollout_ref.actor.policy.ppo_kl_coef=${kl_cov_coef}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )
@@ -128,6 +147,8 @@ ROLLOUT=(
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.temperature=${temperature}
+    # pure temperature sampling: top_k=-1 and top_p=1.0 both disable (no topk/topp).
+    actor_rollout_ref.rollout.top_k=-1
     actor_rollout_ref.rollout.top_p=1.0
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
