@@ -1,0 +1,134 @@
+examples/reasoning_rl/scripts/mix.py
+  s_6e383936f0166c::t_4f27fc03846ec2 55-59
+  s_6e383936f0166c::t_0c2ab4a2a8cc76 1-54,60-80,82-154
+  s_6e383936f0166c::t_8fb431321c51c7 81
+examples/reasoning_rl/scripts/difficulty_tag.py
+  s_6e383936f0166c::t_488e1f076baf2a 1-80,82-164
+  s_6e383936f0166c::t_410e48ce48ec15 81
+examples/reasoning_rl/scripts/dedup.py
+  s_fb113baaa3cded::t_601c2a3982acf4 1-97,99-137
+  s_fb113baaa3cded::t_57c5fae016f52f 98
+examples/reasoning_rl/scripts/to_parquet_stem.py
+  s_6e383936f0166c::t_0e2594733aeed6 1-150
+examples/reasoning_rl/reasoning_rl_dataset.py
+  s_6e383936f0166c::t_a1b2985a9f76c0 1-74
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
+  s_6e383936f0166c::t_2e783bda7dbffe 1-215
+examples/reasoning_rl/hard_replay.py
+  s_6e383936f0166c::t_8a3c295a57d2bf 1-53
+examples/reasoning_rl/scripts/to_parquet_code.py
+  s_fb113baaa3cded::t_43a9a4c9c8dc0e 104
+  s_fb113baaa3cded::t_27ccd1705791fd 1-103,105-142,145,149-247
+  s_fb113baaa3cded::t_d70dfbef4b53cc 143-144,146-148
+examples/reasoning_rl/reward/test_compute_score.py
+  s_5437a745d03709::t_8c7baff1ca0735 38
+  s_5437a745d03709::t_fdd03e05628605 128,133,138,143
+  s_5437a745d03709::t_f0e52f8d5b5640 145-203
+  s_6e383936f0166c::t_abd0ca3a1be281 1-28,30-31,37,39-112,114-117,119-122,124-127,129-132,134-137,139-142,144
+  s_5437a745d03709::t_665d6602fc6ccc 29,32-36
+  s_5437a745d03709::t_5239ca29878936 113,118,123
+examples/reasoning_rl/scripts/to_parquet_logic.py
+  s_6e383936f0166c::t_bff1d2e662f4d5 162,164-171,173-178,180,182-214
+  s_6e383936f0166c::t_3ea2124c4c6954 1-111,113-161,163,172,215-287,295-310,312-347
+  s_6e383936f0166c::t_6db0f1fcc57ed3 288-292,294
+  s_6e383936f0166c::t_339f6fcd0ed74a 311
+  s_6e383936f0166c::t_9d533e7fe18ca8 112
+  s_6e383936f0166c::t_b4c155e13b8a0d 179
+  s_6e383936f0166c::t_d74404d1ce1349 181
+  s_6e383936f0166c::t_1e89fd84287ef7 293
+examples/reasoning_rl/scripts/to_parquet_math.py
+  s_fb113baaa3cded::t_42d462e7bbcc6a 60-66
+  s_fb113baaa3cded::t_8dde28ad7a4d16 1-59,67-146,150-158
+  s_fb113baaa3cded::t_05448d2a627a76 147-149
+examples/reasoning_rl/README.md
+  s_6e383936f0166c::t_5b16561f7a22b9 118-193
+  s_fb113baaa3cded::t_d23072c1950059 1-25,33-117,194-198,200-201,204-211,213-218,222-225
+  s_6e383936f0166c::t_15fa2dca073dac 212,219-221,226
+  s_6e383936f0166c::t_9630eac8624dfb 26-32
+  s_6e383936f0166c::t_61d3d62f4b1b47 199,202-203
+examples/reasoning_rl/reward/compute_score.py
+  s_6e383936f0166c::t_cb6505db708b0e 219,221-222
+  s_5437a745d03709::t_ff2c8e3a67e94d 279-288
+  s_6e383936f0166c::t_6dcf3daa22bcd4 117-120
+  s_6e383936f0166c::t_16394feb85028a 1-41,50-67,105-116,121-218,220,223-278,289-299
+  s_5437a745d03709::t_be48a8c6b6a66b 42-49
+  s_5437a745d03709::t_c683f0d9356f78 68-104
+examples/reasoning_rl/scripts/decontaminate.py
+  s_fb113baaa3cded::t_630015fc43478b 1-210,217-218,220,223-230,233-289
+  s_fb113baaa3cded::t_1676028c0f23d7 211-216,219,221-222
+  s_fb113baaa3cded::t_0a106ac0d9b3ba 231-232
+examples/reasoning_rl/DESIGN.md
+  s_fb113baaa3cded::t_0e3aafe5d4337f 282,284-285
+  s_6e383936f0166c::t_f25343e3143109 283,286-292
+  s_6e383936f0166c::t_d1186a98004179 28-29,31-32,34-38
+  s_fb113baaa3cded::t_f1daab9e16557d 23,25-27,30
+  s_fb113baaa3cded::t_4bb58e63f259db 1-22,24,33,39-85,88-281
+  s_fb113baaa3cded::t_84dcc0638f3b5f 86-87
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "cb400057978239bd49a117df2012839b6fbf7a6b",
+  "prompts": {},
+  "sessions": {
+    "s_5437a745d03709": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9ea504470a267b69e5bcc6",
+        "model": "kimi-k3__dev"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "edit_kind": "bash",
+        "external_session_id": "6a9ea504470a267b69e5bcc6",
+        "tool_name": "RunCommand",
+        "tool_use_id": "6a9ea701470a267b69e5bd16",
+        "display_model_name": "Kimi-K3",
+        "operation_id": "6a9ea701470a267b69e5bd16",
+        "session_id": "6a9ea504470a267b69e5bcc6"
+      }
+    },
+    "s_6e383936f0166c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9e82df470a267b69e5b95e",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_use_id": "6a9ea33d470a267b69e5bca7",
+        "tool_type": "builtin",
+        "edit_kind": "file_edit",
+        "dedupe_key": "6a9e82df470a267b69e5b95e:6a9ea33d470a267b69e5bca7:afterEdit:d2ed73aa",
+        "source_scene": "agent",
+        "operation_id": "6a9ea33d470a267b69e5bca7",
+        "external_session_id": "6a9e82df470a267b69e5b95e",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6a9e82df470a267b69e5b95e"
+      }
+    },
+    "s_fb113baaa3cded": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9e7248470a267b69e5b8b3",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_type": "builtin",
+        "external_session_id": "6a9e7248470a267b69e5b8b3",
+        "source_scene": "agent",
+        "dedupe_key": "6a9e7248470a267b69e5b8b3:6a9e8089470a267b69e5b957:afterEdit:3aa2b4d0",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "edit_kind": "file_edit",
+        "session_id": "6a9e7248470a267b69e5b8b3",
+        "operation_id": "6a9e8089470a267b69e5b957",
+        "tool_use_id": "6a9e8089470a267b69e5b957",
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai"
+      }
+    }
+  }
+}
