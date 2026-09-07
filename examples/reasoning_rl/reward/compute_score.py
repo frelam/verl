@@ -1,0 +1,299 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Four-domain reward dispatcher for reasoning RL (DESIGN.md section 6).
+
+Mounted without touching verl source::
+
+    reward.custom_reward_function.path=examples/reasoning_rl/reward/compute_score.py
+    reward.custom_reward_function.name=compute_score
+    # sandbox URL rides through reward_kwargs (merged into every call):
+    +reward.custom_reward_function.reward_kwargs.sandbox_fusion_url=http://<host>/run_code
+
+Routing (data_source prefix -> verifier):
+
+===================  =====================================================
+``math_*``           math_verify (``pip install math-verify``); falls back
+                     to verl's math_dapo when the package is missing
+``code_*``           sandbox_fusion when ``sandbox_fusion_url`` is set,
+                     else prime_code local execution (smoke runs only)
+``logic_*``          rule verifier: extract the final answer
+                     (<answer> tags -> \\boxed{} -> "Final Answer:" line)
+                     and compare with the ground truth after normalisation
+                     (whitespace/case folding, literal/JSON structural
+                     compare, numeric tolerance)
+``stem_*``           math_verify on the \\boxed{} answer; Dr.SCI prompts
+                     already request the boxed format
+===================  =====================================================
+
+Every branch returns ``{"score": float}`` so the naive reward manager lifts
+``score`` into ``reward_extra_info`` and DAPO ``filter_groups.metric=score``
+(plus the hard-replay pass-rate computation) works unchanged.
+
+Format gate
+-----------
+
+Before routing, every response must follow the Qwen3-4B thinking-template
+shape — one non-empty ``<think>...</think>`` block followed by a non-empty
+final response (``format_ok``). Non-compliant generations score 0 regardless
+of answer correctness, and never reach the code sandbox.
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import logging
+import math
+import re
+
+logger = logging.getLogger(__name__)
+
+_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
+_BOXED_RE = re.compile(r"\\boxed\s*\{")
+_FINAL_ANSWER_RE = re.compile(r"final answer\s*[::]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+
+# ---------------------------------------------------------------------------
+# format gate (Qwen3-4B chat template, thinking enabled)
+# ---------------------------------------------------------------------------
+
+
+def format_ok(solution_str: str) -> bool:
+    """Structural gate enforcing the Qwen3-4B thinking-template response shape.
+
+    With the default Qwen3 chat template (thinking on), the rollout prompt ends
+    with ``<|im_start|>assistant\\n`` and a compliant generation is exactly one
+    think block followed by the final response::
+
+        <think>
+        {reasoning}
+        </think>
+
+        {final response}
+
+    The naive reward manager decodes with ``skip_special_tokens=True``, so
+    ``<|im_start|>``/``<|im_end|>`` never reach this function — the template
+    contract enforceable on ``solution_str`` is the think-block shape: starts
+    with ``<think>``, exactly one closing ``</think>``, non-empty reasoning
+    (an empty block is the ``enable_thinking=False`` shortcut), a non-empty
+    final response, and no stray think tags afterwards.
+    """
+    if not solution_str.startswith("<think>"):
+        return False
+    think_body, sep, response_body = solution_str[len("<think>") :].partition("</think>")
+    if not sep:  # unterminated think block (e.g. truncated rollout)
+        return False
+    if not think_body.strip():  # "<think>\n\n</think>" == thinking disabled
+        return False
+    if not response_body.strip():
+        return False
+    return "<think>" not in response_body and "</think>" not in response_body
+
+
+# ---------------------------------------------------------------------------
+# math / stem
+# ---------------------------------------------------------------------------
+
+
+def _math_score(solution_str: str, ground_truth: str) -> float:
+    try:
+        from verl.utils.reward_score import math_verify
+
+        return float(math_verify.compute_score(solution_str, str(ground_truth)))
+    except ImportError:
+        from verl.utils.reward_score import math_dapo
+
+        # math_dapo returns {"score": ±1.0, "acc": bool, ...}; normalise to 0/1
+        # so all four domains share the same pass-rate semantics.
+        res = math_dapo.compute_score(solution_str, str(ground_truth))
+        return float(res["acc"]) if isinstance(res, dict) else float(res)
+    except Exception as e:  # never let one bad sample kill the reward pass
+        logger.warning("[reasoning_rl] math verify error: %s", e)
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# code
+# ---------------------------------------------------------------------------
+
+
+def _code_score(
+    solution_str: str, ground_truth: str, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
+) -> float:
+    try:
+        if sandbox_fusion_url:
+            from verl.utils.reward_score import sandbox_fusion
+
+            res = sandbox_fusion.compute_score(
+                sandbox_fusion_url,
+                concurrent_semaphore,
+                memory_limit_mb,
+                solution_str,
+                ground_truth,
+                continuous=True,
+            )
+        else:
+            from verl.utils.reward_score import prime_code
+
+            res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+        # Both return (score, metadata_list).
+        return float(res[0])
+    except Exception as e:
+        logger.warning("[reasoning_rl] code verify error: %s", e)
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# logic
+# ---------------------------------------------------------------------------
+
+
+def _extract_boxed(text: str) -> str | None:
+    """Return the content of the last \\boxed{...} with balanced braces."""
+    starts = [m.end() for m in _BOXED_RE.finditer(text)]
+    if not starts:
+        return None
+    i = starts[-1]
+    depth = 1
+    for j in range(i, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[i:j]
+    return None
+
+
+def extract_logic_answer(solution_str: str) -> str | None:
+    """Extract the final answer: <answer> tags, then \\boxed{}, then a
+    "Final Answer: ..." line (DESIGN.md section 1 prompt conventions)."""
+    matches = _ANSWER_TAG_RE.findall(solution_str)
+    if matches:
+        return matches[-1].strip()
+    boxed = _extract_boxed(solution_str)
+    if boxed is not None:
+        return boxed.strip()
+    tail = solution_str[-2000:]  # the final line is what matters; bound the scan
+    matches = _FINAL_ANSWER_RE.findall(tail)
+    if matches:
+        return matches[-1].strip().rstrip(".")
+    return None
+
+
+def _normalise_text(s: str) -> str:
+    s = s.strip().strip('"').strip("'")
+    s = re.sub(r"\s+", " ", s)
+    return s.casefold()
+
+
+def _parse_structured(s: str):
+    """Best-effort parse of an answer into a Python object (grids, tuples,
+    lists, numbers). Returns None when it only parses to a plain string —
+    that case is covered by text comparison instead."""
+    s = s.strip()
+    for parser in (ast.literal_eval, json.loads):
+        try:
+            obj = parser(s)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            continue
+        if not isinstance(obj, str):
+            return obj
+    return None
+
+
+def _structured_equal(a, b, tol: float = 1e-6) -> bool:
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if isinstance(a, int | float) and isinstance(b, int | float):
+        return math.isclose(float(a), float(b), rel_tol=tol, abs_tol=tol)
+    if isinstance(a, list | tuple) and isinstance(b, list | tuple):
+        return len(a) == len(b) and all(_structured_equal(x, y, tol) for x, y in zip(a, b, strict=True))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_structured_equal(a[k], b[k], tol) for k in a)
+    return _normalise_text(str(a)) == _normalise_text(str(b))
+
+
+def logic_answer_match(prediction: str | None, ground_truth: str) -> bool:
+    """Normalised comparison shared by all logic_* verifiers."""
+    if prediction is None:
+        return False
+    pred_norm = _normalise_text(prediction)
+    gt_norm = _normalise_text(ground_truth)
+    if not gt_norm:
+        return False
+    if pred_norm == gt_norm:
+        return True
+    # Numeric fast path (handles "42" vs "42.0").
+    try:
+        return math.isclose(float(pred_norm), float(gt_norm), rel_tol=1e-6, abs_tol=1e-6)
+    except (ValueError, OverflowError):
+        pass
+    # Structural path (grids / lists; SynLogic arc_agi answers are nested lists
+    # whose ground truth we serialised with json.dumps at data prep time).
+    pred_obj = _parse_structured(prediction)
+    gt_obj = _parse_structured(ground_truth)
+    if pred_obj is not None and gt_obj is not None:
+        return _structured_equal(pred_obj, gt_obj)
+    return False
+
+
+def _logic_score(solution_str: str, ground_truth: str) -> float:
+    try:
+        payload = json.loads(ground_truth)
+        answer = payload.get("answer") if isinstance(payload, dict) else payload
+    except (json.JSONDecodeError, TypeError):
+        answer = ground_truth
+    if answer is None:
+        return 0.0
+    prediction = extract_logic_answer(solution_str)
+    return 1.0 if logic_answer_match(prediction, str(answer)) else 0.0
+
+
+# ---------------------------------------------------------------------------
+# dispatcher
+# ---------------------------------------------------------------------------
+
+
+def compute_score(
+    data_source,
+    solution_str,
+    ground_truth,
+    extra_info=None,
+    sandbox_fusion_url=None,
+    concurrent_semaphore=None,
+    memory_limit_mb=None,
+    **kwargs,
+):
+    """Dispatch on the data_source prefix; always returns {"score": float}.
+
+    The format gate runs first: generations that do not follow the Qwen3-4B
+    thinking-template shape (see format_ok) score 0 without calling the
+    domain verifier — this also keeps malformed code out of the sandbox.
+    Unknown data_sources still raise once the response is format-compliant,
+    so config errors surface instead of being silently zeroed.
+    """
+    if not format_ok(solution_str):
+        return {"score": 0.0}
+    if data_source.startswith("math"):
+        score = _math_score(solution_str, ground_truth)
+    elif data_source.startswith("code"):
+        score = _code_score(solution_str, ground_truth, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb)
+    elif data_source.startswith("logic"):
+        score = _logic_score(solution_str, ground_truth)
+    elif data_source.startswith("stem"):
+        score = _math_score(solution_str, ground_truth)
+    else:
+        raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+    return {"score": float(score)}
