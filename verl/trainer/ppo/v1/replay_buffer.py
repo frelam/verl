@@ -175,6 +175,12 @@ class ReplayBuffer:
         self.failure_keys: dict[str, set] = defaultdict(set)
         # partition_id => {prompt_key: global_steps}, used to prioritize older samples.
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
+        # partition_id => {prompt_key: oldest weight version that generated any trajectory of the
+        # group}. Built from per-trajectory ``min_global_steps`` tags stamped by the rollout server
+        # at generation time. Under Laminar-style lazy per-replica weight pulls this is the only
+        # correct staleness signal: the dispatch step above says nothing about the (possibly stale)
+        # replica version that actually produced the tokens.
+        self.trajectory_min_versions: dict[str, dict[str, int]] = defaultdict(dict)
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
 
@@ -193,6 +199,7 @@ class ReplayBuffer:
         self.finished_keys.clear()
         self.failure_keys.clear()
         self.prompt_global_steps.clear()
+        self.trajectory_min_versions.clear()
 
         data = tq.kv_list()
         if data is None:
@@ -220,10 +227,36 @@ class ReplayBuffer:
                     if key not in partition:
                         partition[key] = {}
                     partition[key].update(tag)
+                    # Track the oldest generating weight version per group (see
+                    # ``trajectory_min_versions``). ``None`` means the producing server
+                    # did not stamp a version; those groups fall back to dispatch-step
+                    # staleness in ``_staleness_span``.
+                    min_version = tag.get("min_global_steps")
+                    if min_version is not None:
+                        uid = key.split("_")[0]
+                        versions = self.trajectory_min_versions[partition_id]
+                        if uid not in versions or min_version < versions[uid]:
+                            versions[uid] = min_version
 
     @staticmethod
     def _metrics_prefix(partition_id: str) -> str:
         return "training" if partition_id == "train" else "validation"
+
+    def _staleness_span(self, partition_id: str, uid: str, global_steps: int) -> int:
+        """Model-version span of a prompt group relative to ``global_steps``.
+
+        The span is measured from the oldest weight version that generated any of the
+        group's trajectories (the ``min_global_steps`` tag stamped by the rollout
+        server). Groups without version stamps (e.g. produced by an unversioned rollout
+        path) fall back to the prompt's dispatch step; a group with neither is treated
+        as fresh (span 1).
+        """
+        version = self.trajectory_min_versions[partition_id].get(uid)
+        if version is None:
+            version = self.prompt_global_steps[partition_id].get(uid)
+        if version is None:
+            return 1
+        return global_steps - version + 1
 
     def _clear_groups(self, partition_id: str, uids: set[str]) -> None:
         """Remove prompt groups from TransferQueue and the active metadata snapshot."""
@@ -243,6 +276,7 @@ class ReplayBuffer:
             status_keys[partition_id].difference_update(uids)
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
+            self.trajectory_min_versions[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
@@ -340,9 +374,8 @@ class ReplayBuffer:
         prefix = self._metrics_prefix(partition_id)
         metrics: dict = {}
         if stale_uids:
-            prompt_global_steps = self.prompt_global_steps[partition_id]
             spans = np.array(
-                [global_steps - prompt_global_steps.get(uid, global_steps) + 1 for uid in stale_uids],
+                [self._staleness_span(partition_id, uid, global_steps) for uid in stale_uids],
                 dtype=float,
             )
             metrics.update(
@@ -503,12 +536,11 @@ class ReplayBufferAsync(ReplayBuffer):
     def _stale_terminal_keys(self, global_steps: int, partition_id: str) -> set[str]:
         if partition_id == "val" or self.max_off_policy_strategy != "drop":
             return set()
-        prompt_global_steps = self.prompt_global_steps[partition_id]
         terminal_keys = self.finished_keys[partition_id]
         return {
             uid
             for uid in terminal_keys
-            if global_steps - prompt_global_steps.get(uid, global_steps) + 1 > self.max_off_policy_threshold
+            if self._staleness_span(partition_id, uid, global_steps) > self.max_off_policy_threshold
         }
 
     def _terminal_eviction_reasons(
@@ -560,7 +592,7 @@ class ReplayBufferAsync(ReplayBuffer):
 
             sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
             if self._has_enough_samples(global_steps, partition_id, batch_size, sampleable_keys):
-                selected_prompt_uids, partition_snapshot, prompt_global_steps_snapshot = self._select_prompt_uids(
+                selected_prompt_uids, partition_snapshot, _ = self._select_prompt_uids(
                     partition_id, sampleable_keys, batch_size
                 )
                 break
@@ -568,9 +600,7 @@ class ReplayBufferAsync(ReplayBuffer):
             last_debug_time = self._wait_for_next_poll(partition_id, last_debug_time)
 
         if partition_id != "val" and self.max_off_policy_strategy == "drop":
-            selected_spans = [
-                global_steps - prompt_global_steps_snapshot.get(uid, global_steps) + 1 for uid in selected_prompt_uids
-            ]
+            selected_spans = [self._staleness_span(partition_id, uid, global_steps) for uid in selected_prompt_uids]
             assert all(span <= self.max_off_policy_threshold for span in selected_spans), (
                 f"drop strategy selected stale prompts: spans={selected_spans}, "
                 f"threshold={self.max_off_policy_threshold}"

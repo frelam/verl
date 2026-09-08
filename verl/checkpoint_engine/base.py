@@ -18,6 +18,7 @@ from typing import Any, AsyncGenerator, Generator
 
 import ray
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
@@ -535,6 +536,62 @@ class CheckpointEngineManager:
         # 8. resume all unfinished requests for partial rollout
         await self.resume_generation_replicas()
 
+        return sync_metrics
+
+    @auto_await
+    async def publish_weights(self, global_steps: int) -> dict:
+        """Publish trainer weights of ``global_steps`` to the weight store (Laminar-style).
+
+        Unlike :meth:`update_weights`, this never touches rollout replicas -- no abort, no
+        rendezvous, no kv-cache release. It only:
+
+        1. (once) assigns key-namespace ranks to actor workers via ``init_process_group``;
+        2. drives every actor rank to write its parameter buckets into the store;
+        3. commits the generation in the driver (version manifest + ``latest`` pointer),
+           which is the atomic point after which replicas may pull this version.
+
+        Returns:
+            Weight-sync metrics merged from actor workers plus store GC stats.
+        """
+        assert self.backend == "mooncake_store", (
+            f"publish_weights requires checkpoint_engine.backend='mooncake_store', got {self.backend!r}"
+        )
+        from verl.checkpoint_engine.store_checkpoint_engine import (
+            commit_version,
+            get_or_create_client,
+        )
+
+        # 1. one-time rank assignment on the actor worker group
+        if not getattr(self, "_publish_group_initialized", False):
+            actor_wg_kwargs, _ = self.backend_cls.build_topology(self.actor_wg.world_size, 0, [])
+            for k, v in actor_wg_kwargs.items():
+                assert len(v) == self.actor_wg.world_size, (
+                    f"actor_wg_kwargs[{k}] must have length of {self.actor_wg.world_size}"
+                )
+            actor_wg_kwargs["method"] = ["init_process_group"] * self.actor_wg.world_size
+            ray.get(self.actor_wg.execute_checkpoint_engine(**actor_wg_kwargs))
+            self._publish_group_initialized = True
+
+        # 2. all actor ranks write their buckets (ray.get = all-ranks barrier)
+        results = ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode=self.backend))
+        sync_metrics: dict = {}
+        for result in results if isinstance(results, list) else [results]:
+            if isinstance(result, dict):
+                sync_metrics.update(result)
+
+        # 3. driver-side commit (atomic `latest` pointer bump) + GC of old generations
+        engine_kwargs = dict(getattr(self.config, "engine_kwargs", None) or {}).get(self.backend, {})
+        if isinstance(engine_kwargs, DictConfig):
+            engine_kwargs = OmegaConf.to_container(engine_kwargs, resolve=True)
+        engine_kwargs = dict(engine_kwargs)
+        store_backend = engine_kwargs.pop("store_backend", "mooncake")
+        keep_versions = engine_kwargs.pop("keep_versions", 2)
+        key_prefix = engine_kwargs.pop("key_prefix", "verl/weights")
+        client = get_or_create_client(store_backend, engine_kwargs)
+        sync_metrics.update(
+            commit_version(client, key_prefix, version=global_steps, num_ranks=self.actor_wg.world_size,
+                           keep_versions=keep_versions)
+        )
         return sync_metrics
 
 

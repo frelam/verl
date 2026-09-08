@@ -286,6 +286,25 @@ class RolloutReplica(ABC):
         """Release only the kv_cache GPU memory, keeping model weights in place."""
         await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
+    async def pull_weights(self, version: int | None = None):
+        """Pull weights of ``version`` from the weight store and load them into the engine.
+
+        Laminar drain-based weight update (https://arxiv.org/abs/2510.12633): must only be
+        called when the replica has no in-flight requests -- the pull path never aborts
+        ongoing generation. Each checkpoint-engine worker of this replica independently
+        reads the pinned (or latest committed) version from the store and hands the tensors
+        to its server adapter (cuda-ipc load), then stamps the server with the version.
+
+        Args:
+            version: Weight version to pull; ``None`` pulls the latest committed version.
+        """
+        from verl.checkpoint_engine.base import _worker_cls
+
+        rollout = RayWorkerGroup(
+            worker_handles=list(self.workers), ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls)
+        )
+        await asyncio.to_thread(ray.get, rollout.update_weights(global_steps=version))
+
     async def resume_kv_cache(self):
         """Restore the kv_cache GPU memory after a weight sync."""
         await asyncio.gather(*[server.resume_kv_cache.remote() for server in self.servers])

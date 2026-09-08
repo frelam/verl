@@ -64,6 +64,10 @@ class GlobalRequestLoadBalancer:
       same request always routes to the same replica across runs.
     - **Dynamic Server Management**: Supports add/remove servers at runtime
       for hybrid scaling.
+    - **Draining (Laminar-style weight updates)**: Servers marked as draining keep
+      serving sticky (already-routed) requests but receive no *new* requests, so a
+      replica can finish its in-flight trajectories before pulling newer weights.
+      With no draining servers marked, routing is identical to before.
     """
 
     def __init__(
@@ -79,9 +83,14 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
+        self._draining: set[str] = set()
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
+
+        Sticky sessions are honored even for draining servers (conversation
+        continuity); brand-new requests prefer non-draining servers and only fall
+        back to draining ones when no non-draining server is available.
 
         Returns:
             A tuple of ``(server_id, actor_handle)`` in a single atomic call.
@@ -106,8 +115,14 @@ class GlobalRequestLoadBalancer:
             # which varies run-to-run, so it is bypassed entirely here.
             server_id = list(self._servers)[hash(request_id) % len(self._servers)]
         else:
-            min_count = min(self._inflight_requests.values())
-            candidates = [sid for sid, count in self._inflight_requests.items() if count == min_count]
+            # Draining servers must finish their in-flight work (e.g. before a weight
+            # pull), so new requests go to non-draining servers first. If every server
+            # is draining, fall back to least-loaded overall to keep dispatch alive.
+            pool = {sid: c for sid, c in self._inflight_requests.items() if sid not in self._draining}
+            if not pool:
+                pool = self._inflight_requests
+            min_count = min(pool.values())
+            candidates = [sid for sid, count in pool.items() if count == min_count]
             server_id = candidates[0]
         self._request_id_to_server[request_id] = server_id
         self._inflight_requests[server_id] += 1
@@ -151,6 +166,49 @@ class GlobalRequestLoadBalancer:
     def get_inflight_count(self, server_id: str) -> int:
         """Get number of in-flight requests for a server."""
         return self._inflight_requests.get(server_id, 0)
+
+    def get_all_inflight_counts(self) -> dict[str, int]:
+        """Get a snapshot of per-server in-flight request counts."""
+        return dict(self._inflight_requests)
+
+    def set_draining(self, server_ids: list[str], draining: bool = True) -> None:
+        """Mark/unmark servers as draining.
+
+        Draining servers keep serving sticky (already-routed) requests but receive
+        no new requests, so their in-flight count can drain to zero (e.g. before a
+        Laminar-style weight pull). Unknown server ids are ignored.
+        """
+        for sid in server_ids:
+            if sid not in self._inflight_requests:
+                continue
+            if draining:
+                self._draining.add(sid)
+            else:
+                self._draining.discard(sid)
+
+    def get_draining_servers(self) -> list[str]:
+        """Get the list of servers currently marked as draining."""
+        return sorted(self._draining)
+
+    def clear_sticky_for_server(self, server_id: str) -> int:
+        """Drop every sticky-session entry pointing at ``server_id``.
+
+        Used by Laminar-style in-flight trajectory migration: after the entries are
+        dropped, requests aborted on ``server_id`` re-acquire through the normal
+        least-loaded path (preferring non-draining servers) instead of stickying back
+        to the server that is trying to drain.
+
+        Returns:
+            Number of sticky entries dropped.
+        """
+        victims = [rid for rid, sid in self._request_id_to_server.items() if sid == server_id]
+        for rid in victims:
+            del self._request_id_to_server[rid]
+        if victims:
+            logger.info(
+                f"[GlobalLoadBalancer] cleared {len(victims)} sticky sessions on {server_id} for migration"
+            )
+        return len(victims)
 
     def get_all_servers(self) -> list[str]:
         """Get list of all active server IDs."""

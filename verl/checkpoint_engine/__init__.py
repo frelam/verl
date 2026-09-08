@@ -71,3 +71,9 @@ try:
     __all__ += ["DeltaShardedCheckpointEngine"]
 except ImportError:
     DeltaShardedCheckpointEngine = None
+
+# The store engine has no hard third-party dependency (mooncake is imported lazily only
+# when the MooncakeWeightStore client is instantiated), so register it unconditionally.
+from .store_checkpoint_engine import StoreCheckpointEngine
+
+__all__ += ["StoreCheckpointEngine"]

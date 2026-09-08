@@ -338,7 +338,11 @@ actor_rollout_ref:
       _target_: verl.workers.config.CheckpointEngineConfig
       backend: naive
       update_weights_bucket_megabytes: 2048
-      engine_kwargs: {}
+      engine_kwargs:
+        mooncake_store:
+          store_backend: mooncake
+          keep_versions: 2
+          key_prefix: verl/weights
       custom_backend_module: null
     trace:
       _target_: verl.workers.config.TraceConfig
@@ -932,6 +936,14 @@ trainer:
     separate_async:
       num_warmup_batches: 1
       parameter_sync_step: 4
+    laminar_async:
+      num_warmup_batches: 1
+      parameter_sync_step: 1
+      poll_interval_seconds: 1.0
+      max_concurrent_pulls: 4
+      drain_timeout_seconds: 600.0
+      init_pull_timeout_seconds: 3600.0
+      max_inflight_prompts: null
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop

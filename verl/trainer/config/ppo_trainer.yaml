@@ -224,7 +224,7 @@ trainer:
   # V1 trainer mode configs
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async"
+    # Trainer mode: "sync", "colocate_async", "separate_async", "laminar_async"
     trainer_mode: sync
 
     # Synchronous PPO trainer
@@ -244,6 +244,40 @@ trainer:
 
       # Frequency of parameter synchronization between trainer and rollout
       parameter_sync_step: 4
+
+    # Asynchronous PPO trainer with Laminar-style trajectory-level asynchrony
+    # (https://arxiv.org/abs/2510.12633): publish/pull weight service with per-replica
+    # drain-based weight updates and no global weight-sync point. Requires
+    # actor_rollout_ref.rollout.checkpoint_engine.backend=mooncake_store.
+    laminar_async:
+
+      # Number of warmup batches to add before training loop starts
+      num_warmup_batches: 1
+
+      # Weights are published every trainer step; decoupled-PPO parameter_sync_step
+      # semantics do not apply and this must stay 1.
+      parameter_sync_step: 1
+
+      # Control-loop interval (seconds) of the rollout manager's drain detection
+      poll_interval_seconds: 1.0
+
+      # Maximum number of replicas pulling weights from the store concurrently
+      max_concurrent_pulls: 4
+
+      # Seconds a draining replica may keep in-flight work before its remaining
+      # requests are aborted and migrated to other replicas, resuming with a
+      # duplicate prefill (simplified dynamic repack without KV-cache transfer).
+      # 0 disables migration: replicas always drain naturally.
+      drain_timeout_seconds: 600.0
+
+      # Timeout (seconds) for the initial all-replica weight-pull barrier at startup
+      init_pull_timeout_seconds: 3600.0
+
+      # Maximum number of in-flight prompt groups (pending + running) before the
+      # per-step prompt dispatch pauses. Bounds version skew and short-sample bias:
+      # in-flight sample count = prompts x rollout.n. Must be >=
+      # data.train_batch_size when set; null disables the cap.
+      max_inflight_prompts: null
 
     # Replay buffer sampling strategy
     sampler:

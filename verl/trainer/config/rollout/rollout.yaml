@@ -292,7 +292,22 @@ checkpoint_engine:
   update_weights_bucket_megabytes: 2048
 
   # Additional keyword arguments to pass to the checkpoint engine constructor
-  engine_kwargs: {}
+  engine_kwargs:
+
+    # Keyword arguments for backend=mooncake_store (Laminar-style publish/pull weight
+    # store, see verl/checkpoint_engine/store_checkpoint_engine.py). Remaining unknown
+    # keys are forwarded to the store client constructor.
+    mooncake_store:
+
+      # Store client implementation: "mooncake" (Mooncake master service) or
+      # "in_memory" (single-process, tests only)
+      store_backend: mooncake
+
+      # Number of committed weight versions to retain before garbage collection
+      keep_versions: 2
+
+      # Key namespace prefix for all weight buckets and version manifests
+      key_prefix: verl/weights
 
   # If set, this Python module is imported on every worker process before the
   # backend is instantiated, allowing custom backends to register themselves
