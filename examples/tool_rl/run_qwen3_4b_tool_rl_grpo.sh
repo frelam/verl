@@ -116,7 +116,7 @@ ref_kl_coef=${REF_KL_COEF:-0.001}
 ref_kl_type=${REF_KL_TYPE:-low_var_kl}
 
 # Cov-KL entropy control (mutually exclusive with bypass_mode, see header)
-cov_kl_ratio=${TOOL_RL_COV_KL_RATIO:-0.0002}
+cov_kl_ratio=${TOOL_RL_COV_KL_RATIO:-0.002}
 ppo_kl_coef=${TOOL_RL_PPO_KL_COEF:-1.0}
 # 1 => keep the original bypass path (no Cov-KL); 0 (default) => Cov-KL
 use_bypass=${TOOL_RL_BYPASS_MODE:-0}
@@ -128,6 +128,9 @@ rollout_n=${ROLLOUT_N:-16}
 total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:-20}
 test_freq=${TEST_FREQ:-5}
+# Number of decoded validation samples (prompt+response+score) logged as a
+# table to the configured logger every test_freq steps, for human monitoring.
+log_val_generations=${LOG_VAL_GENERATIONS:-10}
 
 # V1 trainer + DAPO group filtering (drop all-zero / all-one reward groups).
 # Filtering requires the V1 trainer; disable filtering only if you also set
@@ -156,6 +159,7 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_tool_rl_grpo_vllm_fsdp_$(date +%Y%m%
 # the reward function reads this at compute time, so exporting it before
 # launching the trainer is sufficient.
 export TOOL_RL_ABSTAIN_MODE=${TOOL_RL_ABSTAIN_MODE:-keyword}
+export TOOL_RL_REWARD_WEIGHTS=${TOOL_RL_REWARD_WEIGHTS:-'{"tool_correctness":0.75,"format":0.15,"tool_call":0.15}'}
 
 DATA=(
     algorithm.adv_estimator=grpo
@@ -248,6 +252,7 @@ TRAINER=(
     trainer.val_before_train=True
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
+    trainer.log_val_generations=${log_val_generations}
     trainer.total_epochs=${total_epochs}
 )
 
