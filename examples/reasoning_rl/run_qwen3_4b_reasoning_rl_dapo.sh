@@ -30,6 +30,12 @@
 #   REASONING_RL_REPLAY_MEDIUM_INTERVAL=10 / REASONING_RL_REPLAY_HARD_INTERVAL=20
 #   REASONING_RL_REPLAY_MAX=0            give up on a pooled sample after this many
 #                                        replays (0 = replay forever)
+#   REASONING_RL_SYSTEM_PROMPT=          prepend this system message to every
+#                                        train/val prompt at dataset level (e.g. a
+#                                        max-reasoning-effort instruction). Empty
+#                                        (default) = off, so the same data + code
+#                                        trains both effort modes. Keep the text
+#                                        free of double quotes (Hydra quoting).
 #   SANDBOX_FUSION_URL=                  sandbox-fusion endpoint for code rewards,
 #                                        e.g. http://<host>/run_code. REQUIRED for real
 #                                        training runs with code data (DESIGN.md section 6);
@@ -69,7 +75,7 @@ clip_ratio_high=${CLIP_RATIO_HIGH:-0.4}
 # kl_cov (PRIME-RL): applies a KL penalty to the top-(kl_cov_ratio) tokens with the
 # largest covariance between advantages and log-probs, preventing entropy collapse.
 # ppo_kl_coef is the strength of that KL penalty; raise it if entropy collapses early.
-kl_cov_ratio=${KL_COV_RATIO:-0.0002}
+kl_cov_ratio=${KL_COV_RATIO:-0.0005}
 kl_cov_coef=${KL_COV_COEF:-0.1}
 
 rollout_tp=${ROLLOUT_TP:-1}
@@ -89,6 +95,10 @@ replay_max=${REASONING_RL_REPLAY_MAX:-0}
 replay_max_fraction=${REASONING_RL_REPLAY_MAX_FRACTION:-0.2}
 replay_medium_interval=${REASONING_RL_REPLAY_MEDIUM_INTERVAL:-10}
 replay_hard_interval=${REASONING_RL_REPLAY_HARD_INTERVAL:-20}
+
+# Optional system prompt injected into every train/val prompt (dataset level).
+# Empty (default) leaves prompts untouched.
+system_prompt=${REASONING_RL_SYSTEM_PROMPT:-}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -185,6 +195,17 @@ TRAINER=(
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
 )
+
+# System prompt injection (ReasoningRLDataset prepends it to every prompt at
+# load time; orthogonal to hard replay). The dataset is constructed inside the
+# remote TaskRunner, so the value must ride the Ray runtime env to reach it —
+# same mechanism as the replay toggles below.
+if [ -n "$system_prompt" ]; then
+    export REASONING_RL_SYSTEM_PROMPT="$system_prompt"
+    DATA+=(
+        "+ray_kwargs.ray_init.runtime_env.env_vars.REASONING_RL_SYSTEM_PROMPT=\"$system_prompt\""
+    )
+fi
 
 # Tiered hard-sample replay: the custom sampler owns DAPO filtering (uniform
 # reward groups are dropped and refilled) AND exports low-pass-rate groups to
