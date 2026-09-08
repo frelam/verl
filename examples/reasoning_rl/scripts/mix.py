@@ -14,7 +14,9 @@
 """
 Stratified domain mixing for reasoning RL (DESIGN.md section 5).
 
-v1 ratios: math 45% / code 25% / logic 15% / STEM 15%.
+v1 ratios: math 45% / code 25% / logic 15% / STEM 15%.  Pass --if_ratio to
+optionally blend in the instruction-following domain mid-training (e.g.
+--if_ratio 0.10 rescales the others to 90% of their base shares).
 
 Reads the per-domain parquets produced by to_parquet_{math,code,logic,stem}.py,
 samples each domain to its share (without replacement when the pool is large
@@ -38,12 +40,17 @@ from collections import Counter
 
 import datasets
 
+# Default v1 ratios (math 45% / code 25% / logic 15% / STEM 15%).  When the
+# 'if' domain is enabled (e.g. mid-training stage), pass --if_ratio to carve
+# out a share for instruction-following; the remaining domains are scaled
+# proportionally so the total stays 1.0.
 DOMAIN_RATIOS = {"math": 0.45, "code": 0.25, "logic": 0.15, "stem": 0.15}
 DOMAIN_FILES = {
     "math": "math/train_math.parquet",
     "code": "code/train_code.parquet",
     "logic": "logic/train_logic.parquet",
     "stem": "stem/train_stem.parquet",
+    "if": "if/train_if.parquet",
 }
 
 
@@ -72,8 +79,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_dir", default="~/data/reasoning_rl")
     parser.add_argument("--output_dir", default="~/data/reasoning_rl/final")
-    for domain in DOMAIN_RATIOS:
-        parser.add_argument(f"--{domain}_path", default=None, help="Override parquet path for this domain.")
+    for domain in DOMAIN_FILES:
+        parser.add_argument(f"--{domain}_path", default=None, help=f"Override parquet path for {domain}.")
+    parser.add_argument(
+        "--if_ratio",
+        type=float,
+        default=0.0,
+        help="Share of the mix reserved for the instruction-following domain (0 = disabled). "
+        "The remaining domains are scaled proportionally to keep the total at 1.0. "
+        "Example: --if_ratio 0.10 with the default v1 ratios yields "
+        "math 0.405 / code 0.225 / logic 0.135 / stem 0.135 / if 0.10.",
+    )
     parser.add_argument(
         "--total_size",
         type=int,
@@ -90,7 +106,22 @@ if __name__ == "__main__":
     output_dir = os.path.expanduser(args.output_dir)
     rng = random.Random(args.seed)
 
-    pools = {d: load_domain(input_dir, d, getattr(args, f"{d}_path")) for d in DOMAIN_RATIOS}
+    # Build the effective domain ratio map.  When if_ratio > 0 we add the 'if'
+    # domain and rescale the base ratios so the total remains 1.0.
+    base_ratios = dict(DOMAIN_RATIOS)
+    if args.if_ratio > 0:
+        if not (0.0 < args.if_ratio < 1.0):
+            raise ValueError(f"--if_ratio must be in (0, 1), got {args.if_ratio}")
+        scale = 1.0 - args.if_ratio
+        ratios = {d: r * scale for d, r in base_ratios.items()}
+        ratios["if"] = args.if_ratio
+    else:
+        ratios = base_ratios
+
+    pools = {}
+    for d in ratios:
+        path_override = getattr(args, f"{d}_path", None)
+        pools[d] = load_domain(input_dir, d, path_override)
     for d, rows in pools.items():
         if not rows:
             raise ValueError(f"domain {d!r} is empty; run its to_parquet script first")
@@ -99,7 +130,7 @@ if __name__ == "__main__":
     val_rows = []
     if args.val_size > 0:
         for d, rows in pools.items():
-            n_val = max(1, int(args.val_size * DOMAIN_RATIOS[d]))
+            n_val = max(1, int(args.val_size * ratios[d]))
             n_val = min(n_val, len(rows) // 10)  # never take more than 10% of a domain
             taken = rng.sample(rows, n_val)
             taken_ids = {id(r) for r in taken}
@@ -111,11 +142,11 @@ if __name__ == "__main__":
     else:
         # Largest total fillable without replacement: min over domains of
         # pool_size / ratio.
-        total = int(min(len(pools[d]) / DOMAIN_RATIOS[d] for d in DOMAIN_RATIOS))
+        total = int(min(len(pools[d]) / ratios[d] for d in ratios))
 
     train_rows = []
     for d, rows in pools.items():
-        target = int(total * DOMAIN_RATIOS[d])
+        target = int(total * ratios[d])
         train_rows.extend(stratified_take(rng, rows, target, d))
 
     rng.shuffle(train_rows)
@@ -140,7 +171,7 @@ if __name__ == "__main__":
         "total_train": len(train_rows),
         "total_val": len(val_rows),
         "seed": args.seed,
-        "ratios": DOMAIN_RATIOS,
+        "ratios": ratios,
         "train_by_ability": dict(Counter(r["ability"] for r in train_rows)),
         "train_by_source": dict(Counter(r["extra_info"]["source"] for r in train_rows)),
         "val_by_ability": dict(Counter(r["ability"] for r in val_rows)),

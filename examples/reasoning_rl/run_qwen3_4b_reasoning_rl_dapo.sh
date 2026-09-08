@@ -8,6 +8,12 @@
 #   python examples/reasoning_rl/scripts/to_parquet_stem.py  --local_save_dir $DATA_DIR_RAW/stem
 #   python examples/reasoning_rl/scripts/mix.py --input_dir $DATA_DIR_RAW -o $DATA_DIR/train.parquet
 #
+# Mid-training instruction-following blend (Nemotron-RL-instruction_following):
+#   python examples/reasoning_rl/scripts/to_parquet_if.py --local_save_dir $DATA_DIR_RAW/if
+#   python examples/reasoning_rl/scripts/mix.py --input_dir $DATA_DIR_RAW \
+#       --if_ratio 0.10 --output_dir $DATA_DIR_IF
+# then resume pointing at the new mix (see TRAIN_FILES / VAL_FILES below).
+#
 # DAPO switches (DESIGN.md section 8):
 #   - clip-higher (clip_ratio_high=0.4)              ON  (keeps low-prob exploration tokens)
 #   - dynamic sampling / filter_groups (metric=score) ON  (owned by the hard-replay sampler)
@@ -50,8 +56,21 @@ NNODES=${NNODES:-1}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final}
-train_files="['$DATA_DIR/train.parquet']"
-val_files="['$DATA_DIR/val.parquet']"
+# Data-file hot-swap seam for mid-training dataset changes (e.g. injecting the
+# instruction-following domain).  Defaults come from DATA_DIR; override
+# TRAIN_FILES / VAL_FILES with a Hydra-style list to point a resumed run at a
+# freshly-mixed parquet WITHOUT moving DATA_DIR:
+#   TRAIN_FILES="['$HOME/data/reasoning_rl/final_if/train.parquet']" \
+#   VAL_FILES="['$HOME/data/reasoning_rl/final_if/val.parquet']" \
+#   RESUME_MODE=resume_path RESUME_PATH=<ckpt_dir> bash run_qwen3_4b_reasoning_rl_dapo.sh
+train_files=${TRAIN_FILES:-"['$DATA_DIR/train.parquet']"}
+val_files=${VAL_FILES:-"['$DATA_DIR/val.parquet']"}
+
+# Resume knobs for the mid-training hand-off.  Leave RESUME_MODE unset for a
+# fresh run; set resume_path + RESUME_PATH to continue from a checkpoint with
+# the new data mix.
+RESUME_MODE=${RESUME_MODE:-}
+RESUME_PATH=${RESUME_PATH:-}
 
 train_batch_size=${TRAIN_BATCH_SIZE:-256}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
@@ -195,6 +214,18 @@ TRAINER=(
     trainer.test_freq=${test_freq}
     trainer.total_epochs=${total_epochs}
 )
+
+# Mid-training resume: continue from a checkpoint with the new data mix.
+if [ -n "$RESUME_MODE" ]; then
+    TRAINER+=(
+        trainer.resume_mode=${RESUME_MODE}
+    )
+    if [ -n "$RESUME_PATH" ]; then
+        TRAINER+=(
+            trainer.resume_from_path=${RESUME_PATH}
+        )
+    fi
+fi
 
 # System prompt injection (ReasoningRLDataset prepends it to every prompt at
 # load time; orthogonal to hard replay). The dataset is constructed inside the

@@ -25,6 +25,7 @@ Step 1  数学域转换   to_parquet_math.py   → train_math.parquet
 Step 2  代码域转换   to_parquet_code.py   → train_code.parquet
 Step 3  逻辑域转换   to_parquet_logic.py  → train_logic.parquet (+ eval_seeds.json)
 Step 4  STEM 域转换  to_parquet_stem.py   → train_stem.parquet
+Step 4b IF 域转换   to_parquet_if.py     → train_if.parquet  (可选，训练中程注入)
 Step 5  验证集准备   (手动下载/整理)       → val/*.parquet|jsonl
 Step 6  去污染       decontaminate.py     → *.decontaminated.parquet + 审计 CSV + report.json
 Step 7  难度预筛     difficulty_tag.py    → *_tagged.parquet (extra_info.pass_rate 回写)
@@ -147,6 +148,44 @@ python3 examples/reasoning_rl/scripts/to_parquet_stem.py \
   或在 Step 8 由 mix.py 按比例采样（推荐后者，池子大不影响）。
 - **产出**：`train_stem.parquet`；prompt 自带 `\boxed{}` 指令，原样保留。
 
+## 6b. 指令遵循域（训练中程注入，可选）
+
+`nvidia/Nemotron-RL-instruction_following`（约 4.6 万条，WildChat-1M 提示 +
+Open-Instruct / IFBench 可验证约束，最多 5 条/样本）。该域设计为**训练中程混入**，
+不参与首发 v1 配比，跑一段时间 reasoning 后按比例注入提升精确指令遵循。
+
+```bash
+python3 examples/reasoning_rl/scripts/to_parquet_if.py \
+    --local_save_dir ~/data/reasoning_rl/if
+```
+
+- **自动下载**：`nvidia/Nemotron-RL-instruction_following`（`--if_path` 可指本地
+  jsonl/parquet 镜像）。
+- **schema 兼容**：loader 同时容忍三种约束写法——平行列表
+  （`instruction_id_list=[...]` + `kwargs=[...]`）、约束字典列表、以及 kwargs 为
+  JSON 字符串；`prompt` 可为 chat 消息列表或纯字符串。空 prompt / 无约束样本自动跳过。
+- **ground_truth**：非单一答案，而是 `{"constraints": [{"id","kwargs"}, ...]}` JSON；
+  reward 侧逐条校验，全部满足才给 1.0（NeMo-Gym 约定）。
+- **产出**：`train_if.parquet`（`data_source=if_nemotron`、`ability=if`、`domain=if`）。
+
+混合时按比例注入（`--if_ratio` 默认 0 = 关闭；其余域按比例缩放到 1.0）：
+
+```bash
+python3 examples/reasoning_rl/scripts/mix.py \
+    --input_dir ~/data/reasoning_rl \
+    --output_dir ~/data/reasoning_rl/final_if \
+    --if_ratio 0.10   # math 0.405 / code 0.225 / logic 0.135 / stem 0.135 / if 0.10
+```
+
+**中程接续训练**（不动 DATA_DIR，直接指向新 mix）：
+
+```bash
+TRAIN_FILES="['$HOME/data/reasoning_rl/final_if/train.parquet']" \
+VAL_FILES="['$HOME/data/reasoning_rl/final_if/val.parquet']" \
+RESUME_MODE=resume_path RESUME_PATH=<checkpoint_dir> \
+bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
+```
+
 ## 7. Step 7/8：难度预筛与混合配比
 
 pass@k 预筛（DESIGN.md §4，可选但推荐；需要 GPU + vLLM）：
@@ -196,10 +235,10 @@ bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `data_source` | str | `{domain}_{dataset}`：`math_bigmath` / `math_dapo` / `code_deepcoder` / `code_codecontests` / `code_apps` / `logic_synlogic` / `logic_enigmata` / `logic_reasoning_gym` / `stem_drsci` |
+| `data_source` | str | `{domain}_{dataset}`：`math_bigmath` / `math_dapo` / `code_deepcoder` / `code_codecontests` / `code_apps` / `logic_synlogic` / `logic_enigmata` / `logic_reasoning_gym` / `stem_drsci` / `if_nemotron` |
 | `prompt` | list[dict] | `[{"role": "user", "content": ...}]`，单轮 |
-| `ability` | str | `math` / `code` / `logic` / `stem` |
-| `reward_model` | dict | `{"style": "rule", "ground_truth": ...}`；数学/STEM 为答案字符串，代码为 `{"inputs","outputs"(,"fn_name")}` JSON，逻辑为 `{"answer","task"}` JSON |
+| `ability` | str | `math` / `code` / `logic` / `stem` / `if` |
+| `reward_model` | dict | `{"style": "rule", "ground_truth": ...}`；数学/STEM 为答案字符串，代码为 `{"inputs","outputs"(,"fn_name")}` JSON，逻辑为 `{"answer","task"}` JSON，IF 为 `{"constraints":[{"id","kwargs"}]}` JSON |
 | `extra_info` | dict | 键固定：`split(str)` `index(int)` `task_id(str)` `domain(str)` `source(str)` `difficulty(str)` `prior_solve_rate(float)` `seed(int,-1=无)`；`difficulty_tag.py` 追加 `pass_rate(float)`（mix.py 对未打标池自动补 -1.0） |
 
 **关键约束**：

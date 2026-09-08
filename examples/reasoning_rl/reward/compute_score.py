@@ -34,6 +34,11 @@ Routing (data_source prefix -> verifier):
                      compare, numeric tolerance)
 ``stem_*``           math_verify on the \\boxed{} answer; Dr.SCI prompts
                      already request the boxed format
+``if_*``             instruction-following (Nemotron-RL-instruction_following):
+                     re-check every constraint in ground_truth against the
+                     model response; reward 1.0 iff ALL pass (NeMo-Gym
+                     convention).  Only the final (post-</think>) response is
+                     verified — the think block is internal reasoning.
 ===================  =====================================================
 
 Every branch returns ``{"score": float}`` so the naive reward manager lifts
@@ -262,6 +267,58 @@ def _logic_score(solution_str: str, ground_truth: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# instruction-following (Nemotron-RL-instruction_following)
+# ---------------------------------------------------------------------------
+
+
+def _extract_final_response(solution_str: str) -> str:
+    """Return the user-facing response body (everything after </think>).
+
+    The format gate already guaranteed a single closed think block, so this
+    partition always succeeds.  Constraints apply to the visible answer only,
+    not to internal reasoning.
+    """
+    _, _, body = solution_str.partition("</think>")
+    return body.strip()
+
+
+def _if_score(solution_str: str, ground_truth: str) -> float:
+    """Verify the final response against the IF constraint list.
+
+    ground_truth is the JSON string written by to_parquet_if.py:
+      {"constraints": [{"id": "<category>:<type>", "kwargs": {...}}, ...]}
+    """
+    try:
+        from examples.reasoning_rl.reward.if_verifier import verify_instructions
+    except ImportError:
+        # Fallback when run as a plain module without the repo on sys.path.
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from if_verifier import verify_instructions
+
+    try:
+        payload = json.loads(ground_truth) if isinstance(ground_truth, str) else ground_truth
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("[reasoning_rl] if ground_truth is not valid JSON")
+        return 0.0
+    if isinstance(payload, dict):
+        constraints = payload.get("constraints", [])
+    elif isinstance(payload, list):
+        constraints = payload
+    else:
+        constraints = []
+    if not constraints:
+        return 0.0
+    response = _extract_final_response(solution_str)
+    if not response:
+        return 0.0
+    score, _ = verify_instructions(response, constraints)
+    return float(score)
+
+
+# ---------------------------------------------------------------------------
 # dispatcher
 # ---------------------------------------------------------------------------
 
@@ -294,6 +351,8 @@ def compute_score(
         score = _logic_score(solution_str, ground_truth)
     elif data_source.startswith("stem"):
         score = _math_score(solution_str, ground_truth)
+    elif data_source.startswith("if"):
+        score = _if_score(solution_str, ground_truth)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
     return {"score": float(score)}
