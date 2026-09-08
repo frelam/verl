@@ -1,0 +1,46 @@
+examples/reasoning_rl/reasoning_rl_dataset.py
+  s_236397064f540c::t_6305b968c896a5 87-121
+  s_236397064f540c::t_f389a502356c77 60-62
+  s_236397064f540c::t_84e088e1a6d606 23-35,37-40
+examples/reasoning_rl/test_reasoning_rl_dataset.py
+  s_236397064f540c::t_e4e6b9d94dff5b 1-116
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
+  s_236397064f540c::t_3f44b9dc63b859 199-209
+  s_236397064f540c::t_d8b4ac5ae434a5 99-102
+  h_25cf8a8e4e8b34 78
+  s_236397064f540c::t_a6908adb30de7d 33-38
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "7b78785a1f5f6fb8a5fe8268c938760b80480501",
+  "prompts": {},
+  "humans": {
+    "h_25cf8a8e4e8b34": {
+      "author": "lvhaoyu <lvhaoyu@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_236397064f540c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9fab95470a267b69e5c2d3",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "session_id": "6a9fab95470a267b69e5c2d3",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_type": "builtin",
+        "operation_id": "6a9fcaf3470a267b69e5c390",
+        "dedupe_key": "6a9fab95470a267b69e5c2d3:6a9fcaf3470a267b69e5c390:afterEdit:babdbe89",
+        "tool_use_id": "6a9fcaf3470a267b69e5c390",
+        "source_scene": "agent",
+        "client_type": "ide",
+        "external_session_id": "6a9fab95470a267b69e5c2d3",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit"
+      }
+    }
+  }
+}
