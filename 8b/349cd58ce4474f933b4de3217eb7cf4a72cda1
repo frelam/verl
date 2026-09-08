@@ -1,0 +1,85 @@
+verl/trainer/ppo/v1/replay_buffer.py
+  s_cbf017cc3ec0d2::t_25181f5e160e74 245-260
+  s_cbf017cc3ec0d2::t_ef0c93de7b9db5 178-183
+  s_cbf017cc3ec0d2::t_a4c1c0937df620 543
+  s_cbf017cc3ec0d2::t_96a3764bc6943d 378
+  s_cbf017cc3ec0d2::t_9ef507f09924c3 595
+  s_cbf017cc3ec0d2::t_7402468796b106 279
+  s_cbf017cc3ec0d2::t_657109eb73ef8c 603
+  s_cbf017cc3ec0d2::t_6130057f2d0dcb 202,230-239
+verl/trainer/config/_generated_ppo_trainer.yaml
+  s_cbf017cc3ec0d2::t_7903694a26e422 341-345,939-946
+verl/workers/rollout/replica.py
+  s_cbf017cc3ec0d2::t_fb20b8203c8e42 289-307
+verl/trainer/ppo/v1/trainer_laminar_async.py
+  s_cbf017cc3ec0d2::t_a2b7c3db8cef80 1-69,71-177
+  s_cbf017cc3ec0d2::t_9d03cf90f97da9 70
+examples/grpo_trainer/run_qwen3_4b_laminar_async.sh
+  s_cbf017cc3ec0d2::t_c4076c0e345209 1-179
+verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+  s_cbf017cc3ec0d2::t_7903694a26e422 330-334,915-922
+verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+  s_cbf017cc3ec0d2::t_7903694a26e422 346-350,946-953
+verl/trainer/config/ppo_trainer.yaml
+  s_cbf017cc3ec0d2::t_82f9232b9153cc 248-281
+  s_cbf017cc3ec0d2::t_072b5a6a4f215f 227
+verl/workers/rollout/llm_server.py
+  s_cbf017cc3ec0d2::t_b9c6c0281520b1 67-70,86,91-94,118-125
+  s_cbf017cc3ec0d2::t_6fef03f0441e7e 170-192
+  s_cbf017cc3ec0d2::t_961cf85f4fb864 193-212
+verl/checkpoint_engine/base.py
+  s_cbf017cc3ec0d2::t_76d987490231dd 541-583,586-596
+  s_cbf017cc3ec0d2::t_3f750ceafb8e4a 21
+  s_cbf017cc3ec0d2::t_6f7bfc4c2c47b5 584-585
+verl/trainer/ppo/v1/__init__.py
+  s_cbf017cc3ec0d2::t_7b702124625ee4 18,29
+verl/workers/rollout/rollout_manager.py
+  s_cbf017cc3ec0d2::t_f0e67618aca9f1 24-32,34,39-40
+  s_cbf017cc3ec0d2::t_fb47cbdac104df 122
+  s_cbf017cc3ec0d2::t_c410b8bad21dc6 67-70,79,83,91-98,106-108
+  s_cbf017cc3ec0d2::t_53b2d2915d3ebb 184,189-198,203-226,228-230,236-239,241
+  s_cbf017cc3ec0d2::t_4ae9b0db7b7a73 227
+  s_cbf017cc3ec0d2::t_de68893595c4f8 249-251
+  s_cbf017cc3ec0d2::t_0519d0bb4fc80f 142-146
+  s_cbf017cc3ec0d2::t_c1d571e4174480 1-23,33,35-38,41-66,71-78,80-82,84-90,99-105,109-115,117-121,123-141,147-183,185-188,199-202,231-235,240,242-246,248,252-257
+  s_cbf017cc3ec0d2::t_e2142859a9116a 116,247
+tests/trainer/ppo/v1/test_laminar_on_cpu.py
+  s_cbf017cc3ec0d2::t_fbdcddb393070f 176-177,179
+  s_cbf017cc3ec0d2::t_1bcced585210a7 1-175,178,180-207,209-509,511-516
+  s_cbf017cc3ec0d2::t_7abcfd297cd8bd 208
+  s_cbf017cc3ec0d2::t_9d03cf90f97da9 510
+verl/checkpoint_engine/__init__.py
+  s_cbf017cc3ec0d2::t_c19c34f6c44f67 74-79
+verl/checkpoint_engine/store_checkpoint_engine.py
+  s_cbf017cc3ec0d2::t_9d03cf90f97da9 123
+  s_cbf017cc3ec0d2::t_d13b972a15c3f4 1-122,124-412
+verl/trainer/config/rollout/rollout.yaml
+  s_cbf017cc3ec0d2::t_47c2fa5c2fc34e 295-310
+verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+  s_cbf017cc3ec0d2::t_7903694a26e422 388-392,1023-1030
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "8b349cd58ce4474f933b4de3217eb7cf4a72cda1",
+  "prompts": {},
+  "sessions": {
+    "s_cbf017cc3ec0d2": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a9f64b5470a267b69e5bdde",
+        "model": "kimi-k3__max"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_name": "RunCommand",
+        "display_model_name": "Kimi-K3",
+        "operation_id": "6a9f8876470a267b69e5c22c",
+        "edit_kind": "bash",
+        "session_id": "6a9f64b5470a267b69e5bdde",
+        "external_session_id": "6a9f64b5470a267b69e5bdde",
+        "tool_use_id": "6a9f8876470a267b69e5c22c"
+      }
+    }
+  }
+}
