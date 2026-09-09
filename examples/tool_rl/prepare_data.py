@@ -1061,6 +1061,28 @@ _IRRELEVANT_DESCRIPTIONS = [
     "Design a knitting pattern for a winter scarf.",
 ]
 
+# Tool names whose result is a deterministic function of the query — the
+# model can legitimately produce the answer itself (no external data
+# needed).  Used to tag derived negatives as "answerable direct": after
+# desc_replace / no_tools removes the tool, computing the answer manually
+# is good behaviour, not a blind guess.
+_SELF_COMPUTABLE_TOOL_RE = re.compile(
+    r"calc|comput|math|convert|translat|encod|decod|cipher|hash|morse"
+    r"|roman|base64|unit_",
+    re.IGNORECASE,
+)
+
+# Queries answerable by pure computation (the model can work them out
+# manually).  Conservative about dates/phone numbers: a bare "-" between
+# digits does NOT count; spaced arithmetic operators do.
+_SELF_COMPUTABLE_QUERY_RE = re.compile(
+    r"\d\s*[+*/×÷^]\s*\d"
+    r"|\d\s+-\s+\d"
+    r"|\d\s*%\s*of\s*\d"
+    r"|\b(?:calculate|compute|evaluate|how much is|square root of)\b[^.?!]*\d",
+    re.IGNORECASE,
+)
+
 # Generic parameter names used for param_rename.
 _GENERIC_PARAM_NAMES = [
     "input_value",
@@ -1166,6 +1188,12 @@ def _augment_desc_replace(task: dict, rng: random.Random) -> str | None:
     task["metadata"]["has_ground_truth"] = False
     task["metadata"]["augmented"] = "desc_replace"
     task["metadata"]["augment_detail"] = {"tool": name}
+    if _SELF_COMPUTABLE_TOOL_RE.search(name):
+        # The original tool was a deterministic computation (e.g. a
+        # calculator): after the swap the model can still answer the
+        # query by working it out manually — tag the sample so the
+        # reward does not guess-penalise a self-computed answer.
+        task["metadata"]["answerable_direct"] = True
     return "desc_replace"
 
 
@@ -1443,6 +1471,35 @@ def validate_tasks(tasks: list) -> list:
     return valid
 
 
+def tag_answerable_direct_negatives(tasks: list[dict]) -> int:
+    """Tag negatives whose query the model can answer by pure computation.
+
+    Sets ``metadata["answerable_direct"] = True`` on every negative whose
+    last user message looks arithmetic / self-computable, so the reward
+    skips the keyword guess penalty: working out a value manually when no
+    tool fits is legitimate behaviour, not a blind guess.  desc_replace
+    negatives whose original label tool was self-computable are already
+    tagged at augmentation time and counted separately there.
+    """
+    tagged = 0
+    for t in tasks:
+        meta = t.get("metadata", {})
+        if not _is_negative(t) or meta.get("answerable_direct"):
+            continue
+        query = next(
+            (
+                str(m.get("content", ""))
+                for m in reversed(t.get("messages") or [])
+                if m.get("role") == "user"
+            ),
+            "",
+        )
+        if query and _SELF_COMPUTABLE_QUERY_RE.search(query):
+            meta["answerable_direct"] = True
+            tagged += 1
+    return tagged
+
+
 # ============================================================================
 # verl schema conversion
 # ============================================================================
@@ -1473,6 +1530,7 @@ def to_verl_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if meta.get("ground_truth") is not None else None
                 ),
                 "augmented": meta.get("augmented", ""),
+                "answerable_direct": bool(meta.get("answerable_direct")),
             },
         })
     return rows
@@ -1638,6 +1696,12 @@ def main():
             all_tasks, args.neg_ratio, random.Random(args.seed),
             top_up=not args.no_neg_topup,
         )
+
+    n_answerable = tag_answerable_direct_negatives(all_tasks)
+    logger.info(
+        "Tagged %d negatives as answerable-direct (self-computable query)",
+        n_answerable,
+    )
 
     rng = random.Random(args.seed)
     rng.shuffle(all_tasks)

@@ -51,13 +51,15 @@ Dim 2 is untouched (format compliance is answer-agnostic). With the
 default weights this yields: clarify/declare 1.0 > guess 0.4 > spurious
 call 0.2 > undeclared spurious call 0.14.
 
-Guess-penalty exemption: when the label string carries the dataset's
-own reference response (``Reference:\n...`` — ToolACE turns) and that
-reference is itself a direct answer, the sample's desired behaviour IS
-answering (chitchat / general knowledge), so a guess-class response
-scores Dim 1 = 1.0 like the desired classes. Designed-abstention
-negatives (hammer, ``desc_replace``, ``no_tools``) carry no reference
-and keep the guess penalty.
+Guess-penalty exemption (two signals, either suffices): when the label
+string carries the dataset's own reference response (``Reference:\n...``
+— ToolACE turns) and that reference is itself a direct answer, or when
+the sample is tagged ``answerable_direct`` at data-prep time (the query
+is resolvable by pure computation — self-computable original tool or an
+arithmetic-looking query), the sample's desired behaviour IS answering,
+so a guess-class response scores Dim 1 = 1.0 like the desired classes.
+Designed-abstention negatives (hammer, ``desc_replace``, ``no_tools``)
+carry neither signal and keep the guess penalty.
 
 Strict think-format gate
 ------------------------
@@ -256,6 +258,10 @@ def compute_score(
     """
     extra_info = dict(extra_info or {})
     available_tools = _to_dict_list(extra_info.get("tools"))
+    # Data-prep tag: negative sample whose query the model can answer by
+    # pure computation (self-computable original tool / arithmetic query)
+    # — a self-computed direct answer is legitimate, not a guess.
+    answerable_direct = bool(extra_info.get("answerable_direct"))
     ground_truth_calls = extra_info.get("ground_truth_calls", None)
     task_id = extra_info.get("task_id", "unknown")
 
@@ -326,11 +332,15 @@ def compute_score(
             # reference response is a direct answer (ToolACE chitchat /
             # general-knowledge negatives), answering directly IS the
             # demonstrated desired behaviour — no guess penalty.
-            # Designed-abstention negatives (hammer, desc_replace,
-            # no_tools) carry no reference and keep it.
+            # Likewise for samples tagged answerable_direct at data-prep
+            # time: the query is self-computable, so working out a value
+            # manually is legitimate. Designed-abstention negatives
+            # (hammer, desc_replace, no_tools) carry neither signal and
+            # keep it.
             ref_direct = reference_prefers_answer(ground_truth)
+            guess_exempt = ref_direct or answerable_direct
             tool_correctness = (
-                0.0 if cls is AbstentionClass.GUESS and not ref_direct else 1.0
+                0.0 if cls is AbstentionClass.GUESS and not guess_exempt else 1.0
             )
 
     # ── Repetition penalty (degenerate loops outside tool calls) ──
@@ -365,12 +375,13 @@ def compute_score(
     logger.info(
         "[tool_rl] %s: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
         "format=%.3f tool_call=%.3f abstention=%s strict_format=%s "
-        "rep_penalty=%.3f(repeats=%d) ref_direct=%s",
+        "rep_penalty=%.3f(repeats=%d) ref_direct=%s answerable_direct=%s",
         task_id, total, tool_correctness, name_score, param_score,
         format_score, tool_call_score,
         AbstentionClass(abstention_class).name
         if abstention_class != ABSTENTION_NOT_APPLICABLE else "n/a",
         strict_format_ok, rep_penalty, rep_repeats, ref_direct,
+        answerable_direct,
     )
 
     return {
@@ -382,6 +393,7 @@ def compute_score(
         "tool_call_format": tool_call_score,
         "abstention_class": int(abstention_class),
         "abstention_ref_direct": float(ref_direct),
+        "abstention_answerable_direct": float(answerable_direct),
         "repetition_penalty": rep_penalty,
         "repetition_repeats": rep_repeats,
     }

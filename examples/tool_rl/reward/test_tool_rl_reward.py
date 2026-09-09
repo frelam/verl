@@ -50,14 +50,16 @@ _CALC_TOOL = {
 }
 
 
-def _extra_info(tools=None, ground_truth_calls=None):
-    return {
+def _extra_info(tools=None, ground_truth_calls=None, **extra):
+    info = {
         "tools": tools if tools is not None else [_WEATHER_TOOL],
         "ground_truth_calls": (
             ground_truth_calls if ground_truth_calls is not None else []
         ),
         "task_id": "test",
     }
+    info.update(extra)
+    return info
 
 
 def _think_call(name: str, params: dict[str, str] | None = None) -> str:
@@ -302,6 +304,61 @@ def test_keyword_spurious_call_penalised_when_reference_answers(keyword_mode):
     )
     assert res["abstention_class"] == int(AbstentionClass.SPURIOUS_CALL)
     assert res["abstention_ref_direct"] == 0.0
+    assert res["tool_correctness"] == 0.0
+    assert res["tool_call_format"] == 0.0
+    assert res["score"] == pytest.approx(0.2)
+
+
+# ============================================================================
+# Reward — answerable_direct tag (self-computable queries)
+# ============================================================================
+#
+# Negatives whose query the model can resolve by pure computation are
+# tagged answerable_direct at data-prep time (prepare_data).  On these a
+# manually computed direct answer is legitimate behaviour — no guess
+# penalty — while calling a tool is still spurious.
+
+
+def test_keyword_guess_exempt_when_answerable_direct(keyword_mode):
+    # No reference in the label; the extra_info tag alone exempts GUESS.
+    res = compute_score(
+        "tool_rl",
+        _think_text("12 * 7 = 84."),
+        "",
+        _extra_info(answerable_direct=True),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.GUESS)
+    assert res["abstention_ref_direct"] == 0.0
+    assert res["abstention_answerable_direct"] == 1.0
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_keyword_abstain_still_ok_when_answerable_direct(keyword_mode):
+    # Abstaining is not penalised either (no signal prefers one over the
+    # other — no gradient distortion).
+    res = compute_score(
+        "tool_rl",
+        _think_text("I cannot answer this — none of the available tools fits."),
+        "",
+        _extra_info(answerable_direct=True),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.NO_VALID_TOOLS)
+    assert res["abstention_answerable_direct"] == 1.0
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_keyword_spurious_call_penalised_when_answerable_direct(keyword_mode):
+    # The exemption only covers no-call responses: calling a tool on a
+    # self-computable query is still a spurious call.
+    res = compute_score(
+        "tool_rl",
+        _think_call("get_weather", {"city": "Paris"}),
+        "",
+        _extra_info(answerable_direct=True),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.SPURIOUS_CALL)
     assert res["tool_correctness"] == 0.0
     assert res["tool_call_format"] == 0.0
     assert res["score"] == pytest.approx(0.2)
@@ -740,6 +797,89 @@ def test_reward_in_range_values_untouched(keyword_mode):
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
     assert res["score"] == pytest.approx(0.5)
+
+
+# ============================================================================
+# Data prep — answerable_direct tagging
+# ============================================================================
+
+def _neg_task(query: str) -> dict:
+    return {
+        "label": "",
+        "messages": [{"role": "user", "content": query}],
+        "metadata": {"ground_truth": [], "task_id": "neg"},
+    }
+
+
+def test_self_computable_tool_regex():
+    from examples.tool_rl.prepare_data import _SELF_COMPUTABLE_TOOL_RE
+
+    for name in ("calculate_tip", "convert_currency", "morse_encode",
+                 "unit_converter", "math_solver"):
+        assert _SELF_COMPUTABLE_TOOL_RE.search(name), name
+    for name in ("get_weather", "search_flights", "book_hotel", "query_db"):
+        assert not _SELF_COMPUTABLE_TOOL_RE.search(name), name
+
+
+def test_self_computable_query_regex():
+    from examples.tool_rl.prepare_data import _SELF_COMPUTABLE_QUERY_RE
+
+    for q in ("What is 12 * 7?", "Calculate 15% of 80", "3 + 5 = ?",
+              "How much is 100 / 4?", "What is the square root of 144?",
+              "100 - 37"):
+        assert _SELF_COMPUTABLE_QUERY_RE.search(q), q
+    # Data-dependent queries and bare-dash digit pairs (dates / phone
+    # numbers) must NOT match.
+    for q in ("What's the weather in Paris?", "Call 555-1234",
+              "Meeting on 2024-01-15", "What's the capital of France?"):
+        assert not _SELF_COMPUTABLE_QUERY_RE.search(q), q
+
+
+def test_tag_answerable_direct_negatives():
+    from examples.tool_rl.prepare_data import tag_answerable_direct_negatives
+
+    arith = _neg_task("What is 12 * 7?")
+    weather = _neg_task("What's the weather in Paris?")
+    positive = {
+        "label": "Ground truth:\n  get_weather()",
+        "messages": [{"role": "user", "content": "What is 12 * 7?"}],
+        "metadata": {
+            "ground_truth": [{"name": "get_weather", "arguments": {}}],
+            "task_id": "pos",
+        },
+    }
+    n = tag_answerable_direct_negatives([arith, weather, positive])
+    assert n == 1
+    assert arith["metadata"]["answerable_direct"] is True
+    assert "answerable_direct" not in weather["metadata"]
+    assert "answerable_direct" not in positive["metadata"]
+
+
+def test_desc_replace_tags_self_computable_tool():
+    import random
+
+    from examples.tool_rl.prepare_data import _augment_desc_replace
+
+    def _pos(tool_name: str) -> dict:
+        tool = {"name": tool_name, "description": "d", "parameters": {}}
+        return {
+            "label": f"Ground truth:\n  {tool_name}()",
+            "tools": [dict(tool)],
+            "messages": [{"role": "user", "content": "q"}],
+            "metadata": {
+                "tools": [dict(tool)],
+                "ground_truth": [{"name": tool_name, "arguments": {}}],
+                "task_id": "pos",
+            },
+        }
+
+    calc = _pos("calculate_tip")
+    assert _augment_desc_replace(calc, random.Random(0)) == "desc_replace"
+    assert calc["metadata"]["answerable_direct"] is True
+
+    weather = _pos("get_weather")
+    assert _augment_desc_replace(weather, random.Random(0)) == "desc_replace"
+    assert "answerable_direct" not in weather["metadata"]
 
 
 # ============================================================================
