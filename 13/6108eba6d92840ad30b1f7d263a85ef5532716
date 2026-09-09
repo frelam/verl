@@ -1,0 +1,78 @@
+examples/tool_rl/reward/abstention.py
+  s_7df0083e6fb87c::t_41bd52a6c8278e 39-43
+  s_7df0083e6fb87c::t_1840d625680030 174-175
+examples/tool_rl/reward/verifier.py
+  s_7df0083e6fb87c::t_60daa71a065190 859-867,869-923
+  s_7df0083e6fb87c::t_48399a289e59d9 142,146-172
+  s_7df0083e6fb87c::t_dd3541aa327314 260-263
+  s_7df0083e6fb87c::t_cdc016482d215e 193-197,200-210,239
+  s_7df0083e6fb87c::t_37b139ee7f5dc4 377-380,402
+  s_7df0083e6fb87c::t_d4bdd8eb46ee6b 60-64,81
+  s_7df0083e6fb87c::t_7fc48a79013067 868
+  s_7df0083e6fb87c::t_b2e090ceb4695b 68-74,88-96
+  s_7df0083e6fb87c::t_dbc84a4a08d755 75,82,85-87
+examples/tool_rl/reward/test_tool_rl_reward.py
+  s_7df0083e6fb87c::t_dfd3051cdc29be 434-452
+  s_7df0083e6fb87c::t_20661850159fe0 27
+  s_7df0083e6fb87c::t_3d157ef3b7b032 383,385,408-410,416,419-431
+  s_7df0083e6fb87c::t_b69ef38aac2224 475-547
+  s_7df0083e6fb87c::t_594103b66a951d 389-392
+  s_7df0083e6fb87c::t_6bdda5766bd90e 87-101
+  s_7df0083e6fb87c::t_f58a73e7a54eb7 453-473
+  s_7df0083e6fb87c::t_0aafa703481345 372-382,384,386-388,400-407,411-415,417-418,432-433,474
+  s_7df0083e6fb87c::t_fba03429d18de3 371,548-579
+  s_7df0083e6fb87c::t_4fd04c7f32127d 23
+  s_7df0083e6fb87c::t_65346ab5c92914 334-338,348-350
+  s_7df0083e6fb87c::t_aba74f1bf32cf7 393-399
+examples/tool_rl/tool_rl_dataset.py
+  s_7df0083e6fb87c::t_d12f6cf9812b7d 86-88,90
+examples/tool_rl/reward/tool_rl_reward.py
+  s_7df0083e6fb87c::t_61f3356a09bc8c 311-317,330-331,342-343,348,359-360
+  s_7df0083e6fb87c::t_7beb2dfb9576c7 332-338
+  s_7df0083e6fb87c::t_d557110e42d6a8 80-87
+  s_7df0083e6fb87c::t_ccc3ac6988f319 128
+  s_7df0083e6fb87c::t_d2509abded3d63 133
+  s_7df0083e6fb87c::t_734f3ff0a96bbf 54-55,67
+  s_7df0083e6fb87c::t_fbd84bd0dec4aa 68-79
+  s_7df0083e6fb87c::t_af7e06b069d0f6 266-274
+  s_7df0083e6fb87c::t_4451381096269a 56-57
+  s_7df0083e6fb87c::t_3113f3b8bb1ef3 58-66
+  s_7df0083e6fb87c::t_ebbebf31e12ee2 101-103
+  s_7df0083e6fb87c::t_58574cd9b8ba31 325-329
+  s_7df0083e6fb87c::t_6fd133b95a4a18 168-184
+  s_7df0083e6fb87c::t_f37e72169c5436 324
+examples/tool_rl/run_qwen3_4b_tool_rl_grpo.sh
+  s_7df0083e6fb87c::t_63dca3a46cc571 17,21-23
+  s_7df0083e6fb87c::t_de718f0f4371b3 36-37
+examples/tool_rl/hard_replay.py
+  s_7df0083e6fb87c::t_eba8f12bd71e19 61-62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "136108eba6d92840ad30b1f7d263a85ef5532716",
+  "prompts": {},
+  "sessions": {
+    "s_7df0083e6fb87c": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa0c767470a267b69e5c514",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_use_id": "6aa0d9fc470a267b69e5c6c9",
+        "external_session_id": "6aa0c767470a267b69e5c514",
+        "edit_kind": "file_edit",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "operation_id": "6aa0d9fc470a267b69e5c6c9",
+        "tool_type": "builtin",
+        "dedupe_key": "6aa0c767470a267b69e5c514:6aa0d9fc470a267b69e5c6c9:afterEdit:2fdaa154",
+        "source_scene": "agent",
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6aa0c767470a267b69e5c514"
+      }
+    }
+  }
+}
