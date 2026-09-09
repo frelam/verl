@@ -1,0 +1,46 @@
+examples/tool_rl/prepare_data.py
+  s_113b13cd6d90ba::t_631f409dfcc788 1191-1196
+  s_113b13cd6d90ba::t_899d1e4cffa590 1700-1705
+  s_113b13cd6d90ba::t_44dca9b4349ae3 1064-1085
+  s_113b13cd6d90ba::t_9015856d8950e3 1533
+  s_113b13cd6d90ba::t_62024852c09dcb 1474-1502
+examples/tool_rl/reward/test_tool_rl_reward.py
+  s_113b13cd6d90ba::t_2222d2e2d75da2 53-54,61-62
+  s_113b13cd6d90ba::t_d2808b4346d48c 313-366
+  s_113b13cd6d90ba::t_2bbf3a3694bc52 312,802-884
+examples/tool_rl/reward/tool_rl_reward.py
+  s_113b13cd6d90ba::t_666f64bef9939e 54-62
+  s_113b13cd6d90ba::t_849b6128b7e3c2 335-339,341,343
+  s_113b13cd6d90ba::t_64a5535adb2fd7 261-264
+  s_113b13cd6d90ba::t_f6906628417e84 378,384
+  s_113b13cd6d90ba::t_f7076a9b198311 396
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "6710bac6504cc7295ec35133fc4762f64b1f17d5",
+  "prompts": {},
+  "sessions": {
+    "s_113b13cd6d90ba": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa11d2202ec400694b0cf87",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "session_id": "6aa11d2202ec400694b0cf87",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "dedupe_key": "6aa11d2202ec400694b0cf87:6aa12e6c02ec400694b0d15d:afterEdit:2fdaa154",
+        "client_type": "ide",
+        "external_session_id": "6aa11d2202ec400694b0cf87",
+        "operation_id": "6aa12e6c02ec400694b0d15d",
+        "tool_type": "builtin",
+        "edit_kind": "file_edit",
+        "tool_use_id": "6aa12e6c02ec400694b0d15d"
+      }
+    }
+  }
+}
