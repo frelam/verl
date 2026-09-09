@@ -1,0 +1,52 @@
+examples/tool_rl/reward/verifier.py
+  s_113b13cd6d90ba::t_600bdbd3e495ef 55-59
+  s_113b13cd6d90ba::t_a74b2eef67a71e 903-904,915-925,930,946-949,956
+  s_113b13cd6d90ba::t_c1014be93df8b0 94-101
+  s_113b13cd6d90ba::t_a87520a67d704c 343-344,346,349-350
+  s_113b13cd6d90ba::t_5d22cdc3f6a26b 179
+  s_113b13cd6d90ba::t_b5755f56917e75 74-81
+  s_113b13cd6d90ba::t_45b1998a9c8725 214-218,222-224,235
+  s_113b13cd6d90ba::t_a748b16d16a80b 258-259,261
+  s_113b13cd6d90ba::t_da51f12b302033 236
+examples/tool_rl/reward/tool_rl_reward.py
+  s_113b13cd6d90ba::t_5aeafd15a1266f 72-80
+  s_113b13cd6d90ba::t_eef8a3b6fffa7b 175-177,184-185
+examples/tool_rl/reward/test_tool_rl_reward.py
+  s_113b13cd6d90ba::t_dd45d201c9e3a6 615
+  s_113b13cd6d90ba::t_06284b68a45428 631
+  s_113b13cd6d90ba::t_e7afbd95262032 561-563,565,570-571,574-575,581-589
+  s_113b13cd6d90ba::t_54ab757886f195 334-374,590-591
+  s_113b13cd6d90ba::t_dee960251295d3 649,653
+  s_113b13cd6d90ba::t_0d4390ee54da9e 534-535,541,546-560,592
+  s_113b13cd6d90ba::t_a08f092436f198 441-444
+  s_113b13cd6d90ba::t_285a86877f9208 611
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "15c5c58d28d571016655e22a9f2eb241a831a601",
+  "prompts": {},
+  "sessions": {
+    "s_113b13cd6d90ba": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa11d2202ec400694b0cf87",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_use_id": "6aa124a302ec400694b0d044",
+        "dedupe_key": "6aa11d2202ec400694b0cf87:6aa124a302ec400694b0d044:afterEdit:2fdaa154",
+        "operation_id": "6aa124a302ec400694b0d044",
+        "session_id": "6aa11d2202ec400694b0cf87",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_type": "builtin",
+        "external_session_id": "6aa11d2202ec400694b0cf87",
+        "source_scene": "agent",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit",
+        "client_type": "ide"
+      }
+    }
+  }
+}
