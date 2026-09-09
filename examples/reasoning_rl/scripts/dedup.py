@@ -23,6 +23,7 @@ Self-contained, no third-party deps beyond numpy.
 """
 
 import hashlib
+import math
 import re
 
 import numpy as np
@@ -102,36 +103,98 @@ def minhash_near_dedup(
     A row is dropped if it shares an LSH band bucket with an earlier kept row AND
     their signature similarity (fraction of equal minima, an unbiased estimate of
     Jaccard) is >= threshold. Empty texts are always kept (they carry no signal).
+
+    Performance notes (all decisions are identical to a naive per-candidate loop):
+
+    1. Kept signatures live in one (n_kept, num_perm) array and band-collision
+       candidates are scored with vectorized broadcast comparisons instead of a
+       per-candidate Python loop. mean(sig == s) >= threshold is evaluated as
+       match count >= ceil(threshold * num_perm).
+    2. Bucket membership is stored in over-allocated numpy arrays (doubling
+       growth, amortized O(1) insert) so queries concatenate array views instead
+       of re-converting Python lists — otherwise hub buckets (templates shared
+       by many rows) cost O(bucket_size) of list->array boxing per query.
+    3. Candidates are filtered in a uint8-truncated copy of the signature space
+       first: uint64 equality implies uint8 equality, so no true duplicate is
+       rejected. Mod-256 collisions can only create false positives, removed by
+       an exact uint64 confirm of the rare survivors. This cuts comparison
+       memory traffic ~4x versus a uint32-domain filter.
+
+    Cluster-heavy pools (many near-dup templates) degrade a naive implementation
+    to O(N^2) tiny numpy calls; the above keeps the same O(N^2) candidate volume
+    but with a much smaller constant.
     """
     assert num_perm % bands == 0
     rows_per_band = num_perm // bands
-    buckets: list[dict[bytes, list[int]]] = [dict() for _ in range(bands)]
-    sigs: list[np.ndarray | None] = []
+    # Smallest c with float(c / num_perm) >= threshold. The ceil is exact when
+    # num_perm is a power of two (multiply is exact); the loops absorb float error
+    # in threshold * num_perm for other num_perm values.
+    min_count = math.ceil(threshold * num_perm)
+    while min_count > 0 and (min_count - 1) / num_perm >= threshold:
+        min_count -= 1
+    while min_count / num_perm < threshold:
+        min_count += 1
+    # Each bucket maps a band key -> [capacity array, used count].
+    buckets: list[dict[bytes, list]] = [dict() for _ in range(bands)]
+    # Buffers of kept rows' signatures; bucket entries index into these buffers.
+    # kept_buf8 holds signatures truncated to uint8 (values are < 2**33); it is
+    # a filter-only copy — final decisions always use kept_buf (uint64).
+    kept_buf = np.empty((len(texts), num_perm), dtype=np.uint64)
+    kept_buf8 = np.empty((len(texts), num_perm), dtype=np.uint8)
+    n_kept = 0
     keep: list[int] = []
+
+    # Chunk size for candidate comparisons; bounds transient memory.
+    _CMP_CHUNK = 1 << 15
 
     for idx, t in enumerate(texts):
         sig = _minhash_signature(t, num_perm, shingle_n)
-        sigs.append(sig)
         if sig is None:
             keep.append(idx)
             continue
 
-        candidates: set[int] = set()
+        q8 = sig.astype(np.uint8)
+        cand_arrays: list[np.ndarray] = []
         band_keys: list[bytes] = []
         for b in range(bands):
             key = sig[b * rows_per_band : (b + 1) * rows_per_band].tobytes()
             band_keys.append(key)
-            candidates.update(buckets[b].get(key, ()))
+            cell = buckets[b].get(key)
+            if cell is not None:
+                cand_arrays.append(cell[0][: cell[1]])
 
         is_dup = False
-        for j in candidates:
-            if float(np.mean(sig == sigs[j])) >= threshold:
-                is_dup = True
-                break
+        if cand_arrays:
+            cand = np.unique(np.concatenate(cand_arrays)) if len(cand_arrays) > 1 else cand_arrays[0]
+            for s in range(0, cand.shape[0], _CMP_CHUNK):
+                c = cand[s : s + _CMP_CHUNK]
+                # uint8 filter, then exact uint64 confirm of the survivors.
+                cnt = (kept_buf8[c] == q8[None, :]).sum(axis=1)
+                surv = c[cnt >= min_count]
+                if surv.size and int((kept_buf[surv] == sig[None, :]).sum(axis=1).max()) >= min_count:
+                    is_dup = True
+                    break
 
         if not is_dup:
+            kept_buf[n_kept] = sig
+            kept_buf8[n_kept] = q8
+            n_kept += 1
+            row = n_kept - 1
             for b, key in enumerate(band_keys):
-                buckets[b].setdefault(key, []).append(idx)
+                bucket = buckets[b]
+                cell = bucket.get(key)
+                if cell is None:
+                    arr = np.empty(8, dtype=np.int64)
+                    arr[0] = row
+                    bucket[key] = [arr, 1]
+                else:
+                    arr, used = cell
+                    if used == arr.size:
+                        arr = np.empty(used * 2, dtype=np.int64)
+                        arr[:used] = cell[0]
+                        cell[0] = arr
+                    arr[used] = row
+                    cell[1] = used + 1
             keep.append(idx)
 
     return keep
