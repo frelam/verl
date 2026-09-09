@@ -34,6 +34,19 @@ Only the {request_info ∪ no_valid_tools} vs guess boundary affects the
 reward (both desired classes score identically), so the lexicons favour
 paraphrase coverage over precision between the two desired classes.
 
+Reference-conditioned guess penalty
+-----------------------------------
+Not every no-tool-label sample desires abstention: ToolACE chitchat /
+general-knowledge turns carry an empty label because the *desired*
+behaviour is a direct answer, and the dataset's own reference response
+(embedded in the label string by ``prepare_data.py``) demonstrates it.
+Penalising a correct direct answer as ``GUESS`` would reward-hack the
+policy towards blanket refusal.  ``reference_prefers_answer`` therefore
+checks the reference response with the same classifier: when it is
+itself a direct answer, the caller skips the guess penalty.  Designed-
+abstention negatives (hammer, ``desc_replace``, ``no_tools``) carry no
+reference and keep the penalty.
+
 Configuration (env vars)
 ------------------------
 ``TOOL_RL_ABSTAIN_MODE``   ``keyword`` (default) | ``off``
@@ -164,6 +177,35 @@ def classify_abstention(response: str) -> AbstentionClass:
     if _has_genuine_question(text) and any(r.search(text) for r in _CLARIFY_RES):
         return AbstentionClass.REQUEST_INFO
     return AbstentionClass.GUESS
+
+
+# ============================================================================
+# Reference-conditioned guess penalty
+# ============================================================================
+
+# Marker written by ``prepare_data.py``: the label string is
+# ``_format_gt(calls)`` optionally followed by
+# ``"\nReference:\n{assistant_response[:1000]}"`` — present only when the
+# dataset's own reference response exists (e.g. ToolACE turns).  Designed-
+# abstention negatives (hammer, desc_replace, no_tools) have an empty label.
+_REFERENCE_RE = re.compile(r"\n?Reference:\n(.*)$", re.DOTALL)
+
+
+def reference_prefers_answer(label: object) -> bool:
+    """True when the label's reference response is itself a direct answer.
+
+    A no-tool sample whose demonstrated behaviour is a direct answer
+    (chitchat / general knowledge) must not guess-penalise the model for
+    answering directly.  No reference → False (abstention samples keep the
+    penalty): an empty reference classifies as ``GUESS``, so the emptiness
+    check must come first.
+    """
+    if not isinstance(label, str):
+        return False
+    m = _REFERENCE_RE.search(label)
+    if not m or not m.group(1).strip():
+        return False
+    return classify_abstention(m.group(1)) is AbstentionClass.GUESS
 
 
 # ============================================================================

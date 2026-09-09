@@ -51,6 +51,14 @@ Dim 2 is untouched (format compliance is answer-agnostic). With the
 default weights this yields: clarify/declare 1.0 > guess 0.4 > spurious
 call 0.2 > undeclared spurious call 0.14.
 
+Guess-penalty exemption: when the label string carries the dataset's
+own reference response (``Reference:\n...`` — ToolACE turns) and that
+reference is itself a direct answer, the sample's desired behaviour IS
+answering (chitchat / general knowledge), so a guess-class response
+scores Dim 1 = 1.0 like the desired classes. Designed-abstention
+negatives (hammer, ``desc_replace``, ``no_tools``) carry no reference
+and keep the guess penalty.
+
 Strict think-format gate
 ------------------------
 A broken response layout — unclosed ``<think>`` opener, stray
@@ -126,6 +134,7 @@ from examples.tool_rl.reward.abstention import (  # noqa: E402
     AbstentionClass,
     abstain_mode_from_env,
     classify_abstention,
+    reference_prefers_answer,
 )
 from examples.tool_rl.reward.verifier import (  # noqa: E402
     _check_strict_format,
@@ -302,6 +311,7 @@ def compute_score(
     # ── No-tool-label behaviour shaping (keyword mode) ──
     # Dim 2 stays answer-agnostic; only Dim 1 / Dim 3 are reshaped.
     abstention_class = ABSTENTION_NOT_APPLICABLE
+    ref_direct = False
     if abstain_mode_from_env() == "keyword" and expects_no_tools:
         if output_calls:
             # Spurious call: Dim 1 = 0 (undeclared calls still subtract
@@ -312,7 +322,16 @@ def compute_score(
         else:
             cls = classify_abstention(solution_str)
             abstention_class = cls
-            tool_correctness = 0.0 if cls is AbstentionClass.GUESS else 1.0
+            # Reference-conditioned guess penalty: when the dataset's own
+            # reference response is a direct answer (ToolACE chitchat /
+            # general-knowledge negatives), answering directly IS the
+            # demonstrated desired behaviour — no guess penalty.
+            # Designed-abstention negatives (hammer, desc_replace,
+            # no_tools) carry no reference and keep it.
+            ref_direct = reference_prefers_answer(ground_truth)
+            tool_correctness = (
+                0.0 if cls is AbstentionClass.GUESS and not ref_direct else 1.0
+            )
 
     # ── Repetition penalty (degenerate loops outside tool calls) ──
     # Applies to think + reply text (tool_call blocks excluded); stacks on
@@ -346,12 +365,12 @@ def compute_score(
     logger.info(
         "[tool_rl] %s: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
         "format=%.3f tool_call=%.3f abstention=%s strict_format=%s "
-        "rep_penalty=%.3f(repeats=%d)",
+        "rep_penalty=%.3f(repeats=%d) ref_direct=%s",
         task_id, total, tool_correctness, name_score, param_score,
         format_score, tool_call_score,
         AbstentionClass(abstention_class).name
         if abstention_class != ABSTENTION_NOT_APPLICABLE else "n/a",
-        strict_format_ok, rep_penalty, rep_repeats,
+        strict_format_ok, rep_penalty, rep_repeats, ref_direct,
     )
 
     return {
@@ -362,6 +381,7 @@ def compute_score(
         "format_compliance": format_score,
         "tool_call_format": tool_call_score,
         "abstention_class": int(abstention_class),
+        "abstention_ref_direct": float(ref_direct),
         "repetition_penalty": rep_penalty,
         "repetition_repeats": rep_repeats,
     }

@@ -219,6 +219,95 @@ def test_keyword_spurious_undeclared_call(keyword_mode):
 
 
 # ============================================================================
+# Reward — reference-conditioned guess penalty (chitchat negatives)
+# ============================================================================
+#
+# ToolACE chitchat / general-knowledge turns carry an empty label because
+# the desired behaviour is a direct answer, and the label string embeds the
+# dataset's reference response ("\nReference:\n...").  When that reference
+# is itself a direct answer, guessing must NOT be penalised.
+
+_CHITCHAT_LABEL = "\nReference:\nParis is the capital of France."
+
+
+def test_reference_prefers_answer_unit():
+    from examples.tool_rl.reward.abstention import reference_prefers_answer
+
+    assert reference_prefers_answer(_CHITCHAT_LABEL) is True
+    # Reference that itself asks for clarification → not a direct answer.
+    assert reference_prefers_answer(
+        "\nReference:\nWhich city do you mean?"
+    ) is False
+    # No reference (designed-abstention negatives: hammer / desc_replace /
+    # no_tools) → penalty kept.  An empty reference would classify as
+    # GUESS, so this guard matters.
+    assert reference_prefers_answer("") is False
+    assert reference_prefers_answer("Ground truth:\n  get_weather()") is False
+    assert reference_prefers_answer(None) is False
+
+
+def test_keyword_guess_exempt_when_reference_answers(keyword_mode):
+    # Model answers the chitchat question directly and correctly: classified
+    # GUESS (kept for diagnostics) but exempt from the guess penalty.
+    res = compute_score(
+        "tool_rl",
+        _think_text("Paris is the capital of France."),
+        _CHITCHAT_LABEL,
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.GUESS)
+    assert res["abstention_ref_direct"] == 1.0
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_keyword_abstain_still_ok_when_reference_answers(keyword_mode):
+    # Abstaining on a chitchat sample is not penalised either (no signal
+    # prefers answering over abstaining — both score Dim 1 = 1.0).
+    res = compute_score(
+        "tool_rl",
+        _think_text("I cannot answer this — none of the available tools fits."),
+        _CHITCHAT_LABEL,
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.NO_VALID_TOOLS)
+    assert res["abstention_ref_direct"] == 1.0
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_keyword_guess_penalised_when_reference_clarifies(keyword_mode):
+    # Reference asks for clarification → the sample IS abstention-designed,
+    # so a fabricated direct answer keeps the guess penalty.
+    res = compute_score(
+        "tool_rl",
+        _think_text("The weather in Paris is 22°C and sunny."),
+        "\nReference:\nWhich city would you like the weather for?",
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.GUESS)
+    assert res["abstention_ref_direct"] == 0.0
+    assert res["tool_correctness"] == 0.0
+    assert res["score"] == pytest.approx(0.4)
+
+
+def test_keyword_spurious_call_penalised_when_reference_answers(keyword_mode):
+    # The exemption only covers no-call responses: calling a tool on a
+    # chitchat sample is still a spurious call.
+    res = compute_score(
+        "tool_rl",
+        _think_call("get_weather", {"city": "Paris"}),
+        _CHITCHAT_LABEL,
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.SPURIOUS_CALL)
+    assert res["abstention_ref_direct"] == 0.0
+    assert res["tool_correctness"] == 0.0
+    assert res["tool_call_format"] == 0.0
+    assert res["score"] == pytest.approx(0.2)
+
+
+# ============================================================================
 # Reward — legacy mode (off)
 # ============================================================================
 
