@@ -52,6 +52,11 @@ _OPENING_RE = re.compile(r"<think>", re.IGNORECASE)
 _CLOSE_TAG_RE = re.compile(r"</think>", re.IGNORECASE)
 
 
+def _in_think(pos: int, think_spans: list[tuple[int, int]]) -> bool:
+    """True when ``pos`` falls inside a complete (closed) think block."""
+    return any(s <= pos < e for s, e in think_spans)
+
+
 def _check_strict_format(text: str) -> bool:
     """Validate the top-level layout of a response's think block.
 
@@ -66,12 +71,14 @@ def _check_strict_format(text: str) -> bool:
       3. Something (response text / tool_call) must follow the think block —
          emitting reasoning and halting is the "think-then-stop" collapse.
       4. When tool calls are present — wrapped ``<tool_call>`` blocks or
-         bare JSON ``{"name": …}`` calls — the response must END at the
-         last call (trailing whitespace aside): content after it is
-         unreachable (the harness executes the calls), so trailing text
-         marks a malformed layout. A bare JSON call with NO trailing
-         text stays layout-valid here — Dim 2/Dim 3 already zero its
-         format credit; only trailing content is a strict violation.
+         bare JSON ``{"name": …}`` calls (both counted only OUTSIDE think
+         blocks — a call drafted inside ``<think>`` is reasoning, not an
+         emitted call) — the response must END at the last call (trailing
+         whitespace aside): content after it is unreachable (the harness
+         executes the calls), so trailing text marks a malformed layout.
+         A bare JSON call with NO trailing text stays layout-valid here —
+         Dim 2/Dim 3 already zero its format credit; only trailing
+         content is a strict violation.
       5. Otherwise valid: no think block at all, or exactly one complete
          ``<think>...</think>`` block.
     """
@@ -84,7 +91,14 @@ def _check_strict_format(text: str) -> bool:
         return False
     if len(matches) == 1 and text[matches[0].end():].strip() == "":
         return False
-    tool_call_ends = [m.end() for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
+    # Wrapped calls drafted inside a think block are reasoning, not
+    # emitted calls — exclude them from the trailing-content check.
+    think_spans = [m.span() for m in matches]
+    tool_call_ends = [
+        m.end()
+        for m in _TOOL_CALL_BLOCK_RE.finditer(text)
+        if not _in_think(m.start(), think_spans)
+    ]
     if tool_call_ends:
         # Any trailing content after the last wrapped call — including a
         # bare JSON call — is invalid (caught here as plain text).
@@ -162,7 +176,7 @@ def _bare_json_call_spans(text: str) -> list[tuple[int, int]]:
         elif ch == "}":
             depth -= 1
             if depth == 0 and start >= 0:
-                if not any(s <= start < e for s, e in think_spans):
+                if not _in_think(start, think_spans):
                     try:
                         obj = json.loads(text[start : i + 1])
                     except ValueError:
@@ -197,12 +211,17 @@ def parse_qwen_tool_calls(
 ) -> list[dict[str, Any]]:
     """Parse Qwen XML tool calls from text.
 
+    ``<think>`` blocks (closed and unclosed) are stripped first: a call
+    drafted inside think — wrapped or bare JSON alike — is reasoning
+    about a candidate call, not an emitted call (the harness never
+    executes think content).
+
     Args:
         text: Raw response text.
         allow_bare_json: When True (default), fall back to bare
-            ``{"name": …, "arguments": {…}}`` objects outside ``<think>``
-            blocks if no ``<tool_call>`` block exists. Pass False for
-            *format* scoring (Dim 2 / Dim 3): an unwrapped call is not a
+            ``{"name": …, "arguments": {…}}`` objects if no
+            ``<tool_call>`` block exists. Pass False for *format*
+            scoring (Dim 2 / Dim 3): an unwrapped call is not a
             properly formatted tool call and must earn no format credit.
             Content scoring (Dim 1) keeps the fallback so semantically
             correct calls still count there (and spurious bare-JSON calls
@@ -212,6 +231,8 @@ def parse_qwen_tool_calls(
         List of ``{"name": str, "arguments": dict}``.
     """
     calls: list[dict[str, Any]] = []
+
+    text = _strip_think_blocks(text)
 
     for tc_match in _TOOL_CALL_BLOCK_RE.finditer(text):
         block = tc_match.group(1)
@@ -234,10 +255,10 @@ def parse_qwen_tool_calls(
         if inline_call is not None:
             calls.append(inline_call)
 
-    # Fallback: JSON format — but ignore JSON discussed inside <think>
-    # blocks: that is reasoning about calls, not emitted calls.
+    # Fallback: bare JSON format (think blocks already stripped above, so
+    # JSON discussed inside think never counts as an emitted call).
     if not calls and allow_bare_json:
-        for obj in _extract_json_tool_calls(_strip_think_blocks(text)):
+        for obj in _extract_json_tool_calls(text):
             if obj not in calls:
                 calls.append(obj)
 
@@ -319,10 +340,14 @@ def _xml_tool_call_spans(text: str) -> list[tuple[int, int]]:
     """Return ``(start, end)`` spans of *valid* ``<tool_call>`` blocks.
 
     A block is valid when it declares a function via ``<function=...>`` or
-    carries a parseable inline-JSON call.
+    carries a parseable inline-JSON call. Blocks inside ``<think>`` are
+    reasoning drafts, not emitted calls, and are ignored.
     """
+    think_spans = [m.span() for m in _THINK_RE.finditer(text)]
     spans: list[tuple[int, int]] = []
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
+        if _in_think(m.start(), think_spans):
+            continue
         if _FUNCTION_NAME_RE.search(m.group(1)) or _parse_inline_json_call(m.group(1)) is not None:
             spans.append((m.start(), m.end()))
     return spans
@@ -875,7 +900,8 @@ def repetition_penalty(
     text: str,
     *,
     ngram: int = 4,
-    threshold: int = 3,
+    free: int = 4,
+    threshold: int = 8,
     per_repeat: float = 0.1,
     max_penalty: float = 1.0,
 ) -> tuple[float, int]:
@@ -886,13 +912,22 @@ def repetition_penalty(
     share structure), think tags are removed, then word-level n-grams are
     counted.
 
-    ``repeats`` = total excess occurrences over all n-grams
-    (``sum(count - 1)``). The first ``threshold`` repeats are tolerated;
-    every further repeat costs ``per_repeat``, capped at ``max_penalty``.
+    The detector is deliberately lenient — it targets death loops (the
+    same fragment looping until max-tokens) and nothing else. ``repeats``
+    = total excess occurrences over all n-grams, counting only
+    occurrences BEYOND THE ``free``-th (``sum(count - free)`` for
+    ``count > free``): with the default ``free=4`` a phrase used four
+    times — think→reply echo, boilerplate in a structured answer — is
+    normal text, not a loop. The first ``threshold`` repeats are
+    tolerated as well; every further repeat costs ``per_repeat``, capped
+    at ``max_penalty``. Defaults mean a single n-gram must appear 13+
+    times before any penalty fires, while a pure loop reaches the cap
+    within ~10 repetitions.
 
     Args:
         text: Raw assistant response.
         ngram: N-gram size (word tokens).
+        free: Occurrences of the same n-gram tolerated before counting.
         threshold: Number of repeat events tolerated before penalising.
         per_repeat: Penalty per repeat event beyond the threshold.
         max_penalty: Cap on the total repetition penalty.
@@ -908,16 +943,17 @@ def repetition_penalty(
     text = _REPEAT_THINK_TAG_RE.sub(" ", text)
     tokens = _REPEAT_TOKEN_RE.findall(text.lower())
 
-    # Max possible excess is len(tokens) - ngram; bail out early when the
-    # text is too short to exceed the threshold.
-    if len(tokens) < ngram + threshold + 1:
+    # Max possible excess is len(tokens) - ngram + 1 - free (one n-gram
+    # filling the whole text, occurrences beyond the free-th); bail out
+    # early when the text is too short to exceed the threshold.
+    if len(tokens) < ngram + free + threshold:
         return 0.0, 0
 
     counts: dict[tuple[str, ...], int] = {}
     for i in range(len(tokens) - ngram + 1):
         ng = tuple(tokens[i : i + ngram])
         counts[ng] = counts.get(ng, 0) + 1
-    repeats = sum(c - 1 for c in counts.values() if c > 1)
+    repeats = sum(c - free for c in counts.values() if c > free)
 
     penalized = max(0, repeats - threshold)
     return min(per_repeat * penalized, max_penalty), repeats

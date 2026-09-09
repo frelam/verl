@@ -331,6 +331,47 @@ def test_json_in_think_not_treated_as_call(keyword_mode):
     assert res["score"] == pytest.approx(1.0)
 
 
+def test_wrapped_call_in_think_not_treated_as_call(keyword_mode):
+    # Drafting a WRAPPED <tool_call> inside <think> — considering a
+    # candidate call and deciding against it — is reasoning, not an
+    # emitted call: a correct visible abstention must score full marks
+    # (same rule as bare JSON in think, see the test above).
+    resp = (
+        "<think>I could try <tool_call>\n<function=get_stock_quote>\n"
+        "<parameter=symbol>AAPL</parameter>\n</function>\n</tool_call> "
+        "but that tool is not declared.</think>\n"
+        "I don't have access to real-time stock data, and none of the "
+        "available tools can retrieve it."
+    )
+    res = compute_score("tool_rl", resp, "", _extra_info())
+    assert res["abstention_class"] == int(AbstentionClass.NO_VALID_TOOLS)
+    assert res["tool_correctness"] == 1.0
+    assert res["tool_call_format"] == 1.0
+    assert res["format_compliance"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_think_draft_then_real_call_full_credit(keyword_mode):
+    # A WRONG call drafted inside <think> followed by the real emitted
+    # call after think: only the emitted call counts (Dim 1 / Dim 3),
+    # and the think-internal draft must not break the Dim 2 layout bonus.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = (
+        "<think>Draft: <tool_call>\n<function=get_weather>\n"
+        "<parameter=city>London</parameter>\n</function>\n</tool_call> "
+        "— no wait, the user asked for Paris.</think>\n"
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>Paris</parameter>\n</function>\n</tool_call>"
+    )
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["tool_correctness"] == 1.0
+    assert res["format_compliance"] == 1.0
+    assert res["tool_call_format"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
 def test_bare_json_call_earns_no_format_credit(keyword_mode):
     # A bare ``{"name": …}`` call WITHOUT the <tool_call> wrapper keeps
     # Dim 1 content credit (semantically correct call) but must earn zero
@@ -397,6 +438,10 @@ def test_inline_json_call_reordered_keys(keyword_mode):
         ('{"name": "f"} trailing', False),
         ("reply with non-call json {\"a\": 1} inside", True),
         ('json in think <think>{"name": "f"}</think> plain reply', True),
+        # A wrapped call drafted inside think is reasoning, not an
+        # emitted call — visible text after think is not "trailing
+        # content after the last call".
+        ("<think>draft <tool_call>x</tool_call> rethink</think>\nanswer", True),
     ],
 )
 def test_check_strict_format(text, expected):
@@ -486,32 +531,62 @@ def _loop_think_call(phrase: str, times: int) -> str:
 
 
 def test_repetition_mild_repeat_tolerated(keyword_mode):
-    # "i need to check" ×2 → only 1 repeat event ≤ threshold → no penalty.
+    # "i need to check" ×2 → each 4-gram appears at most twice → zero
+    # repeat events (twice = normal restatement, not a loop).
     label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
     resp = _loop_think_call("i need to check", 2)
     res = compute_score(
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
+    assert res["repetition_repeats"] == 0
+    assert res["repetition_penalty"] == 0.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_repetition_think_reply_echo_tolerated(keyword_mode):
+    # Think reasoning echoed verbatim in the visible reply: every shared
+    # 4-gram appears exactly twice → zero repeat events → no penalty
+    # (the old count-from-the-second-occurrence rule scored -0.5 here).
+    resp = (
+        "<think>\nThe Eiffel Tower is 330 metres tall and located in Paris.\n</think>\n"
+        "The Eiffel Tower is 330 metres tall and located in Paris."
+    )
+    res = compute_score("tool_rl", resp, "", _extra_info())  # no-tool label
+    assert res["repetition_repeats"] == 0
+    assert res["repetition_penalty"] == 0.0
+    # guess: Dim 1 = 0, Dim 2 = 1.0, Dim 3 = 1.0 → 0.4
+    assert res["score"] == pytest.approx(0.4)
+
+
+def test_repetition_moderate_repeat_tolerated(keyword_mode):
+    # "i need to check" ×6 → 5 repeat events ≤ threshold (8) → no
+    # penalty: the detector only fires on death loops.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _loop_think_call("i need to check", 6)
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["repetition_repeats"] == 5
     assert res["repetition_penalty"] == 0.0
     assert res["score"] == pytest.approx(1.0)
 
 
 def test_repetition_loop_in_think_penalized(keyword_mode):
-    # "i need to check" ×3 → 5 repeat events → 2 beyond threshold → -0.2.
+    # "i need to check" ×8 → 13 repeat events → 5 beyond threshold → -0.5.
     label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
-    resp = _loop_think_call("i need to check", 3)
+    resp = _loop_think_call("i need to check", 8)
     res = compute_score(
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
-    assert res["repetition_repeats"] == 5
-    assert res["repetition_penalty"] == pytest.approx(0.2)
-    assert res["score"] == pytest.approx(0.8)
+    assert res["repetition_repeats"] == 13
+    assert res["repetition_penalty"] == pytest.approx(0.5)
+    assert res["score"] == pytest.approx(0.5)
 
 
 def test_repetition_penalty_capped(keyword_mode):
-    # Long loop → penalty capped at 1.0: a perfect call scores 0.0.
+    # Pure loop ×10 → penalty capped at 1.0: a perfect call scores 0.0.
     label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
-    resp = _loop_think_call("i need to check", 8)
+    resp = _loop_think_call("i need to check", 10)
     res = compute_score(
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
@@ -533,10 +608,11 @@ def test_repetition_inside_tool_call_not_penalized(keyword_mode):
 
 
 def test_repetition_env_config(keyword_mode, monkeypatch):
+    monkeypatch.setenv("TOOL_RL_REPEAT_FREE", "2")
     monkeypatch.setenv("TOOL_RL_REPEAT_THRESHOLD", "0")
     monkeypatch.setenv("TOOL_RL_REPEAT_PER", "0.5")
     label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
-    resp = _loop_think_call("i need to check", 2)  # 1 repeat event
+    resp = _loop_think_call("i need to check", 3)  # 1 repeat event
     res = compute_score(
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
@@ -552,7 +628,7 @@ def test_reward_clamped_at_minus_one(keyword_mode):
     # No-tool label + 10 undeclared spurious calls (Dim 1 = -1.0, Dim 2
     # = 1.0, Dim 3 = 0 → weighted -0.3) + heavy think loop (-1.0): raw
     # total -1.3 must clamp to exactly -1.0; breakdown fields stay raw.
-    think = "i need to check " * 8
+    think = "i need to check " * 10
     calls = "\n".join(
         f"<tool_call>\n<function=ghost_tool_{i}>\n"
         f"<parameter=x>\n{i}\n</parameter>\n</function>\n</tool_call>"
@@ -570,11 +646,11 @@ def test_reward_clamped_at_minus_one(keyword_mode):
 def test_reward_in_range_values_untouched(keyword_mode):
     # Clamping must not distort values already inside [-1, 1].
     label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
-    resp = _loop_think_call("i need to check", 3)  # -0.2 repetition
+    resp = _loop_think_call("i need to check", 8)  # -0.5 repetition
     res = compute_score(
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
-    assert res["score"] == pytest.approx(0.8)
+    assert res["score"] == pytest.approx(0.5)
 
 
 # ============================================================================

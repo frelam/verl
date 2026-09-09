@@ -69,12 +69,15 @@ Repetition penalty
 ------------------
 Degenerate loops in the non-tool-call text (think + visible reply —
 ``<tool_call>`` blocks are stripped first) are detected with word-level
-n-grams. ``repeats`` is the total excess n-gram count; the first
-``threshold`` repeats are tolerated, every further repeat costs
-``per_repeat``, capped at ``max_penalty``. The penalty is subtracted
-from the total AFTER the strict-format gate and may push the score
-negative. Knobs (env vars): ``TOOL_RL_REPEAT_NGRAM`` (4),
-``TOOL_RL_REPEAT_THRESHOLD`` (3), ``TOOL_RL_REPEAT_PER`` (0.1),
+n-grams. The detector is deliberately lenient — it targets death loops
+and nothing else: ``repeats`` counts only occurrences BEYOND the
+``free``-th (default 4) of the same n-gram, and the first ``threshold``
+repeats are tolerated as well, so a single n-gram must appear 13+ times
+before anything fires. Every further repeat costs ``per_repeat``, capped
+at ``max_penalty``. The penalty is subtracted from the total AFTER the
+strict-format gate and may push the score negative. Knobs (env vars):
+``TOOL_RL_REPEAT_NGRAM`` (4), ``TOOL_RL_REPEAT_FREE`` (4),
+``TOOL_RL_REPEAT_THRESHOLD`` (8), ``TOOL_RL_REPEAT_PER`` (0.1),
 ``TOOL_RL_REPEAT_MAX`` (1.0).
 
 Score range
@@ -169,14 +172,17 @@ def _get_repetition_config() -> dict[str, Any]:
     """Repetition-penalty knobs (env-overridable).
 
     - ``TOOL_RL_REPEAT_NGRAM``     — n-gram size in word tokens (default 4)
-    - ``TOOL_RL_REPEAT_THRESHOLD`` — repeat events tolerated (default 3)
+    - ``TOOL_RL_REPEAT_FREE``      — occurrences of the same n-gram
+      tolerated before counting (default 4)
+    - ``TOOL_RL_REPEAT_THRESHOLD`` — repeat events tolerated (default 8)
     - ``TOOL_RL_REPEAT_PER``       — penalty per repeat beyond threshold
       (default 0.1)
     - ``TOOL_RL_REPEAT_MAX``       — cap on the total penalty (default 1.0)
     """
     return {
         "ngram": int(os.environ.get("TOOL_RL_REPEAT_NGRAM", "4")),
-        "threshold": int(os.environ.get("TOOL_RL_REPEAT_THRESHOLD", "3")),
+        "free": int(os.environ.get("TOOL_RL_REPEAT_FREE", "4")),
+        "threshold": int(os.environ.get("TOOL_RL_REPEAT_THRESHOLD", "8")),
         "per_repeat": float(os.environ.get("TOOL_RL_REPEAT_PER", "0.1")),
         "max_penalty": float(os.environ.get("TOOL_RL_REPEAT_MAX", "1.0")),
     }
