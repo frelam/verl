@@ -1,0 +1,42 @@
+examples/tool_rl/reward/test_tool_rl_reward.py
+  s_113b13cd6d90ba::t_de24b8d78b2ab4 221-309
+examples/tool_rl/reward/abstention.py
+  s_113b13cd6d90ba::t_baaf3972181d5f 182-210
+  s_113b13cd6d90ba::t_e43a5897bbdc67 37-49
+examples/tool_rl/reward/tool_rl_reward.py
+  s_113b13cd6d90ba::t_c82f327c355918 137
+  s_113b13cd6d90ba::t_bd712da6164f10 325-334
+  s_113b13cd6d90ba::t_d6c5571fffe075 368,373
+  s_113b13cd6d90ba::t_ea8570ff35798f 54-61
+  s_113b13cd6d90ba::t_ab98b0d16b4b0f 314
+  s_113b13cd6d90ba::t_4cdf8aba7d61f3 384
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "bbe4864a43be8dabd77ca93626922dbb39775e53",
+  "prompts": {},
+  "sessions": {
+    "s_113b13cd6d90ba": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa11d2202ec400694b0cf87",
+        "model": "kimi-k3"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "operation_id": "6aa1299b02ec400694b0d0c0",
+        "runtime_client": "trae-tob-git-ai",
+        "edit_kind": "file_edit",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "external_session_id": "6aa11d2202ec400694b0cf87",
+        "client_type": "ide",
+        "session_id": "6aa11d2202ec400694b0cf87",
+        "source_scene": "agent",
+        "tool_type": "builtin",
+        "tool_use_id": "6aa1299b02ec400694b0d0c0",
+        "dedupe_key": "6aa11d2202ec400694b0cf87:6aa1299b02ec400694b0d0c0:afterEdit:2fdaa154"
+      }
+    }
+  }
+}
