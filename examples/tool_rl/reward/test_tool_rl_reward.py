@@ -20,9 +20,11 @@ if _REPO_ROOT not in sys.path:
 
 from examples.tool_rl.reward.abstention import (  # noqa: E402
     AbstentionClass,
+    abstain_mode_from_env,
     classify_abstention,
 )
 from examples.tool_rl.reward.tool_rl_reward import compute_score  # noqa: E402
+from examples.tool_rl.reward.verifier import _check_strict_format  # noqa: E402
 
 # ============================================================================
 # Fixtures / helpers
@@ -80,6 +82,21 @@ def keyword_mode(monkeypatch):
 @pytest.fixture
 def off_mode(monkeypatch):
     monkeypatch.setenv("TOOL_RL_ABSTAIN_MODE", "off")
+
+
+def test_abstain_mode_defaults_to_keyword(monkeypatch):
+    # Env unset (e.g. reward worker did not inherit the launcher shell's
+    # exports) must fall back to keyword shaping, not legacy off.
+    monkeypatch.delenv("TOOL_RL_ABSTAIN_MODE", raising=False)
+    assert abstain_mode_from_env() == "keyword"
+    res = compute_score(
+        "tool_rl",
+        _think_text("The Eiffel Tower is 330 metres tall."),
+        "",
+        _extra_info(),  # no-tool label
+    )
+    assert res["abstention_class"] == int(AbstentionClass.GUESS)
+    assert res["tool_correctness"] == 0.0
 
 
 # ============================================================================
@@ -314,7 +331,11 @@ def test_json_in_think_not_treated_as_call(keyword_mode):
     assert res["score"] == pytest.approx(1.0)
 
 
-def test_json_call_after_think_still_counts(keyword_mode):
+def test_bare_json_call_earns_no_format_credit(keyword_mode):
+    # A bare ``{"name": …}`` call WITHOUT the <tool_call> wrapper keeps
+    # Dim 1 content credit (semantically correct call) but must earn zero
+    # on both format dims: Dim 2 treats it as "no calls" (tools are
+    # available → 0.0) and Dim 3 cannot match it against the label.
     label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
     resp = (
         "<think>The user wants the weather in Paris.</think>\n"
@@ -324,7 +345,9 @@ def test_json_call_after_think_still_counts(keyword_mode):
         "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
     )
     assert res["tool_correctness"] == 1.0
-    assert res["score"] == pytest.approx(1.0)
+    assert res["format_compliance"] == 0.0
+    assert res["tool_call_format"] == 0.0
+    assert res["score"] == pytest.approx(0.6)
 
 
 # ============================================================================
@@ -343,6 +366,215 @@ def test_inline_json_call_reordered_keys(keyword_mode):
     assert res["tool_correctness"] == 1.0
     assert res["format_compliance"] == 1.0
     assert res["score"] == pytest.approx(1.0)
+
+
+# ============================================================================
+# Regression: strict think-block format must reject stray </think> closers
+# ============================================================================
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("plain answer, no think block", True),
+        ("<think>reasoning</think>\nanswer", True),
+        ("<think>reasoning</think>\n<tool_call>x</tool_call>", True),
+        ("<think>unclosed reasoning", False),
+        ("stray </think> closer", False),
+        ("</think> a </think> b </think>", False),
+        ("<think>reasoning</think> answer </think> tail", False),
+        ("<think>a</think> ok </think> and </think>", False),
+        ("</think> <think>reasoning</think> answer", False),
+        ("<think>a</think> <think>b</think> answer", False),
+        ("<think>reasoning</think>", False),
+        ("<think>r</think>\n<tool_call>x</tool_call>\n", True),
+        ("<think>r</think>\n<tool_call>x</tool_call>\ntrailing text", False),
+        ("<tool_call>x</tool_call> trailing text", False),
+        ("plain reply, no tool call at all", True),
+        # Bare JSON calls: trailing content after the last one is a
+        # strict violation; the call alone (or non-call JSON) is not.
+        ('<think>r</think>\n{"name": "f", "arguments": {"a": 1}}', True),
+        ('<think>r</think>\n{"name": "f"}\ntrailing text', False),
+        ('{"name": "f"} trailing', False),
+        ("reply with non-call json {\"a\": 1} inside", True),
+        ('json in think <think>{"name": "f"}</think> plain reply', True),
+    ],
+)
+def test_check_strict_format(text, expected):
+    assert _check_strict_format(text) is expected
+
+
+def test_stray_close_think_tag_zeroes_format(keyword_mode):
+    # ``<think>...</think> <tool_call>...</tool_call> </think>`` — the
+    # trailing stray closer must zero ALL dims and the total reward even
+    # though the tool call itself is perfectly matched (name/param
+    # sub-scores stay raw as diagnostics).
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _think_call("get_weather", {"city": "Paris"}) + "\n</think>\n"
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["name_score"] == pytest.approx(1.0)
+    assert res["format_compliance"] == 0.0
+    assert res["tool_call_format"] == 0.0
+    assert res["tool_correctness"] == 0.0
+    assert res["score"] == 0.0
+
+
+def test_multiple_stray_closers_zero_total(keyword_mode):
+    # ``</think> ... </think> ... </think>`` repeated strays — total 0.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _think_call("get_weather", {"city": "Paris"}) + "\n</think>\n</think>\n"
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["score"] == 0.0
+    assert res["tool_correctness"] == 0.0
+
+
+def test_trailing_text_after_tool_call_zeroes_score(keyword_mode):
+    # Content after the last ``</tool_call>`` is unreachable (the harness
+    # executes the calls) — malformed layout: the total must be 0 even
+    # though the call itself is perfectly matched.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = (
+        _think_call("get_weather", {"city": "Paris"})
+        + "\nLet me summarize the weather for you...\n"
+    )
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["name_score"] == pytest.approx(1.0)  # raw diagnostic
+    assert res["format_compliance"] == 0.0
+    assert res["tool_call_format"] == 0.0
+    assert res["tool_correctness"] == 0.0
+    assert res["score"] == 0.0
+
+
+def test_bare_json_call_with_trailing_text_zeroes_score(keyword_mode):
+    # Same rule for an UNWRAPPED bare JSON call: trailing text after it
+    # is a strict-layout violation → total 0 (a bare JSON call with no
+    # trailing text keeps its 0.6 Dim-1 fallback credit — see
+    # test_bare_json_call_earns_no_format_credit).
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = (
+        "<think>The user wants the weather in Paris.</think>\n"
+        '{"name": "get_weather", "arguments": {"city": "Paris"}}\n'
+        "Let me summarize the weather for you...\n"
+    )
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["name_score"] == pytest.approx(1.0)  # raw diagnostic
+    assert res["tool_correctness"] == 0.0
+    assert res["format_compliance"] == 0.0
+    assert res["tool_call_format"] == 0.0
+    assert res["score"] == 0.0
+
+
+# ============================================================================
+# Repetition penalty — degenerate loops outside tool calls
+# ============================================================================
+
+def _loop_think_call(phrase: str, times: int) -> str:
+    """Response whose think block repeats *phrase* *times*, then one call."""
+    think = (phrase + " ") * times
+    return (
+        f"<think>\n{think}</think>\n"
+        "<tool_call>\n<function=get_weather>\n"
+        "<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+    )
+
+
+def test_repetition_mild_repeat_tolerated(keyword_mode):
+    # "i need to check" ×2 → only 1 repeat event ≤ threshold → no penalty.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _loop_think_call("i need to check", 2)
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["repetition_penalty"] == 0.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_repetition_loop_in_think_penalized(keyword_mode):
+    # "i need to check" ×3 → 5 repeat events → 2 beyond threshold → -0.2.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _loop_think_call("i need to check", 3)
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["repetition_repeats"] == 5
+    assert res["repetition_penalty"] == pytest.approx(0.2)
+    assert res["score"] == pytest.approx(0.8)
+
+
+def test_repetition_penalty_capped(keyword_mode):
+    # Long loop → penalty capped at 1.0: a perfect call scores 0.0.
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _loop_think_call("i need to check", 8)
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["repetition_penalty"] == pytest.approx(1.0)
+    assert res["score"] == pytest.approx(0.0)
+
+
+def test_repetition_inside_tool_call_not_penalized(keyword_mode):
+    # Repetitive parameter VALUES inside <tool_call> are stripped before
+    # detection — tool calls legitimately share structure.
+    repeated_value = ("echo " * 30).strip()
+    label_calls = [{"name": "get_weather", "arguments": {"city": repeated_value}}]
+    resp = _think_call("get_weather", {"city": repeated_value})
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["repetition_penalty"] == 0.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_repetition_env_config(keyword_mode, monkeypatch):
+    monkeypatch.setenv("TOOL_RL_REPEAT_THRESHOLD", "0")
+    monkeypatch.setenv("TOOL_RL_REPEAT_PER", "0.5")
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _loop_think_call("i need to check", 2)  # 1 repeat event
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["repetition_penalty"] == pytest.approx(0.5)
+    assert res["score"] == pytest.approx(0.5)
+
+
+# ============================================================================
+# Score range guard — final reward clamped to [-1, 1]
+# ============================================================================
+
+def test_reward_clamped_at_minus_one(keyword_mode):
+    # No-tool label + 10 undeclared spurious calls (Dim 1 = -1.0, Dim 2
+    # = 1.0, Dim 3 = 0 → weighted -0.3) + heavy think loop (-1.0): raw
+    # total -1.3 must clamp to exactly -1.0; breakdown fields stay raw.
+    think = "i need to check " * 8
+    calls = "\n".join(
+        f"<tool_call>\n<function=ghost_tool_{i}>\n"
+        f"<parameter=x>\n{i}\n</parameter>\n</function>\n</tool_call>"
+        for i in range(10)
+    )
+    resp = f"<think>\n{think}</think>\n{calls}"
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=[]),
+    )
+    assert res["tool_correctness"] == pytest.approx(-1.0)  # raw
+    assert res["repetition_penalty"] == pytest.approx(1.0)  # raw
+    assert res["score"] == pytest.approx(-1.0)  # clamped from -1.3
+
+
+def test_reward_in_range_values_untouched(keyword_mode):
+    # Clamping must not distort values already inside [-1, 1].
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+    resp = _loop_think_call("i need to check", 3)  # -0.2 repetition
+    res = compute_score(
+        "tool_rl", resp, "", _extra_info(ground_truth_calls=label_calls),
+    )
+    assert res["score"] == pytest.approx(0.8)
 
 
 # ============================================================================

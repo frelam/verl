@@ -83,8 +83,11 @@ class ToolRLHintDataset(RLHFDataset):
         # data.dataloader_num_workers=0.  Never applied to val files, which
         # would corrupt val metrics.
         self._replay_ratio = float(os.environ.get("TOOL_RL_REPLAY_RATIO", "1.0"))
+        # On by default: the dataset may run in a process that did not
+        # inherit the launcher shell's exports — set TOOL_RL_HARD_REPLAY=off
+        # explicitly to disable.
         self._replay_enabled = (
-            os.environ.get("TOOL_RL_HARD_REPLAY", "off") != "off" and not self._looks_like_val_files()
+            os.environ.get("TOOL_RL_HARD_REPLAY", "1") != "off" and not self._looks_like_val_files()
         )
         self._replay_rng = random.Random(f"replay:{self._hint_seed}:{os.getpid()}")
         if self._replay_enabled:

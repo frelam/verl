@@ -57,20 +57,43 @@ def _check_strict_format(text: str) -> bool:
 
     Rules:
       1. ``<think>`` tags must be paired — an unclosed ``<think>`` opener
-         with no ``</think>`` is invalid.
+         with no ``</think>`` is invalid, and a stray ``</think>`` closer
+         without a matching opener is equally invalid. (Each complete
+         block consumes exactly one opener and one closer, so comparing
+         both tag counts against the number of complete blocks catches
+         strays on either side.)
       2. More than one complete ``<think>...</think>`` block is invalid.
       3. Something (response text / tool_call) must follow the think block —
          emitting reasoning and halting is the "think-then-stop" collapse.
-      4. Otherwise valid: no think block at all, or exactly one complete
+      4. When tool calls are present — wrapped ``<tool_call>`` blocks or
+         bare JSON ``{"name": …}`` calls — the response must END at the
+         last call (trailing whitespace aside): content after it is
+         unreachable (the harness executes the calls), so trailing text
+         marks a malformed layout. A bare JSON call with NO trailing
+         text stays layout-valid here — Dim 2/Dim 3 already zero its
+         format credit; only trailing content is a strict violation.
+      5. Otherwise valid: no think block at all, or exactly one complete
          ``<think>...</think>`` block.
     """
     matches = list(_THINK_RE.finditer(text))
     if len(_OPENING_RE.findall(text)) != len(matches):
         return False
+    if len(_CLOSE_TAG_RE.findall(text)) != len(matches):
+        return False
     if len(matches) > 1:
         return False
-    if len(matches) == 1:
-        return text[matches[0].end():].strip() != ""
+    if len(matches) == 1 and text[matches[0].end():].strip() == "":
+        return False
+    tool_call_ends = [m.end() for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
+    if tool_call_ends:
+        # Any trailing content after the last wrapped call — including a
+        # bare JSON call — is invalid (caught here as plain text).
+        if text[tool_call_ends[-1]:].strip() != "":
+            return False
+    else:
+        json_spans = _bare_json_call_spans(text)
+        if json_spans and text[json_spans[-1][1]:].strip() != "":
+            return False
     return True
 
 
@@ -116,16 +139,37 @@ def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
 
 
 def _strip_think_blocks(text: str) -> str:
-    """Remove ``<think>`` blocks (closed and unclosed) from *text*."""
+    """Remove think blocks (closed and unclosed) from text."""
     return _UNCLOSED_THINK_RE.sub(" ", _THINK_RE.sub(" ", text))
 
 
-def _think_block_spans(text: str) -> list[tuple[int, int]]:
-    """Return ``(start, end)`` spans of think blocks (closed and unclosed)."""
-    spans = [m.span() for m in _THINK_RE.finditer(text)]
-    for m in _UNCLOSED_THINK_RE.finditer(text):
-        if not any(s <= m.start() < e for s, e in spans):
-            spans.append(m.span())
+def _bare_json_call_spans(text: str) -> list[tuple[int, int]]:
+    """Return ``(start, end)`` spans of bare JSON tool calls.
+
+    A bare call is a balanced ``{...}`` object outside (closed) think
+    blocks that parses as a dict with a ``name`` key — the same
+    definition the Dim 1 fallback in ``parse_qwen_tool_calls`` uses.
+    """
+    think_spans = [m.span() for m in _THINK_RE.finditer(text)]
+    spans: list[tuple[int, int]] = []
+    depth = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                if not any(s <= start < e for s, e in think_spans):
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                    except ValueError:
+                        obj = None
+                    if isinstance(obj, dict) and obj.get("name"):
+                        spans.append((start, i + 1))
+                start = -1
     return spans
 
 
@@ -146,8 +190,23 @@ def _parse_inline_json_call(block: str) -> dict[str, Any] | None:
 # ============================================================================
 
 
-def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
+def parse_qwen_tool_calls(
+    text: str,
+    *,
+    allow_bare_json: bool = True,
+) -> list[dict[str, Any]]:
     """Parse Qwen XML tool calls from text.
+
+    Args:
+        text: Raw response text.
+        allow_bare_json: When True (default), fall back to bare
+            ``{"name": …, "arguments": {…}}`` objects outside ``<think>``
+            blocks if no ``<tool_call>`` block exists. Pass False for
+            *format* scoring (Dim 2 / Dim 3): an unwrapped call is not a
+            properly formatted tool call and must earn no format credit.
+            Content scoring (Dim 1) keeps the fallback so semantically
+            correct calls still count there (and spurious bare-JSON calls
+            on no-tool samples are still detected).
 
     Returns:
         List of ``{"name": str, "arguments": dict}``.
@@ -177,7 +236,7 @@ def parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 
     # Fallback: JSON format — but ignore JSON discussed inside <think>
     # blocks: that is reasoning about calls, not emitted calls.
-    if not calls:
+    if not calls and allow_bare_json:
         for obj in _extract_json_tool_calls(_strip_think_blocks(text)):
             if obj not in calls:
                 calls.append(obj)
@@ -197,6 +256,10 @@ def check_format_compliance(
     expects_no_tools: bool = False,
 ) -> float:
     """Check <think>...<tool_call> format compliance.
+
+    Only ``<tool_call>``-wrapped calls count — a bare ``{"name": …}`` JSON
+    object without the wrapper is NOT a properly formatted call and earns
+    no credit here (it is treated as "no calls").
 
     Scoring:
       1. All tool_calls after a single, non-empty <think> block → +0.6
@@ -219,7 +282,6 @@ def check_format_compliance(
         return 0.0
 
     n_calls = len(_xml_tool_call_spans(all_text))
-    n_calls += len(_find_json_tool_call_spans(all_text))
 
     if n_calls == 0:
         if expects_no_tools or not available_tools:
@@ -253,30 +315,6 @@ def _get_agent_text(trajectory: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _find_json_tool_call_spans(text: str) -> list[tuple[int, int]]:
-    """Return ``(start, end)`` spans of ``{"name": …}`` objects in *text*.
-
-    Spans that fall inside a think block are excluded — JSON discussed in
-    reasoning is not an emitted call.
-    """
-    think_spans = _think_block_spans(text)
-    spans: list[tuple[int, int]] = []
-    depth = 0
-    start = -1
-    for i, ch in enumerate(text):
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start >= 0:
-                if not any(s <= start < e for s, e in think_spans):
-                    spans.append((start, i + 1))
-                start = -1
-    return spans
-
-
 def _xml_tool_call_spans(text: str) -> list[tuple[int, int]]:
     """Return ``(start, end)`` spans of *valid* ``<tool_call>`` blocks.
 
@@ -299,9 +337,6 @@ def _all_calls_after_think(text: str) -> bool:
     for start, _end in _xml_tool_call_spans(text):
         if start < think_end:
             return False
-    for start, _end in _find_json_tool_call_spans(text):
-        if start < think_end:
-            return False
     return True
 
 
@@ -314,7 +349,6 @@ def _count_preceded_by_think(text: str, total: int) -> int:
         return 0
 
     call_starts = [start for start, end in _xml_tool_call_spans(text)]
-    call_starts.extend(start for start, end in _find_json_tool_call_spans(text))
     call_starts.sort()
 
     count = 0
@@ -340,6 +374,10 @@ def check_tool_call_format(
 
     Only param **names** and param **types** are checked — values are ignored.
 
+    Only ``<tool_call>``-wrapped calls count — a bare ``{"name": …}`` JSON
+    object without the wrapper is not a properly formatted call and cannot
+    match a label call here.
+
     Two cases:
       1. Label provides tool calls: score = ``matched / len(label_calls)``.
       2. Label provides no tool calls: score 1.0 (no detection).
@@ -361,7 +399,7 @@ def check_tool_call_format(
         logger.debug("[dim3] Strict thinking→response format broken → 0.0")
         return 0.0
 
-    output_calls = parse_qwen_tool_calls(all_text)
+    output_calls = parse_qwen_tool_calls(all_text, allow_bare_json=False)
     n = len(label_calls)
     matched = _count_label_matches(output_calls, label_calls)
     score = matched / n
@@ -818,3 +856,68 @@ def compute_verifier_scores(
             label_calls=label_calls,
         ),
     }
+
+
+# ============================================================================
+# Repetition penalty — degenerate loop detection (non-tool-call text)
+# ============================================================================
+
+# Word-level tokens: latin words/numbers as single tokens, each CJK char as
+# one token; punctuation is ignored so markdown structure does not count as
+# repetition.
+_REPEAT_TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?|[一-鿿]")  # 一-鿿 = U+4E00–U+9FFF
+_REPEAT_TOOL_CALL_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL | re.IGNORECASE)
+_REPEAT_UNCLOSED_TOOL_CALL_RE = re.compile(r"<tool_call>.*$", re.DOTALL | re.IGNORECASE)
+_REPEAT_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+
+
+def repetition_penalty(
+    text: str,
+    *,
+    ngram: int = 4,
+    threshold: int = 3,
+    per_repeat: float = 0.1,
+    max_penalty: float = 1.0,
+) -> tuple[float, int]:
+    """Detect degenerate repetition loops outside tool calls.
+
+    Checks the non-tool-call text (think content + visible reply):
+    ``<tool_call>`` blocks are stripped first (tool calls legitimately
+    share structure), think tags are removed, then word-level n-grams are
+    counted.
+
+    ``repeats`` = total excess occurrences over all n-grams
+    (``sum(count - 1)``). The first ``threshold`` repeats are tolerated;
+    every further repeat costs ``per_repeat``, capped at ``max_penalty``.
+
+    Args:
+        text: Raw assistant response.
+        ngram: N-gram size (word tokens).
+        threshold: Number of repeat events tolerated before penalising.
+        per_repeat: Penalty per repeat event beyond the threshold.
+        max_penalty: Cap on the total repetition penalty.
+
+    Returns:
+        ``(penalty, repeats)`` — penalty is a non-negative amount to
+        SUBTRACT from the score; repeats is the raw excess count
+        (diagnostic).
+    """
+    if ngram < 1:
+        return 0.0, 0
+    text = _REPEAT_UNCLOSED_TOOL_CALL_RE.sub(" ", _REPEAT_TOOL_CALL_RE.sub(" ", text))
+    text = _REPEAT_THINK_TAG_RE.sub(" ", text)
+    tokens = _REPEAT_TOKEN_RE.findall(text.lower())
+
+    # Max possible excess is len(tokens) - ngram; bail out early when the
+    # text is too short to exceed the threshold.
+    if len(tokens) < ngram + threshold + 1:
+        return 0.0, 0
+
+    counts: dict[tuple[str, ...], int] = {}
+    for i in range(len(tokens) - ngram + 1):
+        ng = tuple(tokens[i : i + ngram])
+        counts[ng] = counts.get(ng, 0) + 1
+    repeats = sum(c - 1 for c in counts.values() if c > 1)
+
+    penalized = max(0, repeats - threshold)
+    return min(per_repeat * penalized, max_penalty), repeats

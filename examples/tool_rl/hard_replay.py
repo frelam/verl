@@ -58,7 +58,8 @@ passed via ``sampler_kwargs``)::
     # "num_prompts must be a positive multiple of gen_batch_size" for any k
     # that is not a multiple of data.gen_batch_size.
     data.gen_batch_size=1
-    # dataset side env: TOOL_RL_HARD_REPLAY=1, TOOL_RL_REPLAY_RATIO=1.0
+    # dataset side env: TOOL_RL_HARD_REPLAY=1 (on by default; =off disables),
+    # TOOL_RL_REPLAY_RATIO=1.0
 """
 
 # NOTE: no `from __future__ import annotations` here — verl's load_module()

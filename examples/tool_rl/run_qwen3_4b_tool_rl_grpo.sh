@@ -14,12 +14,13 @@
 # Optional env knobs:
 #   TOOL_RL_MASK_FAILED_CALLS=1      mask tokens of incorrect tool calls
 #   TOOL_RL_REWARD_WEIGHTS='{"tool_correctness":0.6,"format":0.2,"tool_call":0.2}'
-#   TOOL_RL_ABSTAIN_MODE=keyword     off (default) | keyword
+#   TOOL_RL_ABSTAIN_MODE=keyword     keyword (default) | off
 #                                    rule-based shaping for no-tool samples:
 #                                    request-more-info / no-valid-tools call 1.0,
 #                                    guess & spurious calls 0 (Dim 1/Dim 3).
-#                                    On by default; set TOOL_RL_ABSTAIN_MODE=off
-#                                    to restore the legacy behaviour.
+#                                    Default ON in code (abstention.py) as well,
+#                                    so reward workers that miss this export
+#                                    still shape; set =off for legacy behaviour.
 #   TOOL_RL_HINT_MODE=random         off (default) | random | fixed
 #                                    inject a random system-prompt hint variant
 #                                    per sample per epoch (fixed = deterministic
@@ -32,7 +33,8 @@
 #                                    and refill with fresh prompts. Requires
 #                                    trainer.use_v1=true (on by default below).
 #   TOOL_RL_HARD_REPLAY=1            tiered hard-sample replay on the V1 trainer
-#                                    (default off): like FILTER_GROUPS, uniform
+#                                    (default on, script- and dataset-side; set
+#                                    =off to disable): like FILTER_GROUPS, uniform
 #                                    groups are filtered, but groups whose pass
 #                                    rate (fraction of rollouts with score > 0)
 #                                    is below 0.5 are additionally pooled and

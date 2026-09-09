@@ -36,8 +36,11 @@ paraphrase coverage over precision between the two desired classes.
 
 Configuration (env vars)
 ------------------------
-``TOOL_RL_ABSTAIN_MODE``   ``off`` (default) | ``keyword``
-                           ``off`` keeps the legacy reward behaviour.
+``TOOL_RL_ABSTAIN_MODE``   ``keyword`` (default) | ``off``
+                           On by default so the shaping survives env
+                           propagation losses (reward workers may not
+                           inherit the launcher shell's exports); set
+                           ``off`` explicitly for the legacy behaviour.
 """
 
 from __future__ import annotations
@@ -168,8 +171,8 @@ def classify_abstention(response: str) -> AbstentionClass:
 # ============================================================================
 
 def abstain_mode_from_env() -> str:
-    """Read ``TOOL_RL_ABSTAIN_MODE``: ``off`` (default) | ``keyword``."""
-    mode = os.environ.get("TOOL_RL_ABSTAIN_MODE", "off").strip().lower()
+    """Read ``TOOL_RL_ABSTAIN_MODE``: ``keyword`` (default) | ``off``."""
+    mode = os.environ.get("TOOL_RL_ABSTAIN_MODE", "keyword").strip().lower()
     if mode not in ("off", "keyword"):
         raise ValueError(f"TOOL_RL_ABSTAIN_MODE must be off|keyword, got {mode!r}")
     return mode

@@ -51,6 +51,40 @@ Dim 2 is untouched (format compliance is answer-agnostic). With the
 default weights this yields: clarify/declare 1.0 > guess 0.4 > spurious
 call 0.2 > undeclared spurious call 0.14.
 
+Strict think-format gate
+------------------------
+A broken response layout — unclosed ``<think>`` opener, stray
+``</think>`` closer (one or many), multiple think blocks,
+think-then-stop, or **trailing content after the last tool call**
+(wrapped ``<tool_call>`` block or bare JSON call alike — unreachable:
+the harness executes the calls) — zeroes the **entire** reward (all
+dims + total). Format is the basic contract: no partial credit for
+tool-call quality when the response layout is malformed. The
+``name_score`` / ``param_content_score`` breakdown fields stay raw as
+diagnostics. A bare JSON call with no trailing text is NOT a strict
+violation: Dim 2/Dim 3 zero its format credit, Dim 1 keeps content
+credit (fallback).
+
+Repetition penalty
+------------------
+Degenerate loops in the non-tool-call text (think + visible reply —
+``<tool_call>`` blocks are stripped first) are detected with word-level
+n-grams. ``repeats`` is the total excess n-gram count; the first
+``threshold`` repeats are tolerated, every further repeat costs
+``per_repeat``, capped at ``max_penalty``. The penalty is subtracted
+from the total AFTER the strict-format gate and may push the score
+negative. Knobs (env vars): ``TOOL_RL_REPEAT_NGRAM`` (4),
+``TOOL_RL_REPEAT_THRESHOLD`` (3), ``TOOL_RL_REPEAT_PER`` (0.1),
+``TOOL_RL_REPEAT_MAX`` (1.0).
+
+Score range
+-----------
+The final ``score`` is clamped to ``[-1.0, 1.0]``. The weighted sum is
+≤ 1 by construction, but undeclared calls (−0.1 each, unbounded) and
+the repetition penalty can push the total below −1. In-range values
+are preserved exactly; per-dimension breakdown fields stay raw
+(unclamped) as diagnostics.
+
 verl integration
 ----------------
 Loaded via ``reward.custom_reward_function.path`` / ``.name=compute_score``.
@@ -64,8 +98,9 @@ Per-sample fields travel in the dataset's ``extra_info`` column:
 Optional knobs (env vars):
 - ``TOOL_RL_REWARD_WEIGHTS`` — JSON dict overriding dimension weights,
   e.g. ``'{"tool_correctness": 0.6, "format": 0.2, "tool_call": 0.2}'``.
-- ``TOOL_RL_ABSTAIN_MODE`` — ``off`` (default) | ``keyword``; enables the
-  no-tool behaviour shaping described above.
+- ``TOOL_RL_ABSTAIN_MODE`` — ``keyword`` (default) | ``off``; the no-tool
+  behaviour shaping described above. On by default so it survives env
+  propagation losses in reward workers.
 """
 
 from __future__ import annotations
@@ -90,10 +125,12 @@ from examples.tool_rl.reward.abstention import (  # noqa: E402
     classify_abstention,
 )
 from examples.tool_rl.reward.verifier import (  # noqa: E402
+    _check_strict_format,
     compute_verifier_scores,
     match_tool_calls_against_label,
     parse_ground_truth_calls,
     parse_qwen_tool_calls,
+    repetition_penalty,
     undeclared_tool_penalty,
 )
 
@@ -126,6 +163,23 @@ def _get_weights() -> dict[str, float]:
     if total > 0:
         defaults = {k: v / total for k, v in defaults.items()}
     return defaults
+
+
+def _get_repetition_config() -> dict[str, Any]:
+    """Repetition-penalty knobs (env-overridable).
+
+    - ``TOOL_RL_REPEAT_NGRAM``     — n-gram size in word tokens (default 4)
+    - ``TOOL_RL_REPEAT_THRESHOLD`` — repeat events tolerated (default 3)
+    - ``TOOL_RL_REPEAT_PER``       — penalty per repeat beyond threshold
+      (default 0.1)
+    - ``TOOL_RL_REPEAT_MAX``       — cap on the total penalty (default 1.0)
+    """
+    return {
+        "ngram": int(os.environ.get("TOOL_RL_REPEAT_NGRAM", "4")),
+        "threshold": int(os.environ.get("TOOL_RL_REPEAT_THRESHOLD", "3")),
+        "per_repeat": float(os.environ.get("TOOL_RL_REPEAT_PER", "0.1")),
+        "max_penalty": float(os.environ.get("TOOL_RL_REPEAT_MAX", "1.0")),
+    }
 
 
 def _to_list(value: Any) -> list:
@@ -209,6 +263,15 @@ def compute_score(
     trajectory = [{"turn": 0, "text": solution_str, "type": "turn"}]
     output_calls = parse_qwen_tool_calls(solution_str)
 
+    # ── Strict think-format gate ──
+    # A broken think-block layout (unclosed ``<think>`` opener, stray
+    # ``</think>`` closer — one or many, multiple think blocks,
+    # think-then-stop) zeroes the ENTIRE reward: format is the basic
+    # contract, so there is no partial credit for tool-call quality.
+    # Dim 2 / Dim 3 already self-zero via their internal strict gates;
+    # the gate here additionally zeroes Dim 1 and the total.
+    strict_format_ok = _check_strict_format(solution_str)
+
     # ── Dim 2 + Dim 3: Verifier (rule-based) ──
     verifier = compute_verifier_scores(
         trajectory,
@@ -245,21 +308,44 @@ def compute_score(
             abstention_class = cls
             tool_correctness = 0.0 if cls is AbstentionClass.GUESS else 1.0
 
+    # ── Repetition penalty (degenerate loops outside tool calls) ──
+    # Applies to think + reply text (tool_call blocks excluded); stacks on
+    # top of everything else and may push the score negative.
+    rep_penalty, rep_repeats = repetition_penalty(
+        solution_str, **_get_repetition_config(),
+    )
+
     # ── Weighted sum (negatives allowed so blind guessing scores < 0) ──
     total = (
         weights["tool_correctness"] * tool_correctness
         + weights["format"] * format_score
         + weights["tool_call"] * tool_call_score
     )
-    total = min(1.0, total)
+
+    # Strict-format gate: zero Dim 1 and the total; name/param sub-scores
+    # stay raw in the breakdown as diagnostics of what was matched.
+    if not strict_format_ok:
+        tool_correctness = 0.0
+        total = 0.0
+
+    total -= rep_penalty
+
+    # ── Range guard: clamp the final reward to [-1, 1] ──
+    # The weighted sum is ≤ 1 by construction, but undeclared calls
+    # (-0.1 each, unbounded) and the repetition penalty can push the
+    # total below -1. In-range values are preserved exactly; breakdown
+    # fields above stay raw (unclamped) as diagnostics.
+    total = max(-1.0, min(1.0, total))
 
     logger.info(
         "[tool_rl] %s: total=%.3f correctness=%.3f(name=%.3f+param=%.3f) "
-        "format=%.3f tool_call=%.3f abstention=%s",
+        "format=%.3f tool_call=%.3f abstention=%s strict_format=%s "
+        "rep_penalty=%.3f(repeats=%d)",
         task_id, total, tool_correctness, name_score, param_score,
         format_score, tool_call_score,
         AbstentionClass(abstention_class).name
         if abstention_class != ABSTENTION_NOT_APPLICABLE else "n/a",
+        strict_format_ok, rep_penalty, rep_repeats,
     )
 
     return {
@@ -270,4 +356,6 @@ def compute_score(
         "format_compliance": format_score,
         "tool_call_format": tool_call_score,
         "abstention_class": int(abstention_class),
+        "repetition_penalty": rep_penalty,
+        "repetition_repeats": rep_repeats,
     }
