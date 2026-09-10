@@ -458,6 +458,57 @@ def test_positive_label_match_untouched(keyword_mode):
 
 
 # ============================================================================
+# pass_check (feeds best@N / pass@N in validation metrics)
+# ============================================================================
+
+def test_pass_check_flips_with_tool_correctness(keyword_mode):
+    """pass_check must be 1.0 exactly when Dim 1 tool correctness is perfect
+    (correct tool + params, or correct abstention), and 0.0 otherwise. verl's
+    process_validation_metrics computes best@16 from this flag → pass@16."""
+    label_calls = [{"name": "get_weather", "arguments": {"city": "Paris"}}]
+
+    # Perfect tool call -> passes.
+    perfect = compute_score(
+        "tool_rl",
+        _think_call("get_weather", {"city": "Paris"}),
+        "",
+        _extra_info(ground_truth_calls=label_calls),
+    )
+    assert perfect["tool_correctness"] == 1.0
+    assert perfect["pass_check"] == 1.0
+
+    # Wrong tool (partial match on a two-tool label) -> fails the pass bar.
+    wrong = compute_score(
+        "tool_rl",
+        _think_call("calculator", {"expression": "1+1"}),
+        "",
+        _extra_info(tools=[_WEATHER_TOOL, _CALC_TOOL], ground_truth_calls=label_calls),
+    )
+    assert wrong["tool_correctness"] < 0.999
+    assert wrong["pass_check"] == 0.0
+
+    # Correct abstention (no-tool label) -> passes as well.
+    abstain = compute_score(
+        "tool_rl",
+        _think_text("I cannot answer this — none of the available tools fits."),
+        "",
+        _extra_info(),
+    )
+    assert abstain["tool_correctness"] == 1.0
+    assert abstain["pass_check"] == 1.0
+
+    # A guessed direct answer (no-tool label) -> fails.
+    guess = compute_score(
+        "tool_rl",
+        _think_text("The weather in Paris is 22°C and sunny."),
+        "",
+        _extra_info(),
+    )
+    assert guess["tool_correctness"] == 0.0
+    assert guess["pass_check"] == 0.0
+
+
+# ============================================================================
 # Regression: hedged guesses must not be rewarded as abstentions
 # ============================================================================
 

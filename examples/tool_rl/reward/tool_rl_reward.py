@@ -387,6 +387,10 @@ def compute_score(
     return {
         "score": total,
         "tool_correctness": tool_correctness,
+        # 0/1 "pass" flag = Dim 1 完全正确（叫对了工具 + 参数都对，或正确弃权）。
+        # 供 verl 的 process_validation_metrics 在其上计算 best@N（即 pass@N，
+        # 如 best@16），用于观察训练过程中模型能力上限的提升。
+        "pass_check": float(tool_correctness >= 0.999),
         "name_score": name_score,
         "param_content_score": param_score,
         "format_compliance": format_score,

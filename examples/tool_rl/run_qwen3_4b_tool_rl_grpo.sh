@@ -126,6 +126,10 @@ use_bypass=${TOOL_RL_BYPASS_MODE:-0}
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.65}
 rollout_n=${ROLLOUT_N:-16}
+# Validation sampling count per prompt. >=16/32 lets process_validation_metrics
+# report pass@16 / pass@32 (best@16 / best@32 over the 0/1 pass_check flag the
+# reward returns). Set >= N to honestly estimate pass@N.
+val_n=${VAL_N:-32}
 
 total_epochs=${TOTAL_EPOCHS:-15}
 save_freq=${SAVE_FREQ:-20}
@@ -227,6 +231,9 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
     actor_rollout_ref.rollout.n=${rollout_n}
+    # Validation: sample val_n responses per prompt so the loss/reward metrics
+    # are bootstrapped into pass@16 / pass@32 (best@16 / best@32 on pass_check).
+    actor_rollout_ref.rollout.val_kwargs.n=${val_n}
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     # Store the generation-time log probs in the batch so bypass mode can use
