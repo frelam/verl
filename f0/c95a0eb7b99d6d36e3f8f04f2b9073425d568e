@@ -1,0 +1,37 @@
+examples/reasoning_rl/test_reasoning_rl_dataset.py
+  s_0fb97993d867c6::t_2f4f6d540ecd92 14-15,24,119-160
+examples/tool_rl/hard_replay.py
+  s_0fb97993d867c6::t_2f4f6d540ecd92 95-99,102-106,310-314,316-325,329-338,534-540
+examples/reasoning_rl/hard_replay.py
+  s_0fb97993d867c6::t_2f4f6d540ecd92 17-20
+tests/trainer/ppo/v1/test_hard_replay_sampler_on_cpu.py
+  s_0fb97993d867c6::t_2f4f6d540ecd92 57-60,86-92,96-97,457-500
+  s_0fb97993d867c6::t_34c76d2793f79d 501-502
+examples/reasoning_rl/README.md
+  s_0fb97993d867c6::t_2f4f6d540ecd92 266
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "f0c95a0eb7b99d6d36e3f8f04f2b9073425d568e",
+  "prompts": {},
+  "sessions": {
+    "s_0fb97993d867c6": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa26b9c02ec400694b0d540",
+        "model": "kimi-k3__dev"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "tool_name": "RunCommand",
+        "tool_use_id": "6aa26ccc02ec400694b0d584",
+        "edit_kind": "bash",
+        "session_id": "6aa26b9c02ec400694b0d540",
+        "operation_id": "6aa26ccc02ec400694b0d584",
+        "external_session_id": "6aa26b9c02ec400694b0d540",
+        "display_model_name": "Kimi-K3"
+      }
+    }
+  }
+}
