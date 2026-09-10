@@ -77,8 +77,11 @@ ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
 # Dataset prompt caps are far below ceiling (math ~2k, code up to ~4k per DESIGN.md
 # section 8); 16384 is a generous safety ceiling so nothing gets truncated.
 max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
-# response curriculum: 8192 -> 16384 -> 24576 -> 32768 (raise between runs).
-max_response_length=${MAX_RESPONSE_LENGTH:-32768}
+# response curriculum: 8192 -> 16384 -> 24576 (raise between runs; DESIGN.md
+# section 8). NOTE: Qwen3-4B's native context is 32768, so keep
+# max_prompt_length + max_response_length <= 32768 or vLLM (max_model_len
+# defaults to the model's max_position_embeddings) silently clamps generation.
+max_response_length=${MAX_RESPONSE_LENGTH:-8192}
 # dynamic-bsz packing budget MUST cover the longest single (prompt+response) sequence
 # or the tail gets dropped. Default = max_prompt + max_response; tune down only if
 # you know the real dataset max and hit GPU memory limits.
@@ -162,16 +165,22 @@ ACTOR=(
     actor_rollout_ref.actor.loss_agg_mode=token-mean
     # kl_cov policy loss: KL-penalize the top-covariance tokens to stop entropy
     # from collapsing (reinforces entropy_coeff=0 above).
-    actor_rollout_ref.actor.policy.loss_mode=kl_cov
-    actor_rollout_ref.actor.policy.kl_cov_ratio=${kl_cov_ratio}
-    actor_rollout_ref.actor.policy.ppo_kl_coef=${kl_cov_coef}
+    actor_rollout_ref.actor.policy_loss.loss_mode=kl_cov
+    actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${kl_cov_ratio}
+    actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${kl_cov_coef}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )
 
 ROLLOUT=(
     actor_rollout_ref.rollout.name=vllm
-    actor_rollout_ref.rollout.mode=sync
+    # sync rollout mode has been REMOVED (RolloutConfig.__post_init__ raises
+    # "Rollout mode 'sync' has been removed"); async is the only supported
+    # mode. Single-turn prompts still work: they go through the framework's
+    # default single_turn_agent loop. NOTE: this is orthogonal to
+    # trainer.v1.trainer_mode=sync (default), which the HardReplaySampler
+    # requires — the trainer stays on-policy/sync either way.
+    actor_rollout_ref.rollout.mode=async
     actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
     actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
     actor_rollout_ref.rollout.n=${rollout_n}
