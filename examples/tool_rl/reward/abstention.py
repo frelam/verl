@@ -16,10 +16,11 @@ with keyword and structure rules.
 Classification (first match wins)
 ---------------------------------
 1. ``NO_VALID_TOOLS`` — capability/tool negation lexicon matches. Tool-
-   explicit phrases ("no suitable tool ...", "none of the tools ...",
-   "don't have access to ...") match bare; *generic* negations ("I can't
-   ...", "unable to ...", "not able to help ...") additionally require a
-   tool/capability/data-access context word within the same sentence.
+   explicit phrases ("no suitable tool ...", "no tools are needed ...",
+   "none of the tools ...", "don't have access to ...") match bare;
+   *generic* negations ("I can't ...", "unable to ...", "not able to
+   help ...") additionally require a tool/capability/data-access context
+   word within the same sentence.
    Without that guard the cheapest reward hack in keyword mode — a hedged
    guess like "I can't be sure, but the answer is 42" — would score full
    marks.  The trade-off is recall: context-free refusals ("I can't help
@@ -117,6 +118,9 @@ _NEGATION_RES = [
         r"\bunable\s+to\b[^.?!]{0,80}?\b" + _CAP_CTX + r"\b",
         # Tool-explicit phrases — match bare.
         r"\bno\s+(?:suitable|available|appropriate|matching|relevant|adequate)\s+tools?\b",
+        r"\bno\s+tools?\s+(?:are|is|were|was)?\s*(?:needed|required|necessary|useful)\b",
+        r"\bno\s+tools?\s+(?:can|could|would|will)\b",
+        r"\bthere\s+(?:is|are)\s+no\s+(?:(?:suitable|available|appropriate)\s+)?tools?\b",
         r"\bnone\s+of\s+the\s+(?:available\s+|provided\s+|declared\s+)?tools?\b",
         r"\b(?:do\s+not|don't|does\s+not|doesn't)\s+have\s+"
         r"(?:access\s+to|the\s+(?:ability|capability|capacity|means)\s+to"

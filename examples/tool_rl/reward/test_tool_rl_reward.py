@@ -130,6 +130,24 @@ def test_classify_none_of_tools():
     assert r is AbstentionClass.NO_VALID_TOOLS
 
 
+def test_classify_no_tools_needed():
+    # Regression: "no tools are needed" (no adjective between "no" and
+    # "tools") fell through to GUESS while the near-synonym "no available
+    # tool ..." scored NO_VALID_TOOLS.
+    r = classify_abstention("No tools are needed for these calculations.")
+    assert r is AbstentionClass.NO_VALID_TOOLS
+
+
+def test_classify_no_tools_can():
+    r = classify_abstention("No tools can directly compute these values.")
+    assert r is AbstentionClass.NO_VALID_TOOLS
+
+
+def test_classify_there_are_no_tools():
+    r = classify_abstention("There are no tools that can fetch this data.")
+    assert r is AbstentionClass.NO_VALID_TOOLS
+
+
 def test_classify_guess():
     r = classify_abstention(_think_text("The weather in Paris is 22°C and sunny."))
     assert r is AbstentionClass.GUESS
@@ -172,6 +190,21 @@ def test_keyword_no_valid_tools_full_score(keyword_mode):
     res = compute_score(
         "tool_rl",
         _think_text("I cannot answer this — none of the available tools fits."),
+        "",
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.NO_VALID_TOOLS)
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_keyword_no_tools_needed_full_score(keyword_mode):
+    # End-to-end regression for the reported score jump: this phrasing
+    # previously classified as GUESS (0.4) while the near-synonym
+    # "no available tool ..." scored 1.0.
+    res = compute_score(
+        "tool_rl",
+        _think_text("No tools are needed for these calculations."),
         "",
         _extra_info(),
     )
