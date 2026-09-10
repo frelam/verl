@@ -22,6 +22,17 @@ DeepCoder-train already covers TACO-verified + PrimeIntellect (see DESIGN.md sec
 
 ground_truth format matches verl prime_code / sandbox_fusion consumers:
     json string of {"inputs": [...], "outputs": [...] (, "fn_name": ...)}
+    Canonical test shapes (enforced by normalize_in_outs):
+      * stdio problems: inputs[i] / outputs[i] are plain strings.
+      * call-based (fn_name) problems: inputs[i] is a JSON-per-line string
+        (one JSON value per function argument); outputs[i] is the expected
+        return value as a JSON string (single-element list unwrapped once,
+        TACO convention). prime_code parses these with json.loads and calls
+        fn(*args); sandbox_fusion feeds inputs[i] verbatim as stdin to its
+        fn_name wrapper and string-compares stdout with outputs[i].
+    Raw APPS rows deviate from this contract (call-based inputs[i] is a list
+    of args, outputs[i] is list-wrapped; some stdio inputs are lists of
+    lines) and score 0 on BOTH verifiers if stored unmodified.
 
 Usage:
     python scripts/to_parquet_code.py \
@@ -67,8 +78,51 @@ def make_extra_info(split, index, task_id, source, difficulty=""):
     }
 
 
+def _canon_stdio_field(v) -> str:
+    """stdio test field -> plain string (APPS stores some as lists of lines)."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list | tuple):
+        return "\n".join(str(x).rstrip("\n") for x in v)
+    return str(v)
+
+
+def _canon_call_input(v) -> str:
+    """call-based test input -> JSON-per-line string (one JSON value per arg).
+
+    prime_code parses each line with json.loads and calls fn(*args);
+    sandbox_fusion pipes the string verbatim as stdin to its fn_name wrapper,
+    which does the same. Raw APPS stores the args as a list instead.
+    """
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list | tuple):
+        return "\n".join(json.dumps(a) for a in v)
+    return json.dumps(v)
+
+
+def _canon_call_output(v) -> str:
+    """call-based expected return -> JSON string.
+
+    prime_code json.loads-es it and compares structurally (tolerating a
+    list-wrapped value); sandbox_fusion string-compares it against the
+    wrapper's stdout (json.dumps of the result for containers/bool/None,
+    str() for int/float/str), so a single-element list is unwrapped once
+    (TACO convention: expected returns are list-wrapped).
+    """
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list | tuple) and len(v) == 1:
+        v = v[0]
+    return json.dumps(v)
+
+
 def normalize_in_outs(raw) -> dict | None:
-    """Parse raw test-case field into {"inputs","outputs"(,"fn_name")}; None if invalid."""
+    """Parse raw test-case field into {"inputs","outputs"(,"fn_name")}; None if invalid.
+
+    Test shapes are canonicalised to the verifier contract (see module docstring);
+    already-canonical rows (DeepCoder, code_contests) pass through unchanged.
+    """
     if raw is None:
         return None
     if isinstance(raw, str):
@@ -86,8 +140,14 @@ def normalize_in_outs(raw) -> dict | None:
         return None
     if len(inputs) != len(outputs):
         return None
-    in_outs = {"inputs": inputs[:MAX_TESTS_PER_PROBLEM], "outputs": outputs[:MAX_TESTS_PER_PROBLEM]}
     fn_name = raw.get("fn_name")
+    if fn_name:
+        canon_i = [_canon_call_input(v) for v in inputs[:MAX_TESTS_PER_PROBLEM]]
+        canon_o = [_canon_call_output(v) for v in outputs[:MAX_TESTS_PER_PROBLEM]]
+    else:
+        canon_i = [_canon_stdio_field(v) for v in inputs[:MAX_TESTS_PER_PROBLEM]]
+        canon_o = [_canon_stdio_field(v) for v in outputs[:MAX_TESTS_PER_PROBLEM]]
+    in_outs = {"inputs": canon_i, "outputs": canon_o}
     if fn_name:
         in_outs["fn_name"] = str(fn_name)
     return in_outs
