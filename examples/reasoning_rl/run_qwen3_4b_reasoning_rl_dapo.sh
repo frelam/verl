@@ -170,6 +170,11 @@ ACTOR=(
     actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${kl_cov_coef}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    # Only persist weights + bookkeeping (global_step/RNG); skip optimizer
+    # state to save ~half the checkpoint disk. load_contents defaults to
+    # ${.save_contents}, so a resumed run also skips loading the optimizer
+    # (momentum/learning-rate restart from scratch).
+    actor_rollout_ref.actor.checkpoint.save_contents='["model","extra"]'
 )
 
 ROLLOUT=(
