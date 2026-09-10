@@ -1,0 +1,52 @@
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_fully_async.sh
+  s_7d4f689433da5a::t_9f27d1c4fbe230 10-26
+  s_7d4f689433da5a::t_3b7992917ece6b 65-67
+  s_7d4f689433da5a::t_8df66b660781b0 99-101
+  s_7d4f689433da5a::t_f813bada885c8e 53-54,56-60
+  s_7d4f689433da5a::t_3f262ee5952440 86-96
+  s_7d4f689433da5a::t_07ede5234b3494 178-180
+  s_7d4f689433da5a::t_71973c68fc0fd5 338
+  s_7d4f689433da5a::t_ae330554c4a158 1-9,27-52,61-64,68,71-85,97-98,102-123,125-150,153-156,164-177,182-243,248-249,254-256,264-281,288-311,314-337,339-383
+  s_7d4f689433da5a::t_be5efc4f9633ec 257-263
+  s_7d4f689433da5a::t_0b883824374842 69-70
+  s_7d4f689433da5a::t_751ca0150a59c3 312-313
+  s_7d4f689433da5a::t_a55fc1e44e1e4e 244-247,250-253
+  s_7d4f689433da5a::t_44f880c87d1f21 282-287
+  s_7d4f689433da5a::t_e1478cc28a5892 55
+  h_25cf8a8e4e8b34 124,181
+  s_7d4f689433da5a::t_f31126f6ee168a 151-152,157-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "5ade6b3877205ce71c20cbe51701cbe6f267770e",
+  "prompts": {},
+  "humans": {
+    "h_25cf8a8e4e8b34": {
+      "author": "lvhaoyu <lvhaoyu@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_7d4f689433da5a": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa2a20702ec400694b0d796",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "operation_id": "6aa2a8c402ec400694b0d8a6",
+        "runtime_client": "trae-tob-git-ai",
+        "source_scene": "agent",
+        "client_type": "ide",
+        "tool_use_id": "6aa2a8c402ec400694b0d8a6",
+        "session_id": "6aa2a20702ec400694b0d796",
+        "edit_kind": "file_edit",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "external_session_id": "6aa2a20702ec400694b0d796",
+        "tool_type": "builtin",
+        "dedupe_key": "6aa2a20702ec400694b0d796:6aa2a8c402ec400694b0d8a6:afterEdit:407f404d"
+      }
+    }
+  }
+}
