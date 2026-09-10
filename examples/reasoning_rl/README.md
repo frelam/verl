@@ -263,3 +263,4 @@ bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
 | MinHash 阶段内存高 | 签名矩阵 128×N×8B（N=27 万约 276MB） | 属正常量级；更大池可分批跑 |
 | `datasets` 下载中断 | 网络抖动 | 重跑即可（HF 缓存断点续传），或先 `hf download` 再用本地路径参数 |
 | HF 直连超时 | 网络受限 | `export HF_ENDPOINT=https://hf-mirror.com` |
+| 训练 step 收尾（导出回放池）报 `KeyError: key "tools" not found in TensorDict with keys ['data_source', 'extra_info', 'raw_prompt', 'reward_model']` | 导出回放样本用的是 tool_rl 的 `ROW_FIELDS`（含 `tools`）；reasoning_rl parquet 没有 `tools` 列，TransferQueue 的 `select_fields` 会**静默丢弃**轨迹里不存在的字段，旧代码却按请求列表逐个索引 | 已修（`examples/tool_rl/hard_replay.py`）：`_tq_fetch_rows` 只回读轨迹实际存在的字段（缺的字段打一条 info 日志），并跳过没有 `raw_prompt` 的导出 |

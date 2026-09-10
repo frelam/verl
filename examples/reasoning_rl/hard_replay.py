@@ -14,8 +14,10 @@
 """Tiered hard-sample replay for reasoning_rl — reuses tool_rl's implementation.
 
 The tool_rl ``hard_replay.py`` module is fully domain-agnostic (all knobs come
-from ``sampler_kwargs``; no env vars are read inside it), so this file is a
-thin re-export that lets the trainer mount it under the reasoning_rl path
+from ``sampler_kwargs``; no env vars are read inside it, and the row read-back
+only asks for fields a trajectory actually stores — a parquet without tool_rl's
+``tools`` column works unchanged), so this file is a thin re-export that lets
+the trainer mount it under the reasoning_rl path
 while BOTH sides share the same underlying module in ``sys.modules`` — which
 is what keeps the ``HardReplayPool`` singleton shared between the sampler
 (trainer driver) and the dataset (``reasoning_rl_dataset.py``)::

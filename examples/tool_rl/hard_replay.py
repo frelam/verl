@@ -92,8 +92,17 @@ TIER_HARD = "hard"
 TIER_MEDIUM = "medium"
 
 # Fields read back from one trajectory of an exported group; enough for the
-# dataset to rebuild an equivalent row (see ``entry_to_row_dict``).
+# dataset to rebuild an equivalent row (see ``entry_to_row_dict``).  This is a
+# *candidate* list, not a schema: TransferQueue stores exactly the dataset row
+# columns a sample carries, so a domain whose parquet has no ``tools`` column
+# (reasoning_rl) never stores ``tools`` at all, and ``_tq_fetch_rows`` reads back
+# whatever the trajectory has instead of requiring every name listed here.
 ROW_FIELDS = ["raw_prompt", "tools", "data_source", "reward_model", "extra_info"]
+
+# A pooled row must at least carry the prompt to be replayable.  Checking here
+# turns an unusable export into one skipped group instead of an empty prompt
+# dispatched through the dataloader on some later step.
+REQUIRED_ROW_FIELDS = ["raw_prompt"]
 
 
 @dataclass
@@ -298,13 +307,35 @@ def _unwrap(value):
     return value
 
 
+# Missing-field combinations already logged by ``_tq_fetch_rows`` (one log line
+# per combination per process: this runs on every export pass).
+_LOGGED_MISSING_FIELDS: set[tuple[str, ...]] = set()
+
+
 def _tq_fetch_rows(partition_id: str, keys: list[str], fields: list[str]) -> list[dict[str, Any]]:
-    """Fetch ``fields`` for ``keys`` and return one plain dict per key."""
+    """Fetch ``fields`` for ``keys`` and return one plain dict per key.
+
+    ``fields`` is a candidate set: TransferQueue's ``select_fields`` keeps only
+    the names present in the stored field schema (``BatchMeta.select_fields``
+    silently drops the rest), so the TensorDict handed back may hold fewer keys
+    than requested — e.g. ``tools`` for a domain whose dataset has no tools
+    column (reasoning_rl).  Indexing every *requested* name would raise
+    ``KeyError: key "tools" not found in TensorDict with keys [...]``, so read
+    back the intersection and report the gap once per process.
+    """
     if not keys:
         return []
     data = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=fields)
-    columns = {f: list(data[f]) for f in fields}
-    return [{f: _unwrap(columns[f][i]) for f in fields} for i in range(len(keys))]
+    present = [field for field in fields if field in data.keys()]
+    missing = tuple(field for field in fields if field not in present)
+    if missing and missing not in _LOGGED_MISSING_FIELDS:
+        _LOGGED_MISSING_FIELDS.add(missing)
+        logger.info(
+            "[tool_rl] hard-replay: trajectories never store %s; pooled rows for this domain omit them",
+            list(missing),
+        )
+    columns = {field: list(data[field]) for field in present}
+    return [{field: _unwrap(columns[field][i]) for field in present} for i in range(len(keys))]
 
 
 def _row_key(row: dict[str, Any]) -> str:
@@ -500,7 +531,13 @@ class HardReplaySampler(ReplayBuffer):
                 uid: next(key for key in trajectory_keys if key.split("_")[0] == uid) for uid, _ in exports
             }
             rows = _tq_fetch_rows(partition_id, [first_key_by_uid[uid] for uid, _ in exports], ROW_FIELDS)
-            for (_, pass_rate), row in zip(exports, rows, strict=True):
+            for (uid, pass_rate), row in zip(exports, rows, strict=True):
+                missing = [field for field in REQUIRED_ROW_FIELDS if not row.get(field)]
+                if missing:
+                    logger.warning(
+                        "[tool_rl] hard-replay: not pooling group %s, its trajectory has no %s", uid, missing
+                    )
+                    continue
                 self.pool.add(_row_key(row), row, pass_rate)
 
         self.pool.end_of_pass()

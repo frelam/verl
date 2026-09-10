@@ -54,6 +54,10 @@ ROW = {
     "extra_info": {"index": 0, "tools_kwargs": {}, "interaction_kwargs": {}},
 }
 
+# reasoning_rl's parquet has no ``tools`` column, so its trajectories never store
+# that field: the replay export pass must read back only what a row actually has.
+ROW_WITHOUT_TOOLS = {key: value for key, value in ROW.items() if key != "tools"}
+
 
 @pytest.fixture(autouse=True)
 def _fresh_pool():
@@ -79,12 +83,18 @@ def _uid() -> str:
     return uuid.uuid4().hex
 
 
-def _produce_group(partition_id: str, task_id: str, rewards: list[float], extra_info: dict | None = None) -> str:
+def _produce_group(
+    partition_id: str,
+    task_id: str,
+    rewards: list[float],
+    extra_info: dict | None = None,
+    row: dict | None = None,
+) -> str:
     """Write one finished group whose trajectories carry row fields plus the reward metric."""
     uid = _uid()
     for session_id, reward in enumerate(rewards):
-        fields = dict(ROW)
-        ei = dict(ROW["extra_info"])
+        fields = dict(ROW if row is None else row)
+        ei = dict(fields["extra_info"])
         ei["task_id"] = task_id
         if extra_info:
             ei.update(extra_info)
@@ -440,6 +450,52 @@ def test_replayed_group_improving_to_medium_retiers_pool_entry(tq_init, partitio
         _classify(rb, partition_id)
         entry = rb.pool.entries["hard-4"]
         assert entry.state == "available" and entry.tier == "medium" and entry.replay_count == 1
+    finally:
+        _clear_partition(partition_id)
+
+
+# --------------------------------------------------------------------------- #
+# Domains whose parquet lacks some of the tool_rl row fields (reasoning_rl).
+# --------------------------------------------------------------------------- #
+
+
+def test_export_pools_row_when_trajectory_has_no_tools_field(tq_init, partition_id):
+    """A ``tools``-less domain (reasoning_rl) must not crash the export pass.
+
+    ``ROW_FIELDS`` is the tool_rl schema; TransferQueue silently drops requested
+    fields a stored sample does not have, so indexing every requested name used
+    to raise ``KeyError: key "tools" not found in TensorDict with keys [...]``.
+    """
+    _produce_group(partition_id, task_id="hard-notools", rewards=[0.0, 0.0], row=ROW_WITHOUT_TOOLS)
+    rb = _make_sampler()
+    try:
+        dapo_uids, _ = _classify(rb, partition_id)
+        assert len(dapo_uids) == 1
+        entry = rb.pool.entries["hard-notools"]
+        assert entry.row["raw_prompt"] == ROW["raw_prompt"]
+        assert entry.row["reward_model"] == ROW["reward_model"]
+        assert entry.row["data_source"] == ROW["data_source"]
+        assert "tools" not in entry.row  # never stored by this domain
+
+        # The rebuilt row still carries what the dataset/agent loop needs.
+        row = entry_to_row_dict(entry)
+        assert row["raw_prompt"] == ROW["raw_prompt"]
+        assert row["extra_info"][HARD_REPLAY_TAG] == "hard-notools"
+        assert row["reward_model"] == ROW["reward_model"]
+        assert "tools" not in row
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_export_skips_group_whose_trajectory_has_no_prompt(tq_init, partition_id):
+    """An unrebuildable row is skipped instead of dispatched as an empty prompt."""
+    row = {key: value for key, value in ROW.items() if key != "raw_prompt"}
+    _produce_group(partition_id, task_id="hard-noprompt", rewards=[0.0, 0.0], row=row)
+    rb = _make_sampler()
+    try:
+        dapo_uids, _ = _classify(rb, partition_id)
+        assert len(dapo_uids) == 1  # still filtered: no gradient signal
+        assert len(rb.pool) == 0  # but nothing pooled: the prompt is missing
     finally:
         _clear_partition(partition_id)
 
