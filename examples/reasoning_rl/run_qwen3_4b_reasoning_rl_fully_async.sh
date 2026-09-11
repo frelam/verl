@@ -124,8 +124,8 @@ RESUME_PATH=${RESUME_PATH:-}
 train_batch_size=${TRAIN_BATCH_SIZE:-128}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
 # Dataset prompt caps are far below ceiling (math ~2k, code up to ~4k per DESIGN.md
-# section 8); 16384 is a generous safety ceiling so nothing gets truncated.
-max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
+# section 8); 8192 is enough headroom so nothing gets truncated.
+max_prompt_length=${MAX_PROMPT_LENGTH:-8192}
 # response curriculum: 8192 -> 16384 -> 24576 (raise between runs; DESIGN.md
 # section 8). NOTE: Qwen3-4B's native context is 32768, so keep
 # max_prompt_length + max_response_length <= 32768 or vLLM silently clamps.
@@ -284,7 +284,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.max_num_seqs=${max_num_seqs}
     actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length))
     actor_rollout_ref.rollout.enforce_eager=${enforce_eager}
-    actor_rollout_ref.rollout.enable_sleep_mode=False
+    +actor_rollout_ref.rollout.enable_sleep_mode=False  # key absent in trainer-side rollout schema, needs +
     # REQUIRED by fully async: Rollouter must return per-token log-probs
     # (asserted in FullyAsyncRollouter._validate_config).
     actor_rollout_ref.rollout.calculate_log_probs=True
