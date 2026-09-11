@@ -136,6 +136,12 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((max_prompt_length + ma
 
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
+# Compute entropy from logits in chunks (chunk_size tokens at a time) instead of
+# materialising the full [bsz*seq_len, voc] tensor. Reduces peak GPU memory when
+# recomputing old_log_prob (calculate_entropy=True) on a tight trainer split
+# (e.g. 12+4 GPUs); the logits tensor is the dominant memory consumer there.
+entropy_from_logits_with_chunking=${ENTROPY_FROM_LOGITS_WITH_CHUNKING:-True}
+entropy_from_logits_chunk_size=${ENTROPY_FROM_LOGITS_CHUNK_SIZE:-2048}
 # clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO). NOTE: as in
 # the sync script, loss_mode=kl_cov does not consume these clip ratios.
 clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
@@ -230,6 +236,9 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
+    # Chunked entropy computation (lower peak memory during old_log_prob forward).
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=${entropy_from_logits_with_chunking}
+    actor_rollout_ref.actor.entropy_from_logits_chunk_size=${entropy_from_logits_chunk_size}
     # clip-higher (DAPO): epsilon_low fixed, epsilon_high raised.
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
