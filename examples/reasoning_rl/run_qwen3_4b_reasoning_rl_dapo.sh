@@ -75,13 +75,13 @@ RESUME_PATH=${RESUME_PATH:-}
 train_batch_size=${TRAIN_BATCH_SIZE:-256}
 ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
 # Dataset prompt caps are far below ceiling (math ~2k, code up to ~4k per DESIGN.md
-# section 8); 16384 is a generous safety ceiling so nothing gets truncated.
-max_prompt_length=${MAX_PROMPT_LENGTH:-16384}
+# section 8); 4096 is enough headroom so nothing gets truncated.
+max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
 # response curriculum: 8192 -> 16384 -> 24576 (raise between runs; DESIGN.md
 # section 8). NOTE: Qwen3-4B's native context is 32768, so keep
 # max_prompt_length + max_response_length <= 32768 or vLLM (max_model_len
 # defaults to the model's max_position_embeddings) silently clamps generation.
-max_response_length=${MAX_RESPONSE_LENGTH:-8192}
+max_response_length=${MAX_RESPONSE_LENGTH:-16384}
 # dynamic-bsz packing budget MUST cover the longest single (prompt+response) sequence
 # or the tail gets dropped. Default = max_prompt + max_response; tune down only if
 # you know the real dataset max and hit GPU memory limits.
