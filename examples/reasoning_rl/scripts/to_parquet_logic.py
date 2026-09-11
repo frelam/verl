@@ -100,6 +100,46 @@ def _serialize_answer(answer) -> str:
     return json.dumps(answer, ensure_ascii=False)
 
 
+def _recover_synlogic_answer(task: str, game_data: dict):
+    """Recover the ground truth from SynLogic ``metadata`` when the top-level
+    ``answer`` field is empty — affects ~25% of rows; whole tasks (minesweeper,
+    norinori, kukurasu, ...) would otherwise be silently dropped.
+
+    Returns None when no reliable string-matchable answer exists: mathador has
+    many arithmetically-equivalent solutions, so exact matching would punish
+    valid alternative expressions."""
+    md = game_data.get("metadata") or {}
+    if task == "word_sorting_mistake":
+        # A null answer means "no mistake"; the prompt expects \boxed{No}.
+        ans = md.get("answer")
+        if ans is None or (isinstance(ans, str) and not ans.strip()):
+            return None if md.get("is_mistake") else "No"
+        return ans
+    if task == "skyscraper_puzzle":
+        return md.get("solved_grid")
+    if task == "minesweeper":
+        return md.get("current_mines")
+    if task in {"campsite", "number_wall", "numbrix", "norinori", "kukurasu"}:
+        return md.get("solution")
+    if task == "star_placement_puzzle":
+        # Prompt asks for a 1-indexed {region: [(r, c), ...]} dict; metadata
+        # holds a flat 0-indexed coordinate list — rebuild the dict from
+        # region_grid so the ground truth matches the prompt's format.
+        solution, region_grid = md.get("solution"), md.get("region_grid")
+        if not solution or not region_grid:
+            return None
+        try:
+            stars: dict[str, list] = {}
+            for r, c in solution:
+                stars.setdefault(region_grid[r][c], []).append((r + 1, c + 1))
+        except (IndexError, TypeError):
+            return None
+        for coords in stars.values():
+            coords.sort()
+        return stars
+    return None
+
+
 def make_logic_row(
     question_content: str,
     answer,
@@ -137,10 +177,12 @@ def load_synlogic(path: str | None, configs=("easy", "hard")) -> list[dict]:
                 game_data = json.loads((ex.get("extra_info") or {}).get("game_data_str") or "{}")
             except (json.JSONDecodeError, TypeError):
                 game_data = {}
+            task = str(ex.get("data_source") or "synlogic")
             answer = game_data.get("answer")
+            if answer is None or (isinstance(answer, str) and not answer.strip()):
+                answer = _recover_synlogic_answer(task, game_data)
             prompt = ex.get("prompt") or []
             content = prompt[0].get("content") if prompt and isinstance(prompt[0], dict) else ""
-            task = str(ex.get("data_source") or "synlogic")
             row = make_logic_row(
                 content,
                 answer,

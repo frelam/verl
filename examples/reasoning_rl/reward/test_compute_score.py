@@ -55,9 +55,22 @@ class TestExtractLogicAnswer:
     def test_final_answer_line(self):
         assert extract_logic_answer("blah\nFinal Answer: B\n") == "B"
 
+    def test_the_answer_is_line(self):
+        # SynLogic web_of_lies / cryptarithm convention.
+        assert extract_logic_answer("reasoning...\nThe answer is **no, no, yes**.\n") == "**no, no, yes**"
+
     def test_answer_tag_beats_boxed(self):
         sol = "$\\boxed{99}$ then <answer>42</answer>"
         assert extract_logic_answer(sol) == "42"
+
+    def test_fenced_block_fallback(self):
+        # SynLogic skyscraper_puzzle / zebra_puzzle require a fenced block.
+        sol = 'analysis...\n最终解答：\n```python\n[[3, 2], [1, 4]]\n```\n'
+        assert extract_logic_answer(sol) == "[[3, 2], [1, 4]]"
+
+    def test_fences_stripped_inside_answer_tag(self):
+        sol = "<answer>```json\n{\"a\": 1}\n```</answer>"
+        assert extract_logic_answer(sol) == '{"a": 1}'
 
     def test_no_answer(self):
         assert extract_logic_answer("no final answer here") is None
@@ -100,6 +113,42 @@ class TestLogicAnswerMatch:
         # Rows separated by double spaces / newlines collapse identically.
         gt = "7 0 7  0 7 0\n7 0 0"
         assert logic_answer_match("7 0 7 0 7 0 7 0 0", gt)
+
+    def test_comma_spacing_invariant(self):
+        # SynLogic boolean_expressions gt is "A,C,D,E"; models naturally
+        # write "A, C, D, E".
+        assert logic_answer_match("A, C, D, E", "A,C,D,E")
+        assert not logic_answer_match("A, C, D, F", "A,C,D,E")
+
+    def test_inner_quotes_invariant(self):
+        # SynLogic cipher gt is "[[WORD]]" (unparseable); the prompt example
+        # tells the model to output "[['WORD']]".
+        assert logic_answer_match("[['HILDRQHZPQ']]", "[[HILDRQHZPQ]]")
+        assert not logic_answer_match("[['HILDRQHZPX']]", "[[HILDRQHZPQ]]")
+
+    def test_bold_emphasis_stripped(self):
+        # SynLogic web_of_lies asks for 'The answer is **yes, no**'.
+        assert logic_answer_match("**no, no, no, yes**", "no, no, no, yes")
+
+    def test_token_spacing_still_significant(self):
+        # Loose form must not collapse spaces between tokens.
+        assert not logic_answer_match("123", "1 2 3")
+
+    def test_unordered_coord_tasks_canonicalised(self):
+        # norinori dominos: domino order and cell order within a domino are
+        # both irrelevant; minesweeper/star_placement behave the same way.
+        gt = json.dumps([[[3, 1], [3, 2]], [[5, 1], [5, 2]]])
+        assert logic_answer_match("[[(5, 1), (5, 2)], [(3, 2), (3, 1)]]", gt, task="norinori")
+        assert not logic_answer_match("[[(5, 1), (5, 2)], [(3, 2), (3, 3)]]", gt, task="norinori")
+        gt_ms = json.dumps([[3, 7], [4, 6]])
+        assert logic_answer_match("[(4, 6), (3, 7)]", gt_ms, task="minesweeper")
+
+    def test_grid_order_still_significant_without_task(self):
+        # The same shuffled-rows input must NOT match for grid tasks (campsite)
+        # or when no task is supplied.
+        gt = json.dumps([[3, 4], [1, 2]])
+        assert not logic_answer_match("[[1, 2], [3, 4]]", gt, task="campsite")
+        assert not logic_answer_match("[[1, 2], [3, 4]]", gt)
 
 
 # ---------------------------------------------------------------------------

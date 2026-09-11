@@ -65,7 +65,11 @@ examples/reasoning_rl/
 - 数学/STEM：`"Please reason step by step, and put your final answer within \\boxed{}."`
 - 代码：`"Write a complete Python program reading from stdin. Wrap it in ```python ... ```."`
   （fn_name 型题目改用函数签名模板）
-- 逻辑：各 task 模板 + 统一 `Final Answer: ...` 收尾行
+- 逻辑：保留各 task 原生模板（SynLogic 收尾约定不统一：`Final Answer:` / `The answer is ...` /
+  `\boxed{}` / ``` ```python``` 代码块均存在），由 verifier 按
+  `<answer>` 标签 → `\boxed{}` → 收尾行 → 末尾代码块 的优先级提取，并做大小写/空白折叠、
+  markdown 强调符剥离、分隔符间距与内层引号不敏感的文本比较及结构化（JSON/literal）比较；
+  minesweeper / norinori / star_placement_puzzle 等坐标集合类答案额外做无序规范化
 
 ---
 

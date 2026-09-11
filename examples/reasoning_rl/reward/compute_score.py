@@ -28,10 +28,12 @@ Routing (data_source prefix -> verifier):
 ``code_*``           sandbox_fusion when ``sandbox_fusion_url`` is set,
                      else prime_code local execution (smoke runs only)
 ``logic_*``          rule verifier: extract the final answer
-                     (<answer> tags -> \\boxed{} -> "Final Answer:" line)
+                     (<answer> tags -> \\boxed{} -> "Final Answer:" /
+                     "The answer is ..." line -> last fenced code block)
                      and compare with the ground truth after normalisation
-                     (whitespace/case folding, literal/JSON structural
-                     compare, numeric tolerance)
+                     (whitespace/case folding, markdown-emphasis stripping,
+                     separator-spacing/quote-insensitive text compare,
+                     literal/JSON structural compare, numeric tolerance)
 ``stem_*``           math_verify on the \\boxed{} answer; Dr.SCI prompts
                      already request the boxed format
 ``if_*``             instruction-following (Nemotron-RL-instruction_following):
@@ -66,7 +68,11 @@ logger = logging.getLogger(__name__)
 
 _ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 _BOXED_RE = re.compile(r"\\boxed\s*\{")
-_FINAL_ANSWER_RE = re.compile(r"final answer\s*[::]\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+# SynLogic task prompts use heterogeneous final-answer conventions: besides
+# "Final Answer: ...", many tasks (web_of_lies, cryptarithm, word_sorting_mistake)
+# instruct 'The answer is $YOUR_ANSWER' — often wrapped in markdown bold.
+_FINAL_ANSWER_RE = re.compile(r"(?:final answer\s*[::]|the answer is)\s*[::]?\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+_FENCED_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
@@ -181,26 +187,62 @@ def _extract_boxed(text: str) -> str | None:
     return None
 
 
+def _strip_fences(s: str) -> str:
+    """Unwrap a markdown fenced code block (```lang\\n...```) around an answer.
+
+    Several SynLogic tasks (skyscraper_puzzle, zebra_puzzle) require the final
+    answer inside a ```python / ```json block; models also wrap <answer>-tag
+    content in fences on their own. The fence is container, not content.
+    """
+    s = s.strip()
+    m = _FENCED_BLOCK_RE.fullmatch(s)
+    return m.group(1).strip() if m else s
+
+
 def extract_logic_answer(solution_str: str) -> str | None:
     """Extract the final answer: <answer> tags, then \\boxed{}, then a
-    "Final Answer: ..." line (DESIGN.md section 1 prompt conventions)."""
+    "Final Answer: ..." / "The answer is ..." line, then the last fenced
+    code block (DESIGN.md section 1 + SynLogic per-task prompt conventions)."""
     matches = _ANSWER_TAG_RE.findall(solution_str)
     if matches:
-        return matches[-1].strip()
+        return _strip_fences(matches[-1])
     boxed = _extract_boxed(solution_str)
     if boxed is not None:
         return boxed.strip()
     tail = solution_str[-2000:]  # the final line is what matters; bound the scan
     matches = _FINAL_ANSWER_RE.findall(tail)
     if matches:
-        return matches[-1].strip().rstrip(".")
+        return _strip_fences(matches[-1].strip().rstrip("."))
+    blocks = _FENCED_BLOCK_RE.findall(tail)
+    if blocks:
+        return blocks[-1].strip()
     return None
 
 
 def _normalise_text(s: str) -> str:
+    s = s.strip()
+    # Strip markdown emphasis/backticks — prompts such as web_of_lies ask for
+    # 'The answer is **yes, no**' and the stars are presentation, not content.
+    s = s.replace("**", "").replace("__", "").replace("`", "")
     s = s.strip().strip('"').strip("'")
     s = re.sub(r"\s+", " ", s)
     return s.casefold()
+
+
+def _loose_token_form(s: str) -> str:
+    """Canonical form insensitive to separator spacing and inner quotes.
+
+    Fixes two systematic false negatives against SynLogic ground truths:
+      - gt "A,C,D,E" vs natural model output "A, C, D, E" (boolean_expressions,
+        calcudoko row separators);
+      - gt "[[WORD]]" vs prompt-example-compliant "[['WORD']]" (cipher): the
+        quoted form parses, the bare-word ground truth never does, so text
+        comparison is the only path and must ignore the quotes.
+    Whitespace *between* tokens is preserved ("1 2 3" != "123").
+    """
+    s = _normalise_text(s)
+    s = re.sub(r"\s*([,\[\]\(\)\{\}:;])\s*", r"\1", s)
+    return s.replace('"', "").replace("'", "")
 
 
 def _parse_structured(s: str):
@@ -227,10 +269,30 @@ def _structured_equal(a, b, tol: float = 1e-6) -> bool:
         return len(a) == len(b) and all(_structured_equal(x, y, tol) for x, y in zip(a, b, strict=True))
     if isinstance(a, dict) and isinstance(b, dict):
         return a.keys() == b.keys() and all(_structured_equal(a[k], b[k], tol) for k in a)
-    return _normalise_text(str(a)) == _normalise_text(str(b))
+    return _loose_token_form(str(a)) == _loose_token_form(str(b))
 
 
-def logic_answer_match(prediction: str | None, ground_truth: str) -> bool:
+# SynLogic tasks whose answer is an unordered collection of coordinates or
+# dominos — both sides are canonicalised (recursively sorted) before the
+# structural compare so collection ordering never decides the reward.
+_UNORDERED_COORD_TASKS = frozenset({"minesweeper", "norinori", "star_placement_puzzle"})
+
+
+def _canon_unordered(obj):
+    """Normalise tuples to lists and sort (bottom-up) any list whose elements
+    are all lists. Applied only to _UNORDERED_COORD_TASKS answers — never to
+    grids, where row/column order is the answer."""
+    if isinstance(obj, dict):
+        return {k: _canon_unordered(v) for k, v in obj.items()}
+    if isinstance(obj, list | tuple):
+        items = [_canon_unordered(x) for x in obj]
+        if items and all(isinstance(x, list) for x in items):
+            items.sort(key=json.dumps)
+        return items
+    return obj
+
+
+def logic_answer_match(prediction: str | None, ground_truth: str, task: str | None = None) -> bool:
     """Normalised comparison shared by all logic_* verifiers."""
     if prediction is None:
         return False
@@ -250,20 +312,25 @@ def logic_answer_match(prediction: str | None, ground_truth: str) -> bool:
     pred_obj = _parse_structured(prediction)
     gt_obj = _parse_structured(ground_truth)
     if pred_obj is not None and gt_obj is not None:
+        if task in _UNORDERED_COORD_TASKS:
+            return _structured_equal(_canon_unordered(pred_obj), _canon_unordered(gt_obj))
         return _structured_equal(pred_obj, gt_obj)
-    return False
+    # Loose text path: separator-spacing / inner-quote insensitive comparison
+    # ("A, C, D, E" vs "A,C,D,E"; "[['WORD']]" vs "[[WORD]]").
+    return _loose_token_form(prediction) == _loose_token_form(ground_truth)
 
 
 def _logic_score(solution_str: str, ground_truth: str) -> float:
     try:
         payload = json.loads(ground_truth)
         answer = payload.get("answer") if isinstance(payload, dict) else payload
+        task = payload.get("task") if isinstance(payload, dict) else None
     except (json.JSONDecodeError, TypeError):
-        answer = ground_truth
+        answer, task = ground_truth, None
     if answer is None:
         return 0.0
     prediction = extract_logic_answer(solution_str)
-    return 1.0 if logic_answer_match(prediction, str(answer)) else 0.0
+    return 1.0 if logic_answer_match(prediction, str(answer), task) else 0.0
 
 
 # ---------------------------------------------------------------------------
