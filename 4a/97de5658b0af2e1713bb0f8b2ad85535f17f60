@@ -1,0 +1,14 @@
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_fully_async.sh
+  h_25cf8a8e4e8b34 128,132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "4a97de5658b0af2e1713bb0f8b2ad85535f17f60",
+  "prompts": {},
+  "humans": {
+    "h_25cf8a8e4e8b34": {
+      "author": "lvhaoyu <lvhaoyu@huawei.com>"
+    }
+  }
+}
