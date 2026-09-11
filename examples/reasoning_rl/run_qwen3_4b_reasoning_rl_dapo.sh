@@ -21,6 +21,8 @@
 #   - entropy anti-collapse (kl_cov policy loss)      ON  (KL-penalizes top-covariance tokens)
 #   - overlong reward shaping                         OFF (this stage)
 #   - length penalty                                  OFF (recall first)
+#   - KL-to-ref anchor (kl_loss)                      ON  (stability anchor, NOT
+#     part of DAPO; colocated ref policy. USE_KL_LOSS=0 restores pure DAPO)
 #   - rollout n=16, temperature=1.0; response length curriculum 8k -> 16k -> 24k
 #     (raise MAX_RESPONSE_LENGTH between runs)
 #
@@ -100,6 +102,19 @@ clip_ratio_high=${CLIP_RATIO_HIGH:-0.4}
 kl_cov_ratio=${KL_COV_RATIO:-0.0005}
 kl_cov_coef=${KL_COV_COEF:-0.1}
 
+# FSDP engine version (actor; the ref policy interpolates the same strategy in
+# the generated config). fsdp2 = per-param dtensor sharding, lower memory than
+# fsdp1. WARNING: fsdp2 checkpoints are NOT load-compatible with fsdp1 — a
+# RESUME_MODE run must keep the strategy of the checkpoint it resumes from.
+fsdp_strategy=${FSDP_STRATEGY:-fsdp2}
+# Optional KL-to-ref anchor (actor kl_loss term). DAPO itself is KL-free and
+# this recipe already has kl_cov against entropy collapse, so treat this purely
+# as a stability anchor. ON spawns a colocated ref policy (Role.ActorRolloutRef,
+# shares the actor worker group — no extra GPU pool) at the cost of one extra
+# full-batch forward per step (+~1GB/GPU weights for the 4B, sharded).
+use_kl_loss=${USE_KL_LOSS:-1}
+kl_loss_coef=${KL_LOSS_COEF:-0.001}
+
 rollout_tp=${ROLLOUT_TP:-1}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.65}
 rollout_n=${ROLLOUT_N:-16}
@@ -155,7 +170,12 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
-    actor_rollout_ref.actor.use_kl_loss=False
+    # KL-to-ref anchor (see knobs above). need_reference_policy() keys off this
+    # flag: ON makes the trainer run a _compute_ref_log_prob pass each step and
+    # adds kl_loss_coef * KL(pi_theta || pi_ref) to the policy loss. Orthogonal
+    # to algorithm.use_kl_in_reward (stays False) and to the kl_cov loss below.
+    actor_rollout_ref.actor.use_kl_loss=$([ "$use_kl_loss" = "1" ] && echo True || echo False)
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
     # clip-higher (DAPO): epsilon_low fixed, epsilon_high raised.
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
@@ -168,8 +188,17 @@ ACTOR=(
     actor_rollout_ref.actor.policy_loss.loss_mode=kl_cov
     actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${kl_cov_ratio}
     actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${kl_cov_coef}
+    # Canonical FSDP-version switch — FSDPActorConfig.__post_init__ copies it
+    # onto engine.strategy (overrides fsdp_config.strategy), and ref.strategy
+    # interpolates from it in the generated config.
+    actor_rollout_ref.actor.strategy=${fsdp_strategy}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    # Overlap next-layer param all-gather with compute. FSDP2 path uses
+    # set_modules_to_forward_prefetch (torch>=2.5; silent no-op below that).
+    # ref.fsdp_config does NOT interpolate from the actor block — set its own.
+    actor_rollout_ref.actor.fsdp_config.forward_prefetch=True
+    actor_rollout_ref.ref.fsdp_config.forward_prefetch=True
     # Only persist weights + bookkeeping (global_step/RNG); skip optimizer
     # state to save ~half the checkpoint disk. load_contents defaults to
     # ${.save_contents}, so a resumed run also skips loading the optimizer
