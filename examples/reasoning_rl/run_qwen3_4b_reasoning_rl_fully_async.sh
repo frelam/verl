@@ -247,6 +247,10 @@ ACTOR=(
     actor_rollout_ref.actor.strategy=${fsdp_strategy}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    # Overlap next-layer param all-gather with current-layer compute. FSDP2 path
+    # uses set_modules_to_forward_prefetch (depth=1, mirrors FSDP1); validated on
+    # Ascend in the geo3k NPU recipe. No-op on torch<2.5 (guarded by hasattr).
+    actor_rollout_ref.actor.fsdp_config.forward_prefetch=True
     # Config default is True (CUDA-oriented); torch.compile is kept off on NPU.
     actor_rollout_ref.actor.use_torch_compile=False
     # HCCL collective timeout (s); default 600 is too tight on Ascend.
