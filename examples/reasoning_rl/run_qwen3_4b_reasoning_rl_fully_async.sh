@@ -71,6 +71,8 @@
 #   REQUIRE_BATCHES=4                       mini-batches fetched per training round
 #   TRIGGER_PARAMETER_SYNC_STEP=1           rounds between weight syncs
 #   PARTIAL_ROLLOUT=True                    interrupt+resume in-flight gens on sync
+#   USE_KL_LOSS=0 REF_MODEL_PATH=...        add colocated KL-to-ref anchor (see above);
+#                                           ref shares the trainer NPUs (no extra devices)
 #   USE_TRAINER_DO_VALIDATE=0               1 = validate on hybrid replicas using
 #                                           trainer GPUs (faster val, but trainer
 #                                           must then share GPU memory: keep
@@ -152,6 +154,18 @@ clip_ratio_high=${CLIP_RATIO_HIGH:-0.4}
 # may be up to ~1 param version stale (staleness_threshold).
 kl_cov_ratio=${KL_COV_RATIO:-0.0005}
 kl_cov_coef=${KL_COV_COEF:-0.1}
+# Optional KL-to-ref anchor (colocated reference policy, Role.RefPolicy). The
+# default fully-async stack needs no separate ref model — kl_cov uses the
+# ROLLOUTER's returned old_log_prob as its KL reference (stale up to ~1 param
+# version). Set USE_KL_LOSS=1 to additionally load a ref policy and add
+# kl_loss_coef * KL(pi_theta || pi_ref) to the policy loss (stability anchor,
+# orthogonal to kl_cov and to algorithm.use_kl_in_reward).
+#   REF_MODEL_PATH defaults to MODEL_PATH (a frozen just-heavy base fit is the
+#   usual choice); the ref worker is COLOCATED with the Actor on the Trainer
+#   pool (shares the trainer NPUs) — no extra devices required.
+use_kl_loss=${USE_KL_LOSS:-0}
+kl_loss_coef=${KL_LOSS_COEF:-0.001}
+ref_model_path=${REF_MODEL_PATH:-}
 
 rollout_tp=${ROLLOUT_TP:-1}
 # Rollout NPUs are dedicated here (no colocate), so 0.8 is safe. Lower to
@@ -278,6 +292,23 @@ ACTOR=(
     actor_rollout_ref.actor.use_rollout_log_probs=True
     algorithm.rollout_correction.bypass_mode=True
 )
+
+# Optional KL-to-ref anchor: spawns a colocated ref policy (Role.RefPolicy) on
+# the Trainer pool and adds kl_loss_coef * KL(pi_theta || pi_ref) to the policy
+# loss. need_reference_policy() keys off use_kl_loss — VERL only materialises
+# the ref worker group and runs the _fit_compute_ref_log_prob pass when this
+# flag is True. ref strategy/fsdp_config interpolate from the actor block;
+# ref.fsdp_config does NOT override them here (only forward_prefetch is set, to
+# mirror the sync run; it is a per-worker CPU-side prefetch flag, safe).
+if [ "$use_kl_loss" = "1" ]; then
+    ref_model_path=${ref_model_path:-$MODEL_PATH}
+    ACTOR+=(
+        actor_rollout_ref.ref.model.path="$ref_model_path"
+        actor_rollout_ref.ref.fsdp_config.forward_prefetch=True
+        actor_rollout_ref.actor.use_kl_loss=True
+        actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
+    )
+fi
 
 ROLLOUT=(
     actor_rollout_ref.rollout.name=vllm
