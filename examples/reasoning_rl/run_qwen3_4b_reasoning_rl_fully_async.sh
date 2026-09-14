@@ -321,10 +321,14 @@ ACTOR=(
 # reads it on the V1 path; algorithm.rollout_correction only drives the data
 # bypass and is NOT injected into the loss). Config here rather than inside the
 # ACTOR=( ) array literal so the toggle stays a plain top-level conditional.
+# NOTE: rollout_correction is absent under policy_loss in the generated yaml
+# (PolicyLossConfig materializes it via default_factory), so plain `key=value`
+# overrides fail Hydra composition ("Could not override ... use +key=value").
+# The ++ prefix (append-or-override) is required, same as enable_sleep_mode.
 if [ "$enable_rollout_rs" = "1" ]; then
     ACTOR+=(
-        actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_rs}
-        actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
+        ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_rs}
+        ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
     )
 fi
 
