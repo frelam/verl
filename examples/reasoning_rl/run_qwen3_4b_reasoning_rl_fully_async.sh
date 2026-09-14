@@ -138,6 +138,12 @@ ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((max_prompt_length + ma
 
 actor_lr=${ACTOR_LR:-1e-6}
 entropy_coeff=${ENTROPY_COEFF:-0}
+# Compute per-token categorical entropy during the TRAINER's forward pass (the
+# update_actor rollout-compute_lp path). In fully async the old_log_prob forward
+# is bypassed, so this is the metric source that emits `actor/entropy_loss`
+# (mean entropy over response tokens). Requires a model forward to be run.
+# NOTE: entropy_coeff is 0, so this is a pure observation metric, no loss impact.
+calculate_entropy=${CALCULATE_ENTROPY:-True}
 # Compute entropy from logits in chunks (chunk_size tokens at a time) instead of
 # materialising the full [bsz*seq_len, voc] tensor. Reduces peak GPU memory when
 # recomputing old_log_prob (calculate_entropy=True) on a tight trainer split
@@ -199,6 +205,24 @@ trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-1}
 partial_rollout=${PARTIAL_ROLLOUT:-True}
 use_trainer_do_validate=${USE_TRAINER_DO_VALIDATE:-0}
 
+# Rollout Rejection Sampling (RS) on the bypass-mode loss. In fully async the
+# ppo_clip ratio = pi_theta / pi_rollout (the IS ratio); with staleness>0 samples
+# can be up to ~1 param version old, so the ratio drifts from 1. RS masks the
+# sequences whose per-sequence mean log-ratio drifts too far, hardening the
+# off-policy step. Ratio-based mode (ideal ratio = 1). NOTE: on the V1 trainer
+# the loss only reads ACTOR.policy_loss.rollout_correction.* (algorithm.* drives
+# only the data-side bypass and is NOT injected into the loss), so RS must be
+# wired via `actor.policy_loss.rollout_correction.*`.
+enable_rollout_rs=${ENABLE_ROLLOUT_RS:-1}
+#   token_k1     token-level ratio RS, lower_upper ratio bounds (default; matches
+#                the geo3k NPU async recipe's choice)
+#   seq_mean_k1  geometric-mean ratio RS, lower_upper ratio bounds
+#   seq_mean_k3  sequence-level RS on exp(r)-1-log(r) (upper-bound only)
+rollout_rs=${ROLLOUT_RS:-token_k1}
+# For *k1 modes: "lower_upper" ratio band (reciprocal saturates the lower side);
+# geo3k NPU async used token_k1 with "0.6_1.6". "0.999_1.001" = ±0.1% band.
+rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-0.6_1.6}
+
 fsdp_strategy=${FSDP_STRATEGY:-fsdp2}
 
 # Optional system prompt injected into every train/val prompt (dataset level).
@@ -245,6 +269,9 @@ ACTOR=(
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
+    # Emit actor/entropy_loss during the trainer forward. entropy_coeff=0 so it
+    # is a pure observation metric (no loss impact).
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy}
     # Chunked entropy computation (lower peak memory during old_log_prob forward).
     actor_rollout_ref.actor.entropy_from_logits_with_chunking=${entropy_from_logits_with_chunking}
     actor_rollout_ref.actor.entropy_from_logits_chunk_size=${entropy_from_logits_chunk_size}
@@ -289,6 +316,17 @@ ACTOR=(
     actor_rollout_ref.actor.use_rollout_log_probs=True
     algorithm.rollout_correction.bypass_mode=True
 )
+
+# Rollout RS is read from ACTOR.policy_loss.rollout_correction (the loss
+# reads it on the V1 path; algorithm.rollout_correction only drives the data
+# bypass and is NOT injected into the loss). Config here rather than inside the
+# ACTOR=( ) array literal so the toggle stays a plain top-level conditional.
+if [ "$enable_rollout_rs" = "1" ]; then
+    ACTOR+=(
+        actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_rs}
+        actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
+    )
+fi
 
 # Optional KL-to-ref anchor: spawns a colocated ref policy (Role.RefPolicy) on
 # the Trainer pool and adds kl_loss_coef * KL(pi_theta || pi_ref) to the policy
