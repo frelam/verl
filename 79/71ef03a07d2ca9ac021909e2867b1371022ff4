@@ -1,0 +1,57 @@
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_fully_async.sh
+  s_b35b5e96752ead::t_fa3895dfd1d1f3 141-146
+  s_f08f5a8113bc54::t_5025e0b3cd63bb 208-216,220,222-223,225
+  s_f08f5a8113bc54::t_7e13f3b03074d3 217-219,221,224
+  s_f08f5a8113bc54::t_d3f725f9bf8ccb 320-330
+  s_b35b5e96752ead::t_eb10e9bcc712bb 272-274
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "7971ef03a07d2ca9ac021909e2867b1371022ff4",
+  "prompts": {},
+  "sessions": {
+    "s_b35b5e96752ead": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa7b69d02ec400694b0e111",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "runtime_client": "trae-tob-git-ai",
+        "session_id": "6aa7b69d02ec400694b0e111",
+        "edit_kind": "file_edit",
+        "dedupe_key": "6aa7b69d02ec400694b0e111:6aa7bfef02ec400694b0e20e:afterEdit:407f404d",
+        "external_session_id": "6aa7b69d02ec400694b0e111",
+        "tool_type": "builtin",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "client_type": "ide",
+        "source_scene": "agent",
+        "tool_use_id": "6aa7bfef02ec400694b0e20e",
+        "operation_id": "6aa7bfef02ec400694b0e20e"
+      }
+    },
+    "s_f08f5a8113bc54": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa7bdc802ec400694b0e15e",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "external_session_id": "6aa7bdc802ec400694b0e15e",
+        "source_scene": "agent",
+        "edit_kind": "file_edit",
+        "tool_use_id": "6aa7bf0d02ec400694b0e1da",
+        "client_type": "ide",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "tool_type": "builtin",
+        "runtime_client": "trae-tob-git-ai",
+        "operation_id": "6aa7bf0d02ec400694b0e1da",
+        "dedupe_key": "6aa7bdc802ec400694b0e15e:6aa7bf0d02ec400694b0e1da:afterEdit:407f404d",
+        "session_id": "6aa7bdc802ec400694b0e15e"
+      }
+    }
+  }
+}
