@@ -1486,10 +1486,28 @@ class PPOTrainer(ABC):
         bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
         if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
             data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["rollout_log_probs"]
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                select_fields=["rollout_log_probs", "response_mask"],
             )
             data["old_log_probs"] = data.pop("rollout_log_probs")
-            tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
+
+            # Sentinel: rollout log-probs may contain -inf/nan (aborted or preempted
+            # generations around weight sync). Positions with response_mask==1 flow
+            # into the policy-loss ratio (clamped there); masked ones are harmless.
+            old_log_probs = data["old_log_probs"]
+            non_finite = ~torch.isfinite(old_log_probs)
+            if non_finite.any():
+                on_valid = (non_finite & (data["response_mask"] > 0)).sum().item()
+                logger.warning(
+                    f"bypass_mode: {non_finite.sum().item()} non-finite rollout_log_probs values "
+                    f"({on_valid} on response_mask==1 positions). "
+                    "Check rollout aborts / weight-sync preemption if this keeps firing."
+                )
+
+            tq.kv_batch_put(
+                keys=batch.keys, partition_id=batch.partition_id, fields=data.select("old_log_probs")
+            )
             return batch
 
         # 1. compute log probs

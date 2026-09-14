@@ -34,9 +34,9 @@
 #     rollout.total_rollout_steps (= train_batch_size-equivalent * TOTAL_STEPS).
 #   * old_log_prob comes from the ROLLOUTER (use_rollout_log_probs=True +
 #     algorithm.rollout_correction.bypass_mode=True, the yaml default). Under
-#     staleness_threshold>0 those log-probs are up to ~1 param version old;
-#     the kl_cov KL penalty is computed against them (approximation inherent
-#     to off-policy async training).
+#     staleness_threshold>0 those log-probs are up to ~1 param version old,
+#     so the ppo_clip ratio pi_theta/pi_rollout is an IS ratio (the intended
+#     off-policy trade-off of async training).
 #   * NOT SUPPORTED here (streaming pipeline has no equivalent):
 #       - tiered hard-sample replay (HardReplaySampler / REASONING_RL_HARD_REPLAY)
 #       - DAPO dynamic sampling (algorithm.filter_groups): uniform-reward groups
@@ -144,22 +144,17 @@ entropy_coeff=${ENTROPY_COEFF:-0}
 # (e.g. 12+4 GPUs); the logits tensor is the dominant memory consumer there.
 entropy_from_logits_with_chunking=${ENTROPY_FROM_LOGITS_WITH_CHUNKING:-True}
 entropy_from_logits_chunk_size=${ENTROPY_FROM_LOGITS_CHUNK_SIZE:-2048}
-# clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO). NOTE: as in
-# the sync script, loss_mode=kl_cov does not consume these clip ratios.
+# clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO). Consumed by
+# the ppo_clip loss (loss_type of the bypass_mode loss) below.
 clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
-clip_ratio_high=${CLIP_RATIO_HIGH:-0.4}
+clip_ratio_high=${CLIP_RATIO_HIGH:-0.5}
 
-# kl_cov (PRIME-RL): KL-penalize the top-covariance tokens to stop entropy
-# collapse. Under fully async the KL reference is the rollout log-prob, which
-# may be up to ~1 param version stale (staleness_threshold).
-kl_cov_ratio=${KL_COV_RATIO:-0.0005}
-kl_cov_coef=${KL_COV_COEF:-0.1}
 # Optional KL-to-ref anchor (colocated reference policy, Role.RefPolicy). The
-# default fully-async stack needs no separate ref model — kl_cov uses the
-# ROLLOUTER's returned old_log_prob as its KL reference (stale up to ~1 param
+# default fully-async stack needs no separate ref model — the ppo_clip ratio
+# already anchors pi_theta to the ROLLOUTER's log-probs (stale up to ~1 param
 # version). Set USE_KL_LOSS=1 to additionally load a ref policy and add
 # kl_loss_coef * KL(pi_theta || pi_ref) to the policy loss (stability anchor,
-# orthogonal to kl_cov and to algorithm.use_kl_in_reward).
+# orthogonal to algorithm.use_kl_in_reward).
 #   REF_MODEL_PATH defaults to MODEL_PATH (a frozen just-heavy base fit is the
 #   usual choice); the ref worker is COLOCATED with the Actor on the Trainer
 #   pool (shares the trainer NPUs) — no extra devices required.
@@ -259,11 +254,13 @@ ACTOR=(
     actor_rollout_ref.actor.clip_ratio_c=10.0
     # token-level policy gradient loss (DAPO).
     actor_rollout_ref.actor.loss_agg_mode=token-mean
-    # kl_cov policy loss: KL-penalize the top-covariance tokens to stop entropy
-    # from collapsing (reinforces entropy_coeff=0 above).
-    actor_rollout_ref.actor.policy_loss.loss_mode=kl_cov
-    actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${kl_cov_ratio}
-    actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${kl_cov_coef}
+    # PPO-clip via the bypass_mode loss (2 policies: pi_rollout=pi_old, pi_theta).
+    # loss_type defaults to "ppo_clip", so the clip-higher knobs above take
+    # effect. NOTE: the loss reads actor.policy_loss.rollout_correction (defaults:
+    # seq-level IS for metrics only, no rejection sampling) — on the V1 path
+    # algorithm.rollout_correction only drives the trainer-side data bypass and
+    # is NOT injected into the loss.
+    actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode
     # NOTE: actor.strategy is the canonical FSDP-version switch — FSDPActorConfig
     #.__post_init__ copies it onto engine.strategy (overwriting whatever sits in
     # fsdp_config.strategy). fsdp2 is validated on Ascend (geo3k NPU recipe).

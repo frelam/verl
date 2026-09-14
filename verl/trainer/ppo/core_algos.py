@@ -1886,6 +1886,11 @@ def compute_policy_loss_kl_cov(
     assert kl_cov_ratio > 0, "kl_cov_ratio should be larger than 0."
 
     negative_approx_kl = log_prob - old_log_prob
+    # Clamp for stability, mirroring compute_policy_loss_vanilla. In fully-async
+    # bypass_mode, old_log_prob is the rollout engine's log-prob and may contain
+    # -inf (aborted/preempted generations), which would otherwise make
+    # ratio=exp(+inf)=inf and turn pg_loss/grad_norm into NaN.
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     abs_kl = negative_approx_kl.abs()
     ratio = torch.exp(negative_approx_kl)
     ppo_kl_abs = verl_F.masked_mean(negative_approx_kl.abs(), response_mask)
