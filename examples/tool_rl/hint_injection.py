@@ -5,12 +5,12 @@ Motivation
 ----------
 Some tool-use queries are hard to roll out successfully, so we inject a
 short behavioural *hint* into the system prompt.  A single fixed hint would
-make the policy over-rely on that exact wording, so instead we keep a pool
-of paraphrased variants — all carrying the **same three semantics**:
+make the policy over-rely on that exact wording, so instead we keep a pool of paraphrased variants — all carrying the **same four semantics**:
 
 1. Stay humble: never assume or invent information you were not given.
 2. Tools may depend on each other: mind the calling order.
 3. Reason before making a tool call.
+4. Abstain: when information is insufficient, do not call a tool.
 
 One "variant" is the empty hint (no guidance at all), drawn with
 probability ``TOOL_RL_HINT_EMPTY_PROB`` (default 0.25) so the policy also
@@ -49,9 +49,10 @@ from typing import Any
 # ============================================================================
 # Hint variant pool
 # ============================================================================
-# Every variant conveys the same three points (humility / tool-dependency
-# ordering / reason-before-call) with different wording, formatting and
-# point order, so the policy cannot latch onto one canonical phrasing.
+# Every variant conveys the same four points (humility / tool-dependency
+# ordering / reason-before-call / abstention-on-insufficient-information)
+# with different wording, formatting and point order, so the policy cannot
+# latch onto one canonical phrasing.
 
 HINT_VARIANTS: list[str] = [
     # 0 — numbered list, direct
@@ -59,20 +60,23 @@ HINT_VARIANTS: list[str] = [
         "Important:\n"
         "1. Stay humble — never assume or invent information you don't have.\n"
         "2. Tools may depend on each other; plan the calling order carefully.\n"
-        "3. Reason carefully before every tool call."
+        "3. Reason carefully before every tool call.\n"
+        "4. When you have insufficient information, don't call a tool."
     ),
     # 1 — bullet list
     (
         "Keep the following in mind:\n"
         "- Do not fabricate or assume facts; acknowledge what you don't know.\n"
         "- Some tools depend on the results of others, so call them in the right sequence.\n"
-        "- Think step by step before invoking any tool."
+        "- Think step by step before invoking any tool.\n"
+        "- If the information you need is missing, hold off on calling a tool."
     ),
     # 2 — plain paragraph
     (
         "Always stay humble and avoid guessing or assuming details. Remember that "
         "tool calls can depend on one another, so decide their order deliberately, "
-        "and think through your reasoning before each call."
+        "and think through your reasoning before each call. When you don't have "
+        "enough information, it is better not to call a tool at all."
     ),
     # 3 — XML-wrapped, keyword style
     (
@@ -80,6 +84,7 @@ HINT_VARIANTS: list[str] = [
         "- Humility: never invent information; say when you don't know.\n"
         "- Dependencies: tools may rely on each other's outputs — respect the calling order.\n"
         "- Deliberation: reason first, then call the tool.\n"
+        "- Abstention: if information is missing, do not call a tool.\n"
         "</guidelines>"
     ),
     # 4 — reordered points (dependency → reasoning → humility)
@@ -87,49 +92,57 @@ HINT_VARIANTS: list[str] = [
         "Note:\n"
         "1) Tools often depend on each other — call them in a sensible order.\n"
         "2) Think before you act: work out your reasoning prior to each tool call.\n"
-        "3) Stay humble; do not assume facts that were not given."
+        "3) Stay humble; do not assume facts that were not given.\n"
+        "4) If you lack enough information to proceed, don't call a tool."
     ),
     # 5 — reflective questions
     (
         "Before answering, ask yourself: Am I assuming anything I shouldn't? Am I "
         "calling tools in the right order given their dependencies? Have I reasoned "
-        "through this step before calling the next tool?"
+        "through this step before calling the next tool? And if the information is "
+        "insufficient, should I call a tool at all — or abstain?"
     ),
     # 6 — single-line compact
     (
         "Stay humble and never guess; mind the dependencies between tools and their "
-        "calling order; always reason before making a tool call."
+        "calling order; always reason before making a tool call; and refrain from "
+        "calling a tool when information is insufficient."
     ),
     # 7 — advisory tone
     (
         "You should avoid making assumptions about missing information. You should "
         "consider how the tools depend on each other and sequence your calls "
-        "accordingly. You should also think carefully before every tool invocation."
+        "accordingly. You should also think carefully before every tool invocation, "
+        "and you should avoid calling a tool when information is insufficient."
     ),
     # 8 — markdown emphasis
     (
         "**Reminders**\n"
         "1. **No assumptions** — if information is missing, don't make it up.\n"
         "2. **Order matters** — some tools need the output of earlier calls.\n"
-        "3. **Reason first** — think through your plan before each tool call."
+        "3. **Reason first** — think through your plan before each tool call.\n"
+        "4. **Abstain when unclear** — if you don't have enough information, don't call a tool."
     ),
     # 9 — terse rules
     (
         "Rules: (1) never hallucinate facts; (2) respect dependencies between tools "
-        "when ordering calls; (3) reason before each tool call."
+        "when ordering calls; (3) reason before each tool call; (4) don't call a tool "
+        "when information is insufficient."
     ),
     # 10 — conversational
     (
         "A few things to remember: Don't pretend to know what you don't. Check "
         "whether one tool's output is needed as another's input, and order your "
-        "calls accordingly. Take a moment to reason before each call."
+        "calls accordingly. Take a moment to reason before each call. And when you "
+        "don't have enough information, don't call a tool."
     ),
     # 11 — guidance bullets
     (
         "Guidance:\n"
         "- Be honest about uncertainty instead of guessing.\n"
         "- Plan tool usage: later calls may depend on earlier results.\n"
-        "- Think through the problem before invoking tools."
+        "- Think through the problem before invoking tools.\n"
+        "- When information is missing, refrain from calling a tool."
     ),
 ]
 
@@ -139,6 +152,7 @@ EMPTY_HINT_ID = -1
 # ============================================================================
 # Sampling
 # ============================================================================
+
 
 def sample_hint_id(rng: random.Random, empty_prob: float) -> int:
     """Draw a variant index; ``EMPTY_HINT_ID`` with probability ``empty_prob``."""
@@ -159,6 +173,7 @@ def fixed_hint_id(sample_key: str, seed: int, empty_prob: float) -> int:
 # ============================================================================
 # Injection
 # ============================================================================
+
 
 def inject_hint(messages: list[dict[str, Any]], hint: str) -> list[dict[str, Any]]:
     """Return a copy of ``messages`` with ``hint`` appended to the system prompt.
@@ -237,6 +252,7 @@ def apply_hint_to_row(
 # ============================================================================
 # Env config
 # ============================================================================
+
 
 def hint_config_from_env() -> dict[str, Any]:
     """Read hint injection settings from ``TOOL_RL_HINT_*`` env vars."""
