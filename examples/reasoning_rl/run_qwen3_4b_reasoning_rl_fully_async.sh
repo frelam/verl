@@ -131,7 +131,7 @@ max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
 # response curriculum: 8192 -> 16384 -> 24576 (raise between runs; DESIGN.md
 # section 8). NOTE: Qwen3-4B's native context is 32768, so keep
 # max_prompt_length + max_response_length <= 32768 or vLLM silently clamps.
-max_response_length=${MAX_RESPONSE_LENGTH:-16384}
+max_response_length=${MAX_RESPONSE_LENGTH:-8192}
 # dynamic-bsz packing budget MUST cover the longest single (prompt+response) sequence
 # or the tail gets dropped. Default = max_prompt + max_response.
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((max_prompt_length + max_response_length))}
@@ -150,6 +150,12 @@ calculate_entropy=${CALCULATE_ENTROPY:-True}
 # (e.g. 12+4 GPUs); the logits tensor is the dominant memory consumer there.
 entropy_from_logits_with_chunking=${ENTROPY_FROM_LOGITS_WITH_CHUNKING:-True}
 entropy_from_logits_chunk_size=${ENTROPY_FROM_LOGITS_CHUNK_SIZE:-2048}
+# Gradient checkpoint the entropy computation: recompute the log_softmax
+# intermediate in the backward instead of saving it, freeing the [tokens, voc]
+# activation (a peak-memory win on long-context training). Trade-off: one extra
+# O(tokens*voc) recompute per micro-batch. Mutually exclusive with the chunked
+# path above (code picks checkpointing if this is on).
+entropy_checkpointing=${ENTROPY_CHECKPOINTING:-True}
 # clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO). Consumed by
 # the ppo_clip loss (loss_type of the bypass_mode loss) below.
 clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
@@ -275,6 +281,9 @@ ACTOR=(
     # Chunked entropy computation (lower peak memory during old_log_prob forward).
     actor_rollout_ref.actor.entropy_from_logits_with_chunking=${entropy_from_logits_with_chunking}
     actor_rollout_ref.actor.entropy_from_logits_chunk_size=${entropy_from_logits_chunk_size}
+    # Gradient-checkpoint the entropy backward (recompute instead of saving the
+    # [tokens, voc] log_softmax intermediate). Wins peak memory; costs recompute.
+    actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing}
     # clip-higher (DAPO): epsilon_low fixed, epsilon_high raised.
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
