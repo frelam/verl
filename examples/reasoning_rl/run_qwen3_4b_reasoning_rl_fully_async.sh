@@ -193,7 +193,10 @@ nccl_timeout=${NCCL_TIMEOUT:-7200}
 # rollout_n trajectories). total_epochs only sets the dataloader replay
 # runway; the explicit total_rollout_steps cap stops the run first.
 total_steps=${TOTAL_STEPS:-400}
-total_rollout_steps=$((train_batch_size * total_steps))
+# Direct sample-budget override: set TOTAL_ROLLOUT_STEPS to pin the exact
+# budget and bypass the derived train_batch_size * total_steps formula (useful
+# when train_batch_size does not divide the target). Default 140000.
+total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-140000}
 total_epochs=${TOTAL_EPOCHS:-10}
 
 # In param-version units (1 param version = require_batches * ppo_mini_batch_size
