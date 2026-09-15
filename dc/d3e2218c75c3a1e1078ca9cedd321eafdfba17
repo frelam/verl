@@ -1,0 +1,32 @@
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_fully_async.sh
+  s_ffbb9167273839::t_5e3b112a7394c6 196-199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "dcd3e2218c75c3a1e1078ca9cedd321eafdfba17",
+  "prompts": {},
+  "sessions": {
+    "s_ffbb9167273839": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa9339002ec400694b0e530",
+        "model": "DeepSeek-V4-Flash-Official"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "dedupe_key": "6aa9339002ec400694b0e530:6aa9345e02ec400694b0e56d:afterEdit:407f404d",
+        "runtime_client": "trae-tob-git-ai",
+        "client_type": "ide",
+        "session_id": "6aa9339002ec400694b0e530",
+        "operation_id": "6aa9345e02ec400694b0e56d",
+        "external_session_id": "6aa9339002ec400694b0e530",
+        "tool_type": "builtin",
+        "tool_use_id": "6aa9345e02ec400694b0e56d",
+        "tool_id": "icube:applyChatSnapshotPatch",
+        "source_scene": "agent",
+        "edit_kind": "file_edit"
+      }
+    }
+  }
+}
