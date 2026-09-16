@@ -63,7 +63,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mix import DOMAIN_FILES, load_domain, stratified_take  # noqa: E402
+from mix import DOMAIN_FILES, load_domain, stratified_take, write_rows_parquet  # noqa: E402
 
 # ================================ CONFIG ================================
 # Directory of the PREVIOUS mix run (must contain mix_stats.json).
@@ -247,12 +247,10 @@ def replay(
     report["replenished_with_replacement"] = replenished
 
     if not dry_run:
-        import datasets
-
         os.makedirs(output_dir, exist_ok=True)
-        datasets.Dataset.from_list(train_rows).to_parquet(os.path.join(output_dir, "train.parquet"))
+        write_rows_parquet(train_rows, os.path.join(output_dir, "train.parquet"))
         if val_rows:
-            datasets.Dataset.from_list(val_rows).to_parquet(os.path.join(output_dir, "val.parquet"))
+            write_rows_parquet(val_rows, os.path.join(output_dir, "val.parquet"))
         with open(os.path.join(output_dir, "mix_stats.json"), "w", encoding="utf-8") as f:
             json.dump(new_stats, f, indent=2, ensure_ascii=False)
         with open(os.path.join(output_dir, "mix_replay_report.json"), "w", encoding="utf-8") as f:

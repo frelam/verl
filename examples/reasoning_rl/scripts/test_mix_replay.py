@@ -26,7 +26,7 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from mix import read_parquet_rows, resolve_parquet_files  # noqa: E402
+from mix import read_parquet_rows, resolve_parquet_files, write_rows_parquet  # noqa: E402
 from mix_replay import _resolve_override, main, replay  # noqa: E402
 
 MIX_PY = os.path.join(HERE, "mix.py")
@@ -295,3 +295,46 @@ class TestReadParquetRows:
     def test_missing_path_is_fatal(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="no parquet files matched"):
             resolve_parquet_files(str(tmp_path / "nope.parquet"))
+
+
+class TestWriteRowsParquet:
+    """The final train/val write must emit several row groups, not one array.
+
+    datasets.Dataset.from_list(all_rows) builds a single Arrow string column and
+    overflows past ~2 GB; chunked ParquetWriter writes keep the offsets local and
+    datasets reads the file back as a chunked table.
+    """
+
+    @staticmethod
+    def _rows(n):
+        return [
+            {
+                "data_source": "math_bigmath",
+                "prompt": [{"role": "user", "content": f"question {i} " + "x" * 100}],
+                "ability": "math",
+                "reward_model": {"style": "rule", "ground_truth": str(i)},
+                "extra_info": {"split": "train", "index": i, "task_id": f"t{i}", "domain": "math", "source": "bigmath"},
+            }
+            for i in range(n)
+        ]
+
+    def test_round_trip_and_multiple_row_groups(self, tmp_path):
+        import datasets
+        import pyarrow.parquet as pq
+
+        rows = self._rows(25)
+        path = tmp_path / "train.parquet"
+        write_rows_parquet(rows, str(path), chunk_size=10)
+
+        assert pq.ParquetFile(str(path)).num_row_groups == 3
+        back = datasets.load_dataset("parquet", data_files=str(path), split="train")
+        assert len(back) == 25
+        assert back[0]["extra_info"]["task_id"] == "t0"
+        assert back[24]["reward_model"]["ground_truth"] == "24"
+        # datasets keeps the row groups as chunks, so nothing is re-concatenated.
+        assert back.data.table.column("data_source").num_chunks == 3
+
+    def test_empty_rows_writes_nothing(self, tmp_path):
+        path = tmp_path / "train.parquet"
+        write_rows_parquet([], str(path))
+        assert not path.exists()

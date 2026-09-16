@@ -89,11 +89,37 @@ def load_domain(input_dir: str, domain: str, path_override: str | None) -> list[
     rows = read_parquet_rows(path)
     # Normalise extra_info keys across domains: difficulty_tag.py adds
     # pass_rate only to tagged pools, and a struct schema mismatch would break
-    # the final Dataset.from_list merge.
+    # the final write (every domain must share one Arrow schema).
     for r in rows:
         r["extra_info"].setdefault("pass_rate", -1.0)
     print(f"[mix] {domain}: {len(rows)} rows from {path}")
     return rows
+
+
+def write_rows_parquet(rows: list[dict], path: str, chunk_size: int = 10_000) -> None:
+    """Write rows to a single parquet file as several row groups.
+
+    ``datasets.Dataset.from_list(rows).to_parquet(path)`` builds one Arrow string
+    array for the whole split, whose 32-bit offsets overflow once the text passes
+    ~2 GB (the mixed train set does).  Writing chunk by chunk with pyarrow's
+    ``ParquetWriter`` emits one row group per chunk, so the offsets stay local;
+    ``datasets`` reads the result back as a chunked table, which the training
+    ``RLHFDataset`` loads without hitting the same limit.
+    """
+    import pyarrow.parquet as pq
+
+    if not rows:
+        return
+    writer = None
+    try:
+        for start in range(0, len(rows), chunk_size):
+            table = datasets.Dataset.from_list(rows[start : start + chunk_size]).data.table
+            if writer is None:
+                writer = pq.ParquetWriter(path, table.schema)
+            writer.write_table(table.cast(writer.schema))
+    finally:
+        if writer is not None:
+            writer.close()
 
 
 def stratified_take(rng: random.Random, rows: list[dict], n: int, domain: str) -> list[dict]:
@@ -189,11 +215,11 @@ if __name__ == "__main__":
 
     os.makedirs(output_dir, exist_ok=True)
     train_path = os.path.join(output_dir, "train.parquet")
-    datasets.Dataset.from_list(train_rows).to_parquet(train_path)
+    write_rows_parquet(train_rows, train_path)
     val_path = None
     if val_rows:
         val_path = os.path.join(output_dir, "val.parquet")
-        datasets.Dataset.from_list(val_rows).to_parquet(val_path)
+        write_rows_parquet(val_rows, val_path)
 
     stats = {
         "total_train": len(train_rows),
