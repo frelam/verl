@@ -22,6 +22,7 @@ Run from the repo root:
     pytest examples/reasoning_rl/reward/test_enigmata_verifier.py -v
 """
 
+import json
 import os
 import sys
 
@@ -154,7 +155,252 @@ class TestDispatch:
         assert verify_enigmata("[[1, 2], [3, 4]]", "[[1, 2], [3, 4]]", "sudoku") is None
 
     def test_handled_tasks_set(self):
-        assert HANDLED_TASKS == {"game24", "countdown", "maze", "stack_permutation"}
+        assert HANDLED_TASKS == {
+            "game24",
+            "countdown",
+            "maze",
+            "stack_permutation",
+            "eight_puzzle",
+            "fifteen_puzzle",
+            "nine_puzzle",
+            "sixteen_puzzle",
+            "twiddle",
+            "hamiltonian_path",
+            "hamiltonian_cycle",
+            "car_painting",
+            "campsite",
+            "star_battle",
+            "full_crosswords",
+            "tic_tac_toe",
+            "zebra_logic",
+        }
+
+
+class TestSlidingPuzzle:
+    """8/15 puzzle: the stored answer is the *initial* board, so only replaying the
+    move sequence can grade the response (real audited row)."""
+
+    BOARD = [[6, 3, 1], [2, 0, 7], [5, 4, 8]]
+    META = {"question": BOARD}
+    SOLUTION = "URDLULDRURDLULDRDLURDR"  # BFS, blank-moves reading
+    TILE_READING = SOLUTION.translate(str.maketrans("UDLR", "DURL"))
+
+    def test_solution_accepted(self):
+        assert verify_enigmata(self.SOLUTION, "[[6, 3, 1], [2, 0, 7], [5, 4, 8]]", "eight_puzzle", self.META) is True
+
+    def test_prompt_tile_reading_accepted(self):
+        # The prompt says the *tile* moves; the official verifier replays the
+        # inverse reading, so both sequences are the same solution.
+        assert verify_enigmata(self.TILE_READING, "x", "eight_puzzle", self.META) is True
+
+    def test_wrong_sequence_rejected(self):
+        assert verify_enigmata("LRUD", "x", "eight_puzzle", self.META) is False
+
+    def test_stored_initial_board_is_not_an_answer(self):
+        assert verify_enigmata("[[6, 3, 1], [2, 0, 7], [5, 4, 8]]", "x", "eight_puzzle", self.META) is False
+
+    def test_unsolvable_instance(self):
+        meta = {"question": [[1, 2, 3], [4, 5, 6], [8, 7, 0]]}
+        assert verify_enigmata("No feasible move path exists.", "x", "fifteen_puzzle", meta) is True
+        assert verify_enigmata("LR", "x", "fifteen_puzzle", meta) is False
+
+    def test_no_solution_claim_on_solvable_instance(self):
+        assert verify_enigmata("No feasible move path exists.", "x", "eight_puzzle", self.META) is False
+
+    def test_without_meta_is_strict(self):
+        assert verify_enigmata(self.SOLUTION, "x", "eight_puzzle") is False
+
+
+class TestShiftPuzzle:
+    """Nine/sixteen puzzle: same initial-state trap, moves are circular shifts."""
+
+    def test_left_shift_accepted(self):
+        meta = {"question": [[2, 3, 1], [4, 5, 6], [7, 8, 9]]}
+        assert verify_enigmata('["R12"]', "x", "nine_puzzle", meta) is True
+
+    def test_right_shift_reading_accepted(self):
+        # The prompt never states the rotation direction, so a sequence that
+        # solves the puzzle under the other reading is the same answer.
+        meta = {"question": [[2, 3, 1], [4, 5, 6], [7, 8, 9]]}
+        assert verify_enigmata('["R11"]', "x", "nine_puzzle", meta) is True
+
+    def test_wrong_move_rejected(self):
+        meta = {"question": [[2, 3, 1], [4, 5, 6], [7, 8, 9]]}
+        assert verify_enigmata('["C11"]', "x", "nine_puzzle", meta) is False
+
+
+class TestTwiddle:
+    META = {"question": [[4, 1, 3], [7, 5, 6], [8, 2, 9]]}
+    ANSWER = "[[1, 0], [0, 0]]"
+
+    def test_generator_answer_accepted(self):
+        assert verify_enigmata(self.ANSWER, self.ANSWER, "twiddle", self.META) is True
+
+    def test_alternative_valid_sequence_accepted(self):
+        # Four turns of the same 2x2 block are the identity, so this still solves it.
+        assert verify_enigmata("[[1, 0], [0, 0], [0, 0], [0, 0], [0, 0], [0, 0]]", "x", "twiddle", self.META) is True
+
+    def test_arrow_notation_accepted(self):
+        assert verify_enigmata("(1,0)->(0,0)", "x", "twiddle", self.META) is True
+
+    def test_wrong_sequence_rejected(self):
+        assert verify_enigmata("[[0, 0]]", "x", "twiddle", self.META) is False
+
+
+class TestHamiltonian:
+    PATH_META = {"question": "4\n0 1\n1 2\n2 3"}
+    CYCLE_META = {"question": "4\n0 1\n1 2\n2 3\n3 0"}
+
+    def test_path_accepted(self):
+        assert verify_enigmata("[0, 1, 2, 3]", "x", "hamiltonian_path", self.PATH_META) is True
+
+    def test_reversed_path_accepted(self):
+        assert verify_enigmata("[3, 2, 1, 0]", "x", "hamiltonian_path", self.PATH_META) is True
+
+    def test_broken_path_rejected(self):
+        assert verify_enigmata("[0, 2, 1, 3]", "x", "hamiltonian_path", self.PATH_META) is False
+
+    def test_non_permutation_rejected(self):
+        assert verify_enigmata("[0, 1, 2, 2]", "x", "hamiltonian_path", self.PATH_META) is False
+
+    def test_cycle_with_and_without_repeat(self):
+        assert verify_enigmata("[0, 1, 2, 3, 0]", "x", "hamiltonian_cycle", self.CYCLE_META) is True
+        assert verify_enigmata("[0, 3, 2, 1]", "x", "hamiltonian_cycle", self.CYCLE_META) is True
+
+    def test_cycle_without_closing_edge_rejected(self):
+        assert verify_enigmata("[0, 1, 3, 2]", "x", "hamiltonian_cycle", self.CYCLE_META) is False
+
+    def test_no_instance(self):
+        meta = {"question": "3\n0 1"}
+        assert verify_enigmata("NO", "NO", "hamiltonian_path", meta) is True
+        assert verify_enigmata("[0, 1, 2]", "NO", "hamiltonian_path", meta) is False
+        assert verify_enigmata("NO", "[0, 1, 2]", "hamiltonian_path", self.PATH_META) is False
+
+
+class TestCarPainting:
+    """Audited row: the stored order is one of several optimal ones."""
+
+    META = {
+        "car_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "colors": ["A", "A", "B", "A", "B", "A", "A", "A", "B", "A"],
+        "K": 4,
+        "min_switches": 2,
+    }
+    ANSWER = "[1, 2, 5, 3, 9, 7, 8, 4, 6, 10]"
+
+    def test_stored_answer_accepted(self):
+        assert verify_enigmata(self.ANSWER, self.ANSWER, "car_painting", self.META) is True
+
+    def test_alternative_optimal_order_accepted(self):
+        assert verify_enigmata("[2, 1, 5, 3, 9, 7, 8, 4, 6, 10]", "x", "car_painting", self.META) is True
+
+    def test_shift_budget_enforced(self):
+        assert verify_enigmata("[10, 2, 3, 4, 5, 6, 7, 8, 9, 1]", "x", "car_painting", self.META) is False
+
+    def test_missing_car_rejected(self):
+        assert verify_enigmata("[1, 2, 5, 3, 9, 7, 8, 4, 6, 6]", "x", "car_painting", self.META) is False
+
+    def test_without_meta_is_strict(self):
+        assert verify_enigmata(self.ANSWER, self.ANSWER, "car_painting") is False
+
+
+class TestBoardTasks:
+    CAMPSITE_GT = (
+        "total number of tents: 4\n"
+        "tents in each row: 2 0 2 0\n"
+        "tents in each column: 2 0 2 0\n"
+        "<begin_board>\n* X * X\n. . . .\n* X * .\n. . X .\n<end_board>"
+    )
+    BOARD = "<begin_board>\n* X * X\n. . . .\n* X * .\n. . X .\n<end_board>"
+
+    def test_campsite_board_only_response_accepted(self):
+        # The prompt asks for the board inside <begin_board>; the ground truth
+        # additionally stores the constraint header.
+        assert verify_enigmata(self.BOARD, self.CAMPSITE_GT, "campsite") is True
+
+    def test_campsite_header_repeat_accepted(self):
+        body = self.BOARD.replace("<begin_board>\n", "")
+        assert verify_enigmata(self.CAMPSITE_GT.split("<begin_board>")[0] + body, self.CAMPSITE_GT, "campsite") is True
+
+    def test_campsite_wrong_board_rejected(self):
+        wrong = self.BOARD.replace("* X * X", "* X * .")
+        assert verify_enigmata(wrong, self.CAMPSITE_GT, "campsite") is False
+
+    def test_star_battle_board_accepted(self):
+        gold = ". . . * .\n* . X . X\n. . * . X\n. . . . *\n. * X . X"
+        wrapped = "<begin_board>\n" + gold + "\n<end_board>"
+        wrong = "<begin_board>\n" + gold.replace("*", ".") + "\n<end_board>"
+        assert verify_enigmata(wrapped, gold, "star_battle") is True
+        assert verify_enigmata(wrong, gold, "star_battle") is False
+
+
+class TestCrosswords:
+    GT = json.dumps({"across": ["FSLIC", "EXJET", "ASSAL"], "down": ["FEELA", "LAJOS", "CETYL"]})
+
+    def test_json_shape_accepted(self):
+        assert verify_enigmata(self.GT, self.GT, "full_crosswords") is True
+
+    def test_prompt_mandated_lines_accepted(self):
+        # The prompt's own Answer Format is "across: ..., down: ...", never JSON.
+        body = "across: FSLIC, EXJET, ASSAL\ndown: FEELA, LAJOS, CETYL"
+        assert verify_enigmata(body, self.GT, "full_crosswords") is True
+
+    def test_wrong_word_rejected(self):
+        body = "across: FSLIC, EXJET, ASSAL\ndown: FEELA, LAJOS, CETYL\n"  # ok
+        assert verify_enigmata(body, self.GT, "full_crosswords") is True
+        bad = "across: FSLIC, EXJET, ASSAL\ndown: FEELA, LAJOS, TEYLC"
+        assert verify_enigmata(bad, self.GT, "full_crosswords") is False
+
+
+class TestZebraLogic:
+    GT = (
+        "| Food          | papaya    | peas    |\n"
+        "| Hobby         | skydiving | cooking |\n"
+        "| Music-Genre   | reggae    | punk    |\n"
+        "| Transport     | bus       | tram    |"
+    )
+
+    def test_verbatim_accepted(self):
+        assert verify_enigmata(self.GT, self.GT, "zebra_logic") is True
+
+    def test_markdown_separator_row_accepted(self):
+        rows = self.GT.splitlines()
+        body = "\n".join([rows[0], "|---|---|---|", *rows[1:]])
+        assert verify_enigmata(body, self.GT, "zebra_logic") is True
+
+    def test_wrong_value_rejected(self):
+        assert verify_enigmata(self.GT.replace("reggae", "jazz"), self.GT, "zebra_logic") is False
+
+
+class TestTicTacToe:
+    def test_forced_centre_accepted(self):
+        meta = {"current_board": [["X", "", ""], ["", "", ""], ["", "", ""]], "active_player": "O"}
+        good = json.dumps([["X", "", ""], ["", "O", ""], ["", "", ""]])
+        assert verify_enigmata(good, "x", "tic_tac_toe", meta) is True
+        # The prompt's own quoted-token shape must parse too.
+        assert verify_enigmata('"X" "" ""\n"" "O" ""\n"" "" ""', "x", "tic_tac_toe", meta) is True
+
+    def test_suboptimal_move_rejected(self):
+        meta = {"current_board": [["X", "", ""], ["", "", ""], ["", "", ""]], "active_player": "O"}
+        bad = json.dumps([["X", "", ""], ["", "", ""], ["O", "", ""]])
+        assert verify_enigmata(bad, "x", "tic_tac_toe", meta) is False
+
+    def test_two_marks_rejected(self):
+        meta = {"current_board": [["X", "", ""], ["", "", ""], ["", "", ""]], "active_player": "O"}
+        bad = json.dumps([["X", "", ""], ["O", "", ""], ["O", "", ""]])
+        assert verify_enigmata(bad, "x", "tic_tac_toe", meta) is False
+
+    def test_audited_row(self):
+        # Real row: X in a corner, O to move, centre is the only optimal move.
+        meta = {
+            "current_board": [["", "", "X"], ["", "", ""], ["", "", ""]],
+            "active_player": "O",
+            "answer": [["", "", "X"], ["", "O", ""], ["", "", ""]],
+        }
+        assert verify_enigmata('[["", "", "X"], ["", "O", ""], ["", "", ""]]', "x", "tic_tac_toe", meta) is True
+
+    def test_without_meta_is_strict(self):
+        assert verify_enigmata('"X" "" ""\n"" "O" ""\n"" "" ""', "x", "tic_tac_toe") is False
 
 
 class TestSafeArithmetic:

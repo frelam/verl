@@ -16,16 +16,28 @@
 Why this exists
 ---------------
 ``to_parquet_logic.py`` stores the raw Enigmata ``answer`` field verbatim.  For
-several tasks that field is *not* the string the model is asked to produce::
+many tasks that field is *not* the string the model is asked to produce::
 
     game24            "The answer is: (12-10)*(12*1) = 24"   (expression, many solutions)
     countdown         "The answer is: 6*11-(15+13)/4 = 59"   (expression, many solutions)
     maze              "The answer is: (1,1)->(1,2)->..."     (prose prefix)
     stack_permutation "The output sequence is a valid stack permutation."  (sentence, not ops)
+    eight_puzzle      "[[6, 3, 1], [2, 0, 7], [5, 4, 8]]"    (the *initial* board; the
+                                                              answer is a move sequence)
+    twiddle           "[[1, 0], [0, 0]]"                     (one of many valid rotations)
+    hamiltonian_path  "[24, 21, 23, ...]"                    (one of many valid paths)
+    car_painting      "[1, 2, 5, 3, 9, 7, 8, 4, 6, 10]"      (one of many optimal orders)
+    full_crosswords   '{"across": [...], "down": [...]}'      (prompt mandates "across: ..., down: ...")
 
-Comparing those strings literally against the model's answer can never succeed,
-so a correct response is scored 0.  (Verified: countdown/game24/maze/
-stack_permutation together are ~10.8% of the Enigmata pool.)
+Comparing those strings literally against the model's answer can never succeed
+(or rejects every correct answer that is not byte-identical), so a correct
+response is scored 0.  Verified against the real pool: the four sliding/shift
+puzzles (8/15/nine/sixteen puzzle, 24k rows) store the *initial* board as the
+answer, so string comparison could never award a single point; hitori /
+kakurasu / light_up / minesweeper compare coordinate *sets*; twiddle,
+hamiltonian and car_painting have many valid solutions; campsite stores the
+constraint header in front of the board, which the prompt never asks the model
+to repeat.
 
 This module mirrors the official per-task verifiers shipped in
 ``BytedTsinghua-SIA/Enigmata`` (``verifiable_tasks/tasks/<task>/verifier.py``)
@@ -37,10 +49,15 @@ adapted to the reasoning_rl reward contract:
 * expression tasks (game24/countdown) are evaluated arithmetically and, when
   ``meta`` carries the input numbers, checked to use exactly those numbers --
   this is what stops the policy from hacking the reward with ``24``;
-* maze/stack_permutation need the original puzzle data, which
-  ``to_parquet_logic.py`` now stores under ``"meta"`` in ``ground_truth``.  Rows
-  built before that change (no ``meta``) still get the safe fallbacks documented
-  per function below.
+* puzzle tasks are *simulated* (sliding puzzles, circular shifts, twiddle
+  rotations, hamiltonian paths, car reordering) or checked against their
+  prompt-mandated container (crosswords, campsite/star_battle boards,
+  zebra tables), exactly as the official verifier does, so any valid solution
+  earns the point rather than only the generator's own;
+* maze/stack_permutation and every task added above need the original puzzle
+  data, which ``to_parquet_logic.py`` stores under ``"meta"`` in
+  ``ground_truth``.  Rows built before that change (no ``meta``) still get the
+  safe fallbacks documented per function below.
 
 ``verify_enigmata`` returns ``True``/``False`` when it owns the task, and
 ``None`` when the task is not handled here (caller falls back to the generic
@@ -50,6 +67,8 @@ matcher).
 from __future__ import annotations
 
 import ast
+import functools
+import json
 import logging
 import operator
 import re
@@ -65,9 +84,35 @@ _PROSE_PREFIX_RE = re.compile(
 
 _COORD_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)")
 _NUMBER_RE = re.compile(r"\d+")
+# String/grid tasks (campsite, star_battle, ...) ask for the board wrapped in
+# <begin_board>...</begin_board> inside the final answer.
+_BOARD_RE = re.compile(r"<begin_board>(.*?)<end_board>", re.DOTALL | re.IGNORECASE)
 
 # Tasks whose ground truth needs semantic verification instead of string match.
-HANDLED_TASKS = frozenset({"game24", "countdown", "maze", "stack_permutation"})
+HANDLED_TASKS = frozenset(
+    {
+        # arithmetic: the stored answer is one of many valid expressions
+        "game24",
+        "countdown",
+        # path / simulation tasks whose answer is prose or one of many solutions
+        "maze",
+        "stack_permutation",
+        "eight_puzzle",
+        "fifteen_puzzle",
+        "nine_puzzle",
+        "sixteen_puzzle",
+        "twiddle",
+        "hamiltonian_path",
+        "hamiltonian_cycle",
+        "car_painting",
+        # tasks whose prompt mandates a container the ground truth does not use
+        "campsite",
+        "star_battle",
+        "full_crosswords",
+        "tic_tac_toe",
+        "zebra_logic",
+    }
+)
 
 _ARITH_BINOPS = {
     ast.Add: operator.add,
@@ -87,6 +132,629 @@ def strip_prose_prefix(text: str) -> str:
     if not text:
         return text
     return _PROSE_PREFIX_RE.sub("", text, count=1).strip()
+
+
+# ---------------------------------------------------------------------------
+# metadata / answer-shape helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode(value):
+    """Decode a metadata field that may still be a JSON or Python literal string.
+
+    The Enigmata jsonl wraps ``meta`` in a JSON *string* and several tasks
+    double-encode their values (``"question": "[6, 11, 15, 4, 13]"``), so a field
+    the verifier needs as a list can arrive as text.  Plain text that is not a
+    literal (a maze grid, a graph, a table) is returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return value
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        return ast.literal_eval(stripped)
+    except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+        return value
+
+
+def _as_list(value) -> list | None:
+    value = _decode(value)
+    if isinstance(value, list | tuple):
+        return list(value)
+    return None
+
+
+def _as_int(value) -> int | None:
+    value = _decode(value)
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int | float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_int_matrix(value) -> list[list[int]] | None:
+    """Parse an integer grid from any answer shape Enigmata uses.
+
+    Accepts a nested list, ``"[[1 2,3 4]]"`` (cells space separated, rows comma
+    separated -- the SynLogic/Enigmata prompt convention), and a plain
+    whitespace/newline separated grid.  Returns ``None`` when the text is not an
+    integer grid, so callers never mistake prose for a board.
+    """
+    decoded = _decode(value)
+    if isinstance(decoded, list | tuple) and decoded and all(isinstance(r, list | tuple) for r in decoded):
+        try:
+            return [[int(c) for c in row] for row in decoded]
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.startswith("[[") and text.endswith("]]") and len(text) > 4 and "," in text:
+        try:
+            return [[int(c) for c in row.split()] for row in text[2:-2].split(",") if row.strip()]
+        except ValueError:
+            return None
+    rows = [row.strip() for row in text.splitlines() if row.strip()]
+    if not rows:
+        return None
+    grid: list[list[int]] = []
+    for row in rows:
+        cells = [c for c in re.split(r"[,\s]+", row) if c]
+        try:
+            grid.append([int(c) for c in cells])
+        except ValueError:
+            return None
+    return grid or None
+
+
+def _int_list(value) -> list[int] | None:
+    """Parse a flat integer list (``"[1, 2, 3]"``, ``"1 2 3"``, ``"(1,2,3)"``)."""
+    decoded = _decode(value)
+    if isinstance(decoded, list | tuple) and all(
+        isinstance(x, int | float) and not isinstance(x, bool) for x in decoded
+    ):
+        return [int(x) for x in decoded]
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"\[([\d\s,]+)\]", value)
+    text = match.group(1) if match else value
+    tokens = [t for t in re.split(r"[,\s]+", text.strip()) if t]
+    if not tokens:
+        return None
+    try:
+        return [int(t) for t in tokens]
+    except ValueError:
+        return None
+
+
+_NO_SOLUTION_RE = re.compile(r"no\s+(?:feasible|valid|solution)", re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# sliding / shift puzzles (8, 15, nine, sixteen puzzle)
+# ---------------------------------------------------------------------------
+
+# The official verifier's offsets: the *empty* cell moves by the offset, i.e.
+# "L" swaps the blank with its left neighbour.
+_SLIDING_MOVES = {"L": (0, -1), "R": (0, 1), "U": (-1, 0), "D": (1, 0)}
+
+
+def _sliding_solvable(board: list[list[int]]) -> bool:
+    """Classic 15-puzzle parity test (goal = 1..n^2-1 followed by the blank)."""
+    size = len(board)
+    flat = [cell for row in board for cell in row]
+    inversions = sum(
+        1 for i in range(len(flat)) for j in range(i + 1, len(flat)) if flat[i] and flat[j] and flat[i] > flat[j]
+    )
+    if size % 2:
+        return inversions % 2 == 0
+    blank_row_from_bottom = size - next(i for i, row in enumerate(board) if 0 in row)
+    return (inversions + blank_row_from_bottom) % 2 == 1
+
+
+def _sliding_moves(text: str) -> list[str] | None:
+    """Extract a move string from a response, or ``None`` when it is not one.
+
+    The official verifier takes the last code block verbatim as the sequence, so
+    a response that mixes prose with the moves is rejected.  As a fallback the
+    last whitespace/comma separated token is accepted when it consists purely of
+    move letters (``"The sequence is LRURDL."``), which is the same answer.
+    """
+    compact = re.sub(r"[^A-Za-z]", "", text).upper()
+    if compact and not set(compact) - set(_SLIDING_MOVES):
+        return list(compact)
+    for token in re.split(r"[\s,;]+", text.strip()):
+        cleaned = re.sub(r"[^A-Za-z]", "", token).upper()
+        if cleaned and not set(cleaned) - set(_SLIDING_MOVES):
+            return list(cleaned)
+    return None
+
+
+def _apply_sliding(board: list[list[int]], moves: list[str], blank_moves: bool) -> list[list[int]]:
+    """Replay a move sequence and return the final board (``None`` entry = stuck)."""
+    size = len(board)
+    grid = [row[:] for row in board]
+    empty = next((i, j) for i, row in enumerate(grid) for j, cell in enumerate(row) if cell == 0)
+    for move in moves:
+        d_row, d_col = _SLIDING_MOVES[move]
+        if not blank_moves:
+            # The prompt says the *tile* moves ("move a tile adjacent to the blank
+            # into the blank"); the official verifier replays the inverse reading
+            # (the blank moves).  Both are the same puzzle, so both are accepted.
+            d_row, d_col = -d_row, -d_col
+        row, col = empty[0] + d_row, empty[1] + d_col
+        if not (0 <= row < size and 0 <= col < size):
+            return None
+        grid[empty[0]][empty[1]], grid[row][col] = grid[row][col], grid[empty[0]][empty[1]]
+        empty = (row, col)
+    return grid
+
+
+def _verify_sliding_puzzle(prediction: str | None, meta) -> bool:
+    """8/15 puzzle: replay the move sequence from the stored initial board."""
+    board = _parse_int_matrix((meta or {}).get("question"))
+    if not board or len(board) != len(board[0]):
+        return False
+    if prediction is None:
+        return False
+    size = len(board)
+    if not _sliding_solvable(board):
+        # Provably unsolvable: the only correct response states that.
+        return bool(_NO_SOLUTION_RE.search(prediction))
+    if _NO_SOLUTION_RE.search(prediction):
+        return False
+    moves = _sliding_moves(prediction)
+    if not moves:
+        return False
+    goal = [[(i * size + j + 1) % (size * size) for j in range(size)] for i in range(size)]
+    return any(_apply_sliding(board, moves, blank_moves) == goal for blank_moves in (True, False))
+
+
+_SHIFT_MOVE_RE = re.compile(r"([RC])\s*(\d)\s*(\d)")
+
+
+def _apply_shift(board: list[list[int]], moves: list[tuple[str, int, int]], left: bool) -> list[int]:
+    """Replay circular row/column shifts and return the flattened board."""
+    size = len(board)
+    state = [cell for row in board for cell in row]
+    for kind, index, steps in moves:
+        steps %= size
+        if not (0 <= index < size):
+            return []
+        if kind == "R":
+            start = index * size
+            row = state[start : start + size]
+            state[start : start + size] = (
+                row[steps:] + row[:steps] if left else row[size - steps :] + row[: size - steps]
+            )
+        else:
+            column = state[index::size]
+            state[index::size] = (
+                column[steps:] + column[:steps] if left else column[size - steps :] + column[: size - steps]
+            )
+    return state
+
+
+def _verify_shift_puzzle(prediction: str | None, meta) -> bool:
+    """Nine/sixteen puzzle: replay ``["R11", "C23"]`` circular row/column shifts."""
+    board = _parse_int_matrix((meta or {}).get("question"))
+    if not board or len(board) != len(board[0]):
+        return False
+    if prediction is None or _NO_SOLUTION_RE.search(prediction):
+        # The generator only emits solvable instances, so this response is wrong.
+        return False
+    matches = _SHIFT_MOVE_RE.findall(prediction.upper())
+    if not matches:
+        return False
+    moves = [(kind, int(index) - 1, int(steps)) for kind, index, steps in matches]
+    size = len(board)
+    goal = list(range(1, size * size + 1))
+    # The prompt does not say which way a row/column rotates, so a sequence that
+    # solves the puzzle under either reading is accepted.
+    return any(_apply_shift(board, moves, left) == goal for left in (True, False))
+
+
+# ---------------------------------------------------------------------------
+# twiddle
+# ---------------------------------------------------------------------------
+
+_TWIDDLE_PAIR_RE = re.compile(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+_TWIDDLE_GOAL = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+
+
+def _verify_twiddle(prediction: str | None, meta) -> bool:
+    """Replay 2x2 counter-clockwise rotations; any solving sequence is accepted."""
+    board = _parse_int_matrix((meta or {}).get("question"))
+    if not board or len(board) != 3 or any(len(row) != 3 for row in board):
+        return False
+    if prediction is None:
+        return False
+    decoded = _decode(prediction)
+    rotations: list[tuple[int, int]] = []
+    if (
+        isinstance(decoded, list | tuple)
+        and decoded
+        and all(isinstance(pair, list | tuple) and len(pair) == 2 for pair in decoded)
+    ):
+        try:
+            rotations = [(int(pair[0]), int(pair[1])) for pair in decoded]
+        except (TypeError, ValueError):
+            rotations = []
+    if not rotations:
+        rotations = [(int(a), int(b)) for a, b in _TWIDDLE_PAIR_RE.findall(prediction)]
+    if not rotations:
+        return False
+    grid = [row[:] for row in board]
+    for i, j in rotations:
+        if i not in (0, 1) or j not in (0, 1):
+            return False
+        grid[i][j], grid[i][j + 1], grid[i + 1][j + 1], grid[i + 1][j] = (
+            grid[i][j + 1],
+            grid[i + 1][j + 1],
+            grid[i + 1][j],
+            grid[i][j],
+        )
+    return grid == _TWIDDLE_GOAL
+
+
+# ---------------------------------------------------------------------------
+# hamiltonian path / cycle
+# ---------------------------------------------------------------------------
+
+
+def _parse_graph(question) -> tuple[int, set[tuple[int, int]]] | None:
+    """Parse the ``"<num_nodes>\\n<u> <v>\\n..."`` graph stored in ``meta``."""
+    if not isinstance(question, str):
+        return None
+    lines = [line.strip() for line in question.strip().splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        num_nodes = int(lines[0])
+    except ValueError:
+        return None
+    edges: set[tuple[int, int]] = set()
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            u, v = int(parts[0]), int(parts[1])
+        except ValueError:
+            return None
+        edges.add((min(u, v), max(u, v)))
+    return num_nodes, edges
+
+
+def _verify_hamiltonian(prediction: str | None, answer, task: str, meta) -> bool:
+    """Validate a path/cycle against the graph: every valid one earns the point."""
+    parsed = _parse_graph((meta or {}).get("question"))
+    if parsed is None:
+        return False
+    num_nodes, edges = parsed
+    answer_text = str(answer).strip()
+    answer_is_no = answer_text.upper().startswith("NO")
+    if prediction is None:
+        return False
+    if re.search(r"\bno\b", prediction, re.IGNORECASE) and not re.search(r"\d", prediction):
+        return answer_is_no
+    sequence = _int_list(prediction)
+    if not sequence:
+        return False
+    if task == "hamiltonian_path":
+        if len(sequence) != num_nodes or sorted(sequence) != list(range(num_nodes)):
+            return False
+        return all(
+            (min(sequence[i], sequence[i + 1]), max(sequence[i], sequence[i + 1])) in edges
+            for i in range(num_nodes - 1)
+        )
+    # A cycle may or may not repeat the starting node; the official verifier
+    # strips the repeat, so both spellings are the same answer.
+    if len(sequence) == num_nodes + 1 and sequence[0] == sequence[-1]:
+        sequence = sequence[:-1]
+    if len(sequence) != num_nodes or sorted(sequence) != list(range(num_nodes)):
+        return False
+    return all(
+        (min(sequence[i], sequence[(i + 1) % num_nodes]), max(sequence[i], sequence[(i + 1) % num_nodes])) in edges
+        for i in range(num_nodes)
+    )
+
+
+# ---------------------------------------------------------------------------
+# car painting
+# ---------------------------------------------------------------------------
+
+
+def _verify_car_painting(prediction: str | None, meta) -> bool:
+    """Any permutation within the K-shift budget that hits min_switches is correct."""
+    meta = meta or {}
+    car_ids = _as_list(meta.get("car_ids"))
+    colors = _as_list(meta.get("colors"))
+    shift_limit = _as_int(meta.get("K"))
+    min_switches = _as_int(meta.get("min_switches"))
+    if prediction is None or not car_ids or not colors or shift_limit is None or min_switches is None:
+        return False
+    try:
+        original = [int(c) for c in car_ids]
+    except (TypeError, ValueError):
+        return False
+    order = _int_list(prediction)
+    if not order or sorted(order) != sorted(original):
+        return False
+    for position, car in enumerate(order, start=1):
+        try:
+            original_position = original.index(car) + 1
+        except ValueError:
+            return False
+        if abs(position - original_position) > shift_limit:
+            return False
+    try:
+        switches = sum(1 for a, b in zip(order, order[1:], strict=False) if colors[a - 1] != colors[b - 1])
+    except (IndexError, TypeError):
+        return False
+    return switches == min_switches
+
+
+# ---------------------------------------------------------------------------
+# board tasks whose prompt mandates <begin_board> (campsite, star_battle)
+# ---------------------------------------------------------------------------
+
+
+def _board_rows(text: str | None) -> list[str] | None:
+    """Return the whitespace-free board rows inside (or around) ``text``."""
+    if not text:
+        return None
+    boards = _BOARD_RE.findall(text)
+    body = boards[-1] if boards else text
+    rows = []
+    for line in body.splitlines():
+        line = line.strip().strip("`")
+        if not line or line.startswith("```") or re.fullmatch(r"</?[A-Za-z_]+>", line):
+            continue  # fence or a stray board/tag marker
+        # campsite's ground truth prefixes the board with its constraint header
+        # ("total number of tents: ..."), which the prompt never asks the model
+        # to repeat.
+        if re.match(r"^(?:total number of tents|tents in each (?:row|column))\s*:", line, re.IGNORECASE):
+            continue
+        rows.append(re.sub(r"\s+", "", line))
+    return rows or None
+
+
+def _verify_board_task(prediction: str | None, answer) -> bool:
+    gold = _board_rows(str(answer))
+    got = _board_rows(prediction)
+    return bool(gold) and bool(got) and gold == got
+
+
+# ---------------------------------------------------------------------------
+# full_crosswords
+# ---------------------------------------------------------------------------
+
+_CROSSWORD_LINE_RE = re.compile(r"^(across|down)\s*[::]\s*(.+)$", re.IGNORECASE)
+
+
+def _crossword_words(values) -> list[str]:
+    words = _as_list(values) or []
+    return [str(word).replace(" ", "").strip().upper() for word in words]
+
+
+def _verify_crosswords(prediction: str | None, answer) -> bool:
+    """Compare the across/down word lists written in either allowed shape.
+
+    The prompt mandates ``across: W1, W2\\ndown: W1, W2`` while ``ground_truth``
+    stores ``{"across": [...], "down": [...]}``; both are accepted.
+    """
+    if prediction is None:
+        return False
+    gold = _decode(answer)
+    if not isinstance(gold, dict):
+        return False
+    gold_across, gold_down = _crossword_words(gold.get("across")), _crossword_words(gold.get("down"))
+    if not gold_across and not gold_down:
+        return False
+    decoded = _decode(prediction)
+    if isinstance(decoded, dict):
+        got_across, got_down = _crossword_words(decoded.get("across")), _crossword_words(decoded.get("down"))
+    else:
+        parsed: dict[str, list[str]] = {}
+        for line in prediction.splitlines():
+            match = _CROSSWORD_LINE_RE.match(line.strip().strip("`*# ").strip())
+            if not match:
+                continue
+            words = [w.strip().strip("\"'") for w in re.split(r"[,\s]+", match.group(2).strip())]
+            parsed[match.group(1).lower()] = [w for w in words if w and set(w) != {"."}]
+        if not parsed:
+            return False
+        got_across = _crossword_words(parsed.get("across"))
+        got_down = _crossword_words(parsed.get("down"))
+    return got_across == gold_across and got_down == gold_down
+
+
+# ---------------------------------------------------------------------------
+# zebra logic
+# ---------------------------------------------------------------------------
+
+
+def _table_rows(text) -> list[tuple[str, ...]]:
+    """Split a Markdown table into its rows (labels included, layout ignored)."""
+    rows: list[tuple[str, ...]] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if line.count("|") < 2:
+            continue
+        cells = tuple(re.sub(r"\s+", " ", cell.strip()).lower() for cell in line.split("|")[1:-1])
+        if not cells or all(not cell for cell in cells):
+            continue
+        if all(set(cell) <= set("-: ") for cell in cells):  # |---|---| separator
+            continue
+        rows.append(cells)
+    return rows
+
+
+def _verify_zebra(prediction: str | None, answer) -> bool:
+    """Official rule: every ground-truth row must appear in the model's table."""
+    gold = _table_rows(answer)
+    got = _table_rows(prediction)
+    if not gold or not got:
+        return False
+    return all(row in got for row in gold)
+
+
+# ---------------------------------------------------------------------------
+# tic tac toe (3x3 optimal move)
+# ---------------------------------------------------------------------------
+
+_OPPONENT = {"X": "O", "O": "X"}
+
+
+def _cell(token) -> str:
+    token = str(token).strip().strip("\"'`").upper()
+    return token if token in {"X", "O"} else ""
+
+
+def _parse_board(text, size: int) -> list[list[str]] | None:
+    """Parse the board from the prompt's quoted-token rows, a table or a literal."""
+    decoded = _decode(text)
+    if isinstance(decoded, list | tuple) and decoded and all(isinstance(r, list | tuple) for r in decoded):
+        rows = [[_cell(cell) for cell in row] for row in decoded]
+    else:
+        rows = []
+        if not isinstance(text, str):
+            return None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("```") or set(line) <= set("-+ "):
+                continue
+            if "|" in line:
+                cells = [cell.strip() for cell in line.strip("|").split("|")]
+            else:
+                cells = re.findall(r'"[^"]*"|\'[^\']*\'|[^\s,]+', line)
+            cells = [_cell(cell) for cell in cells]
+            if len(cells) == size:
+                rows.append(cells)
+    if len(rows) < size:
+        return None
+    return rows[-size:]  # the prompt may be echoed before the answer
+
+
+def _winner(board: list[list[str]]) -> str | None:
+    size = len(board)
+    lines = [list(row) for row in board]
+    lines += [[board[i][j] for i in range(size)] for j in range(size)]
+    lines.append([board[i][i] for i in range(size)])
+    lines.append([board[i][size - 1 - i] for i in range(size)])
+    for line in lines:
+        if line[0] and all(cell == line[0] for cell in line):
+            return line[0]
+    return None
+
+
+def _board_key(board: list[list[str]]) -> tuple[tuple[str, ...], ...]:
+    return tuple(tuple(row) for row in board)
+
+
+@functools.lru_cache(maxsize=4096)
+def _minimax(board: tuple[tuple[str, ...]], current: str, maximizing: bool, me: str) -> int:
+    grid = [list(row) for row in board]
+    winner = _winner(grid)
+    if winner == me:
+        return 1
+    if winner:
+        return -1
+    if all(cell for row in grid for cell in row):
+        return 0
+    size = len(grid)
+    scores = []
+    for i in range(size):
+        for j in range(size):
+            if grid[i][j]:
+                continue
+            grid[i][j] = current
+            scores.append(_minimax(_board_key(grid), _OPPONENT[current], not maximizing, me))
+            grid[i][j] = ""
+    if not scores:
+        return 0
+    return max(scores) if maximizing else min(scores)
+
+
+def _immediate_moves(board: list[list[str]], player: str) -> list[tuple[int, int]]:
+    """Winning moves for ``player``, else the moves that block the opponent."""
+    size = len(board)
+    grid = [row[:] for row in board]
+    for target in (player, _OPPONENT[player]):
+        moves = []
+        for i in range(size):
+            for j in range(size):
+                if grid[i][j]:
+                    continue
+                grid[i][j] = target
+                if _winner(grid) == target:
+                    moves.append((i, j))
+                grid[i][j] = ""
+        if moves:
+            return moves
+    return []
+
+
+def _best_moves_3x3(board: list[list[str]], player: str) -> list[tuple[int, int]]:
+    immediate = _immediate_moves(board, player)
+    if immediate:
+        return immediate
+    size = len(board)
+    best_score: int | None = None
+    best: list[tuple[int, int]] = []
+    for i in range(size):
+        for j in range(size):
+            if board[i][j]:
+                continue
+            grid = [row[:] for row in board]
+            grid[i][j] = player
+            score = _minimax(_board_key(grid), _OPPONENT[player], False, player)
+            if best_score is None or score > best_score:
+                best_score, best = score, [(i, j)]
+            elif score == best_score:
+                best.append((i, j))
+    return best
+
+
+def _verify_tic_tac_toe(prediction: str | None, meta) -> bool:
+    """Accept any optimal move, not only the generator's own board."""
+    meta = meta or {}
+    current = meta.get("current_board")
+    player = str(meta.get("active_player") or "").strip().upper()
+    if not isinstance(current, list) or player not in _OPPONENT:
+        return False
+    size = len(current)
+    if size != 3 or prediction is None:
+        return False
+    board = [[_cell(cell) for cell in row] for row in current]
+    predicted = _parse_board(prediction, size)
+    if predicted is None:
+        return False
+    move = None
+    for i in range(size):
+        for j in range(size):
+            if board[i][j] == predicted[i][j]:
+                continue
+            if board[i][j] or predicted[i][j] != player or move is not None:
+                return False  # must be exactly the active player's single new mark
+            move = (i, j)
+    if move is None:
+        return False
+    return move in _best_moves_3x3(board, player)
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +837,9 @@ def _verify_expression_task(prediction: str | None, answer, target: float, meta)
     value = _safe_arith_eval(expr)
     if value is None or abs(value - target) > 1e-4:
         return False
-    numbers = (meta or {}).get("question")
+    numbers = _as_list((meta or {}).get("question"))
     numeric_numbers = None
-    if isinstance(numbers, list) and numbers:
+    if numbers:
         try:
             numeric_numbers = sorted(_number_key(n) for n in numbers)
         except (TypeError, ValueError):
@@ -329,21 +997,35 @@ def verify_enigmata(
     meta = meta if isinstance(meta, dict) else None
 
     if task == "game24":
-        target = 24.0
-        if meta and isinstance(meta.get("target"), int | float):
-            target = float(meta["target"])
-        return _verify_expression_task(prediction, answer, target, meta)
+        target = _as_int((meta or {}).get("target")) or 24
+        return _verify_expression_task(prediction, answer, float(target), meta)
     if task == "countdown":
-        target = None
-        if meta and isinstance(meta.get("target"), int | float):
-            target = float(meta["target"])
-        else:
+        target = _as_int((meta or {}).get("target"))
+        if target is None:
             target = _target_from_answer(answer)
         if target is None:
             return None
-        return _verify_expression_task(prediction, answer, target, meta)
+        return _verify_expression_task(prediction, answer, float(target), meta)
     if task == "maze":
         return _verify_maze(prediction, answer, meta)
     if task == "stack_permutation":
         return _verify_stack_permutation(prediction, answer, meta)
+    if task in {"eight_puzzle", "fifteen_puzzle"}:
+        return _verify_sliding_puzzle(prediction, meta)
+    if task in {"nine_puzzle", "sixteen_puzzle"}:
+        return _verify_shift_puzzle(prediction, meta)
+    if task == "twiddle":
+        return _verify_twiddle(prediction, meta)
+    if task in {"hamiltonian_path", "hamiltonian_cycle"}:
+        return _verify_hamiltonian(prediction, answer, task, meta)
+    if task == "car_painting":
+        return _verify_car_painting(prediction, meta)
+    if task in {"campsite", "star_battle"}:
+        return _verify_board_task(prediction, answer)
+    if task == "full_crosswords":
+        return _verify_crosswords(prediction, answer)
+    if task == "zebra_logic":
+        return _verify_zebra(prediction, answer)
+    if task == "tic_tac_toe":
+        return _verify_tic_tac_toe(prediction, meta)
     return None

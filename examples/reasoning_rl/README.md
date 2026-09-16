@@ -279,6 +279,10 @@ python3 examples/reasoning_rl/scripts/check_reward.py --data_file $DATA_DIR/val.
 python3 examples/reasoning_rl/scripts/check_reward.py --dump_dir /tmp/val_dump   # 汇总 validation_data_dir 的真实生成
 ```
 
+注意 `logic_enigmata` 的 4 个滑块/位移 task（eight/fifteen/nine/sixteen puzzle）**故意** echo
+不满分：它们库内 `answer` 存的是题目初始棋盘，模型要输出的是移动序列，所以自检里这几行会被
+verifier 正确判 0（见 DESIGN.md §6 "Enigmata 答案约定"）；其余 task 应 100%。
+
 | 症状 | 原因 | 处理 |
 |---|---|---|
 | `Big-Math schema changed: missing columns ...` | HF 数据集字段改名 | 按报错中的 available columns 更新 `to_parquet_math.py` 的 `load_bigmath()` 字段映射 |
@@ -289,6 +293,8 @@ python3 examples/reasoning_rl/scripts/check_reward.py --dump_dir /tmp/val_dump  
 | Dr.SCI 全是证明题、无短答案 | 误载 `Dr_SCI_open-ended.parquet` | 必须加载 `Dr_SCI_verifiable.parquet`（loader 已内置 data_files 指定） |
 | `val-core/logic_synlogic/*` 偏低（非 0，但明显低于预期） | ① 一半以上的 task prompt 要求**裸答案**（dyck_*、time_sequence、kukurasu、numbrix、campsite…），旧提取只认 `<answer>`/`\boxed{}`/收尾行/代码块；② prompt 规定的包装与库内 `game_data_str.answer` 不一致：math_path 的 `[[expr]]`、buggy_tables 的 `{"result":[{"answer":X}]}`、futoshiki 的 `[[A B C,…]]`；③ goods_exchange 是集合语义却按顺序比 | 已修：`extract_logic_answer` 增加 `</think>` 正文兜底；`logic_answer_match` 增加 `[[ ]]`/容器包装兜底、`[[行,行]]` 网格归一化、goods_exchange 无序比较（DESIGN.md §6 "SynLogic 答案约定"；easy+hard 48,677 行 / 35 task 实测两种写法均判 1.0） |
 | `val-core/logic_reasoning_gym/*` 长期 0，且训练侧该源 reward 也上不去 | ① 库自带 prompt 要求 "only your answer"，模型可能不套 `<answer>`，裸答案旧版提取不到；② countdown / word_ladder / shortest_path 是"多解但只存一个规范答案"，字符串比较会把等价正确答案判 0 | 已修：`extract_logic_answer` 增加 `</think>` 后正文兜底；新增 `reward/reasoning_gym_verifier.py`，通用比较判失败后用库自带 task verifier 复核（需 `pip install reasoning-gym`；按 `extra_info.seed` 复现题目，复现答案与 ground_truth 不符则拒绝判分） |
+| `val-core/logic_enigmata/*` 偏低（如 0.1~0.2），训练侧同样上不去 | 36 个 task 里 11 类只做字符串比较会**答对判 0**：eight/fifteen/nine/sixteen puzzle 的 `answer` 存的是初始棋盘（24k 行，永远 0）；twiddle/hamiltonian/car_painting 是多解只存一解；hitori/kakurasu/light_up 是坐标集合却按顺序比；campsite 的 `answer` 带约束头而 prompt 只要求 `<begin_board>`；full_crosswords 的 prompt 规定 `across:/down:` 行格式而库内是 JSON；tic_tac_toe 最优手有多个 | 已修：`reward/enigmata_verifier.py` 覆盖 17 个 task（重放移动/旋转/位移、按 `meta` 图校验路径、置换+K+换色数、棋盘区域 / 十字词行 / 表格行 / 3x3 minimax），hitori/kakurasu/light_up 加入 `_UNORDERED_COLLECTION_TASKS`（DESIGN.md §6 "Enigmata 答案约定"，含每类行数与 old→new 实测） |
+| `val-core/stem_drsci/*` 偏低 | 先自检排除 reward：7,015 条抽样按 prompt 的 `\boxed{}` 格式回灌，7,014 条判 1.0 → **不是**"答对必判 0"。剩余差异来自模型本身（Dr.SCI 可验证子集含 MegaScience 教材题 + GPQA 级难题）；约 4% 的答案本身是自由文本/表述式（如 "Sensitivity = TP/(TP+FN)"），math_verify 只能做（近似）字符串比较，换个说法即判 0，属于该数据源固有限制 | 自检：`check_reward.py --data_source stem_drsci`；另外 `_math_score` 已在 math_verify 抛错（共享进程池被单个样本搞坏）时 fallback 到 math_dapo，避免一个坏样本把后续所有 `math_*`/`stem_*` 判 0 |
 | decontaminate 报 embedding 连接失败 | vLLM 服务未起或端口不对 | 确认 `curl http://127.0.0.1:8001/v1/models`，或 `--embedding_base_url` 指向实际端点 |
 | decontaminate 极慢 | embedding 批量太小 | 调大 `--batch_size`（默认 64，A100 可到 256+） |
 | MinHash 阶段内存高 | 签名矩阵 128×N×8B（N=27 万约 276MB） | 属正常量级；更大池可分批跑 |

@@ -71,13 +71,18 @@ examples/reasoning_rl/
   `<answer>` 标签 → `\boxed{}` → 收尾行 → 末尾代码块 → `</think>` 后的裸答案正文 的优先级提取，
   并做大小写/空白折叠、
   markdown 强调符剥离、分隔符间距与内层引号不敏感的文本比较及结构化（JSON/literal）比较；
-  minesweeper / norinori / star_placement_puzzle / goods_exchange 等**集合语义**答案做无序规范化，
+  minesweeper / norinori / star_placement_puzzle / goods_exchange / hitori / kakurasu /
+  light_up 等**集合语义**答案做无序规范化，
   整数网格答案（Enigmata arc 系、SynLogic calcudoko/futoshiki）做
   "嵌套 list ↔ 空格分隔文本 ↔ `[[行,行]]`" 的矩阵归一化比较；
   最后再兜底接受 prompt 规定的包装（`[[expr]]`、`{"result":[{"answer":X}]}`，见 §6 "SynLogic 答案约定"）；
   Enigmata 的 game24 / countdown（表达式，多解）、maze（路径合法性）、stack_permutation
-  （栈模拟）由 `reward/enigmata_verifier.py` 做 task 级语义校验（ground_truth 需带 `meta`，
-  见 §1 数据 schema）；
+  （栈模拟）、8/15/nine/sixteen puzzle（按 `meta` 初始局面重放移动序列）、twiddle
+  （重放 2x2 旋转）、hamiltonian path/cycle（按 `meta` 图校验路径）、car_painting
+  （置换 + K 约束 + 最少换色数）、campsite / star_battle（只比 `<begin_board>` 棋盘）、
+  full_crosswords（`across:/down:` 行格式）、zebra_logic（行集合）、tic_tac_toe（3x3 最优先手）
+  由 `reward/enigmata_verifier.py` 做 task 级语义校验（ground_truth 需带 `meta`，
+  见 §1 数据 schema 与 §6 "Enigmata 答案约定"）；
   Reasoning Gym 的 countdown / word_ladder / shortest_path 同样是"多解但只有一个规范答案"，
   上述字符串比较判失败后再交给 `reward/reasoning_gym_verifier.py`，用库自带 task verifier
   按 `extra_info.seed` 复现题目后判定（复现出的 answer 与 ground_truth 不一致就拒绝判分，
@@ -218,13 +223,13 @@ filter_groups 的浪费大幅下降。Big-Math 自带的 `llama8b_solve_rate` �
 
 | data_source | verifier | ground_truth 格式 |
 |---|---|---|
-| `math_*` | math_verify（`pip install math-verify`），fallback math_dapo | 字符串答案 |
+| `math_*` | math_verify（`pip install math-verify`）；math_verify 抛错（进程池损坏等）或缺失时 fallback math_dapo（先 `\boxed{}` 严格匹配，再 Minerva `Answer:`） | 字符串答案 |
 | `code_*` | sandbox_fusion（正式训练）；prime_code 本地执行（smoke run） | `{"inputs","outputs"(,"fn_name")}` JSON |
 | `logic_synlogic` / `logic_puzzleclone` | 通用比较 + per-task 约定（见下方"SynLogic 答案约定"） | per-task 结构 |
-| `logic_enigmata` | `reward/enigmata_verifier.py` 的 task 级 verifier（game24/countdown 表达式求值 + 数字使用校验、maze 路径合法性、stack_permutation 栈模拟），其余走通用比较 | `{"answer","task"(,"meta")}` |
+| `logic_enigmata` | `reward/enigmata_verifier.py` 的 task 级 verifier（17 个 task，见下方"Enigmata 答案约定"），其余走通用比较 | `{"answer","task"(,"meta")}` |
 | `logic_reasoning_gym` | 先走通用比较；字符串判失败时再用 reasoning_gym 库自己的 task verifier（`reward/reasoning_gym_verifier.py`，按 `extra_info.seed` 复现 entry，只做加分不加分） | `{"answer","task"}` |
 | `logic_arc` | 网格 exact match | 二维数组 JSON |
-| `stem_*` | MCQ 选项字母 match + 数值题走 math_verify | `\boxed{}` 内答案 |
+| `stem_*` | 全线走 math_verify（Dr.SCI prompt 自带 `The final answer is: $\boxed{...}$` 指令）；实测 7,015 条按 prompt 格式回灌 7,014 条判 1.0，即答案本身没有"答对必判 0" | `\boxed{}` 内答案 |
 
 新 data_source 统一在 `reward/compute_score.py` 扩展，训练配置用
 `reward_model.custom_reward_function.path/name` 挂载，不改 verl 源码。
@@ -247,6 +252,35 @@ SynLogic 每个 task 的 prompt 都自带输出格式，而 `extra_info.game_dat
 此外所有 task 都实测通过"裸答案"（prompt 常写 "output only your answer"，见
 `extract_logic_answer` 的 `</think>` 正文兜底）。任何包装类比较都只在通用比较失败后才执行，
 因此只可能加分、不会误判为正确。
+
+### Enigmata 答案约定
+
+Enigmata-Data 的 36 个 task（39 个 `train.jsonl`，217,541 行）里，官方 verifier
+（`BytedTsinghua-SIA/Enigmata` 的 `verifiable_tasks/tasks/<task>/verifier.py`）对多数
+task 做的是**语义校验/模拟**，而 `ground_truth` 只存了生成器自己的那一个解（甚至存的是
+题目初始状态）；只做字符串比较会让答对判 0。差异已在本地全量数据上实测：
+
+| task | 行数 | 只做字符串比较的问题 | 现在的处理 |
+|---|---|---|---|
+| `eight_puzzle` / `fifteen_puzzle` | 12,000 | `answer` 存的是**初始棋盘**，模型要输出的是 L/R/U/D 移动序列 → 永远判 0 | 用 `meta.question` 重放序列，比较终局；顺带做 15-puzzle 奇偶可解性判断（无解时接受 "No feasible..."） |
+| `nine_puzzle` / `sixteen_puzzle` | 12,000 | 同上（`answer` 是初始棋盘），模型要输出 `["R11","C23"]` 循环位移 | 同上，重放循环行列位移；prompt 未规定旋转方向，两个方向都接受 |
+| `twiddle` | 6,000 | 一个解有多种旋转序列 | 用 `meta.question` 重放 2x2 逆时针旋转，任意可行序列给分 |
+| `hamiltonian_path` / `hamiltonian_cycle` | 7,095 | 一条合法路径/回路有多个 | 用 `meta.question` 的图校验路径/回路（含不带重复起点的回路写法） |
+| `car_painting` | 6,000 | 最优换色方案有多个 | 校验排列完整性 + K 位移约束 + 换色数 == `meta.min_switches` |
+| `hitori` / `kakurasu` / `light_up` | 14,000 | 答案是**坐标集合**，生成器顺序任意 | 加入 `_UNORDERED_COLLECTION_TASKS`（与 SynLogic minesweeper 同一处理） |
+| `campsite` | 6,000 | `answer` 前面多带了 `total number of tents: ...` 约束头，prompt 只要求 `<begin_board>` 棋盘 | 只比 `<begin_board>` 内的棋盘行，忽略约束头 |
+| `star_battle` | 6,000 | 模型按 prompt 把棋盘包在 `<begin_board>` 里时与裸棋盘串不同 | 同上（取棋盘区域比较） |
+| `full_crosswords` | 19,000 | prompt 规定 `across: W1, W2` / `down: W1, W2` 行格式，库内存 JSON dict | 两种形状都接受 |
+| `zebra_logic` | 6,000 | 官方按"每一行是否出现"比较，允许行序与 markdown 分隔行 | 行集合比较 |
+| `tic_tac_toe` | 4,000 | 最优手有多个；且答案是走子后的棋盘 | 3x3 minimax + 立即取胜/封堵，任意最优手给分（与官方 `find_best_move_3x3` 在真实数据上逐条一致） |
+
+实测（抽样每 task 120 行）：把**合法但形状不同**的答案回灌，`old → new` 判分从
+0 提升到满分（campsite 0→120、star_battle 0→120、full_crosswords 0→120、zebra_logic
+0→120、twiddle 0→120、car_painting 0→120、hamiltonian_path 0→67、hamiltonian_cycle
+0→61、tic_tac_toe 0→72、eight_puzzle 0→120、nine_puzzle 0→79、hitori 0→120、
+kakurasu 1→120、light_up 0→120）。仍未覆盖的是"官方做约束校验、库内存唯一解"的
+task（`sudoku`/`sudoku2`/`skyscraper`/`sum_skyscraper`/`binario`/`magic_square`/`slant`）：
+这些只有当生成器给的解不唯一时才会漏判，目前按 exact match 处理。
 
 ### sandbox-fusion 说明
 

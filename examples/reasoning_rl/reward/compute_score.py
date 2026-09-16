@@ -36,8 +36,14 @@ Routing (data_source prefix -> verifier):
                      separator-spacing/quote-insensitive text compare,
                      literal/JSON structural compare, numeric tolerance,
                      integer-grid normalisation). Enigmata arithmetic
-                     (game24/countdown), maze and stack_permutation answers are
-                     verified by ``enigmata_verifier`` instead of string match;
+                     (game24/countdown), maze, stack_permutation, the four
+                     sliding/shift puzzles, twiddle, hamiltonian path/cycle,
+                     car_painting, campsite/star_battle boards, full_crosswords,
+                     zebra_logic and tic_tac_toe answers are verified by
+                     ``enigmata_verifier`` instead of string match — their stored
+                     answers are prose, one of many valid solutions, or the
+                     puzzle's *initial* state, so text comparison scored correct
+                     responses 0;
                      Reasoning Gym answers that string comparison rejects are
                      re-checked with the library's own task verifier
                      (``reasoning_gym_verifier``), which accepts the many
@@ -142,20 +148,38 @@ def format_ok(solution_str: str) -> bool:
 
 
 def _math_score(solution_str: str, ground_truth: str) -> float:
+    """math_verify when available, else/also-on-failure verl's rule matcher.
+
+    math_verify runs each comparison in a *shared* process pool
+    (``verl.utils.reward_score.math_verify``).  A single sample that crashes or
+    wedges one of its workers permanently breaks that pool for the rest of the
+    run, and the upstream helper swallows the resulting ``BrokenProcessPool``
+    into a plain ``0.0`` -- one pathological response would then zero the
+    ``math_*`` **and** ``stem_*`` reward of every later sample.  Falling back to
+    math_dapo (in-process, no shared state) keeps those samples scoreable
+    instead of silently rewarding nothing.
+    """
+    ground_truth = str(ground_truth)
     try:
         from verl.utils.reward_score import math_verify
 
-        return float(math_verify.compute_score(solution_str, str(ground_truth)))
+        return float(math_verify.compute_score(solution_str, ground_truth))
     except ImportError:
-        from verl.utils.reward_score import math_dapo
-
-        # math_dapo returns {"score": ±1.0, "acc": bool, ...}; normalise to 0/1
-        # so all four domains share the same pass-rate semantics.
-        res = math_dapo.compute_score(solution_str, str(ground_truth))
-        return float(res["acc"]) if isinstance(res, dict) else float(res)
+        pass
     except Exception as e:  # never let one bad sample kill the reward pass
-        logger.warning("[reasoning_rl] math verify error: %s", e)
-        return 0.0
+        logger.warning("[reasoning_rl] math_verify failed (%s); falling back to math_dapo", e)
+    from verl.utils.reward_score import math_dapo
+
+    # math_dapo returns {"score": ±1.0, "acc": bool, ...}; normalise to 0/1 so
+    # all four domains share the same pass-rate semantics.  Try the boxed-answer
+    # rule first -- every prompt in this mix asks for ``\boxed{}`` -- then the
+    # Minerva "Answer: X" rule, so the fallback stays useful for either shape.
+    for strict_box in (True, False):
+        res = math_dapo.compute_score(solution_str, ground_truth, strict_box_verify=strict_box)
+        acc = float(res["acc"]) if isinstance(res, dict) else float(res)
+        if acc:
+            return acc
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -375,10 +399,23 @@ def _structured_equal(a, b, tol: float = 1e-6) -> bool:
     return _loose_token_form(str(a)) == _loose_token_form(str(b))
 
 
-# SynLogic tasks whose answer is an unordered collection of coordinates, dominos
-# or (person, item) pairs — both sides are canonicalised (recursively sorted)
+# Tasks whose answer is an unordered collection of coordinates, dominos or
+# (person, item) pairs -- both sides are canonicalised (recursively sorted)
 # before the structural compare so collection ordering never decides the reward.
-_UNORDERED_COLLECTION_TASKS = frozenset({"minesweeper", "norinori", "star_placement_puzzle", "goods_exchange"})
+# Enigmata's hitori/kakurasu/light_up/minesweeper are coordinate sets too: the
+# official verifiers compare them as Python sets, while the generators store
+# them in an arbitrary order.
+_UNORDERED_COLLECTION_TASKS = frozenset(
+    {
+        "minesweeper",
+        "norinori",
+        "star_placement_puzzle",
+        "goods_exchange",
+        "hitori",
+        "kakurasu",
+        "light_up",
+    }
+)
 
 # SynLogic tasks whose answer is an arithmetic expression: the prompt asks for it
 # wrapped in [[...]] and the generator's own spacing ("9 +6 -7 +(6 %5)") differs

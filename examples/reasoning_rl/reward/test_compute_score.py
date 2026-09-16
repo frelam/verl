@@ -164,6 +164,16 @@ class TestLogicAnswerMatch:
         assert not logic_answer_match("[[1, 2], [3, 4]]", gt, task="campsite")
         assert not logic_answer_match("[[1, 2], [3, 4]]", gt)
 
+    def test_enigmata_coordinate_sets_canonicalised(self):
+        # Enigmata hitori/kakurasu/light_up store the blacked-out / bulb cells in
+        # generator order while the official verifiers compare them as Python
+        # sets, so only the membership may decide the reward.
+        gold = json.dumps([[2, 4], [3, 3], [4, 4]])
+        for task in ("hitori", "kakurasu", "light_up", "minesweeper"):
+            assert logic_answer_match("[(4, 4), (2, 4), (3, 3)]", gold, task=task)
+            assert not logic_answer_match("[(4, 4), (2, 4)]", gold, task=task)
+            assert not logic_answer_match("[(4, 4), (2, 4), (4, 3)]", gold, task=task)
+
 
 class TestSynLogicPromptConventions:
     """The prompt-mandated answer shape must not decide the reward.
@@ -293,6 +303,18 @@ class TestComputeScore:
     def test_math_route(self):
         res = compute_score("math_bigmath", think_wrap("The answer is $\\boxed{7}$."), "7")
         assert isinstance(res["score"], float)
+
+    def test_math_verify_failure_falls_back_to_math_dapo(self, monkeypatch):
+        # math_verify shares one process pool; a wedged or broken pool used to
+        # zero every later math/stem sample. The rule matcher must take over.
+        from verl.utils.reward_score import math_verify
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("process pool is not usable anymore")
+
+        monkeypatch.setattr(math_verify, "compute_score", boom)
+        res = compute_score("stem_drsci", think_wrap("The final answer is: $\\boxed{105}$"), "105")
+        assert res["score"] == 1.0
 
 
 # ---------------------------------------------------------------------------
