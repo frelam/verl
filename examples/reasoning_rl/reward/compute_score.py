@@ -375,15 +375,20 @@ def _structured_equal(a, b, tol: float = 1e-6) -> bool:
     return _loose_token_form(str(a)) == _loose_token_form(str(b))
 
 
-# SynLogic tasks whose answer is an unordered collection of coordinates or
-# dominos — both sides are canonicalised (recursively sorted) before the
-# structural compare so collection ordering never decides the reward.
-_UNORDERED_COORD_TASKS = frozenset({"minesweeper", "norinori", "star_placement_puzzle"})
+# SynLogic tasks whose answer is an unordered collection of coordinates, dominos
+# or (person, item) pairs — both sides are canonicalised (recursively sorted)
+# before the structural compare so collection ordering never decides the reward.
+_UNORDERED_COLLECTION_TASKS = frozenset({"minesweeper", "norinori", "star_placement_puzzle", "goods_exchange"})
+
+# SynLogic tasks whose answer is an arithmetic expression: the prompt asks for it
+# wrapped in [[...]] and the generator's own spacing ("9 +6 -7 +(6 %5)") differs
+# from anything a model writes ("9+6-7+(6%5)"), so whitespace is not content.
+_WHITESPACE_FREE_TASKS = frozenset({"math_path"})
 
 
 def _canon_unordered(obj):
     """Normalise tuples to lists and sort (bottom-up) any list whose elements
-    are all lists. Applied only to _UNORDERED_COORD_TASKS answers — never to
+    are all lists. Applied only to _UNORDERED_COLLECTION_TASKS answers — never to
     grids, where row/column order is the answer."""
     if isinstance(obj, dict):
         return {k: _canon_unordered(v) for k, v in obj.items()}
@@ -398,12 +403,14 @@ def _canon_unordered(obj):
 def _parse_grid_matrix(text: str) -> list[list[int]] | None:
     """Parse a rectangular integer grid, or return None if ``text`` is not one.
 
-    The two answer conventions in the logic domain are a nested list
-    (``"[[1, 2], [3, 4]]"``, the ARC-style model output) and an Enigmata ground
-    truth stored as space/newline separated text (``"1 2\\n3 4"``).  Both become
-    the same matrix here so the comparison is format-agnostic; non-numeric
-    grids (star_battle/star placement) return None and fall through to the text
-    path.
+    Three answer conventions appear in the logic domain: a nested list
+    (``"[[1, 2], [3, 4]]"``, the ARC-style model output), an Enigmata ground
+    truth stored as space/newline separated text (``"1 2\\n3 4"``), and the
+    ``"[[1 2,3 4]]"`` form the SynLogic calcudoko/futoshiki prompts *mandate*
+    (cells separated by spaces, rows by commas, one outer bracket pair).  All
+    three become the same matrix here so the comparison is format-agnostic;
+    non-numeric grids (star_battle/star placement) return None and fall through
+    to the text path.
     """
     s = text.strip()
     if not s:
@@ -417,6 +424,14 @@ def _parse_grid_matrix(text: str) -> list[list[int]] | None:
             return [[int(x) for x in row] for row in rows]
         except (TypeError, ValueError):
             return None
+    if s.startswith("[[") and s.endswith("]]") and len(s) > 4:
+        # "[[1 2 3,4 5 6]]" -> [[1, 2, 3], [4, 5, 6]]; non-numeric wrappers
+        # (cipher, wordscapes) drop through to the text path.
+        try:
+            wrapped = [[int(c) for c in row.split()] for row in s[2:-2].split(",") if row.strip()]
+        except ValueError:
+            return None
+        return wrapped or None
     rows = [row.strip() for row in s.splitlines() if row.strip()]
     if not rows:
         return None
@@ -430,7 +445,58 @@ def _parse_grid_matrix(text: str) -> list[list[int]] | None:
     return grid or None
 
 
-def logic_answer_match(prediction: str | None, ground_truth: str, task: str | None = None) -> bool:
+def _unwrap_answer_container(text: str) -> str | None:
+    """Extract the answer from a wrapper object some prompts mandate.
+
+    ``buggy_tables`` requires the response to be ``{"result": [{"answer": X}]}``
+    (a Markdown JSON block) while ground_truth stores the bare ``X``, so a
+    perfectly correct response would otherwise never match.  Returns the inner
+    answer rendered as text, or None when ``text`` is not such a container.
+    """
+    obj = _parse_structured(text)
+    if not isinstance(obj, dict):
+        return None
+    if "answer" in obj:
+        values = [obj["answer"]]
+    elif isinstance(obj.get("result"), list):
+        values = [r["answer"] for r in obj["result"] if isinstance(r, dict) and "answer" in r]
+    elif isinstance(obj.get("result"), dict) and "answer" in obj["result"]:
+        values = [obj["result"]["answer"]]
+    else:
+        return None
+    if not values:
+        return None
+    rendered = [v if isinstance(v, str) else json.dumps(v, ensure_ascii=False) for v in values]
+    return rendered[0] if len(rendered) == 1 else json.dumps(rendered, ensure_ascii=False)
+
+
+def _unwrap_double_brackets(text: str) -> str | None:
+    """Return the inner text of a prompt-mandated ``[[...]]`` wrapper, else None."""
+    s = text.strip()
+    if len(s) > 4 and s.startswith("[[") and s.endswith("]]"):
+        return s[2:-2].strip()
+    return None
+
+
+def _wrapper_tolerant_match(prediction: str, ground_truth: str, task: str | None) -> bool:
+    """Last-resort comparison against prompt-mandated answer wrappers.
+
+    Every branch here runs only after the plain comparisons failed, so it can
+    add credit but never remove it.
+    """
+    inner = _unwrap_answer_container(prediction)
+    if inner is not None and logic_answer_match(inner, ground_truth, task, _depth=1):
+        return True
+    inner = _unwrap_double_brackets(prediction)
+    if inner is not None:
+        if _loose_token_form(inner) == _loose_token_form(ground_truth):
+            return True
+        if task in _WHITESPACE_FREE_TASKS and re.sub(r"\s+", "", inner) == re.sub(r"\s+", "", ground_truth):
+            return True
+    return False
+
+
+def logic_answer_match(prediction: str | None, ground_truth: str, task: str | None = None, _depth: int = 0) -> bool:
     """Normalised comparison shared by all logic_* verifiers."""
     if prediction is None:
         return False
@@ -446,13 +512,16 @@ def logic_answer_match(prediction: str | None, ground_truth: str, task: str | No
     except (ValueError, OverflowError):
         pass
     # Structural path (grids / lists; SynLogic arc_agi answers are nested lists
-    # whose ground truth we serialised with json.dumps at data prep time).
+    # whose ground truth we serialised with json.dumps at data prep time).  A
+    # mismatch falls through: the text/matrix paths below must still get a say.
     pred_obj = _parse_structured(prediction)
     gt_obj = _parse_structured(ground_truth)
     if pred_obj is not None and gt_obj is not None:
-        if task in _UNORDERED_COORD_TASKS:
-            return _structured_equal(_canon_unordered(pred_obj), _canon_unordered(gt_obj))
-        return _structured_equal(pred_obj, gt_obj)
+        if task in _UNORDERED_COLLECTION_TASKS:
+            if _structured_equal(_canon_unordered(pred_obj), _canon_unordered(gt_obj)):
+                return True
+        elif _structured_equal(pred_obj, gt_obj):
+            return True
     # Grid path: a nested-list answer and a space/newline separated grid ground
     # truth ("[[1, 2], [3, 4]]" vs "1 2\n3 4") are the same answer written
     # differently.  Only a match short-circuits; a mismatch falls through so the
@@ -463,7 +532,11 @@ def logic_answer_match(prediction: str | None, ground_truth: str, task: str | No
         return True
     # Loose text path: separator-spacing / inner-quote insensitive comparison
     # ("A, C, D, E" vs "A,C,D,E"; "[['WORD']]" vs "[[WORD]]").
-    return _loose_token_form(prediction) == _loose_token_form(ground_truth)
+    if _loose_token_form(prediction) == _loose_token_form(ground_truth):
+        return True
+    # Prompt-mandated [[...]] / {"result": [...]} wrappers (math_path,
+    # buggy_tables) are presentation, not content: peel one layer and retry.
+    return _depth == 0 and _wrapper_tolerant_match(prediction, ground_truth, task)
 
 
 def _logic_score(

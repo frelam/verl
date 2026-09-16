@@ -71,8 +71,10 @@ examples/reasoning_rl/
   `<answer>` 标签 → `\boxed{}` → 收尾行 → 末尾代码块 → `</think>` 后的裸答案正文 的优先级提取，
   并做大小写/空白折叠、
   markdown 强调符剥离、分隔符间距与内层引号不敏感的文本比较及结构化（JSON/literal）比较；
-  minesweeper / norinori / star_placement_puzzle 等坐标集合类答案额外做无序规范化，整数网格
-  答案（Enigmata arc 系）做"嵌套 list ↔ 空格分隔文本"的矩阵归一化比较；
+  minesweeper / norinori / star_placement_puzzle / goods_exchange 等**集合语义**答案做无序规范化，
+  整数网格答案（Enigmata arc 系、SynLogic calcudoko/futoshiki）做
+  "嵌套 list ↔ 空格分隔文本 ↔ `[[行,行]]`" 的矩阵归一化比较；
+  最后再兜底接受 prompt 规定的包装（`[[expr]]`、`{"result":[{"answer":X}]}`，见 §6 "SynLogic 答案约定"）；
   Enigmata 的 game24 / countdown（表达式，多解）、maze（路径合法性）、stack_permutation
   （栈模拟）由 `reward/enigmata_verifier.py` 做 task 级语义校验（ground_truth 需带 `meta`，
   见 §1 数据 schema）；
@@ -218,7 +220,7 @@ filter_groups 的浪费大幅下降。Big-Math 自带的 `llama8b_solve_rate` �
 |---|---|---|
 | `math_*` | math_verify（`pip install math-verify`），fallback math_dapo | 字符串答案 |
 | `code_*` | sandbox_fusion（正式训练）；prime_code 本地执行（smoke run） | `{"inputs","outputs"(,"fn_name")}` JSON |
-| `logic_synlogic` / `logic_puzzleclone` | 各官方 repo 的 rule verifier 封装 | per-task 结构 |
+| `logic_synlogic` / `logic_puzzleclone` | 通用比较 + per-task 约定（见下方"SynLogic 答案约定"） | per-task 结构 |
 | `logic_enigmata` | `reward/enigmata_verifier.py` 的 task 级 verifier（game24/countdown 表达式求值 + 数字使用校验、maze 路径合法性、stack_permutation 栈模拟），其余走通用比较 | `{"answer","task"(,"meta")}` |
 | `logic_reasoning_gym` | 先走通用比较；字符串判失败时再用 reasoning_gym 库自己的 task verifier（`reward/reasoning_gym_verifier.py`，按 `extra_info.seed` 复现 entry，只做加分不加分） | `{"answer","task"}` |
 | `logic_arc` | 网格 exact match | 二维数组 JSON |
@@ -226,6 +228,25 @@ filter_groups 的浪费大幅下降。Big-Math 自带的 `llama8b_solve_rate` �
 
 新 data_source 统一在 `reward/compute_score.py` 扩展，训练配置用
 `reward_model.custom_reward_function.path/name` 挂载，不改 verl 源码。
+
+### SynLogic 答案约定
+
+SynLogic 每个 task 的 prompt 都自带输出格式，而 `extra_info.game_data_str.answer` 不一定与
+它一致；verifier 必须**同时接受**"prompt 规定格式"和"库内 answer 格式"，否则模型答对也判 0。
+全库扫描（easy+hard，48,677 行 / 35 task）确认整库只有 5 个 task 存在差异，其余 30 个 task
+两种写法都能判 1.0：
+
+| task | prompt 要求 | 库内 answer | 处理 |
+|---|---|---|---|
+| `math_path` | `[[expr]]`，表达式间距任意 | 裸表达式 | 剥一层 `[[ ]]` 后做**去空白**比较（`_WHITESPACE_FREE_TASKS`） |
+| `buggy_tables` | ` ```json {"result": [{"answer": X}]} ``` ` | 裸 `X` | 解包容器取 `answer`（`_unwrap_answer_container`） |
+| `futoshiki` | `[[A B C,D E F,G H I]]` | 嵌套 list | `[[行,行]]` 网格归一化（`_parse_grid_matrix`） |
+| `calcudoko` | `[[A B C,D E F,G H I]]` | 同 prompt | 同上（同时接受自然的嵌套 list） |
+| `goods_exchange` | `(('人','物'),…)` Python 元组 | 同 prompt（顺序固定） | 集合语义，忽略顺序（`_UNORDERED_COLLECTION_TASKS`） |
+
+此外所有 task 都实测通过"裸答案"（prompt 常写 "output only your answer"，见
+`extract_logic_answer` 的 `</think>` 正文兜底）。任何包装类比较都只在通用比较失败后才执行，
+因此只可能加分、不会误判为正确。
 
 ### sandbox-fusion 说明
 

@@ -165,6 +165,54 @@ class TestLogicAnswerMatch:
         assert not logic_answer_match("[[1, 2], [3, 4]]", gt)
 
 
+class TestSynLogicPromptConventions:
+    """The prompt-mandated answer shape must not decide the reward.
+
+    Audited against every SynLogic task (48,677 rows / 35 tasks): the stored
+    ``game_data_str.answer`` is not always written in the format the prompt
+    demands, so both shapes have to score 1.0.
+    """
+
+    def test_wrapped_row_grid_vs_nested_ground_truth(self):
+        # futoshiki asks for "[[A B C,D E F,G H I]]" but stores a nested list.
+        nested = "[[2, 4, 3, 1], [1, 2, 4, 3], [3, 1, 2, 4], [4, 3, 1, 2]]"
+        assert logic_answer_match("[[2 4 3 1,1 2 4 3,3 1 2 4,4 3 1 2]]", nested, task="futoshiki")
+        assert not logic_answer_match("[[2 4 3 1,1 2 4 3,3 1 2 4,4 3 1 9]]", nested, task="futoshiki")
+        # calcudoko stores the wrapped form, so the natural nested list must pass.
+        wrapped = "[[4 2 1 3,1 3 2 4,2 4 3 1,3 1 4 2]]"
+        assert logic_answer_match("[[4, 2, 1, 3], [1, 3, 2, 4], [2, 4, 3, 1], [3, 1, 4, 2]]", wrapped, task="calcudoko")
+        assert not logic_answer_match(
+            "[[4, 2, 1, 3], [1, 3, 2, 4], [2, 4, 3, 1], [3, 1, 4, 9]]", wrapped, task="calcudoko"
+        )
+
+    def test_double_bracket_wrapped_expression(self):
+        # math_path: the answer is "[[expr]]" and the generator's operator
+        # spacing ("9 +6 -7") differs from anything a model writes.
+        gt = "9 +6 -7 +(6 %5) -7 *9 +3 *(0 *4) %8 = -54"
+        assert logic_answer_match(f"[[{gt}]]", gt, task="math_path")
+        assert logic_answer_match("[[9+6-7+(6%5)-7*9+3*(0*4)%8=-54]]", gt, task="math_path")
+        assert not logic_answer_match("[[9+6-7+(6%5)-7*9+3*(0*4)%8=-53]]", gt, task="math_path")
+
+    def test_answer_container_unwrapped(self):
+        # buggy_tables requires {"result": [{"answer": X}]} in a JSON block.
+        assert logic_answer_match('{"result": [{"answer": 8924.00}]}', "8924.00", task="buggy_tables")
+        assert logic_answer_match('{"answer": "42"}', "42", task="buggy_tables")
+        assert not logic_answer_match('{"result": [{"answer": 8924.00}]}', "8925.00", task="buggy_tables")
+
+    def test_goods_exchange_is_order_insensitive(self):
+        # The answer is a set of (person, item) pairs; only its members matter.
+        gt = "(('Alice','x'),('Bob','y'))"
+        assert logic_answer_match("(('Bob','y'),('Alice','x'))", gt, task="goods_exchange")
+        assert not logic_answer_match("(('Bob','x'),('Alice','y'))", gt, task="goods_exchange")
+
+    def test_wrapper_tolerance_never_removes_credit(self):
+        # Unwrapping happens only after every plain comparison failed, so a
+        # wrapped *wrong* answer and a plain right answer behave unchanged.
+        gt = json.dumps([[1, 2], [3, 4]])
+        assert logic_answer_match("[[1, 2], [3, 4]]", gt, task="arc_agi")
+        assert not logic_answer_match('{"result": [{"answer": [[1, 2], [3, 5]]}]}', gt, task="arc_agi")
+
+
 # ---------------------------------------------------------------------------
 # dispatcher contract
 # ---------------------------------------------------------------------------
