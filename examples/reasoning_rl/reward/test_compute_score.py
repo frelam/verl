@@ -76,6 +76,19 @@ class TestExtractLogicAnswer:
     def test_no_answer(self):
         assert extract_logic_answer("no final answer here") is None
 
+    def test_bare_final_response(self):
+        # Reasoning Gym (and SynLogic tasks phrased "respond with only your
+        # answer") ask for a bare answer, so a compliant generation may carry no
+        # marker at all; the visible body is then the answer.
+        assert extract_logic_answer("<think>six steps</think>\n\n6") == "6"
+        assert extract_logic_answer("<think>x</think>\n\n8 6 2 1\n4 5 3 8") == "8 6 2 1\n4 5 3 8"
+
+    def test_bare_body_prefers_markers_first(self):
+        # The body fallback must not shadow the structured extractors.
+        assert extract_logic_answer("<think>x</think>\n\n<answer>42</answer>") == "42"
+        assert extract_logic_answer("<think>x</think>\n\nnothing useful") == "nothing useful"
+        assert extract_logic_answer("<think>x</think>\n\n") is None
+
 
 # ---------------------------------------------------------------------------
 # normalised matching
@@ -177,6 +190,46 @@ class TestComputeScore:
         # Non-JSON ground truth (schema drift) falls back to raw string compare.
         res = compute_score("logic_arc", think_wrap("<answer>yes</answer>"), "yes")
         assert res == {"score": 1.0}
+
+    def test_logic_bare_response_scored(self):
+        # No <answer> tag: Reasoning Gym prompts ask for a bare answer.
+        gt = json.dumps({"answer": "6", "task": "maze"})
+        assert compute_score("logic_reasoning_gym", think_wrap("6"), gt) == {"score": 1.0}
+        assert compute_score("logic_reasoning_gym", think_wrap("7"), gt) == {"score": 0.0}
+
+    def test_reasoning_gym_verifier_only_on_string_miss(self, monkeypatch):
+        import compute_score as cs
+
+        calls = []
+
+        def _fake(prediction, answer, task, seed):
+            calls.append((prediction, answer, task, seed))
+            return True
+
+        monkeypatch.setattr(cs, "verify_reasoning_gym", _fake)
+        gt = json.dumps({"answer": "42", "task": "countdown"})
+        extra_info = {"seed": 7, "task_id": "rgym-countdown-7"}
+
+        # A string match is authoritative: the library verifier must not run.
+        assert compute_score("logic_reasoning_gym", think_wrap("<answer>42</answer>"), gt)["score"] == 1.0
+        assert calls == []
+
+        # Only a string miss asks the library, and a True verdict lifts the score.
+        got = compute_score("logic_reasoning_gym", think_wrap("<answer>6*7</answer>"), gt, extra_info=extra_info)
+        assert got == {"score": 1.0}
+        assert calls == [("6*7", "42", "countdown", 7)]
+
+        # Other logic sources never consult it.
+        got = compute_score("logic_synlogic", think_wrap("<answer>6*7</answer>"), gt, extra_info=extra_info)
+        assert got == {"score": 0.0}
+        assert len(calls) == 1
+
+    def test_reasoning_gym_verifier_without_seed_is_noop(self):
+        # Real bridge, no extra_info: no seed -> it declines and string compare stands.
+        gt = json.dumps({"answer": "42", "task": "countdown"})
+        response = think_wrap("<answer>6*7</answer>")
+        assert compute_score("logic_reasoning_gym", response, gt)["score"] == 0.0
+        assert compute_score("logic_reasoning_gym", response, gt, extra_info={})["score"] == 0.0
 
     def test_unknown_source_raises(self):
         with pytest.raises(NotImplementedError):

@@ -68,13 +68,18 @@ examples/reasoning_rl/
   （fn_name 型题目改用函数签名模板）
 - 逻辑：保留各 task 原生模板（SynLogic 收尾约定不统一：`Final Answer:` / `The answer is ...` /
   `\boxed{}` / ``` ```python``` 代码块均存在），由 verifier 按
-  `<answer>` 标签 → `\boxed{}` → 收尾行 → 末尾代码块 的优先级提取，并做大小写/空白折叠、
+  `<answer>` 标签 → `\boxed{}` → 收尾行 → 末尾代码块 → `</think>` 后的裸答案正文 的优先级提取，
+  并做大小写/空白折叠、
   markdown 强调符剥离、分隔符间距与内层引号不敏感的文本比较及结构化（JSON/literal）比较；
   minesweeper / norinori / star_placement_puzzle 等坐标集合类答案额外做无序规范化，整数网格
   答案（Enigmata arc 系）做"嵌套 list ↔ 空格分隔文本"的矩阵归一化比较；
   Enigmata 的 game24 / countdown（表达式，多解）、maze（路径合法性）、stack_permutation
   （栈模拟）由 `reward/enigmata_verifier.py` 做 task 级语义校验（ground_truth 需带 `meta`，
-  见 §1 数据 schema）
+  见 §1 数据 schema）；
+  Reasoning Gym 的 countdown / word_ladder / shortest_path 同样是"多解但只有一个规范答案"，
+  上述字符串比较判失败后再交给 `reward/reasoning_gym_verifier.py`，用库自带 task verifier
+  按 `extra_info.seed` 复现题目后判定（复现出的 answer 与 ground_truth 不一致就拒绝判分，
+  因此只可能加分、不会误加分）
 
 ---
 
@@ -215,7 +220,7 @@ filter_groups 的浪费大幅下降。Big-Math 自带的 `llama8b_solve_rate` �
 | `code_*` | sandbox_fusion（正式训练）；prime_code 本地执行（smoke run） | `{"inputs","outputs"(,"fn_name")}` JSON |
 | `logic_synlogic` / `logic_puzzleclone` | 各官方 repo 的 rule verifier 封装 | per-task 结构 |
 | `logic_enigmata` | `reward/enigmata_verifier.py` 的 task 级 verifier（game24/countdown 表达式求值 + 数字使用校验、maze 路径合法性、stack_permutation 栈模拟），其余走通用比较 | `{"answer","task"(,"meta")}` |
-| `logic_reasoning_gym` | reasoning_gym 库的 `verify()` | 库内 answer 字段 |
+| `logic_reasoning_gym` | 先走通用比较；字符串判失败时再用 reasoning_gym 库自己的 task verifier（`reward/reasoning_gym_verifier.py`，按 `extra_info.seed` 复现 entry，只做加分不加分） | `{"answer","task"}` |
 | `logic_arc` | 网格 exact match | 二维数组 JSON |
 | `stem_*` | MCQ 选项字母 match + 数值题走 math_verify | `\boxed{}` 内答案 |
 

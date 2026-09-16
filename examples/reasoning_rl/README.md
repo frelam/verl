@@ -258,7 +258,7 @@ bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
 | `prompt` | list[dict] | `[{"role": "user", "content": ...}]`，单轮 |
 | `ability` | str | `math` / `code` / `logic` / `stem` / `if` |
 | `reward_model` | dict | `{"style": "rule", "ground_truth": ...}`；数学/STEM 为答案字符串，代码为 `{"inputs","outputs"(,"fn_name")}` JSON，逻辑为 `{"answer","task"}` JSON（Enigmata 另带 `meta`：输入数字/目标、迷宫盘面、栈序列，供 task 级 verifier 语义校验），IF 为 `{"constraints":[{"id","kwargs"}]}` JSON |
-| `extra_info` | dict | 键固定：`split(str)` `index(int)` `task_id(str)` `domain(str)` `source(str)` `difficulty(str)` `prior_solve_rate(float)` `seed(int,-1=无)`；`difficulty_tag.py` 追加 `pass_rate(float)`（mix.py 对未打标池自动补 -1.0） |
+| `extra_info` | dict | 键固定：`split(str)` `index(int)` `task_id(str)` `domain(str)` `source(str)` `difficulty(str)` `prior_solve_rate(float)` `seed(int,-1=无)`；`difficulty_tag.py` 追加 `pass_rate(float)`（mix.py 对未打标池自动补 -1.0）。reasoning_gym 行的 `seed` 是奖励侧用库自带 verifier 复现题目的唯一依据，勿丢 |
 
 **关键约束**：
 
@@ -269,6 +269,16 @@ bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
 
 ## 10. 常见问题排查
 
+先跑一次「数据 ↔ reward」自检（不需要 GPU）：把每行自己的 ground_truth 当答案喂回 reward 函数（echo），
+正常应 100% 命中；某个源 <100% 就说明该源的数据或 verifier 有问题，不必先怀疑模型：
+
+```bash
+python3 examples/reasoning_rl/scripts/check_reward.py --data_file $DATA_DIR/val.parquet
+python3 examples/reasoning_rl/scripts/check_reward.py --data_file $DATA_DIR/val.parquet \
+    --data_source logic_reasoning_gym --samples 5
+python3 examples/reasoning_rl/scripts/check_reward.py --dump_dir /tmp/val_dump   # 汇总 validation_data_dir 的真实生成
+```
+
 | 症状 | 原因 | 处理 |
 |---|---|---|
 | `Big-Math schema changed: missing columns ...` | HF 数据集字段改名 | 按报错中的 available columns 更新 `to_parquet_math.py` 的 `load_bigmath()` 字段映射 |
@@ -277,6 +287,7 @@ bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
 | Enigmata 整库加载 CastError | 36 个 task jsonl 字段异构 | 已按 task 逐文件加载（`load_enigmata`），勿改回一次性 `load_dataset(ENIGMATA_REPO)` |
 | SynLogic `Config name is missing` | 需要 config 名 | 用 `easy` / `hard` 两个 config（loader 已内置） |
 | Dr.SCI 全是证明题、无短答案 | 误载 `Dr_SCI_open-ended.parquet` | 必须加载 `Dr_SCI_verifiable.parquet`（loader 已内置 data_files 指定） |
+| `val-core/logic_reasoning_gym/*` 长期 0，且训练侧该源 reward 也上不去 | ① 库自带 prompt 要求 "only your answer"，模型可能不套 `<answer>`，裸答案旧版提取不到；② countdown / word_ladder / shortest_path 是"多解但只存一个规范答案"，字符串比较会把等价正确答案判 0 | 已修：`extract_logic_answer` 增加 `</think>` 后正文兜底；新增 `reward/reasoning_gym_verifier.py`，通用比较判失败后用库自带 task verifier 复核（需 `pip install reasoning-gym`；按 `extra_info.seed` 复现题目，复现答案与 ground_truth 不符则拒绝判分） |
 | decontaminate 报 embedding 连接失败 | vLLM 服务未起或端口不对 | 确认 `curl http://127.0.0.1:8001/v1/models`，或 `--embedding_base_url` 指向实际端点 |
 | decontaminate 极慢 | embedding 批量太小 | 调大 `--batch_size`（默认 64，A100 可到 256+） |
 | MinHash 阶段内存高 | 签名矩阵 128×N×8B（N=27 万约 276MB） | 属正常量级；更大池可分批跑 |

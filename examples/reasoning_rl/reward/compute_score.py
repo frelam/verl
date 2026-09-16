@@ -30,13 +30,19 @@ Routing (data_source prefix -> verifier):
 ``logic_*``          rule verifier: extract the final answer
                      (<answer> tags -> \\boxed{} -> "Final Answer:" /
                      "The answer is ..." line -> last fenced code block /
-                     <begin_board> block) and compare with the ground truth
-                     after normalisation (whitespace/case folding, markdown-
-                     emphasis stripping, separator-spacing/quote-insensitive
-                     text compare, literal/JSON structural compare, numeric
-                     tolerance, integer-grid normalisation). Enigmata arithmetic
+                     <begin_board> block -> the bare post-</think> response) and
+                     compare with the ground truth after normalisation
+                     (whitespace/case folding, markdown-emphasis stripping,
+                     separator-spacing/quote-insensitive text compare,
+                     literal/JSON structural compare, numeric tolerance,
+                     integer-grid normalisation). Enigmata arithmetic
                      (game24/countdown), maze and stack_permutation answers are
-                     verified by ``enigmata_verifier`` instead of string match.
+                     verified by ``enigmata_verifier`` instead of string match;
+                     Reasoning Gym answers that string comparison rejects are
+                     re-checked with the library's own task verifier
+                     (``reasoning_gym_verifier``), which accepts the many
+                     equivalent-but-different countdown / word_ladder /
+                     shortest_path answers.
 ``stem_*``           math_verify on the \\boxed{} answer; Dr.SCI prompts
                      already request the boxed format
 ``if_*``             instruction-following (Nemotron-RL-instruction_following):
@@ -71,6 +77,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from examples.reasoning_rl.reward.enigmata_verifier import strip_prose_prefix, verify_enigmata
+    from examples.reasoning_rl.reward.reasoning_gym_verifier import seed_from_extra_info, verify_reasoning_gym
 except ImportError:
     # Fallback when run as a plain module without the repo on sys.path.
     import os
@@ -78,6 +85,7 @@ except ImportError:
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from enigmata_verifier import strip_prose_prefix, verify_enigmata
+    from reasoning_gym_verifier import seed_from_extra_info, verify_reasoning_gym
 
 _ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 _BOXED_RE = re.compile(r"\\boxed\s*\{")
@@ -285,7 +293,15 @@ def _strip_fences(s: str) -> str:
 def extract_logic_answer(solution_str: str) -> str | None:
     """Extract the final answer: <answer> tags, then \\boxed{}, then a
     "Final Answer: ..." / "The answer is ..." line, then the last fenced
-    code block (DESIGN.md section 1 + SynLogic per-task prompt conventions)."""
+    code block (DESIGN.md section 1 + SynLogic per-task prompt conventions).
+
+    Last resort: the visible response itself.  Several task prompts (all of
+    Reasoning Gym, plus SynLogic tasks phrased "respond with only your answer")
+    ask for a bare answer, so a fully compliant generation can carry no marker
+    at all: ``"<think>...</think>\\n\\n6"``.  Returning the body instead of
+    ``None`` there is what keeps such answers scoreable; a body with extra prose
+    still fails the comparison it is fed into, so this adds recall, not credit.
+    """
     matches = _ANSWER_TAG_RE.findall(solution_str)
     if matches:
         return _strip_fences(matches[-1])
@@ -302,7 +318,8 @@ def extract_logic_answer(solution_str: str) -> str | None:
     boards = _BOARD_RE.findall(solution_str)
     if boards:
         return boards[-1].strip()
-    return None
+    body = solution_str.partition("</think>")[2].strip()
+    return body or None
 
 
 def _normalise_text(s: str) -> str:
@@ -449,7 +466,9 @@ def logic_answer_match(prediction: str | None, ground_truth: str, task: str | No
     return _loose_token_form(prediction) == _loose_token_form(ground_truth)
 
 
-def _logic_score(solution_str: str, ground_truth: str, data_source: str | None = None) -> float:
+def _logic_score(
+    solution_str: str, ground_truth: str, data_source: str | None = None, extra_info: dict | None = None
+) -> float:
     try:
         payload = json.loads(ground_truth)
         if isinstance(payload, dict):
@@ -472,7 +491,16 @@ def _logic_score(solution_str: str, ground_truth: str, data_source: str | None =
             return 1.0 if verdict else 0.0
     # Strip the "The answer is: ..." scaffolding several Enigmata answers carry
     # before the generic normalised comparison.
-    return 1.0 if logic_answer_match(prediction, strip_prose_prefix(str(answer)), task) else 0.0
+    if logic_answer_match(prediction, strip_prose_prefix(str(answer)), task):
+        return 1.0
+    # Reasoning Gym stores one canonical answer per puzzle, but countdown /
+    # word_ladder / shortest_path accept many equivalent answers; only a
+    # string-match failure is worth the (regeneration) cost of asking the
+    # library's own task verifier, and it can only add credit here.
+    if data_source is not None and data_source.startswith("logic_reasoning_gym"):
+        if verify_reasoning_gym(prediction, answer, task, seed_from_extra_info(extra_info)) is True:
+            return 1.0
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +585,7 @@ def compute_score(
     elif data_source.startswith("code"):
         score = _code_score(solution_str, ground_truth, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb)
     elif data_source.startswith("logic"):
-        score = _logic_score(solution_str, ground_truth, data_source)
+        score = _logic_score(solution_str, ground_truth, data_source, extra_info)
     elif data_source.startswith("stem"):
         score = _math_score(solution_str, ground_truth)
     elif data_source.startswith("if"):
