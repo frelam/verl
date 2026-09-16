@@ -1,0 +1,31 @@
+examples/tool_rl/prepare_data.py
+  s_dfdd55c717c883::t_194ea616ae5681 71,79,93-99,136,183-190,200,246-260,269-274,295,330-333,337-344,354,359,366-367,384-385,468,478-491,509,542,555,566-568,595-600,638-639,666-668,671-673,677-678,733-736,740-752,756-761,782-787,801-802,823-825,829-831,899-902,911-923,927-928,937,942,957,961,964,990-992,1004-1006,1152,1174,1243,1315-1317,1355,1375,1392,1403-1405,1426-1427,1444-1445,1459-1462,1471-1474,1483,1494-1495,1522,1535,1542-1545,1547-1567,1586,1598,1617,1621-1627,1630-1632,1658,1672,1674-1681,1692-1694,1709,1713-1714,1726-1728,1736-1738,1764-1765
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "532fa7e355802ab966d26d6d7c193fbfca5649ad",
+  "prompts": {},
+  "sessions": {
+    "s_dfdd55c717c883": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa9ef9f02ec400694b0e594",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "external_session_id": "6aa9ef9f02ec400694b0e594",
+        "edit_kind": "bash",
+        "checkpoint_content_bytes": "65265",
+        "tool_use_id": "6aaa02be02ec400694b0e6b4",
+        "display_model_name": "DeepSeek-V4-Flash 正式版",
+        "operation_id": "6aaa02be02ec400694b0e6b4",
+        "session_id": "6aa9ef9f02ec400694b0e594",
+        "included_file_count": "1",
+        "original_file_count": "1",
+        "tool_name": "RunCommand"
+      }
+    }
+  }
+}
