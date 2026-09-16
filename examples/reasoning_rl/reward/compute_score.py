@@ -54,8 +54,17 @@ Routing (data_source prefix -> verifier):
 ``if_*``             instruction-following (Nemotron-RL-instruction_following):
                      re-check every constraint in ground_truth against the
                      model response; reward 1.0 iff ALL pass (NeMo-Gym
-                     convention).  Only the final (post-</think>) response is
-                     verified — the think block is internal reasoning.
+                     ``grading_mode="binary"``).  Only the final (post-</think>)
+                     response is verified — the think block is internal
+                     reasoning.  ``if_verifier`` implements the full
+                     ``verifiable_instructions`` checker registry (54 ids,
+                     including the ``paragraphs:*``/``first_word:*``/
+                     ``last_word:*``/``count:*`` families the dataset uses);
+                     an id it cannot evaluate is graded as failed, so
+                     ``check_reward.py`` reports per-row coverage instead of
+                     echoing.  Install ``langdetect`` for the reference
+                     language checks (otherwise a Latin-script target language
+                     such as Spanish cannot be recognised).
 ===================  =====================================================
 
 Every branch returns ``{"score": float}`` so the naive reward manager lifts

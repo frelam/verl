@@ -21,7 +21,14 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from check_reward import audit_dump, audit_rows, echo_response, ground_truth_answer, print_report
+from check_reward import (
+    audit_dump,
+    audit_rows,
+    echo_response,
+    ground_truth_answer,
+    if_constraints,
+    print_report,
+)
 
 
 class TestGroundTruthAnswer:
@@ -152,6 +159,37 @@ class TestAuditRows:
         assert "logic_synlogic: 1 rows" in out
         assert "echo 1/1 (100%) OK" in out
         assert "bare echo 1/1 (100%) OK" in out
+
+
+class TestIfConstraintCoverage:
+    def test_if_constraints_parsing(self):
+        payload = json.dumps({"constraints": [{"id": "keywords:palindrome", "kwargs": {}}]})
+        assert if_constraints(payload) == [{"id": "keywords:palindrome", "kwargs": {}}]
+        assert if_constraints('{"constraints": "oops"}') == []
+        assert if_constraints("not json") == []
+        assert if_constraints(None) == []
+
+    def test_supported_rows_are_counted_as_covered(self):
+        gt = json.dumps({"constraints": [{"id": "keywords:palindrome", "kwargs": {}}]})
+
+        def compute_score(**kwargs):
+            raise AssertionError("if rows must never be echoed")
+
+        entry = audit_rows([_row("if_nemotron", gt)], compute_score)["per_source"]["if_nemotron"]
+        assert entry["if_rows"] == 1 and entry["if_covered"] == 1
+        assert not entry["unsupported_ids"]
+
+    def test_unimplemented_ids_are_reported(self):
+        gt = json.dumps({"constraints": [{"id": "made_up:thing", "kwargs": {}}]})
+        entry = audit_rows([_row("if_nemotron", gt)], lambda **kwargs: {"score": 1.0})["per_source"]["if_nemotron"]
+        assert entry["if_rows"] == 1 and entry["if_covered"] == 0
+        assert entry["unsupported_ids"]["made_up:thing"] == 1
+
+    def test_report_prints_coverage(self, capsys):
+        gt = json.dumps({"constraints": [{"id": "keywords:palindrome", "kwargs": {}}]})
+        report = audit_rows([_row("if_nemotron", gt)], lambda **kwargs: {"score": 1.0})
+        print_report(report)
+        assert "constraint coverage 1/1 (100%) OK" in capsys.readouterr().out
 
 
 class TestAuditDump:

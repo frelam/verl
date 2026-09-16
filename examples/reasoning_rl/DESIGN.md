@@ -230,6 +230,7 @@ filter_groups 的浪费大幅下降。Big-Math 自带的 `llama8b_solve_rate` �
 | `logic_reasoning_gym` | 先走通用比较；字符串判失败时再用 reasoning_gym 库自己的 task verifier（`reward/reasoning_gym_verifier.py`，按 `extra_info.seed` 复现 entry，只做加分不加分） | `{"answer","task"}` |
 | `logic_arc` | 网格 exact match | 二维数组 JSON |
 | `stem_*` | 全线走 math_verify（Dr.SCI prompt 自带 `The final answer is: $\boxed{...}$` 指令）；实测 7,015 条按 prompt 格式回灌 7,014 条判 1.0，即答案本身没有"答对必判 0" | `\boxed{}` 内答案 |
+| `if_*` | `reward/if_verifier.py` 按 NeMo-Gym 官方约定逐条复核约束（`grading_mode="binary"`：全部通过才 1.0，见下方"Instruction-following 约束覆盖"） | `{"constraints":[{"id","kwargs"},…]}` |
 
 新 data_source 统一在 `reward/compute_score.py` 扩展，训练配置用
 `reward_model.custom_reward_function.path/name` 挂载，不改 verl 源码。
@@ -282,6 +283,52 @@ kakurasu 1→120、light_up 0→120）。仍未覆盖的是"官方做约束校�
 task（`sudoku`/`sudoku2`/`skyscraper`/`sum_skyscraper`/`binario`/`magic_square`/`slant`）：
 这些只有当生成器给的解不唯一时才会漏判，目前按 exact match 处理。
 
+### Instruction-following 约束覆盖
+
+`nvidia/Nemotron-RL-instruction_following`（46,391 行）用了 **48 种 instruction id**。
+NeMo-Gym 的官方环境（`NVIDIA-NeMo/Gym` 的 `resources_servers/instruction_following/app.py`）
+把每条约束交给 `verifiable_instructions`
+（github.com/abukharin-nv/verifiable-instructions，即 IFBench 那套 checker）的
+`check_following`，默认 `grading_mode="binary"`：**全部约束通过才给 1.0**。
+`reward/if_verifier.py` 现在覆盖官方 registry 的全部 54 个 id；改动前只覆盖 30 个，
+且有多处 kwargs 名不匹配、一处恒真：
+
+| 问题 | 影响 | 处理 |
+|---|---|---|
+| 23 个 id 完全没实现（`paragraphs:*`、`first_word:*`、`last_word:*`、`count:*`、`copy:repeat_phrase`、`detectable_format:{bigram_wrapping,sentence_hyphens,square_brackets}`、`punctuation:{punctuation_dot,punctuation_exclamation}`、`keywords:{word_once,palindrome,start_end,keyword_specific_position,no_adjacent_consecutive,word_count_different_numbers}`、`letters:letter_counting{,2}`） | 35,713 / 46,391 行（77%）至少带一个无法评估的 id → binary 下**永远判 0** | 按官方 checker 逐个补齐（纯正则/集合逻辑，无新依赖） |
+| `detectable_content:number_placeholders` 读的是 `placeholders` kwarg，数据里是 int 的 `num_placeholders` | `all([]) == True` → 该约束**恒真**（2,304 行白送分） | 官方语义：`len(re.findall(r"\[.*?\]", text)) >= num_placeholders` |
+| `keywords:letter_frequency` / `letters:letter_counting2` 读 `frequency/relation`，数据里是 `let_frequency/let_relation` | 2,416 行恒判 0 | 按官方 `LetterFrequencyChecker` 读 `letter/let_frequency/let_relation` |
+| `change_case:capital_word_frequency` 读 `frequency/relation`，数据里是 `capital_frequency/capital_relation` | 2,182 行恒判 0 | 按官方读 `capital_*` |
+| `length_constraints:nth_paragraph_first_word` 把 `num_paragraphs` 当成了目标段号 | 2,247 行判分错误 | 按官方 `ParagraphFirstWordCheck`：`\n\n` 分段、`nth_paragraph` 定位、首词去标点比较 |
+| `number_paragraphs` / `nth_paragraph_first_word` 按空行分段，官方按 `***` 分隔符 | 合规答案误判 | 改用官方 `***` 语义（`paragraphs:paragraphs2` 才按空行） |
+| `number_bullet_lists` 把有序列表也算 bullet；`json_format` 要求以 `{`/`[` 开头；`startend:quotation` 接受单引号；`two_responses` 不要求两个回答不同；`forbidden_words` 用子串匹配 | 双向误判（既误伤合规答案，也有白送分） | 逐条对齐官方正则/语义（`\b…\b`、只认双引号、要求两条回答不同、先剥 ``` 围栏再 `json.loads`） |
+
+覆盖度（全量 46,391 行）：**23.0% → 100%**。
+
+与官方实现的已知差异（做差分测试：11,151 个 `(id, 真实 kwargs, 探针回答)` 三元组逐条对比，
+除下列几类外与官方一致）：
+
+| 差异 | 说明 |
+|---|---|
+| `language:response_language` / `change_case:english_*` | 装了 `langdetect` 就用它（与官方一致，**建议 `pip install langdetect`**）；没有时退化为 ASCII 比例启发式，无法识别西语/越南语等拉丁字母目标语言（数据里有 30 种目标语言）。查不到语言的文本按"通过"处理，与官方 `LangDetectException` 分支一致 |
+| `nltk.word_tokenize` / punkt | 用 `\w+` + 单标点分词、官方 `split_into_sentences` 正则分段近似；`count:count_unique`、`number_sentences`、`keywords:start_end` 在含小数/缩写时偶有差异（15/11,151） |
+| `count:count_increment_word` | 数据把 `keyword1/keyword2` 存成单元素 list，官方 `build_description` 直接 AttributeError → **2,275 行恒 0**；这里解包单元素 list 后正常判分（只加分） |
+
+### 代码域实测（参考解回灌）
+
+用各数据集自带的 accepted solution 走**同一套**执行 wrapper 与比较逻辑（连续分数取前 10 例），
+"正确解"应当等于 1.0；不等于 1.0 的就是"答对也只能判 0"的行。实测：
+
+- `apps`：400 行里 378 条 1.0（94.5%）。22 条失败中 **9 条只是行尾空格**（APPS 存的 expected
+  output 带行尾空格，参考解不打印；只把每行 `rstrip` 后即为 1.0），其余 13 条是 APPS 自身噪声：
+  期望输出小数位数与参考解不同（`3.000000000000000` vs `3.0`）、多解只存一解、参考解自带 debug
+  print、单参数被 JSON 双重编码。
+- `code_contests` / `deepcoder`：见 README 的排查表（同类噪声为主）。
+
+`sandbox_fusion` 的 call-based wrapper 另有一个**真 bug**（已修，见下）：fn_name 与预置
+`from re import *` 等导入的标准库名重名时（`search`/`count`/`prod`…），`class Solution` 布局的解
+实际调用到标准库函数、必然判 0。
+
 ### sandbox-fusion 说明
 
 - **是什么**：字节开源的远程代码执行沙箱服务（`bytedance/SandboxFusion`），verl 通过 HTTP
@@ -295,6 +342,13 @@ task（`sudoku`/`sudoku2`/`skyscraper`/`sum_skyscraper`/`binario`/`magic_square`
   1. 安全——RL 生成海量不可信代码，直接在 trainer 机器执行等于开放 RCE 面；
   2. 吞吐——官方文档称 reward 阶段省 10–30% 时间；`reward_manager=prime` 可多子进程并行验证；
   3. 环境一致——依赖/超时/内存集中管理，消除 trainer 节点差异带来的 reward 噪声。
+- **fn_name 解析（已修）**：wrapper 前置的 `from re import *` / `from math import *` 等会往
+  module globals 塞 400+ 个标准库名字（`search`、`copy`、`prod`、`comb`…）。原实现用
+  `if fn_name in globals()` 解析可调用对象，于是 `class Solution: def search(...)` 这种解会调用
+  `re.search`、每个测试都失败（实测 APPS 的 2,616 个 call-based fn_name 里有 26 个重名 / 42 行）。
+  现在先 `_PREEXISTING_GLOBALS = set(globals())` 快照，**优先用户代码自己定义的名字**，其次
+  `Solution` 方法，最后才回退到导入名；`tests/utils/reward_score/test_sandbox_fusion_fn_name_wrapper.py`
+  在本地直接跑渲染出的 wrapper 做回归。
 - **资源**：max_concurrent=256 对应 64–128 核 CPU 起步，无 GPU 需求。
 - **退路**：不配 URL 自动 fallback 到 prime_code 本地执行，仅供 smoke run。
 

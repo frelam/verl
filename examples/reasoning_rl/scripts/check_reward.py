@@ -41,7 +41,9 @@ before spending a training run on it::
 Echo is defined per domain: ``<answer>{gt}</answer>`` *and* the bare ``{gt}``
 for ``logic_*`` (both are legitimate response shapes and both must score 1.0),
 ``\\boxed{gt}`` for ``math_*``/``stem_*``.  ``code_*`` (needs a sandbox) and
-``if_*`` (the constraint JSON is not an answer) are counted but not echoed.
+``if_*`` (the constraint JSON is not an answer) are counted but not echoed —
+for ``if_*`` the report instead prints verifier *coverage*: a row carrying an
+instruction id the reward cannot evaluate is pinned to 0 forever.
 """
 
 from __future__ import annotations
@@ -65,6 +67,23 @@ from mix import read_parquet_rows  # noqa: E402
 
 ECHOABLE_PREFIXES = ("math", "stem", "logic")
 SKIPPED_PREFIXES = ("code", "if")
+
+
+def if_constraints(ground_truth) -> list:
+    """Constraint list inside an ``if_*`` ground_truth payload ([] when unparsable)."""
+    payload = ground_truth
+    if isinstance(ground_truth, str):
+        try:
+            payload = json.loads(ground_truth)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    if isinstance(payload, dict):
+        constraints = payload.get("constraints", [])
+    elif isinstance(payload, list):
+        constraints = payload
+    else:
+        return []
+    return constraints if isinstance(constraints, list) else []
 
 
 def ground_truth_answer(ground_truth) -> str | None:
@@ -120,6 +139,9 @@ def audit_rows(rows: list[dict], compute_score, samples: int = 3) -> dict:
             "skipped": 0,
             "failures": [],
             "tasks": collections.Counter(),
+            "if_rows": 0,
+            "if_covered": 0,
+            "unsupported_ids": collections.Counter(),
         }
     )
 
@@ -138,8 +160,22 @@ def audit_rows(rows: list[dict], compute_score, samples: int = 3) -> dict:
             if isinstance(payload, dict) and payload.get("task"):
                 entry["tasks"][str(payload["task"])] += 1
 
+        if data_source.startswith("if"):
+            constraints = if_constraints(ground_truth)
+            if constraints:
+                from if_verifier import unsupported_instruction_ids
+
+                entry["if_rows"] += 1
+                bad = unsupported_instruction_ids(constraints)
+                if bad:
+                    for cid in bad:
+                        entry["unsupported_ids"][cid] += 1
+                else:
+                    entry["if_covered"] += 1
+            entry["skipped"] += 1  # constraint payload, not an answer
+            continue
         if data_source.startswith(SKIPPED_PREFIXES):
-            entry["skipped"] += 1  # code (sandbox) / if (constraint payload, not an answer)
+            entry["skipped"] += 1  # code (sandbox)
             continue
         if ground_truth_answer(ground_truth) is None:
             entry["empty_gt"] += 1
@@ -198,6 +234,13 @@ def print_report(report: dict, samples: int = 3) -> None:
             rate = entry[f"{key}passed"] / entry[f"{key}echoed"]
             status = "OK" if entry[f"{key}passed"] == entry[f"{key}echoed"] else "FAIL"
             words.append(f"{label} {entry[f'{key}passed']}/{entry[f'{key}echoed']} ({rate:.0%}) {status}")
+        if entry["if_rows"]:
+            rate = entry["if_covered"] / entry["if_rows"]
+            status = "OK" if entry["if_covered"] == entry["if_rows"] else "FAIL"
+            words.append(f"constraint coverage {entry['if_covered']}/{entry['if_rows']} ({rate:.0%}) {status}")
+            if entry["unsupported_ids"]:
+                top = ", ".join(f"{k} x{v}" for k, v in entry["unsupported_ids"].most_common(5))
+                words.append(f"unimplemented ids: {top}")
         if entry["skipped"]:
             words.append(f"echo skipped x{entry['skipped']} (needs sandbox/constraints)")
         if not entry["echoed"] and not entry["skipped"]:
