@@ -150,3 +150,73 @@ def test_patch_dataset_dry_run_writes_nothing(tmp_path):
 
     patch_dataset(str(src), str(dst), dry_run=True)
     assert not dst.exists()
+
+
+class TestShardedInput:
+    """The original code parquet may be sharded (00000.parquet, 00001.parquet, ...)."""
+
+    @staticmethod
+    def _write_shards(code_dir):
+        import datasets
+
+        code_dir.mkdir(parents=True, exist_ok=True)
+        shards = [
+            [_old_row(fn_name="make_acronym", outputs=['"MAS"'])],
+            [_old_row(fn_name="f", outputs=['"x"']), _old_row(outputs=["1\n"])],
+        ]
+        for i, rows in enumerate(shards):
+            datasets.Dataset.from_list(rows).to_parquet(str(code_dir / f"{i:05d}.parquet"))
+
+    def test_directory_input_writes_single_output(self, tmp_path):
+        import datasets
+
+        code_dir = tmp_path / "code"
+        self._write_shards(code_dir)
+        out_dir = tmp_path / "code_v2"
+
+        stats = patch_dataset(str(code_dir), str(out_dir))
+        assert stats["input_shards"] == 2
+        assert stats["total_rows"] == 3
+        assert stats["call_based_rows"] == 2
+        assert stats["outputs_unquoted"] == 2
+
+        out_path = out_dir / "train_code.parquet"
+        assert out_path.is_file()
+        rows = datasets.load_dataset("parquet", data_files=str(out_path), split="train").to_list()
+        assert len(rows) == 3
+        assert "make_acronym" in rows[0]["prompt"][0]["content"]
+        assert json.loads(rows[0]["reward_model"]["ground_truth"])["outputs"] == ["MAS"]
+
+    def test_multiple_file_inputs(self, tmp_path):
+        code_dir = tmp_path / "code"
+        self._write_shards(code_dir)
+        files = [str(code_dir / "00001.parquet"), str(code_dir / "00000.parquet")]
+
+        stats = patch_dataset(files, str(tmp_path / "out.parquet"))
+        assert stats["input_shards"] == 2
+        assert stats["total_rows"] == 3
+        # explicit file order is respected (00001 first)
+        assert stats["input_files"][0].endswith("00001.parquet")
+
+    def test_input_directory_without_parquet_is_fatal(self, tmp_path):
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        with pytest.raises(SystemExit, match="no \\*.parquet found"):
+            patch_dataset(str(empty), str(tmp_path / "out"))
+
+    def test_missing_input_is_fatal(self, tmp_path):
+        with pytest.raises(SystemExit, match="input not found"):
+            patch_dataset(str(tmp_path / "nope.parquet"), str(tmp_path / "out"))
+
+    def test_output_with_parquet_suffix_is_a_file(self, tmp_path):
+        code_dir = tmp_path / "code"
+        self._write_shards(code_dir)
+        target = tmp_path / "custom_name.parquet"
+        patch_dataset(str(code_dir), str(target))
+        assert target.is_file()
+
+    def test_prompt_guard_survives_missing_prompt(self):
+        # A malformed row must not crash the whole shard.
+        row = _old_row(fn_name="f", outputs=['"x"'])
+        del row["prompt"]
+        assert patch_row(row)[0] is False

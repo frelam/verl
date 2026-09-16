@@ -46,14 +46,22 @@ its outer quotes.  Rebuilding from raw avoids the ambiguity entirely.
 
 Usage::
 
+    # single file
     python3 examples/reasoning_rl/scripts/patch_code_parquet.py \
         --input  ~/data/reasoning_rl/code/train_code.parquet \
         --output ~/data/reasoning_rl/code_v2/train_code.parquet
+
+    # sharded input (00000.parquet, 00001.parquet, ...): pass the directory,
+    # a glob, or several files; --output may also be a directory
+    python3 examples/reasoning_rl/scripts/patch_code_parquet.py \
+        --input  ~/data/reasoning_rl/code \
+        --output ~/data/reasoning_rl/code_v2
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -96,14 +104,21 @@ def patch_row(row: dict) -> tuple[bool, int]:
     new_instruction = FUNCTION_INSTRUCTION.replace("{fn_name}", str(fn_name))
 
     prompt_changed = False
-    prompt = row["prompt"][0]["content"]
-    if new_instruction not in prompt:
-        if OLD_FUNCTION_INSTRUCTION in prompt:
-            prompt = prompt.replace(OLD_FUNCTION_INSTRUCTION, new_instruction)
-        else:
-            prompt = prompt.rstrip() + "\n\n" + new_instruction
-        row["prompt"][0]["content"] = prompt
-        prompt_changed = True
+    prompt = row.get("prompt")
+    if (
+        isinstance(prompt, list)
+        and prompt
+        and isinstance(prompt[0], dict)
+        and isinstance(prompt[0].get("content"), str)
+    ):
+        content = prompt[0]["content"]
+        if new_instruction not in content:
+            if OLD_FUNCTION_INSTRUCTION in content:
+                content = content.replace(OLD_FUNCTION_INSTRUCTION, new_instruction)
+            else:
+                content = content.rstrip() + "\n\n" + new_instruction
+            prompt[0]["content"] = content
+            prompt_changed = True
 
     outputs = ground_truth.get("outputs")
     n_unquoted = 0
@@ -121,10 +136,49 @@ def patch_row(row: dict) -> tuple[bool, int]:
     return prompt_changed, n_unquoted
 
 
-def patch_dataset(input_path: str, output_path: str, dry_run: bool = False) -> dict:
+def _collect_input_files(inputs) -> list[str]:
+    """Expand files/directories/globs into a de-duplicated, ordered file list.
+
+    Accepts a single path or a list of them.  A directory is scanned recursively
+    for ``*.parquet`` (the ``00000.parquet``, ``00001.parquet``, ... shard
+    layout), sorted by name so the row order is deterministic.
+    """
+    if isinstance(inputs, str):
+        inputs = [inputs]
+    files: list[str] = []
+    for raw in inputs:
+        path = os.path.abspath(os.path.expanduser(raw))
+        if os.path.isdir(path):
+            found = sorted(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
+            if not found:
+                raise SystemExit(f"[patch_code] no *.parquet found under {path}")
+            files.extend(found)
+        elif os.path.isfile(path):
+            files.append(path)
+        else:
+            raise SystemExit(f"[patch_code] input not found: {path}")
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in files:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def _resolve_output(output: str) -> str:
+    """A ``.parquet`` path is used as-is; anything else is treated as a directory."""
+    path = os.path.abspath(os.path.expanduser(output))
+    return path if path.endswith(".parquet") else os.path.join(path, "train_code.parquet")
+
+
+def patch_dataset(inputs, output_path: str, dry_run: bool = False) -> dict:
     import datasets
 
-    data = datasets.load_dataset("parquet", data_files=input_path, split="train").to_list()
+    files = _collect_input_files(inputs)
+    resolved_output = _resolve_output(output_path)
+    data = datasets.load_dataset("parquet", data_files=files, split="train").to_list()
 
     rows_with_fn = prompts_changed = outputs_unquoted = rows_touched = 0
     for row in data:
@@ -140,8 +194,9 @@ def patch_dataset(input_path: str, output_path: str, dry_run: bool = False) -> d
         rows_touched += int(changed or unquoted > 0)
 
     stats = {
-        "input": os.path.abspath(input_path),
-        "output": os.path.abspath(output_path),
+        "input_files": files,
+        "input_shards": len(files),
+        "output": resolved_output,
         "total_rows": len(data),
         "call_based_rows": rows_with_fn,
         "prompts_updated": prompts_changed,
@@ -150,25 +205,33 @@ def patch_dataset(input_path: str, output_path: str, dry_run: bool = False) -> d
     }
 
     if not dry_run:
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        datasets.Dataset.from_list(data).to_parquet(output_path)
+        os.makedirs(os.path.dirname(resolved_output), exist_ok=True)
+        datasets.Dataset.from_list(data).to_parquet(resolved_output)
 
     return stats
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--input", required=True, help="Existing (pre-fix) train_code.parquet.")
-    parser.add_argument("--output", required=True, help="Destination for the patched parquet.")
+    parser.add_argument(
+        "--input",
+        required=True,
+        nargs="+",
+        help="One or more pre-fix parquet files, or directories containing *.parquet shards.",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Patched parquet path, or a directory (writes train_code.parquet inside it).",
+    )
     parser.add_argument("--dry_run", action="store_true", help="Report counts without writing anything.")
     args = parser.parse_args(argv)
 
-    if not os.path.isfile(os.path.expanduser(args.input)):
-        raise SystemExit(f"[patch_code] input not found: {os.path.abspath(os.path.expanduser(args.input))}")
-
-    stats = patch_dataset(os.path.expanduser(args.input), os.path.expanduser(args.output), dry_run=args.dry_run)
+    stats = patch_dataset(args.input, args.output, dry_run=args.dry_run)
     print(f"[patch_code] {'DRY RUN' if args.dry_run else 'wrote ' + stats['output']}")
-    for key in ("total_rows", "call_based_rows", "prompts_updated", "outputs_unquoted", "rows_touched"):
+    for path in stats["input_files"]:
+        print(f"[patch_code] input shard: {path}")
+    for key in ("input_shards", "total_rows", "call_based_rows", "prompts_updated", "outputs_unquoted", "rows_touched"):
         print(f"[patch_code] {key}={stats[key]}")
     return 0
 
