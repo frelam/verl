@@ -1,0 +1,38 @@
+examples/reasoning_rl/run_qwen3_4b_reasoning_rl_fully_async.sh
+  s_69bec8831a027d::t_a827a6e1f998c2 426-428
+  s_69bec8831a027d::t_0bc502a44a0080 206-209
+  h_25cf8a8e4e8b34 210
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "b30b0503f00eee48c0ce8e2db252466fd8e09b99",
+  "prompts": {},
+  "humans": {
+    "h_25cf8a8e4e8b34": {
+      "author": "lvhaoyu <lvhaoyu@huawei.com>"
+    }
+  },
+  "sessions": {
+    "s_69bec8831a027d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aaa0d8502ec400694b0e881",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "original_file_count": "3",
+        "tool_use_id": "6aaa0e9002ec400694b0e8b5",
+        "included_file_count": "3",
+        "edit_kind": "bash",
+        "display_model_name": "DeepSeek-V4-Flash 正式版",
+        "operation_id": "6aaa0e9002ec400694b0e8b5",
+        "session_id": "6aaa0d8502ec400694b0e881",
+        "tool_name": "RunCommand",
+        "external_session_id": "6aaa0d8502ec400694b0e881",
+        "checkpoint_content_bytes": "29353"
+      }
+    }
+  }
+}
