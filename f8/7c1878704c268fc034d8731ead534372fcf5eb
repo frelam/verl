@@ -1,0 +1,33 @@
+examples/reasoning_rl/scripts/test_patch_code_parquet.py
+  s_6df5f2fcdb5e42::t_5a4681cfb975e9 1-152
+examples/reasoning_rl/scripts/patch_code_parquet.py
+  s_6df5f2fcdb5e42::t_5a4681cfb975e9 1-177
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "f87c1878704c268fc034d8731ead534372fcf5eb",
+  "prompts": {},
+  "sessions": {
+    "s_6df5f2fcdb5e42": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aaa3bb702ec400694b0e917",
+        "model": "kimi-k3__dev"
+      },
+      "human_author": "lvhaoyu <lvhaoyu@huawei.com>",
+      "custom_attributes": {
+        "edit_kind": "bash",
+        "checkpoint_content_bytes": "12863",
+        "included_file_count": "2",
+        "display_model_name": "Kimi-K3",
+        "original_file_count": "2",
+        "tool_use_id": "6aaa3cee02ec400694b0e952",
+        "operation_id": "6aaa3cee02ec400694b0e952",
+        "external_session_id": "6aaa3bb702ec400694b0e917",
+        "tool_name": "RunCommand",
+        "session_id": "6aaa3bb702ec400694b0e917"
+      }
+    }
+  }
+}
