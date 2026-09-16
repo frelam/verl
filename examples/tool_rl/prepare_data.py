@@ -51,18 +51,6 @@ from typing import Any
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Instruction — prepended to first user message
-# ============================================================================
-
-_INSTRUCTION = (
-    "At no point should you assume any information about location, date, "
-    "or any other details. Stay humble and honest. "
-    "The entire task can be solved through multiple rounds of dialogue, "
-    "gathering detailed information step by step — "
-    "there is no need to solve everything in one go."
-)
-
 _DEFAULT_MAX = 5000
 _SEED = 42
 _DATA_SOURCE = "tool_rl"
@@ -139,18 +127,6 @@ def _make_meta(source: str, task_id: str, tools: list, gt: Any, **extra) -> dict
     }
 
 
-def _prepend_instruction(messages: list[dict]) -> list[dict]:
-    """Prepend instruction to the first user message in the conversation."""
-    for msg in messages:
-        if msg.get("role") == "user":
-            msg["content"] = (
-                f"<instruction>\n{_INSTRUCTION}\n</instruction>\n\n"
-                + msg["content"]
-            )
-            break
-    return messages
-
-
 # ============================================================================
 # APIGen loader
 # ============================================================================
@@ -196,10 +172,10 @@ def load_apigen(max_samples: int) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             answers = []
 
-        messages = _prepend_instruction([
+        messages = [
             {"role": "system", "content": _GENERIC_TOOL_SYSTEM},
             {"role": "user", "content": query},
-        ])
+        ]
 
         tasks.append({
             "messages": messages,
@@ -257,7 +233,6 @@ def load_toolace(max_samples: int) -> list[dict[str, Any]]:
                 for h in history[-8:]:
                     messages.append(dict(h))
                 messages.append({"role": "user", "content": value})
-                messages = _prepend_instruction(messages)
 
                 assistant_resp = _find_next_assistant(conversations, ti)
                 gt_calls = _parse_qwen_tool_calls(assistant_resp)
@@ -339,10 +314,10 @@ def load_hammer(max_samples: int) -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             answers = []
 
-        messages = _prepend_instruction([
+        messages = [
             {"role": "system", "content": "You are a helpful assistant. Determine if tools are needed for the user's request."},
             {"role": "user", "content": query},
-        ])
+        ]
 
         tasks.append({
             "messages": messages,
@@ -467,7 +442,6 @@ def _parse_bfcl(raw: dict, category: str) -> list[dict]:
         for h in history[-8:]:
             msgs.append(dict(h))
         msgs.append({"role": "user", "content": query_text})
-        msgs = _prepend_instruction(msgs)
 
         # Parse ground truth for this turn
         gt_raw = raw.get("ground_truth") or raw.get("answers") or raw.get("answer") or ""
@@ -725,7 +699,6 @@ def load_apibank(max_samples: int) -> list[dict[str, Any]]:
                     messages = [{"role": "system", "content": _GENERIC_TOOL_SYSTEM}]
                     messages.extend(ctx)
                     if any(m["role"] == "user" for m in messages):
-                        messages = _prepend_instruction(messages)
                         gt = [{"name": api_name, "arguments": params}]
                         gt_names = {api_name}
                         tools = [schemas[api_name]] + _pick_distractors(
@@ -884,10 +857,10 @@ def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
         tools = [schemas[n] for n in sorted(gt_names)] + distractors
         rng.shuffle(tools)
 
-        messages = _prepend_instruction([
+        messages = [
             {"role": "system", "content": _GENERIC_TOOL_SYSTEM},
             {"role": "user", "content": query},
-        ])
+        ]
         tasks.append({
             "messages": messages,
             "tools": _normalize_tools(tools),
