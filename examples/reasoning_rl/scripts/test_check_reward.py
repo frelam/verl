@@ -54,9 +54,17 @@ class TestEchoResponse:
     def test_math_uses_boxed(self):
         assert echo_response("math_bigmath", "7") == "<think>echo</think>\n\nThe final answer is: \\boxed{7}"
 
+    def test_logic_bare_style(self):
+        assert echo_response("logic_reasoning_gym", json.dumps({"answer": "6"}), "bare") == "<think>echo</think>\n\n6"
+
+    def test_math_ignores_bare_style(self):
+        # math/stem have a single prompt-mandated \boxed{} shape.
+        assert echo_response("stem_drsci", "7", "bare") == "<think>echo</think>\n\nThe final answer is: \\boxed{7}"
+
     def test_code_and_if_are_not_echoable(self):
         assert echo_response("code_apps", json.dumps({"inputs": [], "outputs": []})) is None
         assert echo_response("if_nemotron", json.dumps({"constraints": []})) is None
+        assert echo_response("code_apps", json.dumps({"inputs": [], "outputs": []}), "bare") is None
 
     def test_empty_ground_truth(self):
         assert echo_response("logic_synlogic", json.dumps({"answer": ""})) is None
@@ -92,15 +100,39 @@ class TestAuditRows:
         assert report["counts"]["logic_reasoning_gym"] == 3
         assert report["counts"]["code_apps"] == 1
         entry = report["per_source"]["logic_reasoning_gym"]
+        # logic rows are echoed twice (tagged + bare); the failing gt fails both.
         assert (entry["echoed"], entry["passed"], entry["empty_gt"]) == (2, 1, 1)
+        assert (entry["bare_echoed"], entry["bare_passed"]) == (2, 1)
         assert entry["tasks"]["countdown"] == 2
         assert len(entry["failures"]) == 1  # capped by samples
         assert entry["failures"][0]["task"] == "countdown"
+        assert entry["failures"][0]["style"] == "tagged"
 
         code_entry = report["per_source"]["code_apps"]
         assert code_entry["echoed"] == 0  # skipped, never scored
         assert code_entry["skipped"] == 1
         assert code_entry["empty_gt"] == 0  # code payloads carry no "answer" key
+
+    def test_bare_style_failure_is_reported(self):
+        # A source whose bare answers are not scoreable must be visible even when
+        # the tagged echo passes (the shape the model actually produces).
+        gt = json.dumps({"answer": "6", "task": "maze"})
+
+        def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+            return {"score": 0.0 if solution_str.endswith("6") and "<answer>" not in solution_str else 1.0}
+
+        entry = audit_rows([_row("logic_reasoning_gym", gt)], compute_score)["per_source"]["logic_reasoning_gym"]
+        assert (entry["passed"], entry["echoed"]) == (1, 1)
+        assert (entry["bare_passed"], entry["bare_echoed"]) == (0, 1)
+
+    def test_math_rows_are_not_bare_echoed(self):
+        gt = "7"
+
+        def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+            return {"score": 1.0}
+
+        entry = audit_rows([_row("math_bigmath", gt)], compute_score)["per_source"]["math_bigmath"]
+        assert (entry["passed"], entry["bare_echoed"]) == (1, 0)
 
     def test_extra_info_is_forwarded(self):
         seen = []
@@ -111,7 +143,7 @@ class TestAuditRows:
 
         rows = [_row("logic_reasoning_gym", json.dumps({"answer": "6", "task": "maze"}), extra={"seed": 11})]
         audit_rows(rows, compute_score)
-        assert seen == [{"source": "src", "seed": 11}]
+        assert seen == [{"source": "src", "seed": 11}] * 2  # tagged + bare
 
     def test_report_smoke(self, capsys):
         rows = [_row("logic_synlogic", "yes")]
@@ -119,6 +151,7 @@ class TestAuditRows:
         out = capsys.readouterr().out
         assert "logic_synlogic: 1 rows" in out
         assert "echo 1/1 (100%) OK" in out
+        assert "bare echo 1/1 (100%) OK" in out
 
 
 class TestAuditDump:

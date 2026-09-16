@@ -38,7 +38,8 @@ before spending a training run on it::
     # real generations dumped by trainer.validation_data_dir=/tmp/val_dump
     python3 examples/reasoning_rl/scripts/check_reward.py --dump_dir /tmp/val_dump
 
-Echo is defined per domain: ``<answer>{gt}</answer>`` for ``logic_*``,
+Echo is defined per domain: ``<answer>{gt}</answer>`` *and* the bare ``{gt}``
+for ``logic_*`` (both are legitimate response shapes and both must score 1.0),
 ``\\boxed{gt}`` for ``math_*``/``stem_*``.  ``code_*`` (needs a sandbox) and
 ``if_*`` (the constraint JSON is not an answer) are counted but not echoed.
 """
@@ -82,10 +83,17 @@ def ground_truth_answer(ground_truth) -> str | None:
     return text or None
 
 
-def echo_response(data_source: str, ground_truth) -> str | None:
+def echo_response(data_source: str, ground_truth, style: str = "tagged") -> str | None:
     """A compliant response that repeats the ground truth, or ``None`` if the
     domain cannot be echoed offline (code needs the sandbox, if needs a real
-    constraint-satisfying answer)."""
+    constraint-satisfying answer).
+
+    ``style`` mirrors the two shapes a logic answer legitimately takes: the
+    reasoning_rl ``<answer>`` contract (``tagged``) and the bare answer several
+    task prompts explicitly demand instead (``bare``).  Both must score 1.0;
+    a source that only passes one of them is a reward-side bug, not a model
+    problem.
+    """
     answer = ground_truth_answer(ground_truth)
     if answer is None:
         return None
@@ -93,7 +101,9 @@ def echo_response(data_source: str, ground_truth) -> str | None:
     if prefix in SKIPPED_PREFIXES:
         return None
     if prefix == "logic":
-        return f"<think>echo</think>\n\n<answer>{answer}</answer>"
+        open_tag = "" if style == "bare" else "<answer>"
+        close_tag = "" if style == "bare" else "</answer>"
+        return f"<think>echo</think>\n\n{open_tag}{answer}{close_tag}"
     return f"<think>echo</think>\n\nThe final answer is: \\boxed{{{answer}}}"
 
 
@@ -101,7 +111,16 @@ def audit_rows(rows: list[dict], compute_score, samples: int = 3) -> dict:
     """Echo every row through the real reward function and collect a report."""
     report: dict = {"counts": collections.Counter(), "sources": collections.defaultdict(collections.Counter)}
     per_source: dict[str, dict] = collections.defaultdict(
-        lambda: {"echoed": 0, "passed": 0, "empty_gt": 0, "skipped": 0, "failures": [], "tasks": collections.Counter()}
+        lambda: {
+            "echoed": 0,
+            "passed": 0,
+            "bare_echoed": 0,
+            "bare_passed": 0,
+            "empty_gt": 0,
+            "skipped": 0,
+            "failures": [],
+            "tasks": collections.Counter(),
+        }
     )
 
     for row in rows:
@@ -125,29 +144,32 @@ def audit_rows(rows: list[dict], compute_score, samples: int = 3) -> dict:
         if ground_truth_answer(ground_truth) is None:
             entry["empty_gt"] += 1
             continue
-        response = echo_response(data_source, ground_truth)
-        if response is None:
-            entry["skipped"] += 1
-            continue
-        entry["echoed"] += 1
-        score = compute_score(
-            data_source=data_source,
-            solution_str=response,
-            ground_truth=ground_truth,
-            extra_info=row.get("extra_info") or {},
-        )
-        score = score.get("score", 0.0) if isinstance(score, dict) else score
-        if score == 1.0:
-            entry["passed"] += 1
-        elif len(entry["failures"]) < samples:
-            entry["failures"].append(
-                {
-                    "task": (json.loads(ground_truth).get("task") if _is_json_object(ground_truth) else None),
-                    "ground_truth": str(ground_truth)[:200],
-                    "response": response[-200:],
-                    "score": score,
-                }
+        styles = (("tagged", ""), ("bare", "bare_")) if data_source.startswith("logic") else (("tagged", ""),)
+        for style, key in styles:
+            response = echo_response(data_source, ground_truth, style)
+            if response is None:
+                entry["skipped"] += 1
+                continue
+            entry[f"{key}echoed"] += 1
+            score = compute_score(
+                data_source=data_source,
+                solution_str=response,
+                ground_truth=ground_truth,
+                extra_info=row.get("extra_info") or {},
             )
+            score = score.get("score", 0.0) if isinstance(score, dict) else score
+            if score == 1.0:
+                entry[f"{key}passed"] += 1
+            elif len(entry["failures"]) < samples:
+                entry["failures"].append(
+                    {
+                        "style": style,
+                        "task": (json.loads(ground_truth).get("task") if _is_json_object(ground_truth) else None),
+                        "ground_truth": str(ground_truth)[:200],
+                        "response": response[-200:],
+                        "score": score,
+                    }
+                )
 
     report["per_source"] = dict(per_source)
     return report
@@ -170,10 +192,12 @@ def print_report(report: dict, samples: int = 3) -> None:
         words = []
         if entry["empty_gt"]:
             words.append(f"EMPTY GROUND TRUTH x{entry['empty_gt']}")
-        if entry["echoed"]:
-            rate = entry["passed"] / entry["echoed"]
-            status = "OK" if entry["passed"] == entry["echoed"] else "FAIL"
-            words.append(f"echo {entry['passed']}/{entry['echoed']} ({rate:.0%}) {status}")
+        for key, label in (("", "echo"), ("bare_", "bare echo")):
+            if not entry[f"{key}echoed"]:
+                continue
+            rate = entry[f"{key}passed"] / entry[f"{key}echoed"]
+            status = "OK" if entry[f"{key}passed"] == entry[f"{key}echoed"] else "FAIL"
+            words.append(f"{label} {entry[f'{key}passed']}/{entry[f'{key}echoed']} ({rate:.0%}) {status}")
         if entry["skipped"]:
             words.append(f"echo skipped x{entry['skipped']} (needs sandbox/constraints)")
         if not entry["echoed"] and not entry["skipped"]:
@@ -182,7 +206,7 @@ def print_report(report: dict, samples: int = 3) -> None:
             words.append("tasks: " + ", ".join(f"{k}={v}" for k, v in sorted(entry["tasks"].items())))
         print(f"  {data_source}: {count} rows [{sources}] -> {' | '.join(words)}")
         for failure in entry["failures"][:samples]:
-            print(f"      score={failure['score']} task={failure['task']}")
+            print(f"      score={failure['score']} style={failure['style']} task={failure['task']}")
             print(f"        gt  : {failure['ground_truth']!r}")
             print(f"        echo: {failure['response']!r}")
 
