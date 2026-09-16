@@ -71,8 +71,8 @@ OLD_DIR = "~/data/reasoning_rl/final"
 # Raw per-domain directory holding the unchanged domains (math/, stem/, [if/]).
 # Rebuilt domains are overridden below.
 INPUT_DIR = "~/data/reasoning_rl"
-# Rebuilt code / logic output. Accepts either the parquet file or the directory
-# the rebuild wrote to (the script looks for train_<domain>.parquet inside it).
+# Rebuilt code / logic output. Accepts the parquet file, a directory holding
+# train_<domain>.parquet, or a sharded directory (00000.parquet, ...).
 # Leave as "" to reuse INPUT_DIR/code, INPUT_DIR/logic.
 NEW_CODE = "~/data/reasoning_rl/code_v2"
 NEW_LOGIC = "~/data/reasoning_rl/logic_v2"
@@ -168,12 +168,16 @@ def replay(
     """
     old = _load_old_stats(old_stats_path)
     ratios = _ordered_ratios(old["ratios"])
-    seed = int(old.get("seed", 42)) if seed is None else int(seed)
-    path_overrides = path_overrides or {}
+    seed = int(old.get("seed", 42)) if seed is None else seed
+    # Resolve here (not only in main) so programmatic callers get the same
+    # file / train_<domain>.parquet / sharded-directory handling.
+    raw_overrides = path_overrides or {}
+    input_dir = os.path.abspath(os.path.expanduser(input_dir))
+    overrides = {domain: _resolve_override(domain, value, input_dir) for domain, value in raw_overrides.items()}
 
     pools: dict[str, list[dict]] = {}
     for domain in ratios:
-        pools[domain] = load_domain(input_dir, domain, path_overrides.get(domain))
+        pools[domain] = load_domain(input_dir, domain, overrides.get(domain))
     for domain, rows in pools.items():
         if not rows:
             raise SystemExit(f"[mix_replay] domain {domain!r} is empty; rebuild/path it first")
@@ -311,13 +315,13 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def _resolve_override(domain: str, override: str | None, input_dir: str) -> str | None:
-    """Resolve a per-domain parquet override to an existing file.
+    """Resolve a per-domain parquet override to a loadable path (or glob).
 
-    Accepts either the parquet itself or the rebuild output *directory*
-    (``<dir>/train_<domain>.parquet``), so pointing ``--new_code`` at
-    ``.../code_v2`` works as well as ``.../code_v2/train_code.parquet``.  A
-    relative path is resolved against ``--input_dir``, matching ``mix.py``'s own
-    override handling.
+    Accepts the parquet itself, the rebuild output *directory* (preferring
+    ``<dir>/train_<domain>.parquet``), or a sharded directory
+    (``00000.parquet``, ``00001.parquet``, ...) which is returned as a glob that
+    ``datasets`` concatenates in chunks.  A relative path is resolved against
+    ``--input_dir``, matching ``mix.py``'s own override handling.
     """
     if not override:
         return None
@@ -329,11 +333,14 @@ def _resolve_override(domain: str, override: str | None, input_dir: str) -> str 
         candidate = os.path.join(path, f"train_{domain}.parquet")
         if os.path.isfile(candidate):
             return candidate
-        found = sorted(glob.glob(os.path.join(path, "*.parquet")))
-        hint = f" Found instead: {found}" if found else " The directory is empty."
-        raise SystemExit(
-            f"[mix_replay] {domain!r} override is a directory ({path}) with no train_{domain}.parquet.{hint}"
-        )
+        shards = sorted(glob.glob(os.path.join(path, "*.parquet")))
+        if len(shards) == 1:
+            return shards[0]
+        if shards:
+            # Sharded output: a glob keeps each shard a separate Arrow chunk, so
+            # the combined text does not have to fit in one 2 GB string column.
+            return os.path.join(path, "*.parquet")
+        raise SystemExit(f"[mix_replay] {domain!r} override directory is empty: {path}")
     if not os.path.isfile(path):
         raise SystemExit(f"[mix_replay] {domain!r} override not found: {path}")
     return path
@@ -349,14 +356,15 @@ def main(argv: list[str] | None = None) -> int:
     input_dir = os.path.abspath(_expand(args.input_dir if args.input_dir is not None else INPUT_DIR))
     output_dir = os.path.abspath(_expand(args.output_dir if args.output_dir is not None else OUTPUT_DIR))
 
-    raw_overrides = {
+    # Raw paths only: replay() resolves files / train_<domain>.parquet /
+    # sharded directories itself, so do not resolve twice here.
+    path_overrides = {
         "code": args.new_code if args.new_code is not None else NEW_CODE,
         "logic": args.new_logic if args.new_logic is not None else NEW_LOGIC,
         "math": args.math_path,
         "stem": args.stem_path,
         "if": args.if_path,
     }
-    path_overrides = {domain: _resolve_override(domain, value, input_dir) for domain, value in raw_overrides.items()}
 
     total_size = args.total_size if args.total_size is not None else TOTAL_SIZE
     val_size = args.val_size if args.val_size is not None else VAL_SIZE

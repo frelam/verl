@@ -31,8 +31,10 @@ data-side fixes can be applied in place instead of re-downloading anything:
    string return as ``json.dumps("hi") == '"hi"'``, but sandbox_fusion prints
    ``str(result) == "hi"`` and compares stdout as text, so every test failed.
 
-The rows, order and ``extra_info`` are preserved, so the output is a drop-in
-replacement for the rebuild output consumed by ``mix_replay.py``.
+The rows, order and ``extra_info`` are preserved.  Sharding is preserved too:
+a multi-shard input produces one output file per input file, which keeps each
+Arrow string column under the 2 GB offset limit and lets ``mix_replay.py`` read
+the output directory directly.
 
 Caveat for (2)
 --------------
@@ -167,46 +169,67 @@ def _collect_input_files(inputs) -> list[str]:
     return unique
 
 
-def _resolve_output(output: str) -> str:
-    """A ``.parquet`` path is used as-is; anything else is treated as a directory."""
-    path = os.path.abspath(os.path.expanduser(output))
-    return path if path.endswith(".parquet") else os.path.join(path, "train_code.parquet")
-
-
 def patch_dataset(inputs, output_path: str, dry_run: bool = False) -> dict:
+    """Patch every input shard, writing one output file per input shard.
+
+    Rows are processed shard by shard on purpose.  Concatenating every shard into
+    one ``Dataset.from_list`` builds a single Arrow string array whose 32-bit
+    offsets overflow once the combined text passes ~2 GB
+    (``pyarrow.lib.ArrowInvalid: offset overflow while concatenating arrays``).
+    Keeping the input sharding avoids that and keeps memory bounded.
+    """
     import datasets
 
     files = _collect_input_files(inputs)
-    resolved_output = _resolve_output(output_path)
-    data = datasets.load_dataset("parquet", data_files=files, split="train").to_list()
-
-    rows_with_fn = prompts_changed = outputs_unquoted = rows_touched = 0
-    for row in data:
-        changed, unquoted = patch_row(row)
-        gt = row.get("reward_model", {}).get("ground_truth")
-        try:
-            has_fn = isinstance(gt, str) and "fn_name" in json.loads(gt)
-        except (json.JSONDecodeError, TypeError):
-            has_fn = False
-        rows_with_fn += int(has_fn)
-        prompts_changed += int(changed)
-        outputs_unquoted += unquoted
-        rows_touched += int(changed or unquoted > 0)
+    output_arg = os.path.abspath(os.path.expanduser(output_path))
+    output_is_file = output_arg.endswith(".parquet")
+    if len(files) > 1 and output_is_file:
+        raise SystemExit(
+            "[patch_code] multiple input shards with a single .parquet --output would concatenate every row "
+            "into one Arrow string column and can hit pyarrow's offset overflow; pass a directory to --output "
+            "so the input sharding is preserved."
+        )
+    out_dir = os.path.dirname(output_arg) if output_is_file else output_arg
 
     stats = {
         "input_files": files,
         "input_shards": len(files),
-        "output": resolved_output,
-        "total_rows": len(data),
-        "call_based_rows": rows_with_fn,
-        "prompts_updated": prompts_changed,
-        "outputs_unquoted": outputs_unquoted,
-        "rows_touched": rows_touched,
+        "output_files": [],
+        "total_rows": 0,
+        "call_based_rows": 0,
+        "prompts_updated": 0,
+        "outputs_unquoted": 0,
+        "rows_touched": 0,
     }
 
-    if not dry_run:
-        os.makedirs(os.path.dirname(resolved_output), exist_ok=True)
-        datasets.Dataset.from_list(data).to_parquet(resolved_output)
+    used_outputs: set[str] = set()
+    for index, shard in enumerate(files):
+        rows = datasets.load_dataset("parquet", data_files=shard, split="train").to_list()
+        for row in rows:
+            changed, unquoted = patch_row(row)
+            gt = row.get("reward_model", {}).get("ground_truth")
+            try:
+                has_fn = isinstance(gt, str) and "fn_name" in json.loads(gt)
+            except (json.JSONDecodeError, TypeError):
+                has_fn = False
+            stats["call_based_rows"] += int(has_fn)
+            stats["prompts_updated"] += int(changed)
+            stats["outputs_unquoted"] += unquoted
+            stats["rows_touched"] += int(changed or unquoted > 0)
+        stats["total_rows"] += len(rows)
+
+        if len(files) == 1:
+            out_file = output_arg if output_is_file else os.path.join(out_dir, "train_code.parquet")
+        else:
+            out_file = os.path.join(out_dir, os.path.basename(shard))
+            if out_file in used_outputs:
+                out_file = os.path.join(out_dir, f"{index:05d}_{os.path.basename(shard)}")
+        used_outputs.add(out_file)
+        stats["output_files"].append(out_file)
+
+        if not dry_run:
+            os.makedirs(os.path.dirname(out_file), exist_ok=True)
+            datasets.Dataset.from_list(rows).to_parquet(out_file)
 
     return stats
 
@@ -222,15 +245,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--output",
         required=True,
-        help="Patched parquet path, or a directory (writes train_code.parquet inside it).",
+        help="Patched parquet path (single input), or a directory (one output file per input shard).",
     )
     parser.add_argument("--dry_run", action="store_true", help="Report counts without writing anything.")
     args = parser.parse_args(argv)
 
     stats = patch_dataset(args.input, args.output, dry_run=args.dry_run)
-    print(f"[patch_code] {'DRY RUN' if args.dry_run else 'wrote ' + stats['output']}")
+    if args.dry_run:
+        print("[patch_code] DRY RUN (nothing written)")
+    else:
+        print(f"[patch_code] wrote {len(stats['output_files'])} file(s)")
     for path in stats["input_files"]:
-        print(f"[patch_code] input shard: {path}")
+        print(f"[patch_code] input shard:  {path}")
+    for path in stats["output_files"]:
+        print(f"[patch_code] output shard: {path}")
     for key in ("input_shards", "total_rows", "call_based_rows", "prompts_updated", "outputs_unquoted", "rows_touched"):
         print(f"[patch_code] {key}={stats[key]}")
     return 0

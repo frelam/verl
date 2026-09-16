@@ -167,7 +167,7 @@ class TestShardedInput:
         for i, rows in enumerate(shards):
             datasets.Dataset.from_list(rows).to_parquet(str(code_dir / f"{i:05d}.parquet"))
 
-    def test_directory_input_writes_single_output(self, tmp_path):
+    def test_directory_input_writes_one_output_per_shard(self, tmp_path):
         import datasets
 
         code_dir = tmp_path / "code"
@@ -179,24 +179,43 @@ class TestShardedInput:
         assert stats["total_rows"] == 3
         assert stats["call_based_rows"] == 2
         assert stats["outputs_unquoted"] == 2
+        assert [os.path.basename(p) for p in stats["output_files"]] == ["00000.parquet", "00001.parquet"]
 
-        out_path = out_dir / "train_code.parquet"
-        assert out_path.is_file()
-        rows = datasets.load_dataset("parquet", data_files=str(out_path), split="train").to_list()
-        assert len(rows) == 3
-        assert "make_acronym" in rows[0]["prompt"][0]["content"]
-        assert json.loads(rows[0]["reward_model"]["ground_truth"])["outputs"] == ["MAS"]
+        # Sharding is preserved so no single Arrow string column has to hold everything.
+        assert not (out_dir / "train_code.parquet").exists()
+        first = datasets.load_dataset("parquet", data_files=str(out_dir / "00000.parquet"), split="train").to_list()
+        assert len(first) == 1
+        assert "make_acronym" in first[0]["prompt"][0]["content"]
+        assert json.loads(first[0]["reward_model"]["ground_truth"])["outputs"] == ["MAS"]
 
-    def test_multiple_file_inputs(self, tmp_path):
+        merged = datasets.load_dataset("parquet", data_files=str(out_dir / "*.parquet"), split="train").to_list()
+        assert len(merged) == 3
+
+    def test_single_input_and_directory_output_uses_train_code_name(self, tmp_path):
+        code_dir = tmp_path / "code"
+        self._write_shards(code_dir)
+        out_dir = tmp_path / "code_v2"
+        stats = patch_dataset(str(code_dir / "00000.parquet"), str(out_dir))
+        assert stats["output_files"] == [str(out_dir / "train_code.parquet")]
+        assert (out_dir / "train_code.parquet").is_file()
+
+    def test_multiple_file_inputs_respect_order(self, tmp_path):
         code_dir = tmp_path / "code"
         self._write_shards(code_dir)
         files = [str(code_dir / "00001.parquet"), str(code_dir / "00000.parquet")]
 
-        stats = patch_dataset(files, str(tmp_path / "out.parquet"))
+        stats = patch_dataset(files, str(tmp_path / "out"))
         assert stats["input_shards"] == 2
         assert stats["total_rows"] == 3
         # explicit file order is respected (00001 first)
         assert stats["input_files"][0].endswith("00001.parquet")
+        assert [os.path.basename(p) for p in stats["output_files"]] == ["00001.parquet", "00000.parquet"]
+
+    def test_multiple_shards_with_file_output_is_fatal(self, tmp_path):
+        code_dir = tmp_path / "code"
+        self._write_shards(code_dir)
+        with pytest.raises(SystemExit, match="offset overflow"):
+            patch_dataset(str(code_dir), str(tmp_path / "merged.parquet"))
 
     def test_input_directory_without_parquet_is_fatal(self, tmp_path):
         empty = tmp_path / "empty"
@@ -208,11 +227,13 @@ class TestShardedInput:
         with pytest.raises(SystemExit, match="input not found"):
             patch_dataset(str(tmp_path / "nope.parquet"), str(tmp_path / "out"))
 
-    def test_output_with_parquet_suffix_is_a_file(self, tmp_path):
-        code_dir = tmp_path / "code"
-        self._write_shards(code_dir)
+    def test_single_input_with_parquet_suffix_is_a_file(self, tmp_path):
+        import datasets
+
+        src = tmp_path / "00000.parquet"
+        datasets.Dataset.from_list([_old_row(fn_name="f", outputs=['"x"'])]).to_parquet(str(src))
         target = tmp_path / "custom_name.parquet"
-        patch_dataset(str(code_dir), str(target))
+        patch_dataset(str(src), str(target))
         assert target.is_file()
 
     def test_prompt_guard_survives_missing_prompt(self):

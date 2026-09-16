@@ -184,12 +184,25 @@ class TestResolveOverride:
         target.write_bytes(b"")
         assert _resolve_override("code", str(target.parent), str(tmp_path)) == str(target)
 
-    def test_directory_without_expected_file_hints(self, tmp_path):
-        other = tmp_path / "code_v2" / "something_else.parquet"
-        other.parent.mkdir(parents=True)
-        other.write_bytes(b"")
-        with pytest.raises(SystemExit, match="train_code.parquet"):
-            _resolve_override("code", str(other.parent), str(tmp_path))
+    def test_directory_with_shards_returns_glob(self, tmp_path):
+        shard_dir = tmp_path / "code_v2"
+        shard_dir.mkdir(parents=True)
+        for i in range(2):
+            (shard_dir / f"{i:05d}.parquet").write_bytes(b"")
+        assert _resolve_override("code", str(shard_dir), str(tmp_path)) == str(shard_dir / "*.parquet")
+
+    def test_directory_with_single_shard_returns_file(self, tmp_path):
+        shard_dir = tmp_path / "code_v2"
+        shard_dir.mkdir(parents=True)
+        shard = shard_dir / "00000.parquet"
+        shard.write_bytes(b"")
+        assert _resolve_override("code", str(shard_dir), str(tmp_path)) == str(shard)
+
+    def test_empty_directory_is_fatal(self, tmp_path):
+        empty = tmp_path / "code_v2"
+        empty.mkdir()
+        with pytest.raises(SystemExit, match="empty"):
+            _resolve_override("code", str(empty), str(tmp_path))
 
     def test_relative_override_resolves_against_input_dir(self, tmp_path):
         target = tmp_path / "code_v2" / "train_code.parquet"
@@ -200,6 +213,33 @@ class TestResolveOverride:
     def test_missing_path_reports_absolute(self, tmp_path):
         with pytest.raises(SystemExit, match="not found"):
             _resolve_override("code", "nope/train_code.parquet", str(tmp_path))
+
+
+def test_replay_reads_sharded_override(raw_layout, tmp_path):
+    """A sharded code_v2 (00000.parquet, ...) is loaded via the glob override."""
+    import datasets
+
+    old_dir = tmp_path / "final"
+    old_stats = _run_old_mix(raw_layout, old_dir)
+
+    rows = datasets.load_dataset(
+        "parquet", data_files=str(raw_layout / "code_v2" / "train_code.parquet"), split="train"
+    ).to_list()
+    shard_dir = tmp_path / "code_shards"
+    shard_dir.mkdir()
+    half = len(rows) // 2
+    datasets.Dataset.from_list(rows[:half]).to_parquet(str(shard_dir / "00000.parquet"))
+    datasets.Dataset.from_list(rows[half:]).to_parquet(str(shard_dir / "00001.parquet"))
+
+    new_stats, _ = replay(
+        old_stats_path=str(old_dir / "mix_stats.json"),
+        input_dir=str(raw_layout),
+        output_dir=str(tmp_path / "final_v2"),
+        path_overrides={"code": str(shard_dir)},
+    )
+    assert new_stats["total_train"] == old_stats["total_train"]
+    assert new_stats["train_by_ability"] == old_stats["train_by_ability"]
+    assert "apps" in new_stats["train_by_source"]
 
 
 def test_main_accepts_directory_overrides(raw_layout, tmp_path):
