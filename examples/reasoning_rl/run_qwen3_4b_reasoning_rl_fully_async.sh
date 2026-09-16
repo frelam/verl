@@ -203,6 +203,11 @@ total_epochs=${TOTAL_EPOCHS:-10}
 # * trigger_parameter_sync_step prompts = 256 with the defaults below).
 save_freq=${SAVE_FREQ:-20}
 test_freq=${TEST_FREQ:-10}
+# Save val trajectories to wandb/swanlab: on each validation (which runs every
+# TEST_FREQ param-version steps), log the first LOG_VAL_GENERATIONS val samples
+# as a table. So "every N steps" == TEST_FREQ steps x this many samples per
+# validation. 0 disables trajectory logging.
+log_val_generations=${LOG_VAL_GENERATIONS:-5}
 
 # Fully async knobs (docs/advance/fully_async.md "Parameter Description").
 # staleness_threshold: fraction of a training batch that may be stale (samples
@@ -418,6 +423,9 @@ TRAINER=(
     # runs on the Rollouter unless USE_TRAINER_DO_VALIDATE=1.
     trainer.save_freq=${save_freq}
     trainer.test_freq=${test_freq}
+    # Save the first log_val_generations val trajectories to the logger
+    # (wandb/swanlab) on each validation (runs every test_freq steps).
+    trainer.log_val_generations=${log_val_generations}
     # Only sets the dataloader replay runway; total_rollout_steps stops the run.
     trainer.total_epochs=${total_epochs}
 )
