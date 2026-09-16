@@ -214,6 +214,25 @@ python3 examples/reasoning_rl/scripts/mix.py \
 - **产出**：`final/train.parquet` + `final/val.parquet` + `mix_stats.json`。
 - 该 val 只是 in-distribution 冒烟验证；正式评估用 DESIGN.md §7 的固定协议。
 
+**只重建了部分域时，用 replay 保持原配比**（例如 code/logic 重建后，不想让 `mix.py`
+按新池子重算 `total_train`）：
+
+```bash
+python3 examples/reasoning_rl/scripts/mix_replay.py \
+    --old_dir   ~/data/reasoning_rl/final \
+    --input_dir ~/data/reasoning_rl \
+    --new_code  ~/data/reasoning_rl/code_v2/train_code.parquet \
+    --new_logic ~/data/reasoning_rl/logic_v2/train_logic.parquet \
+    --output_dir ~/data/reasoning_rl/final_v2
+```
+
+- 读取旧 `mix_stats.json`，回放同样的 `ratios` / `seed` / `total_train`（钉住训练行数）和
+  各域 val 数量；未重建的域继续从 `--input_dir` 取。
+- 也可直接编辑脚本顶部 `CONFIG` 块后 `python3 examples/reasoning_rl/scripts/mix_replay.py`。
+- `--strict`：池子填不满时直接报错，而不是静默有放回采样（避免隐性重复）。
+- **产出**：同 mix.py，外加 `mix_replay_report.json`（新旧配置是否一致 + `train_by_source`
+  对比）。注意 `train_by_source` 不受参数控制——域内均匀采样，重建后来源占比随池子构成变化。
+
 ## 8. Step 9：训练
 
 ```bash
@@ -238,7 +257,7 @@ bash examples/reasoning_rl/run_qwen3_4b_reasoning_rl_dapo.sh
 | `data_source` | str | `{domain}_{dataset}`：`math_bigmath` / `math_dapo` / `code_deepcoder` / `code_codecontests` / `code_apps` / `logic_synlogic` / `logic_enigmata` / `logic_reasoning_gym` / `stem_drsci` / `if_nemotron` |
 | `prompt` | list[dict] | `[{"role": "user", "content": ...}]`，单轮 |
 | `ability` | str | `math` / `code` / `logic` / `stem` / `if` |
-| `reward_model` | dict | `{"style": "rule", "ground_truth": ...}`；数学/STEM 为答案字符串，代码为 `{"inputs","outputs"(,"fn_name")}` JSON，逻辑为 `{"answer","task"}` JSON，IF 为 `{"constraints":[{"id","kwargs"}]}` JSON |
+| `reward_model` | dict | `{"style": "rule", "ground_truth": ...}`；数学/STEM 为答案字符串，代码为 `{"inputs","outputs"(,"fn_name")}` JSON，逻辑为 `{"answer","task"}` JSON（Enigmata 另带 `meta`：输入数字/目标、迷宫盘面、栈序列，供 task 级 verifier 语义校验），IF 为 `{"constraints":[{"id","kwargs"}]}` JSON |
 | `extra_info` | dict | 键固定：`split(str)` `index(int)` `task_id(str)` `domain(str)` `source(str)` `difficulty(str)` `prior_solve_rate(float)` `seed(int,-1=无)`；`difficulty_tag.py` 追加 `pass_rate(float)`（mix.py 对未打标池自动补 -1.0） |
 
 **关键约束**：

@@ -25,11 +25,13 @@ ground_truth format matches verl prime_code / sandbox_fusion consumers:
     Canonical test shapes (enforced by normalize_in_outs):
       * stdio problems: inputs[i] / outputs[i] are plain strings.
       * call-based (fn_name) problems: inputs[i] is a JSON-per-line string
-        (one JSON value per function argument); outputs[i] is the expected
-        return value as a JSON string (single-element list unwrapped once,
-        TACO convention). prime_code parses these with json.loads and calls
-        fn(*args); sandbox_fusion feeds inputs[i] verbatim as stdin to its
-        fn_name wrapper and string-compares stdout with outputs[i].
+        (one JSON value per function argument); outputs[i] is the wrapper's
+        expected stdout: the JSON form of the return value for
+        containers/bool/None, but the raw (unquoted) string for a string return,
+        because sandbox_fusion prints ``str(result)`` for strings and compares
+        stdout as text.  A single-element list is unwrapped once (TACO
+        convention: expected returns are list-wrapped).  The prompt also names
+        the function explicitly, since the wrapper resolves it by exact name.
     Raw APPS rows deviate from this contract (call-based inputs[i] is a list
     of args, outputs[i] is list-wrapped; some stdio inputs are lists of
     lines) and score 0 on BOTH verifiers if stored unmodified.
@@ -56,7 +58,9 @@ STDIO_INSTRUCTION = (
     "Write a complete Python program that reads the input from standard input and prints "
     "the answer to standard output. Wrap your code in ```python and ```."
 )
-FUNCTION_INSTRUCTION = "Implement the required function(s). Wrap your code in ```python and ```."
+FUNCTION_INSTRUCTION = (
+    "Implement the function named `{fn_name}` exactly (do not rename it). Wrap your code in ```python and ```."
+)
 
 DEEPCODER_REPO = "agentica-org/DeepCoder-Preview-Dataset"
 CODECONTESTS_REPO = "deepmind/code_contests"
@@ -102,18 +106,26 @@ def _canon_call_input(v) -> str:
 
 
 def _canon_call_output(v) -> str:
-    """call-based expected return -> JSON string.
+    """call-based expected return -> the stdout string the sandbox wrapper prints.
 
-    prime_code json.loads-es it and compares structurally (tolerating a
-    list-wrapped value); sandbox_fusion string-compares it against the
-    wrapper's stdout (json.dumps of the result for containers/bool/None,
-    str() for int/float/str), so a single-element list is unwrapped once
-    (TACO convention: expected returns are list-wrapped).
+    sandbox_fusion string-compares this against the ``fn_name`` wrapper's stdout,
+    which is ``json.dumps(result)`` for containers/bool/None and ``str(result)``
+    for int/float/str (see ``sandbox_fusion/utils.py``).  A single-element list is
+    unwrapped once (TACO convention: expected returns are list-wrapped) and a
+    *string* element is kept UNQUOTED so it matches ``str("hi") == "hi"`` --
+    ``json.dumps`` would emit ``'"hi"'`` and fail every test for a function that
+    returns a string.
+
+    Note: ``prime_code`` (the smoke-run fallback, not used for real training)
+    parses the expected value with ``json.loads``, so unquoted string returns are
+    not round-trippable there; the production verifier is sandbox_fusion.
     """
     if isinstance(v, str):
         return v
     if isinstance(v, list | tuple) and len(v) == 1:
         v = v[0]
+        if isinstance(v, str):
+            return v
     return json.dumps(v)
 
 
@@ -161,7 +173,13 @@ def tests_key(in_outs: dict) -> str:
 
 
 def make_code_row(problem: str, in_outs: dict, task_id: str, source: str, difficulty="") -> dict:
-    instruction = FUNCTION_INSTRUCTION if "fn_name" in in_outs else STDIO_INSTRUCTION
+    # Call-based problems MUST name the function: the sandbox/prime_code wrapper
+    # resolves it by exact name, and the problem statement frequently omits it.
+    instruction = (
+        FUNCTION_INSTRUCTION.replace("{fn_name}", str(in_outs["fn_name"]))
+        if "fn_name" in in_outs
+        else STDIO_INSTRUCTION
+    )
     content = problem.strip() + "\n\n" + instruction
     return {
         "data_source": f"code_{source}",

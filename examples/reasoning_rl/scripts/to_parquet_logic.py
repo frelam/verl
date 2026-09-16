@@ -33,6 +33,10 @@ generated data only:
 
 ground_truth format (consumed by reward/compute_score.py):
   JSON string of {"answer": <str|number|nested list>, "task": <task name>}
+  Enigmata rows additionally carry "meta": the source metadata dict (input
+  numbers/target, maze grid + dimensions, stack input/output sequences) that
+  reward/enigmata_verifier.py needs for task-aware checking. SynLogic and
+  reasoning-gym rows omit it.
 
 Usage:
     python scripts/to_parquet_logic.py \
@@ -150,12 +154,20 @@ def make_logic_row(
     difficulty="",
     seed=-1,
     dedup_text: str | None = None,
+    meta: dict | None = None,
 ) -> dict | None:
     answer_str = _serialize_answer(answer)
     question_content = (question_content or "").strip()
     if not question_content or not answer_str:
         return None
-    ground_truth = json.dumps({"answer": answer_str, "task": task}, ensure_ascii=False)
+    payload = {"answer": answer_str, "task": task}
+    # Enigmata rows carry the per-task metadata (input numbers/target, maze grid,
+    # stack sequences) that the task-aware reward verifier needs to check an
+    # answer semantically instead of comparing strings. Omitted when absent so
+    # SynLogic / reasoning-gym ground truths stay byte-identical.
+    if meta is not None:
+        payload["meta"] = meta
+    ground_truth = json.dumps(payload, ensure_ascii=False)
     return {
         "data_source": data_source,
         "prompt": [{"role": "user", "content": question_content}],
@@ -230,15 +242,16 @@ def load_enigmata(path: str | None, max_per_task: int | None = None) -> list[dic
             question = (ex.get("prompt") or "").strip()
             answer = ex.get("answer")
             task = str(ex.get("task_name") or rel.split("/")[0])
-            meta = ex.get("meta")
-            meta_id = idx
-            if isinstance(meta, str) and meta.strip():
+            meta_raw = ex.get("meta")
+            meta = None
+            if isinstance(meta_raw, dict):
+                meta = meta_raw
+            elif isinstance(meta_raw, str) and meta_raw.strip():
                 try:
-                    meta_id = json.loads(meta).get("id", idx)
+                    meta = json.loads(meta_raw)
                 except (json.JSONDecodeError, TypeError):
-                    pass
-            elif isinstance(meta, dict):
-                meta_id = meta.get("id", idx)
+                    meta = None
+            meta_id = (meta or {}).get("id", idx)
             content = question + "\n\n" + ANSWER_INSTRUCTION if question else ""
             row = make_logic_row(
                 content,
@@ -248,6 +261,7 @@ def load_enigmata(path: str | None, max_per_task: int | None = None) -> list[dic
                 source="enigmata",
                 data_source="logic_enigmata",
                 dedup_text=question,
+                meta=meta,
             )
             if row is None:
                 skipped += 1

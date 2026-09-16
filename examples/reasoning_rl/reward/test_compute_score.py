@@ -24,6 +24,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compute_score import (
+    _align_callable_name,
     compute_score,
     extract_logic_answer,
     format_ok,
@@ -65,11 +66,11 @@ class TestExtractLogicAnswer:
 
     def test_fenced_block_fallback(self):
         # SynLogic skyscraper_puzzle / zebra_puzzle require a fenced block.
-        sol = 'analysis...\n最终解答：\n```python\n[[3, 2], [1, 4]]\n```\n'
+        sol = "analysis...\n最终解答：\n```python\n[[3, 2], [1, 4]]\n```\n"
         assert extract_logic_answer(sol) == "[[3, 2], [1, 4]]"
 
     def test_fences_stripped_inside_answer_tag(self):
-        sol = "<answer>```json\n{\"a\": 1}\n```</answer>"
+        sol = '<answer>```json\n{"a": 1}\n```</answer>'
         assert extract_logic_answer(sol) == '{"a": 1}'
 
     def test_no_answer(self):
@@ -250,3 +251,98 @@ class TestFormatGate:
         gt = json.dumps({"answer": "42", "task": "sudoku"})
         res = compute_score("logic_synlogic", think_wrap("<answer>42</answer>"), gt)
         assert res == {"score": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Enigmata task-aware verification (audit regressions)
+# ---------------------------------------------------------------------------
+
+
+class TestEnigmataTaskAware:
+    def test_game24_expression_with_meta(self):
+        # Raw gt is a prose-wrapped, non-unique expression; the model's different
+        # but mathematically valid expression must score 1.
+        gt = json.dumps(
+            {"answer": "The answer is: (12-10)*(12*1) = 24", "task": "game24", "meta": {"question": [10, 12, 12, 1]}}
+        )
+        assert compute_score("logic_enigmata", think_wrap("<answer>(12-10)*(12*1)</answer>"), gt) == {"score": 1.0}
+        assert compute_score("logic_enigmata", think_wrap("<answer>(12-10)*(12+1)</answer>"), gt) == {"score": 0.0}
+
+    def test_game24_bare_target_is_not_rewarded(self):
+        gt = json.dumps(
+            {"answer": "The answer is: (12-10)*(12*1) = 24", "task": "game24", "meta": {"question": [10, 12, 12, 1]}}
+        )
+        assert compute_score("logic_enigmata", think_wrap("<answer>24</answer>"), gt) == {"score": 0.0}
+
+    def test_countdown_legacy_row_without_meta(self):
+        # Rows built before the meta change still get expression checking (target
+        # is recoverable from the "= 59" suffix).
+        gt = json.dumps({"answer": "The answer is: 6*11-(15+13)/4 = 59", "task": "countdown"})
+        assert compute_score("logic_enigmata", think_wrap("<answer>6*11-(15+13)/4</answer>"), gt) == {"score": 1.0}
+        assert compute_score("logic_enigmata", think_wrap("<answer>59</answer>"), gt) == {"score": 0.0}
+
+    def test_maze_prose_prefixed_ground_truth(self):
+        gt = json.dumps({"answer": "The answer is: (1,1)->(1,2)->(2,2)", "task": "maze"})
+        assert compute_score("logic_enigmata", think_wrap("<answer>(1,1)->(1,2)->(2,2)</answer>"), gt) == {"score": 1.0}
+        assert compute_score("logic_enigmata", think_wrap("<answer>(9,9)->(9,8)</answer>"), gt) == {"score": 0.0}
+
+    def test_stack_permutation_with_meta(self):
+        meta = {"input_sequence": [1, 2, 4, 3], "output_sequence": [1, 4, 3, 2]}
+        gt = json.dumps(
+            {"answer": "The output sequence is a valid stack permutation.", "task": "stack_permutation", "meta": meta}
+        )
+        ops = '["Push(1)", "Pop()", "Push(2)", "Push(4)", "Pop()", "Push(3)", "Pop()", "Pop()"]'
+        assert compute_score("logic_enigmata", think_wrap(f"<answer>{ops}</answer>"), gt) == {"score": 1.0}
+        bad = '["Push(1)", "Push(2)", "Push(4)", "Push(3)", "Pop()", "Pop()", "Pop()", "Pop()"]'
+        assert compute_score("logic_enigmata", think_wrap(f"<answer>{bad}</answer>"), gt) == {"score": 0.0}
+
+    def test_grid_answer_is_format_agnostic(self):
+        # Enigmata stores the grid as space separated text; models emit nested lists.
+        gt = json.dumps({"answer": "7 0\n7 0", "task": "arc_agi"})
+        assert compute_score("logic_enigmata", think_wrap("<answer>[[7, 0], [7, 0]]</answer>"), gt) == {"score": 1.0}
+        assert compute_score("logic_enigmata", think_wrap("<answer>[[7, 1], [7, 0]]</answer>"), gt) == {"score": 0.0}
+
+    def test_generic_enigmata_prose_prefix_stripped(self):
+        gt = json.dumps({"answer": "The answer is: yes", "task": "not_a_special_task"})
+        assert compute_score("logic_enigmata", think_wrap("<answer>yes</answer>"), gt) == {"score": 1.0}
+
+    def test_other_logic_sources_unaffected(self):
+        gt = json.dumps({"answer": "42", "task": "sudoku"})
+        assert compute_score("logic_synlogic", think_wrap("<answer>42</answer>"), gt) == {"score": 1.0}
+        assert compute_score("logic_reasoning_gym", think_wrap("<answer>42</answer>"), gt) == {"score": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# code callable-name alignment (fn_name contract gap)
+# ---------------------------------------------------------------------------
+
+
+class TestCodeCallableNameAlignment:
+    GT = json.dumps({"inputs": ['"ab"'], "outputs": ["AB"], "fn_name": "make_acronym"})
+
+    def test_exact_name_left_alone(self):
+        sol = think_wrap("```python\ndef make_acronym(s):\n    return s.upper()\n```")
+        assert _align_callable_name(sol, self.GT) == self.GT
+
+    def test_camel_case_variant_rewritten(self):
+        sol = think_wrap("```python\ndef makeAcronym(s):\n    return s.upper()\n```")
+        aligned = json.loads(_align_callable_name(sol, self.GT))
+        assert aligned["fn_name"] == "makeAcronym"
+        assert aligned["inputs"] == ['"ab"']
+
+    def test_single_unrelated_top_level_function_rewritten(self):
+        sol = think_wrap("```python\ndef solution(s):\n    return s.upper()\n```")
+        assert json.loads(_align_callable_name(sol, self.GT))["fn_name"] == "solution"
+
+    def test_ambiguous_multiple_functions_left_alone(self):
+        sol = think_wrap("```python\ndef helper(s):\n    return s\ndef other(s):\n    return s\n```")
+        assert _align_callable_name(sol, self.GT) == self.GT
+
+    def test_solution_class_layout_left_alone(self):
+        sol = think_wrap("```python\nclass Solution:\n    def make_acronym(self, s):\n        return s\n```")
+        assert _align_callable_name(sol, self.GT) == self.GT
+
+    def test_stdio_payload_without_fn_name_untouched(self):
+        gt = json.dumps({"inputs": ["1\n"], "outputs": ["1\n"]})
+        sol = think_wrap("```python\ndef anything():\n    pass\n```")
+        assert _align_callable_name(sol, gt) == gt

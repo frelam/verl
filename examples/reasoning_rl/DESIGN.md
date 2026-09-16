@@ -30,6 +30,7 @@ examples/reasoning_rl/
 │   ├── decontaminate.py          # n-gram + embedding 两级去污染（已实现）
 │   ├── difficulty_tag.py         # pass@k 难度预筛（已实现）
 │   └── mix.py                    # 按比例混合生成最终训练 parquet（已实现）
+│   └── mix_replay.py             # 回放旧 mix_stats.json，仅替换重建域（已实现）
 ├── reward/
 │   ├── compute_score.py          # 四域 reward 分发（已实现）
 │   └── test_compute_score.py     # reward 单元测试
@@ -69,7 +70,11 @@ examples/reasoning_rl/
   `\boxed{}` / ``` ```python``` 代码块均存在），由 verifier 按
   `<answer>` 标签 → `\boxed{}` → 收尾行 → 末尾代码块 的优先级提取，并做大小写/空白折叠、
   markdown 强调符剥离、分隔符间距与内层引号不敏感的文本比较及结构化（JSON/literal）比较；
-  minesweeper / norinori / star_placement_puzzle 等坐标集合类答案额外做无序规范化
+  minesweeper / norinori / star_placement_puzzle 等坐标集合类答案额外做无序规范化，整数网格
+  答案（Enigmata arc 系）做"嵌套 list ↔ 空格分隔文本"的矩阵归一化比较；
+  Enigmata 的 game24 / countdown（表达式，多解）、maze（路径合法性）、stack_permutation
+  （栈模拟）由 `reward/enigmata_verifier.py` 做 task 级语义校验（ground_truth 需带 `meta`，
+  见 §1 数据 schema）
 
 ---
 
@@ -208,7 +213,8 @@ filter_groups 的浪费大幅下降。Big-Math 自带的 `llama8b_solve_rate` �
 |---|---|---|
 | `math_*` | math_verify（`pip install math-verify`），fallback math_dapo | 字符串答案 |
 | `code_*` | sandbox_fusion（正式训练）；prime_code 本地执行（smoke run） | `{"inputs","outputs"(,"fn_name")}` JSON |
-| `logic_synlogic` / `logic_enigmata` / `logic_puzzleclone` | 各官方 repo 的 rule verifier 封装 | per-task 结构 |
+| `logic_synlogic` / `logic_puzzleclone` | 各官方 repo 的 rule verifier 封装 | per-task 结构 |
+| `logic_enigmata` | `reward/enigmata_verifier.py` 的 task 级 verifier（game24/countdown 表达式求值 + 数字使用校验、maze 路径合法性、stack_permutation 栈模拟），其余走通用比较 | `{"answer","task"(,"meta")}` |
 | `logic_reasoning_gym` | reasoning_gym 库的 `verify()` | 库内 answer 字段 |
 | `logic_arc` | 网格 exact match | 二维数组 JSON |
 | `stem_*` | MCQ 选项字母 match + 数值题走 math_verify | `\boxed{}` 内答案 |

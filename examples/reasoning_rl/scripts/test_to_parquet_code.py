@@ -28,7 +28,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from to_parquet_code import normalize_in_outs
+from to_parquet_code import make_code_row, normalize_in_outs
 
 
 class TestCallBasedCanonicalisation:
@@ -62,6 +62,42 @@ class TestCallBasedCanonicalisation:
         out = normalize_in_outs(raw)
         assert out["inputs"] == raw["inputs"]
         assert out["outputs"] == raw["outputs"]
+
+    def test_string_return_is_unquoted_for_sandbox(self):
+        # sandbox_fusion's fn_name wrapper prints str(result) for a string return
+        # and compares stdout as raw text, so the expected value must be unquoted;
+        # json.dumps would emit '"hello"' and fail every test.
+        raw = {"inputs": [[1]], "outputs": [["hello"]], "fn_name": "f"}
+        out = normalize_in_outs(raw)
+        assert out["outputs"] == ["hello"]
+
+    def test_list_returning_string_elements_still_json(self):
+        # A list return is json.dumps-ed by the wrapper -> keep the JSON form.
+        raw = {"inputs": [[1]], "outputs": [[["a", "b"]]], "fn_name": "f"}
+        out = normalize_in_outs(raw)
+        assert out["outputs"] == ['["a", "b"]']
+
+
+class TestFunctionNamePrompt:
+    def test_call_based_prompt_names_the_function(self):
+        row = make_code_row(
+            "Complete the function.",
+            {"inputs": ['"a"'], "outputs": ["A"], "fn_name": "make_acronym"},
+            task_id="t",
+            source="apps",
+        )
+        content = row["prompt"][0]["content"]
+        assert "make_acronym" in content
+
+    def test_stdio_prompt_has_no_function_name(self):
+        row = make_code_row(
+            "Sum two numbers.",
+            {"inputs": ["1 2\n"], "outputs": ["3\n"]},
+            task_id="t",
+            source="deepcoder",
+        )
+        content = row["prompt"][0]["content"]
+        assert "reads the input from standard input" in content
 
 
 class TestStdioCanonicalisation:

@@ -29,11 +29,14 @@ Routing (data_source prefix -> verifier):
                      else prime_code local execution (smoke runs only)
 ``logic_*``          rule verifier: extract the final answer
                      (<answer> tags -> \\boxed{} -> "Final Answer:" /
-                     "The answer is ..." line -> last fenced code block)
-                     and compare with the ground truth after normalisation
-                     (whitespace/case folding, markdown-emphasis stripping,
-                     separator-spacing/quote-insensitive text compare,
-                     literal/JSON structural compare, numeric tolerance)
+                     "The answer is ..." line -> last fenced code block /
+                     <begin_board> block) and compare with the ground truth
+                     after normalisation (whitespace/case folding, markdown-
+                     emphasis stripping, separator-spacing/quote-insensitive
+                     text compare, literal/JSON structural compare, numeric
+                     tolerance, integer-grid normalisation). Enigmata arithmetic
+                     (game24/countdown), maze and stack_permutation answers are
+                     verified by ``enigmata_verifier`` instead of string match.
 ``stem_*``           math_verify on the \\boxed{} answer; Dr.SCI prompts
                      already request the boxed format
 ``if_*``             instruction-following (Nemotron-RL-instruction_following):
@@ -66,6 +69,16 @@ import re
 
 logger = logging.getLogger(__name__)
 
+try:
+    from examples.reasoning_rl.reward.enigmata_verifier import strip_prose_prefix, verify_enigmata
+except ImportError:
+    # Fallback when run as a plain module without the repo on sys.path.
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from enigmata_verifier import strip_prose_prefix, verify_enigmata
+
 _ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 _BOXED_RE = re.compile(r"\\boxed\s*\{")
 # SynLogic task prompts use heterogeneous final-answer conventions: besides
@@ -73,6 +86,9 @@ _BOXED_RE = re.compile(r"\\boxed\s*\{")
 # instruct 'The answer is $YOUR_ANSWER' — often wrapped in markdown bold.
 _FINAL_ANSWER_RE = re.compile(r"(?:final answer\s*[::]|the answer is)\s*[::]?\s*(.+)$", re.IGNORECASE | re.MULTILINE)
 _FENCED_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+-]*\s*\n(.*?)```", re.DOTALL)
+# Enigmata string/grid tasks (campsite, star_battle, ...) ask for the board
+# wrapped in <begin_board>...</begin_board> inside the final answer.
+_BOARD_RE = re.compile(r"<begin_board>(.*?)<end_board>", re.DOTALL | re.IGNORECASE)
 
 
 # ---------------------------------------------------------------------------
@@ -139,10 +155,77 @@ def _math_score(solution_str: str, ground_truth: str) -> float:
 # ---------------------------------------------------------------------------
 
 
+def _extract_python_solution(solution_str: str) -> str | None:
+    """Mirror sandbox_fusion's code-block extraction (last ```python block)."""
+    if "```python" in solution_str:
+        return solution_str.split("```python")[-1].split("```")[0]
+    if "```" in solution_str:
+        parts = solution_str.split("```")
+        if len(parts) >= 2:
+            solution = parts[1]
+            if "\n" in solution:
+                first_line, rest = solution.split("\n", 1)
+                if first_line.strip().isalpha():
+                    solution = rest
+            return solution
+    return None
+
+
+def _name_key(name: str) -> str:
+    return name.replace("_", "").casefold()
+
+
+def _align_callable_name(solution_str: str, ground_truth: str):
+    """Rewrite ``fn_name`` when the model defined the callable under a variant name.
+
+    The code prompt historically omitted the required function name, and models
+    legitimately switch between snake_case and camelCase. Both the sandbox and
+    prime_code wrappers resolve the callable by *exact* name, so a correct
+    solution defining ``makeAcronym`` scores 0 when the tests expect
+    ``make_acronym``.
+
+    The rewrite is deliberately conservative: it only fires when the exact name
+    is absent and either a case/underscore-insensitive match or a single
+    non-``main`` top-level function exists, so an unrelated helper can never be
+    silently substituted. ``class Solution`` layouts (handled natively by the
+    wrapper) are left untouched. Returns ``ground_truth`` unchanged when the
+    payload is not a call-based test dict.
+    """
+    try:
+        payload = json.loads(ground_truth) if isinstance(ground_truth, str) else ground_truth
+    except (json.JSONDecodeError, TypeError):
+        return ground_truth
+    if not isinstance(payload, dict) or not payload.get("fn_name"):
+        return ground_truth
+    code = _extract_python_solution(solution_str)
+    if not code:
+        return ground_truth
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return ground_truth
+    if any(isinstance(node, ast.ClassDef) and node.name == "Solution" for node in tree.body):
+        return ground_truth
+    defined = [node.name for node in tree.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+    fn_name = payload["fn_name"]
+    if not defined or fn_name in defined:
+        return ground_truth
+    matches = [name for name in defined if _name_key(name) == _name_key(fn_name)]
+    chosen = matches[0] if len(matches) == 1 else None
+    if chosen is None:
+        candidates = [name for name in defined if name != "main"]
+        chosen = candidates[0] if len(candidates) == 1 else None
+    if chosen is None or chosen == fn_name:
+        return ground_truth
+    logger.info("[reasoning_rl] fn_name %r absent from solution; scoring against %r", fn_name, chosen)
+    return json.dumps({**payload, "fn_name": chosen})
+
+
 def _code_score(
     solution_str: str, ground_truth: str, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
 ) -> float:
     try:
+        ground_truth = _align_callable_name(solution_str, ground_truth)
         if sandbox_fusion_url:
             from verl.utils.reward_score import sandbox_fusion
 
@@ -216,6 +299,9 @@ def extract_logic_answer(solution_str: str) -> str | None:
     blocks = _FENCED_BLOCK_RE.findall(tail)
     if blocks:
         return blocks[-1].strip()
+    boards = _BOARD_RE.findall(solution_str)
+    if boards:
+        return boards[-1].strip()
     return None
 
 
@@ -292,6 +378,41 @@ def _canon_unordered(obj):
     return obj
 
 
+def _parse_grid_matrix(text: str) -> list[list[int]] | None:
+    """Parse a rectangular integer grid, or return None if ``text`` is not one.
+
+    The two answer conventions in the logic domain are a nested list
+    (``"[[1, 2], [3, 4]]"``, the ARC-style model output) and an Enigmata ground
+    truth stored as space/newline separated text (``"1 2\\n3 4"``).  Both become
+    the same matrix here so the comparison is format-agnostic; non-numeric
+    grids (star_battle/star placement) return None and fall through to the text
+    path.
+    """
+    s = text.strip()
+    if not s:
+        return None
+    obj = _parse_structured(s)
+    if obj is not None:
+        if not isinstance(obj, list) or not obj:
+            return None
+        rows = obj if all(isinstance(r, list | tuple) for r in obj) else [obj]
+        try:
+            return [[int(x) for x in row] for row in rows]
+        except (TypeError, ValueError):
+            return None
+    rows = [row.strip() for row in s.splitlines() if row.strip()]
+    if not rows:
+        return None
+    grid: list[list[int]] = []
+    for row in rows:
+        cells = [c for c in re.split(r"[,\s]+", row) if c]
+        try:
+            grid.append([int(c) for c in cells])
+        except ValueError:
+            return None
+    return grid or None
+
+
 def logic_answer_match(prediction: str | None, ground_truth: str, task: str | None = None) -> bool:
     """Normalised comparison shared by all logic_* verifiers."""
     if prediction is None:
@@ -315,22 +436,43 @@ def logic_answer_match(prediction: str | None, ground_truth: str, task: str | No
         if task in _UNORDERED_COORD_TASKS:
             return _structured_equal(_canon_unordered(pred_obj), _canon_unordered(gt_obj))
         return _structured_equal(pred_obj, gt_obj)
+    # Grid path: a nested-list answer and a space/newline separated grid ground
+    # truth ("[[1, 2], [3, 4]]" vs "1 2\n3 4") are the same answer written
+    # differently.  Only a match short-circuits; a mismatch falls through so the
+    # whitespace-insensitive text path can still accept flat-grid answers.
+    pred_grid = _parse_grid_matrix(prediction)
+    gt_grid = _parse_grid_matrix(ground_truth)
+    if pred_grid is not None and gt_grid is not None and pred_grid == gt_grid:
+        return True
     # Loose text path: separator-spacing / inner-quote insensitive comparison
     # ("A, C, D, E" vs "A,C,D,E"; "[['WORD']]" vs "[[WORD]]").
     return _loose_token_form(prediction) == _loose_token_form(ground_truth)
 
 
-def _logic_score(solution_str: str, ground_truth: str) -> float:
+def _logic_score(solution_str: str, ground_truth: str, data_source: str | None = None) -> float:
     try:
         payload = json.loads(ground_truth)
-        answer = payload.get("answer") if isinstance(payload, dict) else payload
-        task = payload.get("task") if isinstance(payload, dict) else None
+        if isinstance(payload, dict):
+            answer = payload.get("answer")
+            task = payload.get("task")
+            meta = payload.get("meta")
+        else:
+            answer, task, meta = payload, None, None
     except (json.JSONDecodeError, TypeError):
-        answer, task = ground_truth, None
+        answer, task, meta = ground_truth, None, None
     if answer is None:
         return 0.0
     prediction = extract_logic_answer(solution_str)
-    return 1.0 if logic_answer_match(prediction, str(answer), task) else 0.0
+    # Enigmata tasks whose answer carries task-specific semantics (arithmetic
+    # expressions, maze paths, stack simulation) are verified by the dedicated
+    # module; it returns None for everything it does not own.
+    if data_source is not None and data_source.startswith("logic_enigmata"):
+        verdict = verify_enigmata(prediction, answer, task, meta)
+        if verdict is not None:
+            return 1.0 if verdict else 0.0
+    # Strip the "The answer is: ..." scaffolding several Enigmata answers carry
+    # before the generic normalised comparison.
+    return 1.0 if logic_answer_match(prediction, strip_prose_prefix(str(answer)), task) else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +557,7 @@ def compute_score(
     elif data_source.startswith("code"):
         score = _code_score(solution_str, ground_truth, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb)
     elif data_source.startswith("logic"):
-        score = _logic_score(solution_str, ground_truth)
+        score = _logic_score(solution_str, ground_truth, data_source)
     elif data_source.startswith("stem"):
         score = _math_score(solution_str, ground_truth)
     elif data_source.startswith("if"):
