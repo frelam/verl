@@ -33,6 +33,7 @@ Dimensions
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -115,7 +116,11 @@ def _check_strict_format(text: str) -> bool:
 _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE,
 )
-_FUNCTION_NAME_RE = re.compile(r"<function=(\w[\w.]*)>")
+# Tool names are not always identifier-shaped: ToolACE ships names such as
+# "Get Competition Standings" and "MarinePollutionResponse.deployCleanupCrews".
+# Match any non-'>' run (plus trailing spaces) so spaces/dots survive; the old
+# ``\w[\w.]*`` silently dropped every call to such a tool.
+_FUNCTION_NAME_RE = re.compile(r"<function=([^>\n]+?)\s*>")
 _PARAM_RE = re.compile(
     r"<parameter=(\w+)>\s*(.*?)\s*</parameter>", re.DOTALL,
 )
@@ -150,6 +155,167 @@ def _extract_json_tool_calls(text: str) -> list[dict[str, Any]]:
                     })
                 start = -1
     return results
+
+
+# ============================================================================
+# ToolACE ``[func(param=value, ...)]`` call format
+# ============================================================================
+#
+# ToolACE (Team-ACE/ToolACE) writes every assistant tool call as a
+# Python-like call list, e.g.::
+#
+#     [Get Competition Standings(timezone=-8.0, locale="en")]
+#     [Market Trends API(trend_type="MARKET_INDEXES"), Get Locales List()]
+#
+# It is neither Qwen XML nor a bare JSON object, so it needs its own parser.
+# The reward uses it as a *content* fallback (a model that imitates the
+# ToolACE style still gets Dim 1 credit, but no Dim 2/3 format credit), and
+# ``prepare_data.py`` reuses it to recover the dataset's ground-truth labels.
+
+_TOOLACE_CALL_NAME_RE = re.compile(r"[A-Za-z]")
+
+
+def _split_top_level_commas(text: str) -> list[str]:
+    """Split ``text`` on commas at bracket depth 0, ignoring quoted strings."""
+    parts: list[str] = []
+    depth = 0
+    in_str = False
+    escaped = False
+    start = 0
+    for i, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+    parts.append(text[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _find_matching_bracket(text: str, open_idx: int) -> int | None:
+    """Index of the bracket matching ``text[open_idx]`` (or ``None``)."""
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    opener = text[open_idx]
+    if opener not in pairs:
+        return None
+    closer = pairs[opener]
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+
+def _parse_call_literal(value: str) -> Any:
+    """Best-effort parse of one ToolACE argument value."""
+    value = value.strip()
+    if not value:
+        return ""
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        return ast.literal_eval(value)  # True/False/None, single-quoted strings
+    except (ValueError, SyntaxError):
+        pass
+    return value
+
+
+def _parse_call_args(args_str: str) -> dict[str, Any]:
+    """Parse ToolACE's ``k=v, k=v`` argument list into a dict."""
+    args: dict[str, Any] = {}
+    for part in _split_top_level_commas(args_str):
+        key, sep, raw = part.partition("=")
+        if not sep:
+            continue
+        key = key.strip().strip("\"'")
+        if key:
+            args[key] = _parse_call_literal(raw)
+    return args
+
+
+def parse_toolace_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Parse ToolACE's ``[func(param=value, ...), ...]`` assistant format.
+
+    Returns ``[]`` when ``text`` is not a single top-level call list (e.g. a
+    plain-text answer) or when any element is malformed, so callers can fall
+    back to the other parsers.  Values are decoded with ``json``/``ast``, so
+    nested dict/list arguments survive.
+
+    Tool names are arbitrary text: they may contain commas ("Search for
+    Words in Title, Text, or URL"), parentheses ("User Feed (Video Posts)
+    V2", "Daily Forecast (10 days)") and dots.  A call is therefore located
+    by its argument list — the first ``(...)`` group whose closing paren is
+    followed by a comma or the end of the list — and everything before it is
+    the tool name.
+    """
+    text = text.strip()
+    if not text.startswith("["):
+        return []
+    close = _find_matching_bracket(text, 0)
+    if close is None or text[close + 1:].strip() not in ("", "."):
+        return []
+
+    body = text[1:close]
+    calls: list[dict[str, Any]] = []
+    pos, length = 0, len(body)
+    while pos < length:
+        while pos < length and body[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= length:
+            break
+        open_idx = close_idx = None
+        for i in range(pos, length):
+            if body[i] != "(":
+                continue
+            match = _find_matching_bracket(body, i)
+            if match is None:
+                continue
+            after = body[match + 1:].lstrip()
+            if after == "" or after.startswith(","):
+                open_idx, close_idx = i, match
+                break
+        if open_idx is None:
+            return []
+        name = body[pos:open_idx].strip().strip(",").strip()
+        if not name or not _TOOLACE_CALL_NAME_RE.search(name):
+            return []
+        calls.append({
+            "name": name,
+            "arguments": _parse_call_args(body[open_idx + 1:close_idx]),
+        })
+        pos = close_idx + 1
+    return calls
 
 
 def _strip_think_blocks(text: str) -> str:
@@ -219,7 +385,8 @@ def parse_qwen_tool_calls(
     Args:
         text: Raw response text.
         allow_bare_json: When True (default), fall back to bare
-            ``{"name": …, "arguments": {…}}`` objects if no
+            ``{"name": …, "arguments": {…}}`` objects and to ToolACE's
+            ``[func(param=value, ...)]`` call lists if no
             ``<tool_call>`` block exists. Pass False for *format*
             scoring (Dim 2 / Dim 3): an unwrapped call is not a
             properly formatted tool call and must earn no format credit.
@@ -247,7 +414,7 @@ def parse_qwen_tool_calls(
                 except (json.JSONDecodeError, TypeError):
                     pass
                 args[pname] = pval
-            calls.append({"name": func_match.group(1), "arguments": args})
+            calls.append({"name": func_match.group(1).strip(), "arguments": args})
             continue
         # Inline JSON style: <tool_call>\n{"name": NAME, "arguments": {...}}\n</tool_call>
         # Parse as JSON so key order / extra whitespace don't matter.
@@ -255,7 +422,14 @@ def parse_qwen_tool_calls(
         if inline_call is not None:
             calls.append(inline_call)
 
-    # Fallback: bare JSON format (think blocks already stripped above, so
+    # Fallback 1: ToolACE ``[func(k=v)]`` call list.  Tried BEFORE the
+    # bare-JSON scan because a ToolACE call's arguments often embed
+    # ``{"name": ...}`` payloads that the JSON scanner would mistake for the
+    # emitted call itself.
+    if not calls and allow_bare_json:
+        calls = parse_toolace_tool_calls(text)
+
+    # Fallback 2: bare JSON format (think blocks already stripped above, so
     # JSON discussed inside think never counts as an emitted call).
     if not calls and allow_bare_json:
         for obj in _extract_json_tool_calls(text):
@@ -597,7 +771,7 @@ def get_incorrect_tool_call_spans(
 
         call: dict[str, Any] = {"name": "", "arguments": {}}
         if func_match:
-            call["name"] = func_match.group(1)
+            call["name"] = func_match.group(1).strip()
 
         for pm in _PARAM_RE.finditer(block_text):
             pname = pm.group(1)

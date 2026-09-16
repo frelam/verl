@@ -48,6 +48,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+# The shared reward parser lives under ``reward/`` and is imported here so the
+# dataset's ground truth and the reward agree on what a tool call is.  Running
+# this file directly puts the *script* directory on sys.path (not the repo
+# root), so make the repo root importable first.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from examples.tool_rl.reward.verifier import parse_toolace_tool_calls  # noqa: E402
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -214,6 +224,11 @@ def load_toolace(max_samples: int) -> list[dict[str, Any]]:
         return []
 
     tasks = []
+    # Guard rail against silently emptying ToolACE labels: every assistant
+    # turn that is shaped like ToolACE's ``[func(k=v)]`` call list must parse
+    # into a ground-truth call.  See the ratio check at the end.
+    n_call_shaped = 0
+    n_unparsed = 0
     for i, sample in enumerate(ds):
         if len(tasks) >= max_samples:
             break
@@ -241,7 +256,17 @@ def load_toolace(max_samples: int) -> list[dict[str, Any]]:
                 messages.append({"role": "user", "content": value})
 
                 assistant_resp = _find_next_assistant(conversations, ti)
-                gt_calls = _parse_qwen_tool_calls(assistant_resp)
+                # ToolACE writes assistant calls as ``[func(k=v, ...)]``,
+                # which neither the Qwen XML nor the bare-JSON parser can
+                # read.  Try the ToolACE parser first and keep the generic
+                # one only as a fallback for rows in another format.
+                gt_calls = parse_toolace_tool_calls(assistant_resp)
+                if not gt_calls:
+                    gt_calls = _parse_qwen_tool_calls(assistant_resp)
+                if _looks_like_toolace_call(assistant_resp):
+                    n_call_shaped += 1
+                    if not gt_calls:
+                        n_unparsed += 1
 
                 tasks.append(
                     {
@@ -276,8 +301,31 @@ def load_toolace(max_samples: int) -> list[dict[str, Any]]:
             if len(tasks) >= max_samples:
                 break
 
+    if n_call_shaped and n_unparsed:
+        logger.warning(
+            "ToolACE: %d/%d call-shaped assistant turns were not parsed into "
+            "ground-truth tool calls",
+            n_unparsed,
+            n_call_shaped,
+        )
+    if n_call_shaped and n_unparsed / n_call_shaped > 0.05:
+        raise RuntimeError(
+            f"ToolACE: {n_unparsed}/{n_call_shaped} call-shaped assistant turns "
+            "could not be parsed into ground-truth tool calls. Emitting them "
+            "as 'no tools needed' would mislabel them as negatives and reward "
+            "abstention over the correct call, so refusing to continue. Fix "
+            "parse_toolace_tool_calls() or check whether the dataset format "
+            "changed."
+        )
+
     logger.info("ToolACE: %d single-turn samples", len(tasks))
     return tasks
+
+
+def _looks_like_toolace_call(text: str) -> bool:
+    """Cheap shape check for ToolACE's ``[func(...)]`` assistant call list."""
+    text = text.strip()
+    return text.startswith("[") and "(" in text
 
 
 def _find_next_assistant(conversations: list, idx: int) -> str:
@@ -992,11 +1040,12 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
         re.DOTALL | re.IGNORECASE,
     ):
         block = tc_match.group(1)
-        # Parse function name
-        func_match = re.search(r"<function=(\w[\w.]*)>", block)
+        # Parse function name — allow spaces/dots (e.g. ToolACE's
+        # "Get Competition Standings"); ``\w[\w.]*`` used to drop those.
+        func_match = re.search(r"<function=([^>\n]+?)\s*>", block)
         if not func_match:
             continue
-        func_name = func_match.group(1)
+        func_name = func_match.group(1).strip()
 
         # Parse parameters
         args = {}

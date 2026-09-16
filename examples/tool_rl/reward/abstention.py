@@ -46,7 +46,8 @@ policy towards blanket refusal.  ``reference_prefers_answer`` therefore
 checks the reference response with the same classifier: when it is
 itself a direct answer, the caller skips the guess penalty.  Designed-
 abstention negatives (hammer, ``desc_replace``, ``no_tools``) carry no
-reference and keep the penalty.
+reference and keep the penalty, and a reference that itself demonstrates
+a tool call is never treated as a direct answer.
 
 Configuration (env vars)
 ------------------------
@@ -195,6 +196,23 @@ def classify_abstention(response: str) -> AbstentionClass:
 _REFERENCE_RE = re.compile(r"\n?Reference:\n(.*)$", re.DOTALL)
 
 
+def _reference_shows_tool_call(reference: str) -> bool:
+    """True when the reference response itself emits tool call(s).
+
+    A demonstrated tool call is the opposite of a demonstrated direct
+    answer.  Without this check a reference like
+    ``[Get Competition Standings(timezone=-8.0, ...)]`` classified as
+    ``GUESS`` and wrongly exempted the guess penalty — which is how a
+    correct tool call scored *below* a fabricated answer on labels that a
+    parser had silently emptied.
+    """
+    # Imported lazily: verifier has no dependency on this module, so the
+    # local import keeps the direction of the dependency obvious.
+    from examples.tool_rl.reward.verifier import parse_qwen_tool_calls
+
+    return bool(parse_qwen_tool_calls(reference))
+
+
 def reference_prefers_answer(label: object) -> bool:
     """True when the label's reference response is itself a direct answer.
 
@@ -202,14 +220,18 @@ def reference_prefers_answer(label: object) -> bool:
     (chitchat / general knowledge) must not guess-penalise the model for
     answering directly.  No reference → False (abstention samples keep the
     penalty): an empty reference classifies as ``GUESS``, so the emptiness
-    check must come first.
+    check must come first.  A reference that demonstrates a tool call also
+    returns False — it does not prefer a direct answer.
     """
     if not isinstance(label, str):
         return False
     m = _REFERENCE_RE.search(label)
     if not m or not m.group(1).strip():
         return False
-    return classify_abstention(m.group(1)) is AbstentionClass.GUESS
+    reference = m.group(1)
+    if _reference_shows_tool_call(reference):
+        return False
+    return classify_abstention(reference) is AbstentionClass.GUESS
 
 
 # ============================================================================

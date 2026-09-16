@@ -998,3 +998,283 @@ def test_group_aware_split_keeps_conversations_together():
         assert not (in_val and in_train), f"{prefix} straddles train/val"
     assert len(val) <= 2
     assert len(train) + len(val) == 5
+
+
+# ============================================================================
+# ToolACE label format — [func(param=value, ...)]
+# ============================================================================
+#
+# ToolACE writes assistant calls as ``[func(k=v)]``.  The old label parser
+# (Qwen XML / bare JSON only) returned ``[]`` for every one of them, so
+# ``prepare_data`` stored a valid tool call as an EMPTY label ("no tools
+# needed").  The reward then treated the correct call as spurious and paid
+# 0.2, while a fabricated direct answer on the same (mislabeled) sample
+# scored 1.0 — a reward inversion that pushed the policy away from calling
+# tools.  See the reported "English Premier League standings" sample.
+
+_TOOLACE_STANDINGS_CALL = (
+    '[Get Competition Standings(timezone=-8.0, locale="en", '
+    'country_slug="england", stage_slug="premier-league", sport="soccer")]'
+)
+_TOOLACE_STANDINGS_ARGS = {
+    "timezone": -8.0,
+    "locale": "en",
+    "country_slug": "england",
+    "stage_slug": "premier-league",
+    "sport": "soccer",
+}
+_TOOLACE_STANDINGS_TOOL = {
+    "name": "Get Competition Standings",
+    "description": "Retrieve the current competition standings for a sport.",
+    "parameters": {
+        "type": "dict",
+        "properties": {
+            "timezone": {"type": "float"},
+            "locale": {"type": "string"},
+            "country_slug": {"type": "string"},
+            "stage_slug": {"type": "string"},
+            "sport": {"type": "string"},
+        },
+        "required": ["timezone", "locale", "country_slug", "stage_slug", "sport"],
+    },
+}
+
+
+def test_parse_toolace_call_format():
+    from examples.tool_rl.reward.verifier import parse_toolace_tool_calls
+
+    assert parse_toolace_tool_calls(_TOOLACE_STANDINGS_CALL) == [
+        {"name": "Get Competition Standings", "arguments": _TOOLACE_STANDINGS_ARGS}
+    ]
+
+
+def test_parse_toolace_multiple_and_nested_values():
+    from examples.tool_rl.reward.verifier import parse_toolace_tool_calls
+
+    text = (
+        '[Media(region="Pacific Ocean", timeFrame={"start": "2026-04-29", '
+        '"end": "2026-10-29"}, details=[{"species": "tuna", "tags": ["a", "b"]}]), '
+        "Get Locales List(), Get Motorcycle Models by Make ID(id=123)]"
+    )
+    calls = parse_toolace_tool_calls(text)
+    assert [c["name"] for c in calls] == [
+        "Media", "Get Locales List", "Get Motorcycle Models by Make ID",
+    ]
+    assert calls[0]["arguments"]["timeFrame"] == {
+        "start": "2026-04-29", "end": "2026-10-29",
+    }
+    assert calls[0]["arguments"]["details"] == [
+        {"species": "tuna", "tags": ["a", "b"]}
+    ]
+    assert calls[1]["arguments"] == {}
+    assert calls[2]["arguments"] == {"id": 123}
+
+
+def test_parse_toolace_names_with_parentheses():
+    from examples.tool_rl.reward.verifier import parse_toolace_tool_calls
+
+    calls = parse_toolace_tool_calls(
+        '[User Feed (Video Posts) V2(username="sunnydays"), '
+        'Daily Forecast (10 days)(latitude="34.05"), '
+        'Sending SMS OTP (Custom OTP - Custom Template)(otp="1234")]'
+    )
+    assert [c["name"] for c in calls] == [
+        "User Feed (Video Posts) V2",
+        "Daily Forecast (10 days)",
+        "Sending SMS OTP (Custom OTP - Custom Template)",
+    ]
+    assert calls[0]["arguments"] == {"username": "sunnydays"}
+    assert calls[1]["arguments"] == {"latitude": "34.05"}
+    assert calls[2]["arguments"] == {"otp": "1234"}
+
+
+def test_parse_toolace_names_with_commas():
+    from examples.tool_rl.reward.verifier import parse_toolace_tool_calls
+
+    calls = parse_toolace_tool_calls(
+        '[Search for Words in Title, Text, or URL(query="Python", location="US"), '
+        "Significant Earthquakes, Past 7 Days(), "
+        "Get Walk, Transit, and Bike Score(zpid=48749425)]"
+    )
+    assert [c["name"] for c in calls] == [
+        "Search for Words in Title, Text, or URL",
+        "Significant Earthquakes, Past 7 Days",
+        "Get Walk, Transit, and Bike Score",
+    ]
+    assert calls[0]["arguments"] == {"query": "Python", "location": "US"}
+    assert calls[1]["arguments"] == {}
+    assert calls[2]["arguments"] == {"zpid": 48749425}
+
+
+def test_parse_toolace_rejects_plain_answers():
+    from examples.tool_rl.reward.verifier import parse_toolace_tool_calls
+
+    for text in (
+        "Paris is the capital of France.",
+        "[Funny Cat GIF](https://media.giphy.com/x.gif)",  # markdown link
+        "See [1] above.",
+        "[1, 2, 3]",
+        "[Get Competition Standings(",  # unbalanced
+        "",
+    ):
+        assert parse_toolace_tool_calls(text) == [], text
+
+
+def test_reward_parses_toolace_call_format():
+    # Content scoring (Dim 1) accepts the ToolACE style as a fallback...
+    from examples.tool_rl.reward.verifier import parse_qwen_tool_calls
+
+    calls = parse_qwen_tool_calls(_TOOLACE_STANDINGS_CALL)
+    assert calls == [
+        {"name": "Get Competition Standings", "arguments": _TOOLACE_STANDINGS_ARGS}
+    ]
+    # ...but it is not a properly wrapped Qwen call, so format scoring
+    # (Dim 2 / Dim 3) must not give it credit.
+    assert parse_qwen_tool_calls(_TOOLACE_STANDINGS_CALL, allow_bare_json=False) == []
+
+
+def test_toolace_sample_scores_full_marks(keyword_mode):
+    # End-to-end regression for the reported 0.2: once the label is recovered
+    # from ToolACE's own format, the exact model response earns 1.0.
+    label_calls = [
+        {"name": "Get Competition Standings", "arguments": _TOOLACE_STANDINGS_ARGS}
+    ]
+    resp = (
+        "<think>EPL standings, PST (-8.0), English.</think>\n"
+        "<tool_call>\n"
+        '{"name": "Get Competition Standings", "arguments": '
+        '{"timezone": -8.0, "locale": "en", "country_slug": "england", '
+        '"stage_slug": "premier-league", "sport": "soccer"}}\n'
+        "</tool_call>"
+    )
+    res = compute_score(
+        "tool_rl",
+        resp,
+        "",
+        _extra_info(
+            tools=[_TOOLACE_STANDINGS_TOOL], ground_truth_calls=label_calls,
+        ),
+    )
+    assert res["tool_correctness"] == pytest.approx(1.0)
+    assert res["tool_call_format"] == pytest.approx(1.0)
+    assert res["pass_check"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+
+def test_spaced_tool_name_parsed_in_xml():
+    # ``_FUNCTION_NAME_RE`` used to be ``\w[\w.]*`` and silently dropped
+    # every call to a tool whose name contains spaces (ToolACE ships many).
+    from examples.tool_rl.reward.verifier import parse_qwen_tool_calls
+
+    resp = (
+        "<think>r</think>\n<tool_call>\n<function=Get Competition Standings>\n"
+        "<parameter=timezone>\n-8.0\n</parameter>\n</function>\n</tool_call>"
+    )
+    assert parse_qwen_tool_calls(resp, allow_bare_json=False) == [
+        {"name": "Get Competition Standings", "arguments": {"timezone": -8.0}}
+    ]
+
+
+# ============================================================================
+# Reference-conditioned guard — a reference that CALLS is not a direct answer
+# ============================================================================
+
+def test_reference_tool_call_does_not_prefer_answer():
+    from examples.tool_rl.reward.abstention import reference_prefers_answer
+
+    assert reference_prefers_answer(f"\nReference:\n{_TOOLACE_STANDINGS_CALL}") is False
+    assert reference_prefers_answer(
+        "\nReference:\nParis is the capital of France."
+    ) is True
+
+
+def test_tool_call_reference_keeps_guess_penalty(keyword_mode):
+    # A label whose reference demonstrates a tool call is NOT a chitchat
+    # negative: a fabricated direct answer must keep the guess penalty (the
+    # old classifier read the reference as a direct answer and paid 1.0).
+    label = f"\nReference:\n{_TOOLACE_STANDINGS_CALL}"
+    res = compute_score(
+        "tool_rl",
+        _think_text("Manchester City are top of the table."),
+        label,
+        _extra_info(tools=[_TOOLACE_STANDINGS_TOOL], ground_truth_calls=[]),
+    )
+    assert res["abstention_ref_direct"] == 0.0
+    assert res["tool_correctness"] == 0.0
+    assert res["score"] == pytest.approx(0.4)
+
+
+# ============================================================================
+# Data prep — ToolACE loader recovers ground truth from [func(k=v)]
+# ============================================================================
+
+def _fake_datasets(monkeypatch, rows):
+    import types
+
+    fake = types.ModuleType("datasets")
+    fake.load_dataset = lambda *a, **k: rows
+    monkeypatch.setitem(sys.modules, "datasets", fake)
+
+
+def test_load_toolace_recovers_ground_truth(monkeypatch):
+    from examples.tool_rl import prepare_data
+
+    system = (
+        "Here is a list of functions in JSON format that you can invoke:\n"
+        '[{"name": "Get Competition Standings", "description": "d", '
+        '"parameters": {"type": "dict", "properties": {}, "required": []}}]. \n'
+        "Put it in the format of [func1(params_name=params_value), func2(params)]"
+    )
+    _fake_datasets(
+        monkeypatch,
+        [{
+            "system": system,
+            "conversations": [
+                {"from": "user", "value": "latest EPL standings?"},
+                {"from": "assistant", "value": _TOOLACE_STANDINGS_CALL},
+            ],
+        }],
+    )
+
+    tasks = prepare_data.load_toolace(max_samples=10)
+    assert len(tasks) == 1
+    assert tasks[0]["metadata"]["ground_truth"] == [
+        {"name": "Get Competition Standings", "arguments": _TOOLACE_STANDINGS_ARGS}
+    ]
+    assert tasks[0]["metadata"]["has_ground_truth"] is True
+
+
+def test_load_toolace_guard_raises_on_unparsed_calls(monkeypatch):
+    # If a future format change makes call-shaped turns unparseable, the
+    # loader must fail loudly instead of emitting them as "no tools needed".
+    from examples.tool_rl import prepare_data
+
+    _fake_datasets(
+        monkeypatch,
+        [{
+            "system": "",
+            "conversations": [
+                {"from": "user", "value": "q"},
+                {"from": "assistant", "value": "[Get Competition Standings(]"},
+            ],
+        }],
+    )
+    with pytest.raises(RuntimeError, match="call-shaped"):
+        prepare_data.load_toolace(max_samples=10)
+
+
+def test_load_toolace_keeps_direct_answers_as_negatives(monkeypatch):
+    from examples.tool_rl import prepare_data
+
+    _fake_datasets(
+        monkeypatch,
+        [{
+            "system": "",
+            "conversations": [
+                {"from": "user", "value": "What is the capital of France?"},
+                {"from": "assistant", "value": "Paris is the capital of France."},
+            ],
+        }],
+    )
+    tasks = prepare_data.load_toolace(max_samples=10)
+    assert tasks[0]["metadata"]["ground_truth"] == []
