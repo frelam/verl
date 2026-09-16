@@ -26,6 +26,7 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+from mix import read_parquet_rows, resolve_parquet_files  # noqa: E402
 from mix_replay import _resolve_override, main, replay  # noqa: E402
 
 MIX_PY = os.path.join(HERE, "mix.py")
@@ -263,3 +264,34 @@ def test_main_accepts_directory_overrides(raw_layout, tmp_path):
     assert rc == 0
     assert (out_dir / "train.parquet").is_file()
     assert (out_dir / "val.parquet").is_file()
+
+
+class TestReadParquetRows:
+    """mix.load_domain reads parquet in batches instead of datasets.to_list().
+
+    datasets builds one Arrow string column per domain, which overflows 32-bit
+    offsets past ~2 GB of text (the Dr.SCI stem pool).  pyarrow RecordBatches
+    keep the offsets local, and must return identical rows.
+    """
+
+    def test_matches_datasets_output(self, raw_layout):
+        import datasets
+
+        path = str(raw_layout / "code_v2" / "train_code.parquet")
+        got = read_parquet_rows(path)
+        expected = datasets.load_dataset("parquet", data_files=path, split="train").to_list()
+        assert len(got) == len(expected)
+        assert [r["data_source"] for r in got] == [r["data_source"] for r in expected]
+        assert [r["extra_info"]["source"] for r in got] == [r["extra_info"]["source"] for r in expected]
+        assert got[0]["prompt"] == expected[0]["prompt"]
+        assert got[0]["reward_model"] == expected[0]["reward_model"]
+
+    def test_directory_and_glob(self, raw_layout):
+        code_dir = raw_layout / "code_v2"
+        assert len(resolve_parquet_files(str(code_dir))) == 1
+        assert len(resolve_parquet_files(str(code_dir / "*.parquet"))) == 1
+        assert len(read_parquet_rows(str(code_dir))) == 1400
+
+    def test_missing_path_is_fatal(self, tmp_path):
+        with pytest.raises(FileNotFoundError, match="no parquet files matched"):
+            resolve_parquet_files(str(tmp_path / "nope.parquet"))

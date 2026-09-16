@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -54,11 +55,38 @@ DOMAIN_FILES = {
 }
 
 
+def resolve_parquet_files(path: str) -> list[str]:
+    """Expand a parquet file, glob or directory into a sorted file list."""
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "**", "*.parquet"), recursive=True))
+    else:
+        files = sorted(glob.glob(path))
+    if not files:
+        raise FileNotFoundError(f"[mix] no parquet files matched: {path}")
+    return files
+
+
+def read_parquet_rows(path: str) -> list[dict]:
+    """Read a parquet file / glob / directory into Python dicts, batch by batch.
+
+    ``datasets.load_dataset(...).to_list()`` materialises one Arrow string column
+    per domain, whose 32-bit offsets overflow once a domain's text passes ~2 GB
+    (Dr.SCI is large enough).  ``pyarrow``'s ``iter_batches`` keeps offsets local
+    to each RecordBatch, so large domains load without the overflow.
+    """
+    import pyarrow.parquet as pq
+
+    rows: list[dict] = []
+    for file in resolve_parquet_files(path):
+        for batch in pq.ParquetFile(file).iter_batches(batch_size=8192):
+            rows.extend(batch.to_pylist())
+    return rows
+
+
 def load_domain(input_dir: str, domain: str, path_override: str | None) -> list[dict]:
     rel = path_override or DOMAIN_FILES[domain]
     path = rel if os.path.isabs(rel) else os.path.join(input_dir, rel)
-    ds = datasets.load_dataset("parquet", data_files=path, split="train")
-    rows = ds.to_list()
+    rows = read_parquet_rows(path)
     # Normalise extra_info keys across domains: difficulty_tag.py adds
     # pass_rate only to tagged pools, and a struct schema mismatch would break
     # the final Dataset.from_list merge.
