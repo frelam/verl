@@ -26,7 +26,7 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from mix_replay import replay  # noqa: E402
+from mix_replay import _resolve_override, main, replay  # noqa: E402
 
 MIX_PY = os.path.join(HERE, "mix.py")
 
@@ -164,3 +164,62 @@ def test_missing_old_stats_is_fatal(tmp_path):
             input_dir=str(tmp_path),
             output_dir=str(tmp_path / "out"),
         )
+
+
+class TestResolveOverride:
+    """--new_code/--new_logic accept the rebuild directory as well as the file."""
+
+    def test_none_and_empty(self, tmp_path):
+        assert _resolve_override("code", None, str(tmp_path)) is None
+        assert _resolve_override("code", "", str(tmp_path)) is None
+
+    def test_file_path(self, tmp_path):
+        target = tmp_path / "train_code.parquet"
+        target.write_bytes(b"")
+        assert _resolve_override("code", str(target), str(tmp_path)) == str(target)
+
+    def test_directory_resolves_to_train_file(self, tmp_path):
+        target = tmp_path / "code_v2" / "train_code.parquet"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"")
+        assert _resolve_override("code", str(target.parent), str(tmp_path)) == str(target)
+
+    def test_directory_without_expected_file_hints(self, tmp_path):
+        other = tmp_path / "code_v2" / "something_else.parquet"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"")
+        with pytest.raises(SystemExit, match="train_code.parquet"):
+            _resolve_override("code", str(other.parent), str(tmp_path))
+
+    def test_relative_override_resolves_against_input_dir(self, tmp_path):
+        target = tmp_path / "code_v2" / "train_code.parquet"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"")
+        assert _resolve_override("code", "code_v2", str(tmp_path)) == str(target)
+
+    def test_missing_path_reports_absolute(self, tmp_path):
+        with pytest.raises(SystemExit, match="not found"):
+            _resolve_override("code", "nope/train_code.parquet", str(tmp_path))
+
+
+def test_main_accepts_directory_overrides(raw_layout, tmp_path):
+    old_dir = tmp_path / "final"
+    _run_old_mix(raw_layout, old_dir)
+    out_dir = tmp_path / "final_v2"
+    rc = main(
+        [
+            "--old_dir",
+            str(old_dir),
+            "--input_dir",
+            str(raw_layout),
+            "--new_code",
+            str(raw_layout / "code_v2"),
+            "--new_logic",
+            str(raw_layout / "logic_v2"),
+            "--output_dir",
+            str(out_dir),
+        ]
+    )
+    assert rc == 0
+    assert (out_dir / "train.parquet").is_file()
+    assert (out_dir / "val.parquet").is_file()

@@ -55,6 +55,7 @@ silently sampling with replacement when a rebuilt pool cannot fill its share.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -70,9 +71,11 @@ OLD_DIR = "~/data/reasoning_rl/final"
 # Raw per-domain directory holding the unchanged domains (math/, stem/, [if/]).
 # Rebuilt domains are overridden below.
 INPUT_DIR = "~/data/reasoning_rl"
-# Rebuilt code / logic parquet. Leave as "" to reuse INPUT_DIR/code, INPUT_DIR/logic.
-NEW_CODE = "~/data/reasoning_rl/code_v2/train_code.parquet"
-NEW_LOGIC = "~/data/reasoning_rl/logic_v2/train_logic.parquet"
+# Rebuilt code / logic output. Accepts either the parquet file or the directory
+# the rebuild wrote to (the script looks for train_<domain>.parquet inside it).
+# Leave as "" to reuse INPUT_DIR/code, INPUT_DIR/logic.
+NEW_CODE = "~/data/reasoning_rl/code_v2"
+NEW_LOGIC = "~/data/reasoning_rl/logic_v2"
 # Where the new train.parquet / val.parquet / mix_stats.json are written.
 OUTPUT_DIR = "~/data/reasoning_rl/final_v2"
 # Optional overrides; None = replay the old run's value.
@@ -307,31 +310,57 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_override(domain: str, override: str | None, input_dir: str) -> str | None:
+    """Resolve a per-domain parquet override to an existing file.
+
+    Accepts either the parquet itself or the rebuild output *directory*
+    (``<dir>/train_<domain>.parquet``), so pointing ``--new_code`` at
+    ``.../code_v2`` works as well as ``.../code_v2/train_code.parquet``.  A
+    relative path is resolved against ``--input_dir``, matching ``mix.py``'s own
+    override handling.
+    """
+    if not override:
+        return None
+    path = _expand(override)
+    if not os.path.isabs(path):
+        path = os.path.join(input_dir, path)
+    path = os.path.abspath(path)
+    if os.path.isdir(path):
+        candidate = os.path.join(path, f"train_{domain}.parquet")
+        if os.path.isfile(candidate):
+            return candidate
+        found = sorted(glob.glob(os.path.join(path, "*.parquet")))
+        hint = f" Found instead: {found}" if found else " The directory is empty."
+        raise SystemExit(
+            f"[mix_replay] {domain!r} override is a directory ({path}) with no train_{domain}.parquet.{hint}"
+        )
+    if not os.path.isfile(path):
+        raise SystemExit(f"[mix_replay] {domain!r} override not found: {path}")
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    old_dir = _expand(args.old_dir if args.old_dir is not None else OLD_DIR)
-    old_stats_path = _expand(args.old_stats) if args.old_stats else os.path.join(old_dir, "mix_stats.json")
-    input_dir = _expand(args.input_dir if args.input_dir is not None else INPUT_DIR)
-    output_dir = _expand(args.output_dir if args.output_dir is not None else OUTPUT_DIR)
+    old_dir = os.path.abspath(_expand(args.old_dir if args.old_dir is not None else OLD_DIR))
+    old_stats_path = (
+        os.path.abspath(_expand(args.old_stats)) if args.old_stats else os.path.join(old_dir, "mix_stats.json")
+    )
+    input_dir = os.path.abspath(_expand(args.input_dir if args.input_dir is not None else INPUT_DIR))
+    output_dir = os.path.abspath(_expand(args.output_dir if args.output_dir is not None else OUTPUT_DIR))
 
-    new_code = _expand(args.new_code) if args.new_code is not None else _expand(NEW_CODE)
-    new_logic = _expand(args.new_logic) if args.new_logic is not None else _expand(NEW_LOGIC)
-    path_overrides = {
-        "code": new_code or None,
-        "logic": new_logic or None,
-        "math": _expand(args.math_path),
-        "stem": _expand(args.stem_path),
-        "if": _expand(args.if_path),
+    raw_overrides = {
+        "code": args.new_code if args.new_code is not None else NEW_CODE,
+        "logic": args.new_logic if args.new_logic is not None else NEW_LOGIC,
+        "math": args.math_path,
+        "stem": args.stem_path,
+        "if": args.if_path,
     }
+    path_overrides = {domain: _resolve_override(domain, value, input_dir) for domain, value in raw_overrides.items()}
 
     total_size = args.total_size if args.total_size is not None else TOTAL_SIZE
     val_size = args.val_size if args.val_size is not None else VAL_SIZE
     seed = args.seed if args.seed is not None else SEED
-
-    for domain, override in path_overrides.items():
-        if override and not os.path.isfile(override):
-            raise SystemExit(f"[mix_replay] override for {domain!r} does not exist: {override}")
 
     replay(
         old_stats_path=old_stats_path,
