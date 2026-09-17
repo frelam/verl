@@ -117,6 +117,16 @@ class TestLogicAnswerMatch:
         gt = json.dumps([[1.0, 2.0]])
         assert logic_answer_match("[[1, 2]]", gt)
 
+    def test_non_finite_grid_is_not_a_crash(self):
+        # ``ast``/``json`` decode "1e999" and "Infinity" to inf; int(inf) used
+        # to raise OverflowError inside _parse_grid_matrix and kill the reward
+        # worker.  Such an answer is simply not an integer grid, so the grid
+        # path must decline and the ordinary comparisons decide the score.
+        for gt in ("[[1e999, 2]]", "[1e999, 2]", "[[Infinity]]"):
+            assert logic_answer_match("[[1, 2]]", gt) is False
+        # A matching non-finite answer is still credited by the structural path.
+        assert logic_answer_match("[[1e999, 2]]", "[[1e999, 2]]")
+
     def test_none_prediction(self):
         assert not logic_answer_match(None, "42")
 
@@ -254,6 +264,15 @@ class TestComputeScore:
         gt = json.dumps({"answer": "6", "task": "maze"})
         assert compute_score("logic_reasoning_gym", think_wrap("6"), gt) == {"score": 1.0}
         assert compute_score("logic_reasoning_gym", think_wrap("7"), gt) == {"score": 0.0}
+
+    def test_non_finite_answer_scores_zero(self):
+        # Regression for the reward-worker OverflowError ("cannot convert float
+        # infinity to integer"): a stored answer that overflows a float
+        # ("1e999") decodes to inf, which the grid parser must decline instead
+        # of aborting the whole rollout.
+        gt = json.dumps({"answer": "[[1e999, 2]]", "task": "arc_agi"})
+        res = compute_score("logic_synlogic", think_wrap("<answer>[[1, 2]]</answer>"), gt)
+        assert res == {"score": 0.0}
 
     def test_reasoning_gym_verifier_only_on_string_miss(self, monkeypatch):
         import compute_score as cs

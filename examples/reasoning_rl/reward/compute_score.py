@@ -381,6 +381,28 @@ def _loose_token_form(s: str) -> str:
     return s.replace('"', "").replace("'", "")
 
 
+# An answer nested hundreds of levels deep (a policy emitting a long run of "[")
+# parses fine but then blows the C stack inside the recursive comparison and
+# repr() paths below. Refusing it at parse time keeps every downstream consumer
+# iterative-safe; the flat text comparison still gets its say, so identical
+# deep answers still match.
+_MAX_STRUCTURE_DEPTH = 64
+
+
+def _too_deep(obj, limit: int = _MAX_STRUCTURE_DEPTH) -> bool:
+    """True when ``obj`` nests deeper than ``limit`` (iterative, no recursion)."""
+    stack = [(obj, 1)]
+    while stack:
+        value, depth = stack.pop()
+        if depth > limit:
+            return True
+        if isinstance(value, list | tuple):
+            stack.extend((item, depth + 1) for item in value)
+        elif isinstance(value, dict):
+            stack.extend((item, depth + 1) for item in value.values())
+    return False
+
+
 def _parse_structured(s: str):
     """Best-effort parse of an answer into a Python object (grids, tuples,
     lists, numbers). Returns None when it only parses to a plain string —
@@ -392,7 +414,7 @@ def _parse_structured(s: str):
         except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
             continue
         if not isinstance(obj, str):
-            return obj
+            return None if _too_deep(obj) else obj
     return None
 
 
@@ -400,7 +422,14 @@ def _structured_equal(a, b, tol: float = 1e-6) -> bool:
     if isinstance(a, bool) or isinstance(b, bool):
         return a is b
     if isinstance(a, int | float) and isinstance(b, int | float):
-        return math.isclose(float(a), float(b), rel_tol=tol, abs_tol=tol)
+        try:
+            return math.isclose(float(a), float(b), rel_tol=tol, abs_tol=tol)
+        except (OverflowError, ValueError):
+            # ``float()`` refuses an integer beyond ~1e308 (OverflowError). Such a
+            # literal is not "un-equal", it is simply unordered by ``isclose``:
+            # fall through to the text comparison so two identical huge integers
+            # still match instead of killing the reward worker.
+            pass
     if isinstance(a, list | tuple) and isinstance(b, list | tuple):
         return len(a) == len(b) and all(_structured_equal(x, y, tol) for x, y in zip(a, b, strict=True))
     if isinstance(a, dict) and isinstance(b, dict):
@@ -468,7 +497,11 @@ def _parse_grid_matrix(text: str) -> list[list[int]] | None:
         rows = obj if all(isinstance(r, list | tuple) for r in obj) else [obj]
         try:
             return [[int(x) for x in row] for row in rows]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # ``ast``/``json`` decode ``1e999`` and ``Infinity`` to a non-finite
+            # float, which is not a grid cell and which ``int()`` refuses with
+            # OverflowError (nan raises ValueError).  Not a grid: fall through
+            # to the text paths instead of killing the reward worker.
             return None
     if s.startswith("[[") and s.endswith("]]") and len(s) > 4:
         # "[[1 2 3,4 5 6]]" -> [[1, 2, 3], [4, 5, 6]]; non-numeric wrappers
@@ -596,7 +629,10 @@ def _logic_score(
             meta = payload.get("meta")
         else:
             answer, task, meta = payload, None, None
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):
+        # ValueError covers JSONDecodeError *and* the plain ValueError CPython
+        # raises for an integer literal past ``sys.get_int_max_str_digits()``;
+        # both mean "this ground truth is not the JSON payload we expect".
         answer, task, meta = ground_truth, None, None
     if answer is None:
         return 0.0
@@ -656,7 +692,7 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
 
     try:
         payload = json.loads(ground_truth) if isinstance(ground_truth, str) else ground_truth
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):
         logger.warning("[reasoning_rl] if ground_truth is not valid JSON")
         return 0.0
     if isinstance(payload, dict):
@@ -665,7 +701,7 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
         constraints = payload
     else:
         constraints = []
-    if not constraints:
+    if not isinstance(constraints, list) or not constraints:
         return 0.0
     response = _extract_final_response(solution_str)
     if not response:
@@ -696,19 +732,28 @@ def compute_score(
     domain verifier — this also keeps malformed code out of the sandbox.
     Unknown data_sources still raise once the response is format-compliant,
     so config errors surface instead of being silently zeroed.
+
+    Every verifier call is additionally guarded: this function runs inside the
+    rollout's thread pool, where any escaping exception aborts the whole rollout
+    (the ``OverflowError`` from a ``1e999`` grid was one example). A pathological
+    row or a crafted answer fails closed with a logged 0 instead.
     """
     if not format_ok(solution_str):
         return {"score": 0.0}
-    if data_source.startswith("math"):
-        score = _math_score(solution_str, ground_truth)
-    elif data_source.startswith("code"):
-        score = _code_score(solution_str, ground_truth, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb)
-    elif data_source.startswith("logic"):
-        score = _logic_score(solution_str, ground_truth, data_source, extra_info)
-    elif data_source.startswith("stem"):
-        score = _math_score(solution_str, ground_truth)
-    elif data_source.startswith("if"):
-        score = _if_score(solution_str, ground_truth)
-    else:
+    if not data_source.startswith(("math", "code", "logic", "stem", "if")):
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
+    try:
+        if data_source.startswith("math"):
+            score = _math_score(solution_str, ground_truth)
+        elif data_source.startswith("code"):
+            score = _code_score(solution_str, ground_truth, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb)
+        elif data_source.startswith("logic"):
+            score = _logic_score(solution_str, ground_truth, data_source, extra_info)
+        elif data_source.startswith("stem"):
+            score = _math_score(solution_str, ground_truth)
+        else:  # if_*
+            score = _if_score(solution_str, ground_truth)
+    except Exception:
+        logger.exception("[reasoning_rl] verifier crashed for %s; scoring 0", data_source)
+        return {"score": 0.0}
     return {"score": float(score)}
