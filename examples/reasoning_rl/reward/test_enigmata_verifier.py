@@ -429,3 +429,40 @@ class TestSafeArithmetic:
         from enigmata_verifier import _safe_arith_eval
 
         assert _safe_arith_eval(expr) is None
+
+    @pytest.mark.parametrize("depth", [2, 3, 4, 6])
+    def test_power_base_growth_is_capped(self, depth):
+        # Every exponent is legal (<= _MAX_POW_EXPONENT), but nesting keeps
+        # multiplying the base: ``((2**64)**64)**64`` reaches 2**262144.  The
+        # evaluator must refuse on the estimated size, before allocating, and
+        # return None instead of raising MemoryError out of the reward worker.
+        from enigmata_verifier import _safe_arith_eval
+
+        expr = "2"
+        for _ in range(depth):
+            expr = f"({expr}**64)"
+        assert _safe_arith_eval(expr) is None
+
+    def test_legitimate_large_result_still_evaluates(self):
+        # 2**64 is a real (if large) answer and must not be caught by the cap.
+        from enigmata_verifier import _safe_arith_eval
+
+        assert _safe_arith_eval("2**64") == 2.0**64
+
+
+class TestNonFiniteAnswerFields:
+    """Answers decoded from JSON/Python literals can overflow to ``inf``.
+
+    ``1e999`` and ``Infinity`` both decode to a non-finite float, and
+    ``int(inf)`` raises OverflowError.  The integer helpers must decline such a
+    field instead of letting it escape into the reward worker (the reported
+    "cannot convert float infinity to integer" crash).
+    """
+
+    @pytest.mark.parametrize("raw", ["1e999", "Infinity", float("inf")])
+    def test_int_helpers_decline_non_finite(self, raw):
+        from enigmata_verifier import _as_int, _int_list, _parse_int_matrix
+
+        assert _as_int(raw) is None
+        assert _int_list(f"[{raw}]") is None
+        assert _parse_int_matrix(f"[[{raw}, 2]]") is None

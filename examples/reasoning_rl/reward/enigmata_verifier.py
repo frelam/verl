@@ -125,6 +125,11 @@ _ARITH_BINOPS = {
 }
 # Guard against a degenerate ``9**9**9``-style rollout hanging the driver.
 _MAX_POW_EXPONENT = 64
+# ... and against one that keeps the exponents legal but grows the *base*:
+# ``((2**64)**64)**64`` adds 64 bits per nesting, so a handful of them asks for
+# gigabytes. Real game24/countdown arithmetic never leaves the small-int range,
+# so cap every intermediate integer at ~1233 decimal digits.
+_MAX_INT_BITS = 4096
 
 
 def strip_prose_prefix(text: str) -> str:
@@ -154,7 +159,11 @@ def _decode(value):
         return value
     try:
         return json.loads(stripped)
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError, RecursionError):
+        # ValueError covers JSONDecodeError *and* the plain ValueError CPython
+        # raises for an integer literal past ``sys.get_int_max_str_digits()``;
+        # RecursionError covers a pathologically nested response. Neither is a
+        # usable metadata literal, so fall through to literal_eval/the raw text.
         pass
     try:
         return ast.literal_eval(stripped)
@@ -174,7 +183,12 @@ def _as_int(value) -> int | None:
     if isinstance(value, bool):
         return None
     if isinstance(value, int | float):
-        return int(value)
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            # ``json``/``ast`` decode nan and 1e999 to a non-finite float, which
+            # is not a usable integer field; treat it as missing.
+            return None
     if isinstance(value, str):
         try:
             return int(value.strip())
@@ -195,7 +209,8 @@ def _parse_int_matrix(value) -> list[list[int]] | None:
     if isinstance(decoded, list | tuple) and decoded and all(isinstance(r, list | tuple) for r in decoded):
         try:
             return [[int(c) for c in row] for row in decoded]
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # Non-finite floats (1e999 / Infinity) are not grid cells.
             return None
     if not isinstance(value, str):
         return None
@@ -226,7 +241,11 @@ def _int_list(value) -> list[int] | None:
     if isinstance(decoded, list | tuple) and all(
         isinstance(x, int | float) and not isinstance(x, bool) for x in decoded
     ):
-        return [int(x) for x in decoded]
+        try:
+            return [int(x) for x in decoded]
+        except (ValueError, OverflowError):
+            # Non-finite floats are not list entries either.
+            return None
     if not isinstance(value, str):
         return None
     match = re.search(r"\[([\d\s,]+)\]", value)
@@ -252,6 +271,19 @@ _NO_SOLUTION_RE = re.compile(r"no\s+(?:feasible|valid|solution)", re.IGNORECASE)
 _SLIDING_MOVES = {"L": (0, -1), "R": (0, 1), "U": (-1, 0), "D": (1, 0)}
 
 
+def _sliding_board_ok(board: list[list[int]]) -> bool:
+    """True for a square sliding board holding exactly the tiles 1..n^2-1 and one blank.
+
+    A malformed ``meta.question`` (ragged rows, or no blank at all) would
+    otherwise make the parity test / blank lookup below fail on ``next()`` and
+    take the rollout with it.
+    """
+    size = len(board)
+    if size < 2 or any(len(row) != size for row in board):
+        return False
+    return sorted(cell for row in board for cell in row) == list(range(size * size))
+
+
 def _sliding_solvable(board: list[list[int]]) -> bool:
     """Classic 15-puzzle parity test (goal = 1..n^2-1 followed by the blank)."""
     size = len(board)
@@ -261,7 +293,10 @@ def _sliding_solvable(board: list[list[int]]) -> bool:
     )
     if size % 2:
         return inversions % 2 == 0
-    blank_row_from_bottom = size - next(i for i, row in enumerate(board) if 0 in row)
+    blank_row = next((i for i, row in enumerate(board) if 0 in row), None)
+    if blank_row is None:
+        return False
+    blank_row_from_bottom = size - blank_row
     return (inversions + blank_row_from_bottom) % 2 == 1
 
 
@@ -283,11 +318,13 @@ def _sliding_moves(text: str) -> list[str] | None:
     return None
 
 
-def _apply_sliding(board: list[list[int]], moves: list[str], blank_moves: bool) -> list[list[int]]:
+def _apply_sliding(board: list[list[int]], moves: list[str], blank_moves: bool) -> list[list[int]] | None:
     """Replay a move sequence and return the final board (``None`` entry = stuck)."""
     size = len(board)
     grid = [row[:] for row in board]
-    empty = next((i, j) for i, row in enumerate(grid) for j, cell in enumerate(row) if cell == 0)
+    empty = next(((i, j) for i, row in enumerate(grid) for j, cell in enumerate(row) if cell == 0), None)
+    if empty is None:  # no blank: not a sliding board
+        return None
     for move in moves:
         d_row, d_col = _SLIDING_MOVES[move]
         if not blank_moves:
@@ -306,7 +343,7 @@ def _apply_sliding(board: list[list[int]], moves: list[str], blank_moves: bool) 
 def _verify_sliding_puzzle(prediction: str | None, meta) -> bool:
     """8/15 puzzle: replay the move sequence from the stored initial board."""
     board = _parse_int_matrix((meta or {}).get("question"))
-    if not board or len(board) != len(board[0]):
+    if not board or not _sliding_board_ok(board):
         return False
     if prediction is None:
         return False
@@ -394,7 +431,12 @@ def _verify_twiddle(prediction: str | None, meta) -> bool:
         except (TypeError, ValueError):
             rotations = []
     if not rotations:
-        rotations = [(int(a), int(b)) for a, b in _TWIDDLE_PAIR_RE.findall(prediction)]
+        try:
+            rotations = [(int(a), int(b)) for a, b in _TWIDDLE_PAIR_RE.findall(prediction)]
+        except ValueError:
+            # ``\d+`` can span thousands of digits, which CPython refuses to
+            # convert (``sys.get_int_max_str_digits()``); that is not a rotation.
+            return False
     if not rotations:
         return False
     grid = [row[:] for row in board]
@@ -489,7 +531,8 @@ def _verify_car_painting(prediction: str | None, meta) -> bool:
         return False
     try:
         original = [int(c) for c in car_ids]
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError: a car id decoded from ``1e999``/``Infinity`` is not one.
         return False
     order = _int_list(prediction)
     if not order or sorted(order) != sorted(original):
@@ -783,14 +826,24 @@ def _safe_arith_eval(expr: str) -> float | None:
             return value if isinstance(n.op, ast.UAdd) else -value
         if isinstance(n, ast.BinOp) and type(n.op) in _ARITH_BINOPS:
             left, right = ev(n.left), ev(n.right)
-            if isinstance(n.op, ast.Pow) and abs(right) > _MAX_POW_EXPONENT:
-                raise ValueError("exponent too large")
-            return _ARITH_BINOPS[type(n.op)](left, right)
+            if isinstance(n.op, ast.Pow):
+                if abs(right) > _MAX_POW_EXPONENT:
+                    raise ValueError("exponent too large")
+                # Estimate the result size *before* allocating it: bit length of
+                # ``left ** right`` is ~``left.bit_length() * right``.
+                if isinstance(left, int) and left.bit_length() * abs(right) > _MAX_INT_BITS:
+                    raise ValueError("operand too large")
+            value = _ARITH_BINOPS[type(n.op)](left, right)
+            if isinstance(value, int) and value.bit_length() > _MAX_INT_BITS:
+                raise ValueError("intermediate operand too large")
+            return value
         raise ValueError("disallowed expression node")
 
     try:
         return float(ev(node))
-    except (ValueError, ZeroDivisionError, OverflowError, TypeError):
+    except (ValueError, ZeroDivisionError, OverflowError, TypeError, MemoryError, RecursionError):
+        # MemoryError/RecursionError: the expression itself is too big/deep to be
+        # an answer -- refuse it instead of stalling the reward worker.
         return None
 
 
@@ -808,7 +861,9 @@ def _number_key(value) -> str:
     """Canonical string for a number so 4 / 4.0 / "4" compare equal."""
     try:
         f = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # A metadata integer beyond ~1e308 has no float form (OverflowError);
+        # ``str`` still gives it a stable, comparable key.
         return str(value)
     return str(int(f)) if f.is_integer() else repr(f)
 
@@ -862,7 +917,16 @@ def _verify_expression_task(prediction: str | None, answer, target: float, meta)
 
 
 def _extract_coords(text: str) -> list[tuple[int, int]]:
-    return [(int(r), int(c)) for r, c in _COORD_RE.findall(text or "")]
+    coords = []
+    for row, col in _COORD_RE.findall(text or ""):
+        try:
+            coords.append((int(row), int(col)))
+        except ValueError:
+            # ``\d+`` can span thousands of digits, which CPython refuses to
+            # convert (``sys.get_int_max_str_digits()``); skip such a "coordinate"
+            # rather than aborting the reward pass.
+            continue
+    return coords
 
 
 def _verify_maze(prediction: str | None, answer, meta) -> bool:
@@ -897,7 +961,7 @@ def _verify_maze(prediction: str | None, answer, meta) -> bool:
                 if i and abs(row - coords[i - 1][0]) + abs(col - coords[i - 1][1]) != 1:
                     return False
             return True
-        except (IndexError, TypeError, ValueError):
+        except (IndexError, TypeError, ValueError, OverflowError):
             return False
 
     gt_coords = _extract_coords(answer_text)
