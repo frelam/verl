@@ -106,5 +106,45 @@ def test_param_rename_does_not_leak_across_samples():
     assert "match_id" in shared["parameters"]["properties"]
 
 
+def _desc_replace_task() -> dict:
+    """A positive sample whose two declared tools share a description."""
+    label_tool = dict(_MATCH_TOOL, parameters=dict(_MATCH_TOOL["parameters"]))
+    label_tool["name"] = "getFootballMatchInfo"
+    sibling = dict(_MATCH_TOOL, parameters=dict(_MATCH_TOOL["parameters"]))
+    other = {
+        "name": "getWeather",
+        "description": "Retrieve the weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "city"}},
+            "required": ["city"],
+        },
+    }
+    tools = _normalize_tools([label_tool, sibling, other])
+    gt = [{"name": "getFootballMatchInfo", "arguments": {"match_id": "X"}}]
+    return {
+        "messages": [{"role": "user", "content": "q"}],
+        "tools": tools,
+        "label": _format_gt(gt),
+        "metadata": _make_meta("test", "t", tools, gt),
+    }
+
+
+def test_desc_replace_swaps_indistinguishable_siblings_too():
+    """After the swap no declared tool may still fit the query."""
+    task = _desc_replace_task()
+    original = _MATCH_TOOL["description"].strip().lower()
+
+    assert prepare_data._augment_desc_replace(task, random.Random(0)) == "desc_replace"
+
+    descriptions = {t["name"]: t["description"] for t in task["tools"]}
+    assert original not in {d.strip().lower() for d in descriptions.values()}
+    assert descriptions["getFootballMatchInfo"] != descriptions["getMatchInfo"]
+    assert task["metadata"]["augment_detail"] == {"tool": "getFootballMatchInfo", "siblings": ["getMatchInfo"]}
+    assert task["metadata"]["ground_truth"] == [] and task["label"] == ""
+    # Both tool copies stayed in sync.
+    assert [t["description"] for t in task["metadata"]["tools"]] == [t["description"] for t in task["tools"]]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

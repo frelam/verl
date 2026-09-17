@@ -1261,20 +1261,37 @@ def _augment_desc_replace(task: dict, rng: random.Random) -> str | None:
     After the swap no declared tool fits the query, so this becomes a
     **negative sample**: ground_truth is emptied (``[]``, not ``None`` —
     the reward distinguishes "label says no tools" from "no label").
+
+    Declared tools that are indistinguishable from the label tool (identical
+    description — Seal-Tools' ``getMatchInfo`` / ``getFootballMatchInfo``)
+    would still answer the query, so their descriptions are swapped too.
+    Otherwise the label would punish a call the query invites.
     """
     candidates = _label_tool_candidates(task)
     if not candidates:
         return None
     name = rng.choice(candidates)
-    new_desc = rng.choice(_IRRELEVANT_DESCRIPTIONS)
-    for t in _augment_tool_copies(task, name):
-        t["description"] = new_desc
+
+    descriptions = {
+        t.get("name"): str(t.get("description", "")).strip().lower() for t in (task.get("tools") or []) if t.get("name")
+    }
+    label_description = descriptions.get(name, "")
+    siblings = sorted(n for n, d in descriptions.items() if n != name and label_description and d == label_description)
+
+    # Distinct unrelated descriptions keep the swapped tools distinguishable
+    # from one another as well.
+    pool = list(_IRRELEVANT_DESCRIPTIONS)
+    rng.shuffle(pool)
+    for i, target in enumerate([name, *siblings]):
+        replacement = pool[i % len(pool)]
+        for t in _augment_tool_copies(task, target):
+            t["description"] = replacement
 
     task["label"] = ""
     task["metadata"]["ground_truth"] = []
     task["metadata"]["has_ground_truth"] = False
     task["metadata"]["augmented"] = "desc_replace"
-    task["metadata"]["augment_detail"] = {"tool": name}
+    task["metadata"]["augment_detail"] = {"tool": name, "siblings": siblings}
     if _SELF_COMPUTABLE_TOOL_RE.search(name):
         # The original tool was a deterministic computation (e.g. a
         # calculator): after the swap the model can still answer the

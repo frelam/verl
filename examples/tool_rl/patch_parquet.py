@@ -29,8 +29,12 @@ when the call has exactly one unmapped key and the tool exactly one
 generically-named property — and drops the rest.
 
 Sibling tools (identical descriptions, e.g. ``getMatchInfo`` /
-``getFootballMatchInfo``) are **left alone**: the reward accepts either as the
-label's tool, see ``reward/verifier.py:_tool_equivalence``.
+``getFootballMatchInfo``) are **left alone** on positive rows: the reward
+accepts either as the label's tool, see ``reward/verifier.py:_tool_equivalence``.
+They are withheld on ``desc_replace`` negatives, where the label was emptied
+after swapping the label tool's description — a sibling still answers that
+query, so abstention would be punished (the generator fix in
+``_augment_desc_replace`` swaps siblings too; this covers existing files).
 
 Usage
 -----
@@ -60,6 +64,7 @@ if _REPO_ROOT not in sys.path:
 
 from examples.tool_rl.prepare_data import (  # noqa: E402
     _GENERIC_PARAM_NAMES,
+    _IRRELEVANT_DESCRIPTIONS,
     _SEAL_TOOLS_REPO,
     _fetch_raw,
     _format_gt,
@@ -116,8 +121,8 @@ def _to_call_list(value: Any) -> list[dict[str, Any]]:
 # ============================================================================
 
 
-def _load_sealtools_anchor() -> dict[str, dict[str, str]]:
-    """``tool -> {original parameter name: description}`` from tool.jsonl."""
+def _load_sealtools_anchor() -> dict[str, dict[str, Any]]:
+    """``tool -> {"description": ..., "params": {name: description}}``."""
     try:
         text = _fetch_raw(
             _SEAL_TOOLS_REPO,
@@ -132,7 +137,7 @@ def _load_sealtools_anchor() -> dict[str, dict[str, str]]:
         print("[patch] tool table unavailable — using the name heuristic")
         return {}
 
-    anchor: dict[str, dict[str, str]] = {}
+    anchor: dict[str, dict[str, Any]] = {}
     for line in text.splitlines():
         try:
             raw = json.loads(line)
@@ -142,9 +147,12 @@ def _load_sealtools_anchor() -> dict[str, dict[str, str]]:
         if not name:
             continue
         anchor[name] = {
-            param: str((spec or {}).get("description", ""))
-            for param, spec in (raw.get("parameters") or {}).items()
-            if isinstance(spec, dict)
+            "description": str(raw.get("api_description", "")),
+            "params": {
+                param: str((spec or {}).get("description", ""))
+                for param, spec in (raw.get("parameters") or {}).items()
+                if isinstance(spec, dict)
+            },
         }
     return anchor
 
@@ -157,11 +165,11 @@ def _resolve_key(
     tool_name: str,
     key: str,
     properties: dict[str, Any],
-    anchor: dict[str, dict[str, str]],
+    anchor: dict[str, dict[str, Any]],
     unmapped: list[str],
 ) -> str | None:
     """Find the parameter ``key`` was renamed to, or None."""
-    original = anchor.get(tool_name, {}).get(key)
+    original = anchor.get(tool_name, {}).get("params", {}).get(key)
     if original:
         candidates = [
             param
@@ -218,6 +226,32 @@ def repair_row(
     return repaired, renamed_total
 
 
+def strip_orphan_siblings(
+    tools: list[dict[str, Any]],
+    anchor: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Withhold tools that still answer a ``desc_replace`` negative's query.
+
+    ``_augment_desc_replace`` swaps the label tool's description for an
+    unrelated one and empties the label, so the row must be answered by
+    abstaining.  A declared tool that was indistinguishable from the label
+    tool (its description *equalled* the original one) still fits the query —
+    leaving it in makes the reward score the correct call as spurious.
+    """
+    anchor = anchor or {}
+    irrelevant = {_normalise(d) for d in _IRRELEVANT_DESCRIPTIONS}
+    swapped = {t.get("name") for t in tools if _normalise(t.get("description")) in irrelevant}
+    originals = {
+        _normalise(anchor.get(name, {}).get("description"))
+        for name in swapped
+        if anchor.get(name, {}).get("description")
+    }
+    if not originals:
+        return tools, 0
+    kept = [t for t in tools if _normalise(t.get("description")) not in originals]
+    return kept, len(tools) - len(kept)
+
+
 def _relabel(label: str, calls: list[dict[str, Any]]) -> str:
     """Rebuild the human-readable label string, keeping a Reference trailer."""
     if not calls:
@@ -232,11 +266,19 @@ def _relabel(label: str, calls: list[dict[str, Any]]) -> str:
 # ============================================================================
 
 
-def patch_frame(df, name: str, anchor: dict[str, dict[str, str]] | None = None) -> tuple[Any, dict[str, int]]:
+def patch_frame(df, name: str, anchor: dict[str, dict[str, Any]] | None = None) -> tuple[Any, dict[str, int]]:
     """Repair one parquet frame in memory; returns ``(df, stats)``."""
     import pandas as pd
 
-    stats = {"rows_in": len(df), "rows_repaired": 0, "keys_renamed": 0, "rows_dropped": 0, "rows_out": 0}
+    stats = {
+        "rows_in": len(df),
+        "rows_repaired": 0,
+        "keys_renamed": 0,
+        "rows_dropped": 0,
+        "rows_with_sibling_withheld": 0,
+        "siblings_withheld": 0,
+        "rows_out": 0,
+    }
     out = []
     for row in df.to_dict("records"):
         extra = row.get("extra_info")
@@ -255,6 +297,13 @@ def patch_frame(df, name: str, anchor: dict[str, dict[str, str]] | None = None) 
                 reward_model = dict(row.get("reward_model") or {})
                 reward_model["ground_truth"] = _relabel(reward_model.get("ground_truth", ""), gt_calls)
                 row["reward_model"] = reward_model
+        elif extra.get("augmented") == "desc_replace":
+            tools, withheld = strip_orphan_siblings(_to_tool_list(row.get("tools")), anchor)
+            if withheld:
+                stats["rows_with_sibling_withheld"] += 1
+                stats["siblings_withheld"] += withheld
+                row["tools"] = tools
+                extra["tools"] = tools
 
         extra["index"] = len(out)  # keep the id compact after dropping rows
         row["extra_info"] = extra
@@ -264,12 +313,20 @@ def patch_frame(df, name: str, anchor: dict[str, dict[str, str]] | None = None) 
     print(
         f"[patch] {name}: {stats['rows_in']} rows -> {stats['rows_out']} "
         f"(repaired {stats['rows_repaired']} rows / {stats['keys_renamed']} keys, "
-        f"dropped {stats['rows_dropped']} unresolvable)"
+        f"dropped {stats['rows_dropped']} unresolvable, "
+        f"withheld {stats['siblings_withheld']} orphan sibling(s) from "
+        f"{stats['rows_with_sibling_withheld']} desc_replace rows)"
     )
     return pd.DataFrame(out), stats
 
 
-def patch_file(path: Path, *, in_place: bool, dry_run: bool, anchor: dict[str, dict[str, str]] | None) -> None:
+def patch_file(
+    path: Path,
+    *,
+    in_place: bool,
+    dry_run: bool,
+    anchor: dict[str, dict[str, Any]] | None,
+) -> None:
     import pandas as pd
 
     patched, _ = patch_frame(pd.read_parquet(path), path.name, anchor)

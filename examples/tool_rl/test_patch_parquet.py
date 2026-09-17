@@ -29,6 +29,11 @@ from examples.tool_rl.patch_parquet import patch_frame, repair_row  # noqa: E402
 _DESC = "The country you want a policy for"
 
 
+def _anchor(params: dict[str, str], description: str = "") -> dict:
+    """Build a ``tool.jsonl``-shaped anchor entry for getEnergyPolicy."""
+    return {"getEnergyPolicy": {"description": description, "params": params}}
+
+
 def _tool(properties: dict) -> dict:
     return {
         "name": "getEnergyPolicy",
@@ -40,7 +45,7 @@ def _tool(properties: dict) -> dict:
 def test_repairs_key_with_the_description_anchor():
     """`country` -> `input_value` because the descriptions agree."""
     tools = [_tool({"input_value": {"type": "string", "description": _DESC}})]
-    anchor = {"getEnergyPolicy": {"country": _DESC}}
+    anchor = _anchor({"country": _DESC})
 
     repaired, renamed = repair_row(tools, [{"name": "getEnergyPolicy", "arguments": {"country": "China"}}], anchor)
 
@@ -52,7 +57,7 @@ def test_ignores_consistent_rows():
     tools = [_tool({"country": {"type": "string", "description": _DESC}})]
     calls = [{"name": "getEnergyPolicy", "arguments": {"country": "China"}}]
 
-    repaired, renamed = repair_row(tools, calls, {"getEnergyPolicy": {"country": _DESC}})
+    repaired, renamed = repair_row(tools, calls, _anchor({"country": _DESC}))
 
     assert repaired == calls and renamed == 0
 
@@ -67,7 +72,7 @@ def test_anchor_disambiguates_two_generic_properties():
             }
         )
     ]
-    anchor = {"getEnergyPolicy": {"country": "The country you want a policy for", "year": "The year of the policy"}}
+    anchor = _anchor({"country": "The country you want a policy for", "year": "The year of the policy"})
     calls = [{"name": "getEnergyPolicy", "arguments": {"country": "China", "year": "2024"}}]
 
     repaired, renamed = repair_row(tools, calls, anchor)
@@ -133,7 +138,7 @@ def test_patch_frame_round_trips_through_pandas(tmp_path):
     path = tmp_path / "train.parquet"
     pd.DataFrame(rows).to_parquet(path, index=False)
 
-    patched, stats = patch_frame(pd.read_parquet(path), path.name, {"getEnergyPolicy": {"country": _DESC}})
+    patched, stats = patch_frame(pd.read_parquet(path), path.name, _anchor({"country": _DESC}))
 
     assert stats["rows_in"] == 2 and stats["rows_out"] == 2
     assert stats["rows_repaired"] == 1 and stats["keys_renamed"] == 1 and stats["rows_dropped"] == 0
@@ -146,6 +151,86 @@ def test_patch_frame_round_trips_through_pandas(tmp_path):
     # The sibling is still declared: the reward accepts either tool.
     assert [t["name"] for t in records[0]["tools"]] == ["getEnergyPolicy", "getPolicyInfo"]
     assert [t["name"] for t in records[0]["extra_info"]["tools"]] == ["getEnergyPolicy", "getPolicyInfo"]
+
+
+# ============================================================================
+# desc_replace negatives: withhold the sibling that still fits the query
+# ============================================================================
+
+_OPTIMISM_DESC = "Retrieve the level of optimism"
+_IRRELEVANT = "Generate chord progressions for a given musical key."
+
+
+def _optimism_tools() -> list[dict]:
+    swapped = {
+        "name": "getOptimismLevel",
+        "description": _IRRELEVANT,  # swapped in by _augment_desc_replace
+        "parameters": {"type": "object", "properties": {"person": {"type": "string"}}},
+    }
+    sibling = {
+        "name": "getOptimismScore",
+        "description": _OPTIMISM_DESC,
+        "parameters": {"type": "object", "properties": {"person": {"type": "string"}}},
+    }
+    other = {
+        "name": "getWeather",
+        "description": "Retrieve the weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }
+    return [swapped, sibling, other]
+
+
+_OPTIMISM_ANCHOR = {"getOptimismLevel": {"description": _OPTIMISM_DESC, "params": {"person": "The person"}}}
+
+
+def test_strip_orphan_siblings_withholds_the_one_that_still_fits():
+    from examples.tool_rl.patch_parquet import strip_orphan_siblings
+
+    kept, withheld = strip_orphan_siblings(_optimism_tools(), _OPTIMISM_ANCHOR)
+
+    assert withheld == 1
+    # The swapped tool itself stays (it no longer fits); the sibling goes.
+    assert [t["name"] for t in kept] == ["getOptimismLevel", "getWeather"]
+
+
+def test_strip_orphan_siblings_is_a_noop_without_an_anchor():
+    from examples.tool_rl.patch_parquet import strip_orphan_siblings
+
+    tools = _optimism_tools()
+    kept, withheld = strip_orphan_siblings(tools, {})
+
+    assert kept == tools and withheld == 0
+
+
+def test_patch_frame_handles_desc_replace_rows(tmp_path):
+    """The empty-label negative must lose the sibling, in both tool copies."""
+    import pandas as pd
+
+    tools = _optimism_tools()
+    rows = [
+        {
+            "data_source": "tool_rl",
+            "prompt": [{"role": "user", "content": "Tell me what my optimism level is."}],
+            "tools": tools,
+            "reward_model": {"style": "rule", "ground_truth": ""},
+            "extra_info": {
+                "index": 0,
+                "tools": tools,
+                "ground_truth_calls": "[]",
+                "augmented": "desc_replace",
+            },
+        }
+    ]
+    path = tmp_path / "train.parquet"
+    pd.DataFrame(rows).to_parquet(path, index=False)
+
+    patched, stats = patch_frame(pd.read_parquet(path), path.name, _OPTIMISM_ANCHOR)
+
+    assert stats["rows_with_sibling_withheld"] == 1 and stats["siblings_withheld"] == 1
+    assert stats["rows_dropped"] == 0
+    record = patched.to_dict("records")[0]
+    assert [t["name"] for t in record["tools"]] == ["getOptimismLevel", "getWeather"]
+    assert [t["name"] for t in record["extra_info"]["tools"]] == ["getOptimismLevel", "getWeather"]
 
 
 if __name__ == "__main__":
