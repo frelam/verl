@@ -1,35 +1,36 @@
 #!/usr/bin/env python3
-"""Repair parquets generated *before* the tool_rl data-prep fixes in 3483165c.
+"""Repair parquets generated *before* the tool_rl data-prep fix in 3483165c.
 
-Commit ``3483165c`` fixed two data-preparation defects, both of which are
-already baked into previously written ``train.parquet`` / ``val.parquet``:
+``_normalize_tools`` used to return a *shared* ``parameters`` object for every
+sample declaring the same tool, while ``_augment_param_rename`` mutates that
+object in place.  A parameter renamed for one sample therefore also rewrote
+other samples' declared schemas — but their labels kept the old key, so a
+schema-conformant call could never match them (Dim1 caps at 0.5, Dim3 is 0).
+Measured on Seal-Tools: 331/5000 rows, spread over 168 tools.
 
-1. ``_normalize_tools`` returned a *shared* ``parameters`` object for every
-   sample declaring the same tool, while ``_augment_param_rename`` mutates it
-   in place.  A rename performed for one sample therefore rewrote other
-   samples' declared schemas but not their labels.  Such a row carries a
-   ground-truth argument key that no longer exists in the schema of the tool
-   it belongs to, so a schema-conformant call can never match it (Dim1 caps
-   at 0.5, Dim3 is always 0).  These rows are **dropped**: the label keeps the
-   pre-rename key, so the original schema cannot be recovered from the parquet
-   alone, and they are ~1% of the mix.
+The rename itself is intentional: the declared parameter name changed, so the
+label must change with it.  This script applies exactly that repair to an
+existing parquet, without re-downloading, re-sampling distractors, re-running
+the negative mix or re-splitting train/val.
 
-2. ``load_sealtools`` now withholds tools that are indistinguishable from a
-   label tool (identical description), because Seal-Tools' label records the
-   API the query was reverse-engineered from rather than a uniquely correct
-   answer.  Affected rows **keep their label tool and lose the twin
-   distractor** — the same effect as regenerating, which would have drawn a
-   different same-field distractor in its place.
+How the new key is found
+------------------------
+``_augment_param_rename`` moves the whole property spec (type + description)
+under the new name, so the **description is the anchor** back to the original:
 
-The same twin also breaks a rarer row type: a ``desc_replace`` negative is a
-positive whose label tool's description was swapped for an unrelated one and
-whose label was then emptied.  With the sibling still declared the query
-stays perfectly servable, so the "no tools needed" label punished the correct
-call.  The patch recovers the pre-swap description from the file-wide majority
-and withholds the twin there too.
+    tool.jsonl : country       -> "The country ..."        (original)
+    schema     : input_value   -> "The country ..."        (renamed)
 
-Row-local: no raw dataset, download or re-shuffling is involved, so the
-existing mix (negative ratio, hard-replay tags, train/val split) is preserved.
+Only the rows whose key cannot be resolved are dropped (3 of 352 damaged calls
+on the Seal-Tools run).  The raw tool table is fetched through
+``prepare_data._fetch_raw`` (same cache the loader uses, 2.5 MB); when it is
+unavailable the script falls back to a conservative heuristic — repair only
+when the call has exactly one unmapped key and the tool exactly one
+generically-named property — and drops the rest.
+
+Sibling tools (identical descriptions, e.g. ``getMatchInfo`` /
+``getFootballMatchInfo``) are **left alone**: the reward accepts either as the
+label's tool, see ``reward/verifier.py:_tool_equivalence``.
 
 Usage
 -----
@@ -47,23 +48,38 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
-from collections import Counter
+import sys
 from pathlib import Path
 from typing import Any
 
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from examples.tool_rl.prepare_data import (  # noqa: E402
+    _GENERIC_PARAM_NAMES,
+    _SEAL_TOOLS_REPO,
+    _fetch_raw,
+    _format_gt,
+)
+
+_REFERENCE_RE = re.compile(r"\nReference:\n(.*)$", re.DOTALL)
+
+
+# ============================================================================
+# Container normalisation — pandas hands nested columns back as arrays
+# ============================================================================
+
 
 def _to_tool_list(value: Any) -> list[dict[str, Any]]:
-    """Normalise the ``tools`` column to plain dicts.
-
-    pandas hands nested columns back as numpy object arrays, so ``tolist()``
-    has to run before the container check.
-    """
+    """Normalise the ``tools`` column to plain dicts."""
     if value is None:
         return []
     if hasattr(value, "tolist"):
         value = value.tolist()
-    if isinstance(value, float) or not isinstance(value, list | tuple):  # NaN on an empty column
+    if isinstance(value, float) or not isinstance(value, list | tuple):  # NaN
         return []
     return [dict(t) for t in value if isinstance(t, dict)]
 
@@ -95,141 +111,182 @@ def _to_call_list(value: Any) -> list[dict[str, Any]]:
     return out
 
 
-def _description(tool: dict[str, Any]) -> str:
-    return str(tool.get("description", "")).strip().lower()
+# ============================================================================
+# Description anchor (original parameter names)
+# ============================================================================
 
 
-def _canonical_descriptions(records: list[dict[str, Any]]) -> dict[str, str]:
-    """Most common description declared for each tool across the file.
+def _load_sealtools_anchor() -> dict[str, dict[str, str]]:
+    """``tool -> {original parameter name: description}`` from tool.jsonl."""
+    try:
+        text = _fetch_raw(
+            _SEAL_TOOLS_REPO,
+            "Seal-Tools_Dataset/tool.jsonl",
+            branch="master",
+            timeout=300,
+        )
+    except Exception as exc:  # noqa: BLE001 - any fetch failure falls back
+        print(f"[patch] tool table unavailable ({exc}) — using the name heuristic")
+        return {}
+    if not text:
+        print("[patch] tool table unavailable — using the name heuristic")
+        return {}
 
-    ``desc_replace`` swaps a label tool's description for an unrelated one, so
-    that row's own description no longer matches the sibling API it used to be
-    indistinguishable from.  The file-wide majority recovers the original.
-    """
-    counts: dict[str, Counter] = {}
-    for row in records:
-        for tool in _to_tool_list(row.get("tools")):
-            name = tool.get("name")
-            if name:
-                counts.setdefault(name, Counter())[_description(tool)] += 1
-    return {name: counter.most_common(1)[0][0] for name, counter in counts.items()}
+    anchor: dict[str, dict[str, str]] = {}
+    for line in text.splitlines():
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        name = raw.get("api_name", "")
+        if not name:
+            continue
+        anchor[name] = {
+            param: str((spec or {}).get("description", ""))
+            for param, spec in (raw.get("parameters") or {}).items()
+            if isinstance(spec, dict)
+        }
+    return anchor
 
 
-def patch_row(
+def _normalise(text: Any) -> str:
+    return str(text or "").strip().lower()
+
+
+def _resolve_key(
+    tool_name: str,
+    key: str,
+    properties: dict[str, Any],
+    anchor: dict[str, dict[str, str]],
+    unmapped: list[str],
+) -> str | None:
+    """Find the parameter ``key`` was renamed to, or None."""
+    original = anchor.get(tool_name, {}).get(key)
+    if original:
+        candidates = [
+            param
+            for param, spec in properties.items()
+            if isinstance(spec, dict) and _normalise(spec.get("description")) == _normalise(original)
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+
+    # Fallback: only when the mapping cannot be ambiguous.
+    if len(unmapped) == 1:
+        generic = [p for p, spec in properties.items() if isinstance(spec, dict) and p in _GENERIC_PARAM_NAMES]
+        if len(generic) == 1:
+            return generic[0]
+    return None
+
+
+def repair_row(
     tools: list[dict[str, Any]],
     gt_calls: list[dict[str, Any]],
-    canonical: dict[str, str] | None = None,
-) -> tuple[list[dict[str, Any]], bool, int]:
-    """Repair one row; return ``(tools, drop, n_twins_removed)``.
+    anchor: dict[str, dict[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]] | None, int]:
+    """Rename label keys to the schema's current parameter names.
 
-    ``drop`` is True when the label cannot be matched against the declared
-    schema (defect 1); ``n_twins_removed`` counts indistinguishable distractors
-    withheld (defect 2).  ``canonical`` maps a tool name to the description it
-    carries elsewhere in the file, which recovers the twin of a
-    ``desc_replace`` label tool whose description was swapped away.
+    Returns ``(repaired_calls, keys_renamed)``; ``repaired_calls`` is None when
+    a key cannot be mapped and the row has to be dropped.
     """
-    canonical = canonical or {}
-    gt_names = {c.get("name", "") for c in gt_calls}
+    anchor = anchor or {}
+    by_name = {t.get("name"): t for t in tools}
 
-    # Descriptions no declared distractor may duplicate: those of the label
-    # tools, plus the pre-swap description of a ``desc_replace`` label tool.
-    protected: set[str] = set()
-    # The swapped tool itself: it now carries the unrelated description, and
-    # must not be mistaken for a twin of its own original.
-    replaced: set[str] = set()
-    for tool in tools:
-        name = tool.get("name", "")
-        if name in gt_names:
-            protected.add(_description(tool))
-        original = canonical.get(name)
-        if original and original != _description(tool):
-            replaced.add(name)
-            protected.add(original)
-
-    kept: list[dict[str, Any]] = []
-    twins_removed = 0
-    for tool in tools:
-        name = tool.get("name", "")
-        if name not in gt_names and name not in replaced and _description(tool) in protected:
-            twins_removed += 1
-            continue
-        kept.append(tool)
-
-    declared = {t.get("name"): t for t in kept}
+    repaired: list[dict[str, Any]] = []
+    renamed_total = 0
     for call in gt_calls:
-        tool = declared.get(call.get("name"))
+        tool = by_name.get(call.get("name"))
         if tool is None:
-            continue  # label tool not declared at all: a different defect
+            repaired.append(call)  # label tool not declared: a different defect
+            continue
         # A parquet round trip unifies nested struct fields, so a property the
-        # tool does not declare comes back as ``key: None`` instead of being
-        # absent — both mean "not declared".
+        # tool does not declare comes back as ``key: None`` instead of absent.
         properties = ((tool.get("parameters") or {}).get("properties")) or {}
-        if any(properties.get(key) is None for key in (call.get("arguments") or {})):
-            return kept, True, twins_removed
-    return kept, False, twins_removed
+        args = dict(call.get("arguments") or {})
+        unmapped = [k for k in args if properties.get(k) is None]
+        if not unmapped:
+            repaired.append({"name": call.get("name", ""), "arguments": args})
+            continue
+
+        for key in unmapped:
+            new_key = _resolve_key(call.get("name", ""), key, properties, anchor, unmapped)
+            if new_key is None:
+                return None, renamed_total
+            args[new_key] = args.pop(key)
+            renamed_total += 1
+        repaired.append({"name": call.get("name", ""), "arguments": args})
+    return repaired, renamed_total
 
 
-def patch_frame(df, name: str) -> tuple[Any, dict[str, int]]:
-    """Patch one parquet frame in memory; returns ``(df, stats)``."""
-    stats = {
-        "rows_in": len(df),
-        "dropped_unmatchable_label": 0,
-        "rows_with_twin_removed": 0,
-        "twins_removed": 0,
-        "rows_out": 0,
-    }
+def _relabel(label: str, calls: list[dict[str, Any]]) -> str:
+    """Rebuild the human-readable label string, keeping a Reference trailer."""
+    if not calls:
+        return label
+    rebuilt = _format_gt(calls)
+    match = _REFERENCE_RE.search(label or "")
+    return rebuilt + ("\nReference:\n" + match.group(1) if match else "")
+
+
+# ============================================================================
+# Frame / file plumbing
+# ============================================================================
+
+
+def patch_frame(df, name: str, anchor: dict[str, dict[str, str]] | None = None) -> tuple[Any, dict[str, int]]:
+    """Repair one parquet frame in memory; returns ``(df, stats)``."""
+    import pandas as pd
+
+    stats = {"rows_in": len(df), "rows_repaired": 0, "keys_renamed": 0, "rows_dropped": 0, "rows_out": 0}
     out = []
-    records = df.to_dict("records")
-    canonical = _canonical_descriptions(records)
-    for row in records:
+    for row in df.to_dict("records"):
         extra = row.get("extra_info")
         extra = dict(extra) if isinstance(extra, dict) else {}
         gt_calls = _to_call_list(extra.get("ground_truth_calls"))
-        tools, drop, twins = patch_row(_to_tool_list(row.get("tools")), gt_calls, canonical)
-        if drop:
-            stats["dropped_unmatchable_label"] += 1
-            continue
-        stats["twins_removed"] += twins
-        if twins:
-            stats["rows_with_twin_removed"] += 1
-        row["tools"] = tools
-        extra["tools"] = tools
+        if gt_calls:
+            repaired, renamed = repair_row(_to_tool_list(row.get("tools")), gt_calls, anchor)
+            if repaired is None:
+                stats["rows_dropped"] += 1
+                continue
+            if renamed:
+                stats["rows_repaired"] += 1
+                stats["keys_renamed"] += renamed
+                gt_calls = repaired
+                extra["ground_truth_calls"] = json.dumps(gt_calls, ensure_ascii=False)
+                reward_model = dict(row.get("reward_model") or {})
+                reward_model["ground_truth"] = _relabel(reward_model.get("ground_truth", ""), gt_calls)
+                row["reward_model"] = reward_model
+
         extra["index"] = len(out)  # keep the id compact after dropping rows
         row["extra_info"] = extra
         out.append(row)
 
-    import pandas as pd
-
     stats["rows_out"] = len(out)
     print(
         f"[patch] {name}: {stats['rows_in']} rows -> {stats['rows_out']} "
-        f"(dropped {stats['dropped_unmatchable_label']} unmatchable-label, "
-        f"withheld {stats['twins_removed']} twin tool(s) from "
-        f"{stats['rows_with_twin_removed']} rows)"
+        f"(repaired {stats['rows_repaired']} rows / {stats['keys_renamed']} keys, "
+        f"dropped {stats['rows_dropped']} unresolvable)"
     )
     return pd.DataFrame(out), stats
 
 
-def patch_file(path: Path, *, in_place: bool, dry_run: bool) -> None:
+def patch_file(path: Path, *, in_place: bool, dry_run: bool, anchor: dict[str, dict[str, str]] | None) -> None:
     import pandas as pd
 
-    df = pd.read_parquet(path)
-    patched, _ = patch_frame(df, path.name)
-    if dry_run or in_place:
-        if not dry_run:
-            backup = path.with_suffix(path.suffix + ".bak")
-            shutil.copy2(path, backup)
-            print(f"[patch] backup -> {backup}")
+    patched, _ = patch_frame(pd.read_parquet(path), path.name, anchor)
     if dry_run:
         print(f"[patch] dry run: {path} not written")
         return
+    if in_place:
+        backup = path.with_suffix(path.suffix + ".bak")
+        shutil.copy2(path, backup)
+        print(f"[patch] backup -> {backup}")
     target = path if in_place else path.with_name(path.stem + ".patched" + path.suffix)
     patched.to_parquet(target, index=False)
     print(f"[patch] wrote {target}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Patch pre-3483165c tool_rl parquets in place.")
+    parser = argparse.ArgumentParser(description="Repair pre-3483165c tool_rl parquets (label parameter keys).")
     parser.add_argument("--data-dir", required=True, help="Directory holding train.parquet / val.parquet")
     parser.add_argument(
         "--files",
@@ -240,6 +297,9 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Report the changes without writing anything.")
     args = parser.parse_args()
 
+    anchor = _load_sealtools_anchor()
+    print(f"[patch] description anchor: {len(anchor)} tools")
+
     data_dir = Path(args.data_dir).expanduser()
     for name in (n.strip() for n in args.files.split(",")):
         if not name:
@@ -248,7 +308,7 @@ def main() -> None:
         if not path.exists():
             print(f"[patch] {path} not found — skipped")
             continue
-        patch_file(path, in_place=args.in_place, dry_run=args.dry_run)
+        patch_file(path, in_place=args.in_place, dry_run=args.dry_run, anchor=anchor)
 
 
 if __name__ == "__main__":

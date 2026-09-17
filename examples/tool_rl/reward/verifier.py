@@ -568,6 +568,7 @@ def _count_preceded_by_think(text: str, total: int) -> int:
 def check_tool_call_format(
     trajectory: list[dict[str, Any]],
     label_calls: list[dict[str, Any]] | None = None,
+    available_tools: list[dict[str, Any]] | None = None,
 ) -> float:
     """Check model tool calls against ground-truth label calls (Dim 3).
 
@@ -581,9 +582,16 @@ def check_tool_call_format(
       1. Label provides tool calls: score = ``matched / len(label_calls)``.
       2. Label provides no tool calls: score 1.0 (no detection).
 
+    A declared tool that is indistinguishable from the label tool (identical
+    description) also counts as a match — the label records the API the query
+    was reverse-engineered from, not a uniquely correct answer.  Such siblings
+    need not share parameter names, so their calls are matched on arity and
+    value *types* instead of names.
+
     Args:
         trajectory: Normalized trajectory.
         label_calls: Ground truth tool calls (``[{"name": …, "arguments": {…}}]``).
+        available_tools: Declared tool schemas (used to spot sibling tools).
 
     Returns:
         Score in [0.0, 1.0].
@@ -600,7 +608,7 @@ def check_tool_call_format(
 
     output_calls = parse_qwen_tool_calls(all_text, allow_bare_json=False)
     n = len(label_calls)
-    matched = _count_label_matches(output_calls, label_calls)
+    matched = _count_label_matches(output_calls, label_calls, _tool_equivalence(available_tools))
     score = matched / n
 
     logger.debug("[dim3] label=%d matched=%d → %.3f", n, matched, score)
@@ -629,23 +637,45 @@ def _values_types_match(v1: Any, v2: Any) -> bool:
 def _call_completely_matches(
     output_call: dict[str, Any],
     label_call: dict[str, Any],
+    same_tool=None,
 ) -> bool:
     """A call completely matches a label call when the tool name agrees, the
     output provides exactly the label's parameter names, and every parameter
     value has a compatible type. Values themselves are ignored.
+
+    ``same_tool`` widens the name check to indistinguishable sibling tools;
+    because siblings may declare different parameter names, their calls are
+    compared on arity and value types instead of parameter names.
     """
-    if output_call.get("name", "") != label_call.get("name", ""):
-        return False
+    o_name = output_call.get("name", "")
+    l_name = label_call.get("name", "")
     o_args = output_call.get("arguments", {}) or {}
     l_args = label_call.get("arguments", {}) or {}
-    if set(o_args.keys()) != set(l_args.keys()):
+
+    if o_name == l_name:
+        if set(o_args.keys()) != set(l_args.keys()):
+            return False
+        return all(_values_types_match(o_args[k], l_args[k]) for k in l_args)
+
+    if same_tool is None or not same_tool(o_name, l_name):
         return False
-    return all(_values_types_match(o_args[k], l_args[k]) for k in l_args)
+    if len(o_args) != len(l_args):
+        return False
+    remaining = list(o_args.values())
+    for value in l_args.values():
+        for i, candidate in enumerate(remaining):
+            if _values_types_match(value, candidate):
+                remaining.pop(i)
+                break
+        else:
+            return False
+    return True
 
 
 def _count_label_matches(
     output_calls: list[dict[str, Any]],
     label_calls: list[dict[str, Any]],
+    same_tool=None,
 ) -> int:
     """Count label calls completely matched by an output call (one-to-one)."""
     used: set[int] = set()
@@ -654,7 +684,7 @@ def _count_label_matches(
         for oi, out_call in enumerate(output_calls):
             if oi in used:
                 continue
-            if _call_completely_matches(out_call, label_call):
+            if _call_completely_matches(out_call, label_call, same_tool):
                 used.add(oi)
                 matched += 1
                 break
@@ -855,6 +885,70 @@ def _param_content_score(
     return max(0.0, correct / len(label_args) - penalty)
 
 
+def _param_value_score(
+    label_args: dict[str, Any],
+    output_args: dict[str, Any],
+) -> float:
+    """Score a sibling-tool call by argument **values** (names may differ).
+
+    Indistinguishable siblings need not declare the same parameter names
+    (Seal-Tools' ``getMatchInfo.match_id`` vs
+    ``getFootballMatchInfo.query_text`` — even their descriptions differ), so
+    the only thing left to compare is the payload.  Same shape as
+    :func:`_param_content_score`: fraction of label values matched, with a
+    50 % penalty on leftover output values.
+    """
+    if not label_args and not output_args:
+        return 1.0
+    if not label_args:
+        return 0.0
+
+    remaining = list(output_args.values())
+    correct = 0
+    for value in label_args.values():
+        for i, candidate in enumerate(remaining):
+            if _values_match(value, candidate):
+                remaining.pop(i)
+                correct += 1
+                break
+    extra = len(remaining)
+    penalty = 0.5 * extra / max(len(label_args) + extra, 1)
+    return max(0.0, correct / len(label_args) - penalty)
+
+
+def _tool_equivalence(
+    available_tools: list[dict[str, Any]] | None,
+):
+    """Build a "same tool" predicate over the declared tools.
+
+    Two declared tools that carry the **same description** are
+    indistinguishable to the caller (the model only sees name + description +
+    parameters): Seal-Tools puts e.g. ``getMatchInfo`` and
+    ``getFootballMatchInfo`` in one field with byte-identical descriptions and
+    the label records only the API the query was reverse-engineered from.
+    A call to either must therefore be accepted as the label's tool.
+
+    Args:
+        available_tools: Declared tool schemas.
+
+    Returns:
+        ``same_tool(output_name, label_name) -> bool``.
+    """
+    descriptions: dict[str, str] = {}
+    for tool in (available_tools or []):
+        name = tool.get("name", "")
+        if name:
+            descriptions[name] = str(tool.get("description", "")).strip().lower()
+
+    def same_tool(output_name: str, label_name: str) -> bool:
+        if output_name == label_name:
+            return True
+        description = descriptions.get(output_name, "")
+        return bool(description) and description == descriptions.get(label_name, "")
+
+    return same_tool
+
+
 def _format_call(call: dict[str, Any]) -> str:
     """Format a tool call as ``name(key=val, ...)`` for logging."""
     name = call.get("name", "?")
@@ -891,6 +985,7 @@ def _guess_penalty(n_emitted: int) -> float:
 def match_tool_calls_against_label(
     output_calls: list[dict[str, Any]],
     label_calls: list[dict[str, Any]],
+    available_tools: list[dict[str, Any]] | None = None,
 ) -> tuple[float, float]:
     """Order-independent matching of tool calls against ground truth labels.
 
@@ -899,6 +994,12 @@ def match_tool_calls_against_label(
 
         name_score  = matched / (M + N - matched)
         param_score = sum(matched_pair_scores) / (M + N - matched)
+
+    A declared tool that is indistinguishable from the label tool (identical
+    description) counts as a name match: the label records which API the query
+    was reverse-engineered from, not a uniquely correct answer, so picking the
+    sibling is equally valid.  Sibling tools may declare different parameter
+    names, so their pair score is computed over argument **values**.
 
     If **no** label call is matched, both scores are set to
     ``-min(0.1 * M, 1.0)`` (blind-guessing penalty). When both are empty,
@@ -934,6 +1035,7 @@ def match_tool_calls_against_label(
 
     matched_indices: set[int] = set()
     pair_param_scores: list[float] = []
+    same_tool = _tool_equivalence(available_tools)
 
     for l_call in label_calls:
         l_name = l_call.get("name", "")
@@ -944,10 +1046,15 @@ def match_tool_calls_against_label(
         for oi, o_call in enumerate(output_calls):
             if oi in matched_indices:
                 continue
-            if o_call.get("name", "") != l_name:
+            o_name = o_call.get("name", "")
+            if not same_tool(o_name, l_name):
                 continue
             o_args = o_call.get("arguments", {}) or {}
-            ps = _param_content_score(l_args, o_args)
+            ps = (
+                _param_content_score(l_args, o_args)
+                if o_name == l_name
+                else _param_value_score(l_args, o_args)
+            )
             if ps > best_param_score:
                 best_param_score = ps
                 best_idx = oi
@@ -1053,6 +1160,7 @@ def compute_verifier_scores(
         "tool_call_format": check_tool_call_format(
             trajectory,
             label_calls=label_calls,
+            available_tools=available_tools,
         ),
     }
 

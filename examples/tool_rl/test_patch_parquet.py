@@ -1,5 +1,10 @@
 """Tests for the pre-3483165c parquet migration (``patch_parquet.py``).
 
+The migration renames label parameter keys to the schema's current names —
+a rename in the declared schema must be mirrored in the label — using the
+property *description* as the anchor back to the original parameter, and drops
+only the rows whose key cannot be mapped.
+
 Run from the repo root:
 
 .. code-block:: bash
@@ -19,97 +24,128 @@ _REPO_ROOT = str(Path(__file__).resolve().parents[2])
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.tool_rl.patch_parquet import patch_frame, patch_row  # noqa: E402
+from examples.tool_rl.patch_parquet import patch_frame, repair_row  # noqa: E402
 
-_MATCH_DESC = "Retrieve information about a football match"
+_DESC = "The country you want a policy for"
 
 
-def _tool(name: str, description: str, props: list[str]) -> dict:
+def _tool(properties: dict) -> dict:
     return {
-        "name": name,
-        "description": description,
-        "parameters": {"type": "object", "properties": {p: {"type": "string"} for p in props}},
+        "name": "getEnergyPolicy",
+        "description": "Retrieve an energy policy",
+        "parameters": {"type": "object", "properties": properties},
     }
 
 
-def _menu() -> list[dict]:
-    return [
-        _tool("getFootballMatchInfo", _MATCH_DESC, ["query_text"]),
-        _tool("getMatchInfo", _MATCH_DESC, ["match_id"]),
-        _tool("getFootballScore", "Retrieve the current score of a football match", ["match_id"]),
+def test_repairs_key_with_the_description_anchor():
+    """`country` -> `input_value` because the descriptions agree."""
+    tools = [_tool({"input_value": {"type": "string", "description": _DESC}})]
+    anchor = {"getEnergyPolicy": {"country": _DESC}}
+
+    repaired, renamed = repair_row(tools, [{"name": "getEnergyPolicy", "arguments": {"country": "China"}}], anchor)
+
+    assert repaired == [{"name": "getEnergyPolicy", "arguments": {"input_value": "China"}}]
+    assert renamed == 1
+
+
+def test_ignores_consistent_rows():
+    tools = [_tool({"country": {"type": "string", "description": _DESC}})]
+    calls = [{"name": "getEnergyPolicy", "arguments": {"country": "China"}}]
+
+    repaired, renamed = repair_row(tools, calls, {"getEnergyPolicy": {"country": _DESC}})
+
+    assert repaired == calls and renamed == 0
+
+
+def test_anchor_disambiguates_two_generic_properties():
+    """Only the description tells `input_value` from `config_option`."""
+    tools = [
+        _tool(
+            {
+                "input_value": {"type": "string", "description": "The country you want a policy for"},
+                "config_option": {"type": "string", "description": "The year of the policy"},
+            }
+        )
+    ]
+    anchor = {"getEnergyPolicy": {"country": "The country you want a policy for", "year": "The year of the policy"}}
+    calls = [{"name": "getEnergyPolicy", "arguments": {"country": "China", "year": "2024"}}]
+
+    repaired, renamed = repair_row(tools, calls, anchor)
+
+    assert repaired == [{"name": "getEnergyPolicy", "arguments": {"input_value": "China", "config_option": "2024"}}]
+    assert renamed == 2
+
+
+def test_falls_back_to_a_single_generic_property():
+    tools = [_tool({"input_value": {"type": "string", "description": _DESC}})]
+
+    repaired, renamed = repair_row(tools, [{"name": "getEnergyPolicy", "arguments": {"country": "China"}}], {})
+
+    assert repaired == [{"name": "getEnergyPolicy", "arguments": {"input_value": "China"}}]
+    assert renamed == 1
+
+
+def test_drops_unresolvable_key():
+    """Two generic candidates and no anchor: refusing beats guessing."""
+    tools = [
+        _tool(
+            {
+                "input_value": {"type": "string", "description": "A"},
+                "config_option": {"type": "string", "description": "B"},
+            }
+        )
     ]
 
+    repaired, renamed = repair_row(tools, [{"name": "getEnergyPolicy", "arguments": {"country": "China"}}], {})
 
-def test_drops_row_whose_label_key_left_the_schema():
-    kept, drop, twins = patch_row(_menu(), [{"name": "getFootballMatchInfo", "arguments": {"match_id": "X"}}])
-    assert drop is True
-    assert twins == 1  # the twin is withheld first, then the row is dropped
-
-
-def test_keeps_row_whose_label_key_matches():
-    kept, drop, _ = patch_row(_menu(), [{"name": "getFootballMatchInfo", "arguments": {"query_text": "X"}}])
-    assert drop is False
-    assert [t["name"] for t in kept] == ["getFootballMatchInfo", "getFootballScore"]
-
-
-def test_withholds_twin_of_a_desc_replace_label_tool():
-    """A swapped description must not hide the sibling the original matched."""
-    canonical = {
-        "getFootballMatchInfo": _MATCH_DESC.lower(),
-        "getMatchInfo": _MATCH_DESC.lower(),
-        "getFootballScore": "retrieve the current score of a football match",
-    }
-    tools = _menu()
-    tools[0]["description"] = "Simulate the orbit of a satellite around a planet."
-
-    kept, drop, twins = patch_row(tools, [], canonical)
-
-    assert drop is False and twins == 1
-    assert [t["name"] for t in kept] == ["getFootballMatchInfo", "getFootballScore"]
+    assert repaired is None and renamed == 0
 
 
 def test_patch_frame_round_trips_through_pandas(tmp_path):
     """pandas returns nested columns as arrays — the frame path must survive it."""
     import pandas as pd
 
+    good = {"country": {"type": "string", "description": _DESC}}
+    renamed = {"input_value": {"type": "string", "description": _DESC}}
+    # A sibling of the label tool: identical description, must stay in the menu.
+    sibling = _tool(renamed)
+    sibling["name"] = "getPolicyInfo"
+    label_tool = _tool(renamed)
+
+    def row(index: int, arguments: dict, tool: dict) -> dict:
+        return {
+            "data_source": "tool_rl",
+            "prompt": [{"role": "user", "content": "energy policy"}],
+            "tools": [tool, sibling],
+            "reward_model": {"style": "rule", "ground_truth": "Ground truth:\n  getEnergyPolicy({...})"},
+            "extra_info": {
+                "index": index,
+                "tools": [tool, sibling],
+                "ground_truth_calls": json.dumps([{"name": "getEnergyPolicy", "arguments": arguments}]),
+                "augmented": "",
+            },
+        }
+
     rows = [
-        {
-            "data_source": "tool_rl",
-            "prompt": [{"role": "user", "content": "match info"}],
-            "tools": _menu(),
-            "reward_model": {"style": "rule", "ground_truth": "Ground truth:\n  getFootballMatchInfo(...)"},
-            "extra_info": {
-                "index": 0,
-                "tools": _menu(),
-                "ground_truth_calls": json.dumps([{"name": "getFootballMatchInfo", "arguments": {"query_text": "X"}}]),
-                "augmented": "",
-            },
-        },
-        {  # unwinnable row: label keeps the pre-rename key
-            "data_source": "tool_rl",
-            "prompt": [{"role": "user", "content": "match info"}],
-            "tools": _menu(),
-            "reward_model": {"style": "rule", "ground_truth": "Ground truth:\n  getFootballMatchInfo(...)"},
-            "extra_info": {
-                "index": 1,
-                "tools": _menu(),
-                "ground_truth_calls": json.dumps([{"name": "getFootballMatchInfo", "arguments": {"match_id": "X"}}]),
-                "augmented": "",
-            },
-        },
+        row(0, {"country": "China"}, label_tool),  # damaged: schema renamed the key
+        row(1, {"country": "China"}, _tool(good)),  # already consistent
     ]
     path = tmp_path / "train.parquet"
     pd.DataFrame(rows).to_parquet(path, index=False)
 
-    patched, stats = patch_frame(pd.read_parquet(path), path.name)
+    patched, stats = patch_frame(pd.read_parquet(path), path.name, {"getEnergyPolicy": {"country": _DESC}})
 
-    assert stats["rows_in"] == 2 and stats["rows_out"] == 1
-    assert stats["dropped_unmatchable_label"] == 1
-    assert stats["twins_removed"] == 1
-    row = patched.to_dict("records")[0]
-    assert [t["name"] for t in row["tools"]] == ["getFootballMatchInfo", "getFootballScore"]
-    assert row["extra_info"]["index"] == 0
-    assert [t["name"] for t in row["extra_info"]["tools"]] == ["getFootballMatchInfo", "getFootballScore"]
+    assert stats["rows_in"] == 2 and stats["rows_out"] == 2
+    assert stats["rows_repaired"] == 1 and stats["keys_renamed"] == 1 and stats["rows_dropped"] == 0
+
+    records = patched.to_dict("records")
+    assert [r["extra_info"]["index"] for r in records] == [0, 1]
+    repaired_calls = json.loads(records[0]["extra_info"]["ground_truth_calls"])
+    assert repaired_calls == [{"name": "getEnergyPolicy", "arguments": {"input_value": "China"}}]
+    assert "input_value" in records[0]["reward_model"]["ground_truth"]
+    # The sibling is still declared: the reward accepts either tool.
+    assert [t["name"] for t in records[0]["tools"]] == ["getEnergyPolicy", "getPolicyInfo"]
+    assert [t["name"] for t in records[0]["extra_info"]["tools"]] == ["getEnergyPolicy", "getPolicyInfo"]
 
 
 if __name__ == "__main__":

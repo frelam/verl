@@ -23,13 +23,23 @@ Dim 1 — rule-based, order-independent matching against ground-truth labels:
   flooring at 0.0 would invert the ordering: an undeclared call would
   outscore a declared-but-unneeded one.
 
+  A declared tool that is indistinguishable from the label tool — same
+  description, e.g. Seal-Tools' ``getMatchInfo`` /
+  ``getFootballMatchInfo`` (identical descriptions, both take a match id) —
+  counts as a name match.  Such siblings may declare different parameter
+  names, so the pair is scored on argument **values**.  The dataset's
+  ``calling`` field records the API the query was reverse-engineered from,
+  not a uniquely correct answer, so choosing either sibling is legitimate.
+
 Dim 2 — Verifier (format, answer-agnostic):
   0.6 if all tool_calls after reasoning + 0.4 × count/N for think before
   each call.
 
 Dim 3 — Verifier (tool call format vs label):
   1/N per label call completely matched (name + param names + param types);
-  full score when the label has no tool calls.
+  full score when the label has no tool calls.  An indistinguishable sibling
+  tool counts as a match here too, and — since siblings may name their
+  parameters differently — its call is matched on arity and value types.
 
 No-tool behaviour shaping (``TOOL_RL_ABSTAIN_MODE=keyword``)
 ------------------------------------------------------------
@@ -304,7 +314,11 @@ def compute_score(
     tool_call_score = verifier["tool_call_format"]
 
     # ── Dim 1: rule-based label matching ──
-    name_score, param_score = match_tool_calls_against_label(output_calls, parsed_gt)
+    # ``available_tools`` lets a call to a declared tool that is
+    # indistinguishable from the label tool (identical description) count as
+    # that tool: the label records which API the query was reverse-engineered
+    # from, not a uniquely correct answer.
+    name_score, param_score = match_tool_calls_against_label(output_calls, parsed_gt, available_tools)
     tool_correctness = 0.5 * name_score + 0.5 * param_score
 
     # Dim 1 undeclared-tool penalty: -0.1 per undeclared call. It must

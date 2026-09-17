@@ -1278,3 +1278,121 @@ def test_load_toolace_keeps_direct_answers_as_negatives(monkeypatch):
     )
     tasks = prepare_data.load_toolace(max_samples=10)
     assert tasks[0]["metadata"]["ground_truth"] == []
+
+
+# ============================================================================
+# Indistinguishable sibling tools — either answer is the label's tool
+# ============================================================================
+
+_SIBLING_A = {
+    "name": "getMatchInfo",
+    "description": "Retrieve information about a football match",
+    "parameters": {
+        "type": "object",
+        "properties": {"match_id": {"type": "string"}},
+        "required": ["match_id"],
+    },
+}
+_SIBLING_B = {
+    "name": "getFootballMatchInfo",
+    "description": "Retrieve information about a football match",
+    "parameters": {
+        "type": "object",
+        "properties": {"query_text": {"type": "string"}},
+        "required": ["query_text"],
+    },
+}
+
+
+def test_sibling_tool_call_is_a_full_match():
+    """Seal-Tools' getMatchInfo / getFootballMatchInfo share a description."""
+    res = compute_score(
+        "tool_rl",
+        _think_call("getMatchInfo", {"match_id": "CoZkh6oR9Y"}),
+        "",
+        _extra_info(
+            tools=[_SIBLING_A, _SIBLING_B, _WEATHER_TOOL],
+            ground_truth_calls=[
+                {"name": "getFootballMatchInfo", "arguments": {"query_text": "CoZkh6oR9Y"}}
+            ],
+        ),
+    )
+    assert res["tool_correctness"] == 1.0
+    assert res["tool_call_format"] == 1.0
+    assert res["score"] == 1.0
+    assert res["pass_check"] == 1.0
+
+
+def test_sibling_works_in_both_directions():
+    res = compute_score(
+        "tool_rl",
+        _think_call("getFootballMatchInfo", {"query_text": "CoZkh6oR9Y"}),
+        "",
+        _extra_info(
+            tools=[_SIBLING_A, _SIBLING_B],
+            ground_truth_calls=[{"name": "getMatchInfo", "arguments": {"match_id": "CoZkh6oR9Y"}}],
+        ),
+    )
+    assert res["tool_correctness"] == 1.0
+
+
+def test_sibling_with_wrong_value_keeps_name_credit_only():
+    res = compute_score(
+        "tool_rl",
+        _think_call("getMatchInfo", {"match_id": "WRONG"}),
+        "",
+        _extra_info(
+            tools=[_SIBLING_A, _SIBLING_B],
+            ground_truth_calls=[
+                {"name": "getFootballMatchInfo", "arguments": {"query_text": "CoZkh6oR9Y"}}
+            ],
+        ),
+    )
+    # Sibling tool counts as the label's tool (name half), value does not.
+    assert res["tool_correctness"] == 0.5
+    assert res["pass_check"] == 0.0
+
+
+def test_same_description_is_required_for_sibling_credit():
+    """A differently-described tool is a plain wrong tool, not a sibling."""
+    res = compute_score(
+        "tool_rl",
+        _think_call("getFootballScore", {"match_id": "CoZkh6oR9Y"}),
+        "",
+        _extra_info(
+            tools=[
+                _SIBLING_B,
+                {
+                    "name": "getFootballScore",
+                    "description": "Retrieve the current score of a football match",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"match_id": {"type": "string"}},
+                        "required": ["match_id"],
+                    },
+                },
+            ],
+            ground_truth_calls=[
+                {"name": "getFootballMatchInfo", "arguments": {"query_text": "CoZkh6oR9Y"}}
+            ],
+        ),
+    )
+    assert res["tool_correctness"] == -0.1
+    assert res["tool_call_format"] == 0.0
+
+
+def test_sibling_credit_needs_the_tool_to_be_declared():
+    """No declared sibling (e.g. tools stripped) → the old strict matching."""
+    res = compute_score(
+        "tool_rl",
+        _think_call("getMatchInfo", {"match_id": "CoZkh6oR9Y"}),
+        "",
+        _extra_info(
+            tools=[_SIBLING_B],
+            ground_truth_calls=[
+                {"name": "getFootballMatchInfo", "arguments": {"query_text": "CoZkh6oR9Y"}}
+            ],
+        ),
+    )
+    # Mis-matched (-0.1) plus the undeclared-tool penalty (-0.1).
+    assert res["tool_correctness"] == -0.2

@@ -833,12 +833,11 @@ def load_apibank(max_samples: int) -> list[dict[str, Any]]:
 # "responses"}]}``).  Samples whose call parameters reference another call's
 # output (``"API_call_N"``, nested calls) are dropped — the pipeline is
 # single-turn with no execution.  Distractors are drawn from the same
-# ``field`` first (hard, same-category negatives), then the global pool —
-# **excluding tools the label cannot be told apart from** (same field and
-# identical description, e.g. ``getMatchInfo`` / ``getFootballMatchInfo``):
-# ``calling`` records the API the query was reverse-engineered from, not a
-# uniquely correct answer, so declaring the twin makes tool selection a coin
-# flip that penalises the equally valid pick.
+# ``field`` first (hard, same-category negatives), then the global pool.
+# Sibling tools that are indistinguishable from the label tool (e.g.
+# ``getMatchInfo`` / ``getFootballMatchInfo``: same field, identical
+# description) stay in the menu on purpose — the reward accepts either, see
+# ``reward/verifier.py:_tool_equivalence``.
 
 _SEAL_TOOLS_REPO = "fairyshine/Seal-Tools"
 _SEAL_TOOLS_TYPE_MAP = {
@@ -879,38 +878,6 @@ def _sealtools_schema(raw: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def _tool_identities(
-    schemas: dict[str, dict[str, Any]],
-    name_to_field: dict[str, str],
-) -> tuple[dict[str, tuple[str, str]], dict[tuple[str, str], list[str]]]:
-    """Map every tool to the identity a caller can actually observe.
-
-    A tool's caller-visible identity is ``(field, description)``: the *name*
-    is exactly what the model is asked to predict, so it carries no evidence
-    about which tool the label wants.
-    """
-    identity = {
-        n: (name_to_field.get(n, ""), str(s.get("description", "")).strip().lower()) for n, s in schemas.items()
-    }
-    peers: dict[tuple[str, str], list[str]] = {}
-    for n, key in identity.items():
-        peers.setdefault(key, []).append(n)
-    return identity, peers
-
-
-def _twin_tool_names(
-    names: set[str],
-    *,
-    identity: dict[str, tuple[str, str]],
-    peers: dict[tuple[str, str], list[str]],
-) -> set[str]:
-    """Tools indistinguishable from any of ``names`` (excluding ``names``)."""
-    twins: set[str] = set()
-    for n in names:
-        twins.update(peers.get(identity.get(n, ("", "")), ()))
-    return twins - set(names)
-
-
 def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
     """Load Seal-Tools train split as single-turn samples."""
     logger.info("Loading Seal-Tools (%s)...", _SEAL_TOOLS_REPO)
@@ -942,17 +909,11 @@ def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
             schemas[schema["name"]] = schema
             fields.setdefault(str(raw.get("field", "")), []).append(schema["name"])
     logger.info("Seal-Tools: %d tools in %d fields", len(schemas), len(fields))
-    identity, peers = _tool_identities(
-        schemas,
-        {n: f for f, names in fields.items() for n in names},
-    )
 
     rng = random.Random(_SEED)
     pool = list(schemas.values())
     tasks: list[dict[str, Any]] = []
     n_nested = 0
-    n_twin_withheld = 0
-    n_ambiguous_label = 0
 
     for line in train_text.splitlines():
         if len(tasks) >= max_samples:
@@ -983,17 +944,6 @@ def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
             continue
 
         gt_names = {c["name"] for c in gt}
-        # A label that requires two indistinguishable tools cannot be inferred
-        # from the prompt at all (nothing tells them apart) — drop it.
-        if len({identity.get(n, ("", "")) for n in gt_names}) != len(gt_names):
-            n_ambiguous_label += 1
-            continue
-        # Withhold tools the label cannot be told apart from.  Keeping them
-        # would make the expected tool a coin flip between equally valid
-        # answers, so the reward would penalise a correct choice.
-        excluded = gt_names | _twin_tool_names(gt_names, identity=identity, peers=peers)
-        if len(excluded) > len(gt_names):
-            n_twin_withheld += 1
         # Hard distractors first: same-field tools (similar functionality).
         # Dedup by name — several GT tools may share one field, which would
         # otherwise add the field's tools once per GT tool (duplicates could
@@ -1005,11 +955,11 @@ def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
                 for n in fields[field]:
                     if n in schemas:
                         same_field.setdefault(n, schemas[n])
-        distractors = _pick_distractors(list(same_field.values()), excluded, _N_DISTRACTORS, rng)
+        distractors = _pick_distractors(list(same_field.values()), gt_names, _N_DISTRACTORS, rng)
         if len(distractors) < _N_DISTRACTORS:
             distractors += _pick_distractors(
                 pool,
-                excluded | {d["name"] for d in distractors},
+                gt_names | {d["name"] for d in distractors},
                 _N_DISTRACTORS - len(distractors),
                 rng,
             )
@@ -1035,13 +985,9 @@ def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
         )
 
     logger.info(
-        "Seal-Tools: %d samples (dropped %d nested/unresolvable, "
-        "%d with mutually indistinguishable label tools; withheld "
-        "indistinguishable twins from %d samples)",
+        "Seal-Tools: %d samples (dropped %d nested/unresolvable)",
         len(tasks),
         n_nested,
-        n_ambiguous_label,
-        n_twin_withheld,
     )
     return tasks
 
