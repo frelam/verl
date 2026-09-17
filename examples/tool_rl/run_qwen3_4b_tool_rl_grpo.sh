@@ -70,15 +70,19 @@
 #   TOOL_RL_REPLAY_MAX_FRACTION=0.2  hard cap on replays per training step, as a
 #                                    fraction of the train batch size (0 = no cap)
 #
-# Cov-KL entropy control (PRIME-RL "Entropy-Mechanism-of-RL"):
-#   - Computed on the actor forward pass (policy_loss.loss_mode=kl_cov).
-#   - This REQUIRES the standard 3-pass forward, so it is mutually exclusive
-#     with algorithm.rollout_correction.bypass_mode (which reuses generation
-#     log probs as old_log_probs and forces loss_mode=bypass_mode). Hence the
-#     script defaults to bypass_mode=False. Set TOOL_RL_BYPASS_MODE=1 to go
-#     back to the cheaper bypass path (and give up the Cov-KL KL penalty).
-#   TOOL_RL_COV_KL_RATIO=0.0002   ratio of top tokens selected for the KL penalty
-#   TOOL_RL_PPO_KL_COEF=1.0       coefficient of the KL penalty term in the loss
+# Policy loss: standard clipped PPO (policy_loss.loss_mode=vanilla).
+#   - The previous loss mode was the Cov-KL variant (kl_cov). kl_cov left the
+#     ratio term *unclipped*, so a rare token with a very large importance
+#     ratio produced an unbounded gradient and could damage the policy.
+#     vanilla applies the PPO clip (clip_ratio_low/high, set below), so those
+#     tokens contribute a bounded objective instead.
+#   - The pre-switch kl_cov version of this script is kept alongside it as
+#     run_qwen3_4b_tool_rl_grpo.sh.bak; TOOL_RL_COV_KL_RATIO and
+#     TOOL_RL_PPO_KL_COEF only take effect in that backup.
+#   - bypass_mode stays off by default (TOOL_RL_BYPASS_MODE=0), so
+#     old_log_probs come from the standard actor forward pass. The original
+#     hard constraint (kl_cov forced the 3-pass forward) no longer applies,
+#     but we keep the synchronous path; set =1 to reuse generation log probs.
 #
 # Ref KL loss (KL(policy || ref) added to the actor loss, GRPO-style):
 #   TOOL_RL_REF_KL=1              on by default; set to 0 to skip the extra
@@ -117,10 +121,8 @@ use_ref_kl=${TOOL_RL_REF_KL:-1}
 ref_kl_coef=${REF_KL_COEF:-0.001}
 ref_kl_type=${REF_KL_TYPE:-low_var_kl}
 
-# Cov-KL entropy control (mutually exclusive with bypass_mode, see header)
-cov_kl_ratio=${TOOL_RL_COV_KL_RATIO:-0.002}
-ppo_kl_coef=${TOOL_RL_PPO_KL_COEF:-1.0}
-# 1 => keep the original bypass path (no Cov-KL); 0 (default) => Cov-KL
+# 1 => reuse generation-time log probs as old_log_probs (cheaper bypass path);
+# 0 (default) => standard actor forward pass for old_log_probs.
 use_bypass=${TOOL_RL_BYPASS_MODE:-0}
 
 rollout_tp=${ROLLOUT_TP:-1}
@@ -170,13 +172,11 @@ export TOOL_RL_REWARD_WEIGHTS=${TOOL_RL_REWARD_WEIGHTS:-'{"tool_correctness":0.7
 DATA=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
-    # Sync/on-policy: reuse the rollout generation-time log probs directly as
-    # old_log_probs, skipping the extra actor forward pass (remember rollout
-    # temperature is 1.0 so the two match). We default to bypass_mode=False
-    # though, because Cov-KL (policy_loss.loss_mode=kl_cov) forces the standard
-    # 3-pass forward and bypass_mode would override loss_mode back to
-    # "bypass_mode". Set TOOL_RL_BYPASS_MODE=1 to take the cheap bypass path
-    # and give up the Cov-KL KL penalty.
+    # Sync/on-policy: the bypass path reuses the rollout generation-time log
+    # probs directly as old_log_probs, skipping the extra actor forward pass
+    # (rollout temperature is 1.0 so the two match). We default to
+    # bypass_mode=False (standard old_log_prob forward); set
+    # TOOL_RL_BYPASS_MODE=1 to take the cheaper bypass path.
     algorithm.rollout_correction.bypass_mode=$([ "$use_bypass" = "1" ] && echo True || echo False)
     data.train_files="$train_files"
     data.val_files="$val_files"
@@ -214,12 +214,11 @@ ACTOR=(
     # slightly larger step.
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
-    # Cov-KL entropy control (PRIME-RL): KL penalty on the tokens with the
-    # largest covariance between per-token advantage and log prob, preventing
-    # entropy collapse. Active only when bypass_mode=False (see DATA header).
-    actor_rollout_ref.actor.policy_loss.loss_mode=kl_cov
-    actor_rollout_ref.actor.policy_loss.kl_cov_ratio=${cov_kl_ratio}
-    actor_rollout_ref.actor.policy_loss.ppo_kl_coef=${ppo_kl_coef}
+    # Standard clipped PPO loss (vanilla). Unlike kl_cov, the PPO clip
+    # (clip_ratio_low/high above) bounds the objective for tokens whose
+    # importance ratio is large, so a single runaway ratio can no longer
+    # produce an unbounded gradient.
+    actor_rollout_ref.actor.policy_loss.loss_mode=vanilla
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
 )
