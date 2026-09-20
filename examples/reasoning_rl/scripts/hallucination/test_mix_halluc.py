@@ -571,3 +571,114 @@ class TestEndToEnd:
         cell = next(e for e in stats["cells"] if e["cell"] == [BRANCH_UNSOLVABLE_BARE, SOURCE_MIP])
         assert cell["shortfall"] > 0
         assert stats["halluc_target_vs_filled"]["filled"] <= 20000
+
+
+class TestStage1Pool:
+    """Section 7.1: stage-1 rows come in as train.parquet + val.parquet.
+
+    Pointing ``--stage1_path`` at stage-1's output *directory* used to read it
+    recursively, which folded stage-1's own val rows into stage-2's train set.
+    These pin the split down in both directions: val out of train, and val kept
+    in val (otherwise a stage-2 run has no old-domain eval signal at all).
+    """
+
+    def stage1_dir(self, tmp_path, n_train=60, n_val=5):
+        path = tmp_path / "stage1"
+        path.mkdir()
+        train = make_cell_rows(BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, n_train, seed=11)
+        val = make_cell_rows(BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, n_val, seed=12)
+        for row in train:
+            row["extra_info"]["task_id"] = f"s1train-{row['extra_info']['task_id']}"
+        for row in val:
+            row["extra_info"]["task_id"] = f"s1val-{row['extra_info']['task_id']}"
+        schema.write_rows_parquet(train, str(path / "train.parquet"))
+        schema.write_rows_parquet(val, str(path / "val.parquet"))
+        return str(path)
+
+    def test_read_stage1_pool_keeps_val_out_of_train(self, tmp_path):
+        train, val = mix_halluc.read_stage1_pool(self.stage1_dir(tmp_path))
+        train_ids = {r["extra_info"]["task_id"] for r in train}
+        val_ids = {r["extra_info"]["task_id"] for r in val}
+        assert train_ids and val_ids
+        assert not (train_ids & val_ids)
+        assert all(task_id.startswith("s1train-") for task_id in train_ids)
+        assert all(task_id.startswith("s1val-") for task_id in val_ids)
+
+    def test_stage1_val_rows_land_in_val_not_train(self, build_dir, tmp_path):
+        stage1 = self.stage1_dir(tmp_path)
+        out = TestEndToEnd().run_mix(build_dir, tmp_path, halluc_total=200, val_size=20, stage1_path=stage1)
+        train = {r["extra_info"]["task_id"] for r in mix_halluc.read_parquet_rows(os.path.join(out, "train.parquet"))}
+        val = mix_halluc.read_parquet_rows(os.path.join(out, "val.parquet"))
+        val_ids = {r["extra_info"]["task_id"] for r in val}
+        assert any(task_id.startswith("s1val-") for task_id in val_ids)
+        assert not any(task_id.startswith("s1val-") for task_id in train)
+        assert all(r["extra_info"]["split"] == "val" for r in val)
+        stats = json.load(open(os.path.join(out, "mix_stats.json")))
+        assert stats["stage1_val_rows_kept_in_val"] == 5
+        assert stats["total_val"] == len(val)
+
+    def test_stage1_train_rows_are_sampled_into_train(self, build_dir, tmp_path):
+        stage1 = self.stage1_dir(tmp_path)
+        out = TestEndToEnd().run_mix(build_dir, tmp_path, halluc_total=200, val_size=20, stage1_path=stage1)
+        train = mix_halluc.read_parquet_rows(os.path.join(out, "train.parquet"))
+        assert any(r["extra_info"]["task_id"].startswith("s1train-") for r in train)
+
+
+class TestNearDedup:
+    """Section 7.2's MinHash pass: reworded stage-1 duplicates must not survive."""
+
+    @staticmethod
+    def long_question():
+        """A ~395-token question, so a two-word edit stays a near-duplicate."""
+        clauses = [
+            f"on day {i} a caravan moves {i * 3} crates from the harbour warehouse to stall {i + 2}"
+            for i in range(1, 25)
+        ]
+        return (
+            "The chronicle records that "
+            + ", and ".join(clauses)
+            + ". How many crates reach the stalls in total?"
+        )
+
+    @classmethod
+    def reworded_question(cls):
+        """The same problem with two words swapped: Jaccard ~0.72, above 0.6."""
+        return cls.long_question().replace("chronicle", "record").replace("harbour", "dock")
+
+    UNRELATED = (
+        "A train leaves the central station travelling at sixty kilometres per hour while a second "
+        "train leaves two hours later from the same platform at ninety kilometres per hour along an "
+        "identical route; how long after the first departure do the two trains meet on the line?"
+    )
+
+    def make_row(self, question, task_id, pair_id=None):
+        extra = {"task_id": task_id}
+        if pair_id:
+            extra["pair_id"] = pair_id
+        return schema.make_row(
+            data_source=SOURCE_GSMIC,
+            question=question,
+            ground_truth=schema.ground_truth_json(schema.ground_truth_payload(solvable=True, answer="42")),
+            template=TEMPLATE_B,
+            branch=BRANCH_SOLVABLE_NUMERIC,
+            extra_info=extra,
+        )
+
+    def test_reworded_duplicate_is_dropped_and_unrelated_row_survives(self):
+        rows = [self.make_row(self.reworded_question(), "dup"), self.make_row(self.UNRELATED, "keep")]
+        kept, dropped, twins = mix_halluc.near_dedup_against_stage1(
+            rows, [self.long_question()], threshold=0.6
+        )
+        assert [row["extra_info"]["task_id"] for row in kept] == ["keep"]
+        assert (dropped, twins) == (1, 0)
+
+    def test_a_dropped_twin_takes_its_pair_with_it(self):
+        rows = [
+            self.make_row(self.reworded_question(), "twin-a", pair_id="falseqa:train:7"),
+            self.make_row(self.UNRELATED, "twin-b", pair_id="falseqa:train:7"),
+        ]
+        kept, dropped, twins = mix_halluc.near_dedup_against_stage1(
+            rows, [self.long_question()], threshold=0.6
+        )
+        assert kept == []
+        assert (dropped, twins) == (2, 1)

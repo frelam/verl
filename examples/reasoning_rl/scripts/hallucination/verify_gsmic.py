@@ -120,6 +120,23 @@ NB_SMOOTHING = 1.0
 NB_CHANCE = 0.50
 NB_POSITIVE_CONTROL_MIN = 0.90
 
+#: Section 4.7's three label axes are "naturally balanced" and its verify bullet
+#: promises the balance is asserted (section 8 lists it too), so each labelled
+#: share must sit within this distance of its documented target, and the share
+#: the generator leaves as ``n/a`` must stay small enough for the reading to mean
+#: anything.
+LABEL_BALANCE_TOLERANCE = 0.05
+LABEL_BALANCE_UNLABELLED_MAX = 0.05
+#: One row of a small fixture is worth more than the tolerance (a 12-row build
+#: moves a share by 8pt per row), so the balance gate only fires once the artifact
+#: is big enough for a 5pt band to mean something.  The real pool is 800 rows.
+LABEL_BALANCE_MIN_ROWS = 100
+LABEL_BALANCE_TARGETS = {
+    "sentence_label": {"in_topic": 0.45, "out_topic": 0.55},
+    "role_label": {"overlapped": 0.50, "nonoverlapped": 0.50},
+    "number_label": {"in_range": 0.50, "out_range": 0.50},
+}
+
 
 # ---------------------------------------------------------------------------
 # independent arithmetic certificate (deliberately not imported from the adapter)
@@ -641,6 +658,33 @@ def audit(rows: list[dict], corpus: dict[str, str], sample: int, seed: int) -> A
             f"5-fold out-of-fold balanced accuracy = {accuracy:.3f} "
             f"(chance {NB_CHANCE:.2f}); vocab = {vocab_size} tokens with "
             f"train doc support >= {NB_MIN_DOC_SUPPORT}",
+        )
+
+    # Section 4.7's balance claim, asserted instead of only printed: the three
+    # axes are what makes the synthesised-distractor pool a *graded* control
+    # rather than a single easy bucket, and section 8 lists "three-way label
+    # balance" as one of the things this audit proves.
+    for axis, targets in LABEL_BALANCE_TARGETS.items():
+        value_counts = collections.Counter(row["extra_info"]["distractor_labels"][axis] for row in rows)
+        unlabelled = sum(count for label, count in value_counts.items() if label not in targets)
+        labelled = total - unlabelled
+        shares = {label: (value_counts.get(label, 0) / labelled if labelled else 0.0) for label in targets}
+        worst = max(abs(shares[label] - target) for label, target in targets.items())
+        detail = (
+            f"{ {label: round(share, 3) for label, share in shares.items()} } "
+            f"(targets {targets}), {unlabelled} n/a of {total} rows"
+        )
+        if total < LABEL_BALANCE_MIN_ROWS:
+            audit.note(
+                f"L3d {axis} balance",
+                f"not gated on {total} rows (needs >= {LABEL_BALANCE_MIN_ROWS} for a "
+                f"{LABEL_BALANCE_TOLERANCE:.2f} band to be meaningful): {detail}",
+            )
+            continue
+        audit.check(
+            f"L3d {axis} balance within {LABEL_BALANCE_TOLERANCE:.2f} of section 4.7",
+            worst <= LABEL_BALANCE_TOLERANCE and unlabelled / total <= LABEL_BALANCE_UNLABELLED_MAX,
+            detail,
         )
 
     return audit

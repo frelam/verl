@@ -432,6 +432,12 @@ def check_contract(rows: list[dict], reporter: Reporter) -> None:
             failures.append(f"{task_id}: a clean row is in the pool (D20 ships perturbed rows only)")
         if info.get("difficulty") != f"{count}ppl":
             failures.append(f"{task_id}: difficulty {info.get('difficulty')!r} != {count}ppl")
+        if count < kk_adapter.MIN_INHABITANTS:
+            # D11 / section 4.1: the 2- and 3-inhabitant tiers are dropped (their
+            # blind-guess floor is 25% / 12.5%), so a small row in the artifact
+            # means the adapter's N >= 4 filter was bypassed -- the reward cannot
+            # tell, it would just train on a coin flip.
+            failures.append(f"{task_id}: {count} inhabitants < the N >= {kk_adapter.MIN_INHABITANTS} floor")
         if info.get("index") != raw_index and info.get("index") is not None:
             failures.append(f"{task_id}: index {info.get('index')!r} != task_id index {raw_index}")
         words = info.get("role_words") or []

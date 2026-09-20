@@ -906,7 +906,16 @@ def check_l3_shortcuts(
         for support in L3_SUPPORT_SWEEP:
             if support == min_support:
                 continue
-            reading = bow_nb_oof(texts, labels, folds=folds, seed=seed, min_support=support)
+            try:
+                reading = bow_nb_oof(texts, labels, folds=folds, seed=seed, min_support=support)
+            except ValueError as exc:
+                # A high support floor can empty the vocabulary for a fold, so no
+                # row of that fold is scored out of fold.  On the full artifact
+                # every sweep point is estimable; on a --limit slice it is not,
+                # and an unhandled ValueError would abort the whole report rather
+                # than annotate one informational sweep point.
+                reporter.note(f"L3d support >= {support} not estimable on {len(rows)} rows ({exc})")
+                continue
             reporter.note(
                 f"L3d support >= {support} reads {reading:.4f}"
                 + (

@@ -177,6 +177,21 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 | `halluc_math_umwp` | UMWP（answerable 两层 / unanswerable 三档，D24） | 新逻辑（§6） |
 | `halluc_math_treecut` | TreeCut（正样本可解 + 负样本四档，D26） | 新逻辑（§6） |
 | `halluc_commonsense_crepe` | CREPE（normal 判断型 / false-presupposition 三档） | 新逻辑（§6） |
+| `halluc_math_main` | 阶段一主池数学题被 §4.7 抽作合成干扰底题的 100 行（D17） | 新逻辑（§6，普通数值分支） |
+
+> **实现口径（2026-09-20 复核）**：`halluc_math_main` 是 §4.7「主池数学题 100」的落地路由键
+> （本表初稿只登记 8 个源；第 9 个键是实现时才需要的——合成行必须与主池行分开记账与监控）。
+> 它只承载 D17 的 100 条合成干扰行，配额计入 §4.8 行 1 的数值 cell（772+200+100=1,072）。
+>
+> **实现口径（2026-09-20 复核）**：`extra_info.difficulty` 沿用阶段一「字符串分桶」约定
+> （`kk_adapter` 写 `"4ppl"` 这类档位串），与 §4.1「`difficulty_tag = len(names)`」的数值读法
+> 差一层映射——人数就是档位串的数字部分，监控分桶等价。落盘类型以本表为准（字符串）。
+>
+> **实现口径（2026-09-20 复核）**：`validate_row(s)` 除本表字段外还硬校验四件事，任一不过即拒绝
+> 落盘（fail closed）：① `extra_info.branch` ∈ §4.8 表 B 的 7 个契约分支键；② `extra_info.template`
+> ∈ {A, B, B_judge, C}；③ `ability == extra_info.domain`（本表 `domain` 同时落两处的映射）；
+> ④ `task_id` **全局唯一**（本表「hard replay 的 dedup key」），冲突按批报出。带选项块的行
+> 选项数必须 = k = 3（D15）。
 
 ---
 
@@ -221,6 +236,10 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
   不得同时进 train 或 val 的同一侧（按组划分 split，避免变体泄漏）。
 - **筛除**：N < 4 的档位不进训练集（瞎猜下限过高：2ppl 25%、3ppl 12.5%）→ 训练池 **≈5,000 组**。
 - `difficulty_tag = len(names)`；`extra_info.perturbation_family` 仅作监控分桶，不参与 reward。
+  > **实现口径（2026-09-20 复核）**：落盘时 `extra_info.difficulty` 是**字符串档位**（`"4ppl"`，
+  > 沿用阶段一的字符串约定，见 §3 注），数值就是 `len(names)`；`task_id` 形态
+  > `kk:{family}:{N}ppl:{index}` 同时证明 N。`verify_kk.py` 现已硬断言 **N ≥ 4**（`MIN_INHABITANTS`），
+  > 2ppl/3ppl 行重新混入会被审计拦下。
 - 保留枚举器作 gold 自检与测试 oracle（免费的、可随时重算的 ground truth）。
 
 ### 4.2 MiP（三档不可解；D12）
@@ -318,6 +337,12 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 - 性质：**可解但含无关干扰条件**，`solvable=true`，`perturbation_type=distracting_condition`。
 - **reward 校验与答案提取保持常规**：与普通数学题完全一样——gold = 原 `answer`，
   期望 `\boxed{答案}`，走现有 `_math_score`（`halluc_math_gsmic` 委托），**不新增任何判分逻辑**。
+  > **实现口径（2026-09-20 复核）**：① 640 行的 gold 去掉了千分位逗号（`1,200` → `1200`）——
+  > `math_verify`/`math_dapo` 对带逗号的字面量解析不稳，数值等价、字符串不同；其余行逐字节等于原
+  > `answer`。② `verify_gsmic.py` 现已把「三组标注配平」做成**硬断言**（§8 承诺、本节称"天然配平"）：
+  > 实测 800 行池 `in_topic/out_topic = 376/424`、`overlapped/nonoverlapped = 373/414`（13 行 `n/a`）、
+  > `in_range/out_range = 385/414`（1 行 `n/a`），三轴各档均在文档目标的 ±5pt 内、`n/a` ≤5%。
+  > ③ 该源的 reward 委托见 §6 注①（无 `halluc_math_gsmic` 专门分支的原因）。
 - 附带资产：242 条 `sentence_template`（全部由 `{role}`/`{number}` 参数化）抽出来当干扰项
   合成引擎（D17，§4.7）；`sentence_label` / `role_label` / `number_label` 三组标注天然配平。
 
@@ -402,6 +427,16 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
   **坑**：可解/不可解两类天然长度不同（351.6 vs 303.6 字符），长度启发式 0.726、BoW NB 0.755，
   属结构性泄漏。**修法**：负类不取"完整题"，改取"剪掉一条非必要边"的版本（句子数/变量数/长度
   分布对齐，可解性不变）；**修完重跑 L3 落到 ≈0.5 才允许入池**（§9 硬门槛）。
+  > **实现口径（2026-09-20 复核）**：① 分层网格落地为 **6 个 `(numVars, ansDepth)` 组合 × 2 theme
+  > = 12 格**，不是 Q11 写的 3×3×2；正样本实测 **41–42 条/格**、负样本 408–409 条/格。
+  > 即「每格 ≥100 条」只对负样本成立——它与 D27 之后的正样本配额（500/12 ≈ 41.7）算术上不相容，
+  > 属 Q11 与 D26 的内部矛盾；实现按 D26 的 500 配额走，格数/每格量记在
+  > `treecut_adapter.py` 的 DEVIATIONS 3。
+  > ② 修复后 L3 实测：长度启发式 **0.5211**、BoW NB **0.5040**（≤ 随机 + 5pt，§9 硬门槛通过，
+  > 阈值比 Q8 的 +10pt 更严）；泄题启发式实测 **0.3269**（选项全部题面外）。
+  > ③ 「修法」句（剪掉一条**非必要**边）与 D26（剪掉的边**必在**根→答案路径上，即缺必要条件的
+  > 构造）读法冲突：实现取 D26 读法（缺必要条件 → 四档诊断有 gold），并在 adapter 的
+  > DEVIATIONS 1 记录。
 - **CREPE**：两个坑——① 标签串是 `'false presupposition'`（**空格**，README 写的下划线串会
   匹配到 0 行）；真值取 train 927 条。② `presuppositions` 仅 **1.1%** 是题面逐字 span（其余是
   转述）→ exact-match 指针 gold 不成立，**只能进判断型/三档**。
@@ -416,6 +451,11 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 
 GSM-IC 的 242 个 `sentence_template` 全部只由 `{role}`（272 个取值）/ `{number}`（55 个）参数化
  → **纯规则可重放**（该 repo 只发布两个 JSON，无 generator）。施加到其他池的可解原题上：
+
+> **实现口径（2026-09-20 复核）**：本节的两个数字是初勘读数，实现用的是**全量重勘**值：
+> 模板库取 GSM-IC 两个文件的**并集 394 条**（含全部 242 条 2step 模板，多出的来自 `mstep`；
+> 「242 条」是 2step 文件的计数），占位符取值域实测 `{role}` **457** / `{number}` **58**。
+> 这不改变契约（仍只由这两个占位符参数化、仍纯规则可重放），只是可用模板比初勘更多。
 
 - **答案与 reward 完全不变**：gold 仍是原答案，走 `_math_score`；不新增判分逻辑、不新增数据源依赖。
 - **难度梯度**直接沿用 GSM-IC 自带三组标注，且天然配平：`sentence_label`（in_topic 45% /
@@ -459,6 +499,12 @@ GSM-IC 的 242 个 `sentence_template` 全部只由 `{role}`（272 个取值）/
 > 计入行 2 的 `(solvable_roles, halluc_logic_kk)` cell（1,600 + 100 = **1,700**），行 1 的数值 cell 为
 > GSM-IC 772 + UMWP 200 + 主池 100 = 1,072。**两侧权重完全不变**（三条都是纯可解行，权重 1），
 > 所以 40/60 与 20,000 总量仍与表 B 逐行一致。
+>
+> **实现口径（2026-09-20 复核，分支键与行号的对应）**：表 B 有 **8 行**，但 `(branch, source)`
+> 记账只有 **7 个分支键**——行 5（TreeCut 正样本）与行 1 共用 `solvable_numeric`：两者的 reward
+> 完全相同（模板 A 数值行、占位选项块不进判分），差别只在 `data_source`（`halluc_math_treecut`）
+> 与选项块来源，因此用 `data_source` 区分、不新增分支键。schema 的分支常量表、§9 reward 矩阵
+> 与 mix 的 15 个 cell 都按这 7 键 + 来源展开。
 
 按**缺陷类型**分布（不可解 12,000；SUM 配对按 3,000 计入"混合"）：
 
@@ -588,6 +634,12 @@ C. man -> teacher
 
 - 模板 A 内**可解与不可解子集必须共用同一套外观**（都先问是否可解、都附选项块、选项个数同为
   k=3），否则"看到选项块 ⇒ 输出 UNSOLVABLE"是 100% 捷径（D18 硬约束）。
+  > **实现口径（2026-09-20 复核）**：为满足这条「共用同一套外观」，落盘文案把上面那行
+  > `其中 <选项ID> 是下列"前提替换"候选中…` 统一写成 `其中 <选项ID> 是下面候选中，能让该问题变为可解的那一项。`
+  > ——「前提替换」是 FalseQA-fake 专用的措辞，写在 UMWP/FalseQA-answerable/TreeCut 的**占位**选项块
+  > 上就是错的（那里没有 premise replacement 这回事），而模板 A 必须**逐字同构**才能防格式记忆。
+  > 这是本节初稿文字与 D18/D26/D27 的同构要求之间的取舍：以同构为准，措辞取两侧都成立的版本。
+  > 另：`schema.question_of(row)` 按模板指令块的前缀把**题面**切出来，供 §7.2 去重使用。
 - UMWP-answerable（D24）/ FalseQA-answerable（D27）行：复用模板 A 外观——选项块由 adapter
   用题面外同类等长替换对**占位**（无正确项），仅为满足 D18；可解时输出 `\boxed{答案}`，
   两层 reward 见 §6（输出选项 ID / `UNSOLVABLE` → 判断层 0 分；FalseQA-answerable 额外接受
@@ -721,6 +773,27 @@ compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs
   双向对称（不可解侧"编造"→ −1、判断型可解侧"误拒"→ −1）。该分支不参与 `math_match`。
 - 任何异常（JSON 坏、抽取越界等）→ log + `{"score": 0.0}`，不抛出（fail-closed）。
 
+> **实现口径（2026-09-20 复核，四则 reward 实现注记）**：
+> ① **`halluc_math_gsmic` 没有专门分支**（与本文伪代码 §6:647-648 的字面写法不同）：
+> `_math_score` 在缺 `math_verify` 的进程里会**静默返回 0.0**——`verl.utils.reward_score.math_verify`
+> 自己吞掉 `ImportError` 并打日志，`_math_score` 等待的 `except ImportError` 因此不可达。本机实测
+> `_math_score('\boxed{42}','42') = 0.0` 而通用数值分支 `math_match('42','42') = True`——若照字面
+> 短路，本节整个 GSM-IC 源的 reward 会全 0 且不报错。代码走通用数值分支（`math_match` →
+> `_math_score` → math_dapo → 阶段一文本比较），对 GSM-IC 的 `{+1, 0}` 语义与本节一致。
+> ② **`math_match` 的三层**：`_math_score` → math_dapo（strict_box 两档）→ 阶段一
+> `logic_answer_match`。第 1 层就是本节的「`_math_score` / math_verify」，第 2 层是 DESIGN.md §6
+> 承诺的 math_dapo fallback；第 3 层是**只增信**的兜底（实测 `042`/`42.000`/`(42)`/`42.`/
+> `2` vs `2.0` 判对，`4.20` vs `42`、`1,2` vs `12`、`12` vs `1.2` 判错），用于 `math_verify` 池
+> 损坏时仍能评普通整数/表达式；`1/2` vs `0.5` 这类分数-小数等价在第 1 层不可用时判 0（假阴性，
+> 宁缺勿错）。三层均只加信，故不严于本节路径。
+> ③ **`pair_task` 嵌在 `if solvable:` 之内**（本文伪代码把它放在顶层）：SUM 行恒 `solvable=true`，
+> 现网无差异；嵌套读法更严——即使出现 `pair_task=true` 且 `solvable=false` 的畸形行，也不会拿到
+> 答案层分数，而是按不可解分支的「编造 → −1」处理。
+> ④ **`norm_match` 自写标点/冠词归一化**（本节说「复用 gsm8k 系 helper」）：阶段一 `gsm8k.py`
+> 并无标点/冠词 helper，实际复用其 `_normalise_text`（大小写/空白）+ 本文件的去标点/去冠词两式；
+> 语义与本节「小写/去标点/去冠词/strip 后精确匹配」一致。另：`parse_ground_truth` 同时接受
+> JSON 字符串（§3 约定）与已解析的 dict（便于单测），四档选项 ID 比较对大小写不敏感。
+
 ---
 
 ## 7. 混合与阶段二接入
@@ -744,6 +817,14 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 `rng.shuffle`、重排 `extra_info.index`、写 `mix_stats.json`（按 ability/source 分桶）。
 `extra_info.split` 在 val 行写 `"val"`。
 
+> **实现口径（2026-09-20 复核）**：`--stage1_path` 传**目录**时按 `train.parquet` / `val.parquet`
+> 分开读（其余 parquet 视作 train 分片），两侧各有去向：train 行按 `--old_domain_ratio` 采样进
+> 阶段二 train，**val 行原样进阶段二 val**（`mix_stats.stage1_val_rows_kept_in_val` 记账）。
+> 这一条是本行「原四域/if 行原样保留」的落地方式，也修掉了递归读目录的隐患——`read_parquet_rows`
+> 走 `**/*.parquet`，直接指向阶段一输出目录会把**阶段一 val 行折进阶段二 train**，正是 §7.2 要防的
+> 泄漏。单文件路径视为 train-only（不产生旧域 val 行）。Q2 的 `--val_size 256` 只描述**幻觉域**
+> 的 val 配额；旧域 val 行是额外追加，故 `total_val` 可能大于 256。
+
 ### 7.2 去重与去污染
 
 - 新数据与阶段一训练 mix 做**池内近重去重**（复用 `dedup.py` 的 MinHash 思路）——**硬前置**：
@@ -751,6 +832,17 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   均与 Big-Math 主池同源。
 - 对评估集（MATH-500 / AIME / GPQA…）的 n-gram + embedding 去污染沿用 `decontaminate.py`；
   若验证集 parquet 未就绪，至少先跑 n-gram 一级并在报告里标注。
+
+> **实现口径（2026-09-20 复核）**：两条去重都在 `mix_halluc.py` 内落地，不再依赖调用方另行开跑。
+> ① **精确文本**（`dedup_against`）与 ② **MinHash 近重**（`dedup.py:minhash_near_dedup`，
+> `--minhash_threshold` 默认 **0.6**，0 关闭）都以**本次抽中的阶段一行**为锚集合：锚行先进
+> 贪心遍历因而必被保留，命中的幻觉行被丢弃；比较对象**只跨池、不池内**——D27 的 FalseQA 双胞胎
+> （label=0/1 只差一个替换片段，Jaccard 远高于阈值）与 UMWP 的配对行必须同时存活，所以被丢的
+> 行若带 `pair_id`，它的孪生行一并退出（`mix_stats.dropped_minhash_pair_twins` 记账）。
+> 相似度算在**题面**上：`schema.question_of()` 先剥掉模板指令块（同一模板所有行共享该块，留着会
+> 虚高无关行的相似度、稀释真重复的相似度）；模板 C 的配对 prompt 返回整段。
+> ③ 评估集去污染（`decontaminate.py` 的 n-gram/embedding 一级）**仍需调用方单独跑**——它要读
+> 评估集 parquet，不在本 mix 的输入范围内；未跑时按本行要求「在报告里标注」。
 
 ### 7.3 阶段二启动方式
 
@@ -793,6 +885,20 @@ examples/reasoning_rl/
     ├── mix_halluc.py
     └── test_*.py                                  # 每个 adapter / mix / schema 的单元测试
 ```
+
+> **实现口径（2026-09-20 复核，清单补充与缺口）**：
+> ① 清单外还有 `scripts/hallucination/conftest.py`（25 行，把 `scripts/` 与本目录加进 `sys.path`，
+> 让 `pytest examples/reasoning_rl/...` 在仓库根直接可跑）——属本清单的既有增量，功能正当。
+> ② **TreeCut 原始数据不能靠 `fetch_raw.py` 拉**：该源是生成器 repo（纯 Python 无依赖，Apache-2.0），
+> `fetch_raw.PENDING_SUBDIRS = ("treecut",)`，`--only treecut` 会以 exit 2 报无匹配文件。构建前需按
+> §4.6 的参数分层在本地生成，或用 `treecut_adapter.py --raw-dir` 指向既有生成物。
+> ③ **§10 的分域监控没有对应交付物**：`reward` 只回标量 `{"score": …}`，训练日志里没有分域/分契约
+> 分支的指标。数据侧的桶列已备齐（`extra_info.branch` / `data_source` / `template` /
+> `perturbation_family` / `answerable_id` / `pair_id`），§10 的各项因此可在 rollout 落盘后离线算出；
+> 「画图脚本」本身不在本清单内，需要时按 §10 单独补（见 §12 Q18）。
+> ④ `halluc_samples.md`（初勘样例通览，f8046fd7 提交）里的 §5「落到 parquet 之后长什么样」是
+> **重设计之前**的口径（K&K clean 入池、MiP 带细粒度诊断、无 SUM/UMWP/TreeCut/CREPE），
+> 只作原始数据形态参考；契约以本文档为准。
 
 ---
 
@@ -847,7 +953,9 @@ examples/reasoning_rl/
   - L1 旁证旗标：统计"rebuttal 指名 gold 片段"的占比（实测 train 仅 56.8%），按此字段
     **抽样 N=50 人工复核**，不通过率 >10% 则整源暂停（§12 Q9）。
   - 替换对结构断言（D21）：每条恰好 3 个选项（D15）；**三个左项全同且逐字出现在题面里**；
-    **三个右项两两不同、与 gold 右项同类等长、且都不出现在题面里**；`correct_option_id ∈ 1..3`。
+    **三个右项两两不同、与 gold 右项同类等长、且都不出现在题面里**；`correct_option_id ∈ {A,B,C}`
+    （§5.1/D15 的字母 ID；本节初稿写的 `1..3` 与 §5.1 自相矛盾，以字母为准——schema 的
+    `build_options` 只产出 A/B/C）。
   - **answerable 侧断言（D27）**：占位替换对 k=3、左项题面内、右项题面外同类等长、
     **无正确项**（`correct_option_id=null`）；gt 键 `solvable_answer=true`、`answer` 非空；
     **按对 split**（同一配对索引的 label=0/1 两条不进异侧 parquet）。
@@ -945,7 +1053,7 @@ examples/reasoning_rl/
 
 | # | 问题 | 当前默认 |
 |---|---|---|
-| Q1 | 是否把原始 spec vendor 进仓库（`HALLUCINATION_RL_SPEC.md`）？ | 是，便于离线查阅与版本对照 |
+| Q1 | 是否把原始 spec vendor 进仓库（`HALLUCINATION_RL_SPEC.md`）？ | 是，便于离线查阅与版本对照。⚠️ **尚未落实**：本文件不是从 spec 迁入的，仓库里也从未有过 `HALLUCINATION_RL_SPEC.md`（只有 §开头记录的 sha256）。需要原始 spec 文件才能补——请提供文件后由 agent vendor 并核对版本 |
 | Q2 | 阶段二 val 切分规模？ | 沿用 `mix.py` 默认 `--val_size 256`（幻觉域内按比例分配） |
 | Q3 | 阶段二怎么切 reward 路径？(a) 新薄 wrapper 脚本 / (b) 现有脚本加默认不变的 `REWARD_PATH` env / (c) 只写手动步骤 | (b)，最小且默认行为不变 |
 | Q4 | 数据源拉取/构建是现在就真跑（需联网），还是先只写代码 + fixture？ | 先写代码 + 小规模真跑验证 |
@@ -962,3 +1070,5 @@ examples/reasoning_rl/
 | Q15 | **SUM 两层 reward 的权重**（判断 0.5 / 答案 0.5）是否调整？ | 默认对半；上线后按 §10 判断层准确率（vs 50% 基线）与答案层准确率再调（如 0.25/0.75） |
 | Q16 | TreeCut 正样本占位选项的干扰强度？（换变量名 / 换变量值比例；换上后是否要求语义合理） | 默认**变量名 / 变量值各 50% 随机**，只要求题面外、不要求语义合理（占位即可）；上线后按 §10 TreeCut 正样本准确率观察是否过易 |
 | Q17 | FalseQA-answerable 答案层匹配噪声与配额让渡确认（D27） | 默认：① 答案层用 `norm_match`（大小写/标点/冠词归一化精确匹配），入池前人工抽检 N=50，误判率 >10% 则只保留短答子集；② 让渡方案默认 **TreeCut 正 1,000→500、GSM-IC 1,200→772**，可改 |
+| Q18 | §10 的分域监控是否要一个交付物（离线统计/绘图脚本）？ | 默认**暂不新增**：数据侧桶列（`branch` / `data_source` / `template` / `perturbation_family` / `answerable_id` / `pair_id`）已备齐，§10 的指标可在 rollout 落盘后离线算；需要固化时再补一个 `scripts/hallucination/monitor_halluc.py`（读 rollout dump → 按 §10 分桶出表） |
+| Q19 | Q9/Q10/Q17 的人工抽检结论由谁出、什么时候出？ | 代码侧已就绪：`verify_falseqa.py --spot-check-out`（L1 旁证 N=50 + 干扰右项 N=50）、`verify_sum.py --spot-check N=100`（含 `--label-file` 人工判读入口）都能导出可复现的抽样清单，但**判定本身是人工步骤**，不自动判罚。上线前需人工过一遍并把结论写进构建报告 |

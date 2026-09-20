@@ -452,12 +452,11 @@ def dedup_against(rows: list[dict], reference_texts: set[str]) -> tuple[list[dic
 
     Design doc section 7.2.  MiP is built from GSM8K/SVAMP/MATH, which the stage-1
     mix also draws on, so an exact-text pass is the cheap floor; the MinHash pass
-    in ``dedup.py`` covers near-duplicates and is run separately by the caller.
+    below covers near-duplicates (reworded statements of the same problem).
     """
     kept, dropped = [], 0
     for row in rows:
-        text = row["prompt"][0]["content"]
-        key = " ".join(text.split()).casefold()
+        key = _question_key(row)
         if key in reference_texts:
             dropped += 1
             continue
@@ -465,8 +464,88 @@ def dedup_against(rows: list[dict], reference_texts: set[str]) -> tuple[list[dic
     return kept, dropped
 
 
+def near_dedup_against_stage1(
+    rows: list[dict], anchor_texts: list[str], *, threshold: float
+) -> tuple[list[dict], int, int]:
+    """Drop rows whose question is a MinHash near-duplicate of a stage-1 row.
+
+    Design doc section 7.2 calls this a *hard prerequisite*: MiP (GSM8K/SVAMP/
+    MATH), UMWP (GSM8K/SVAMP/MultiArith/ASDiv) and SUM (DeepScaleR) share their
+    underlying problems with the Big-Math main pool, so an exact-text pass alone
+    leaves reworded duplicates in the stage-2 mix and silently inflates that
+    slice's weight.
+
+    The stage-1 rows are the *anchors*: they go into the greedy pass first, so
+    they are always kept and a hallucination row that near-duplicates one is the
+    row that gets dropped.  Rows are only ever compared against the stage-1 pool,
+    never against each other -- D27's FalseQA twins (label=0 / label=1 differ by
+    one replaced fragment, Jaccard well above the threshold) must both survive.
+    A dropped row that carries a ``pair_id`` therefore takes its twin with it.
+
+    Similarity is measured on the *presented prompt* (template included).  The
+    shared instruction block is identical for every row of a template, so it
+    lowers the effective bar on the question text; measured on the real pools an
+    unrelated pair still lands well under 0.6 while a reworded duplicate of the
+    same problem lands well above it.
+
+    Returns ``(kept_rows, dropped, dropped_pair_twins)``.
+    """
+    from dedup import minhash_near_dedup
+
+    texts = [str(text) for text in anchor_texts] + [_question_key(row) for row in rows]
+    kept_indices = set(minhash_near_dedup(texts, threshold=threshold))
+    n_anchor = len(anchor_texts)
+    dropped_ids = {row["extra_info"]["task_id"] for i, row in enumerate(rows) if n_anchor + i not in kept_indices}
+    if not dropped_ids:
+        return rows, 0, 0
+    dropped_pairs = {
+        row["extra_info"].get("pair_id")
+        for row in rows
+        if row["extra_info"]["task_id"] in dropped_ids and row["extra_info"].get("pair_id")
+    }
+    kept: list[dict] = []
+    twins = 0
+    for row in rows:
+        info = row["extra_info"]
+        if info["task_id"] in dropped_ids:
+            continue
+        if info.get("pair_id") and info["pair_id"] in dropped_pairs:
+            # Its twin left the pool, so this row can no longer be judged against
+            # a paired counterpart (section 4.3 / D27).
+            twins += 1
+            continue
+        kept.append(row)
+    dropped = len(rows) - len(kept)
+    return kept, dropped, twins
+
+
 def _question_key(row: dict) -> str:
-    return " ".join(row["prompt"][0]["content"].split()).casefold()
+    """Normalised problem text of a row, template instruction block removed."""
+    return " ".join(schema.question_of(row).split()).casefold()
+
+
+def read_stage1_pool(path: str) -> tuple[list[dict], list[dict]]:
+    """Stage-1 ``(train_rows, val_rows)``, kept apart (design doc section 7.1).
+
+    A *directory* is split on ``train.parquet`` / ``val.parquet`` instead of being
+    read recursively: ``read_parquet_rows`` walks ``**/*.parquet``, so pointing
+    ``--stage1_path`` at stage-1's output directory would fold stage-1's own val
+    rows into the stage-2 **train** set -- exactly the leakage section 7.2 works
+    to avoid.  Every other parquet in the directory is treated as train (a sharded
+    dump), and a single file is train-only.
+    """
+    if not os.path.isdir(path):
+        return read_parquet_rows(path), []
+    val_path = os.path.join(path, "val.parquet")
+    val_rows = read_parquet_rows(val_path) if os.path.exists(val_path) else []
+    train_rows: list[dict] = []
+    for file in resolve_parquet_files(path):
+        if os.path.abspath(file) == os.path.abspath(val_path):
+            continue
+        train_rows.extend(read_parquet_rows(file))
+    if not val_rows:
+        print("[mix_halluc] stage-1 directory has no val.parquet; stage-2 val stays hallucination-only")
+    return train_rows, val_rows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -490,6 +569,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--val_size", type=int, default=256, help="hallucination-domain val rows (0 disables)")
     parser.add_argument("--no-dedup", action="store_true", help="skip the section 7.2 exact-text dedup")
+    parser.add_argument(
+        "--minhash_threshold",
+        type=float,
+        default=0.6,
+        help="Section 7.2 near-duplicate Jaccard threshold against the stage-1 pool (0 disables). "
+        "Only runs when --stage1_path is given: rows are compared with stage-1, never with each other, "
+        "so D27's FalseQA twins both survive.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -528,17 +615,24 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- optional stage-1 mixing (section 7.1) ---------------------------------
     old_rows: list[dict] = []
+    old_val_rows: list[dict] = []
     if args.stage1_path:
         stage1_path = os.path.expanduser(args.stage1_path)
         if not (os.path.exists(stage1_path) or os.path.isdir(stage1_path)):
             raise FileNotFoundError(f"--stage1_path does not exist: {stage1_path}")
-        stage1_rows = read_parquet_rows(stage1_path)
+        stage1_rows, old_val_rows = read_stage1_pool(stage1_path)
         n_old = round(filled_total * args.old_domain_ratio / (1.0 - args.old_domain_ratio))
         if n_old > len(stage1_rows):
             print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
             n_old = len(stage1_rows)
         old_rows = rng.sample(stage1_rows, n_old)
         print(f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={args.old_domain_ratio})")
+        if old_val_rows:
+            # Section 7.1 keeps the stage-1 rows verbatim; keeping its val rows in
+            # the stage-2 val is what makes an old-domain regression visible,
+            # because the carved 256 rows are hallucination-only (section 12 Q2).
+            val_rows = list(val_rows) + old_val_rows
+            print(f"[mix_halluc] stage-1 val rows preserved: {len(old_val_rows)}")
     else:
         print("[mix_halluc] no --stage1_path: emitting the hallucination domain only")
 
@@ -561,6 +655,22 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[mix_halluc] dedup: -{dropped_old} overlapping stage-1, -{dropped_self} internal")
     else:
         dropped_old = dropped_self = 0
+
+    # Section 7.2's near-duplicate pass.  It needs the stage-1 pool as the anchor
+    # set, so it is a no-op without --stage1_path (the hallucination domain is
+    # never near-deduped against itself: D27's twins and UMWP's paired rows are
+    # *supposed* to be near-identical).
+    minhash_dropped = minhash_twins = 0
+    if old_rows and args.minhash_threshold > 0:
+        anchor_texts = [_question_key(r) for r in old_rows]
+        rows, minhash_dropped, minhash_twins = near_dedup_against_stage1(
+            rows, anchor_texts, threshold=args.minhash_threshold
+        )
+        print(
+            f"[mix_halluc] section 7.2 MinHash (Jaccard >= {args.minhash_threshold}) against "
+            f"{len(anchor_texts)} stage-1 row(s): -{minhash_dropped} near-duplicates"
+            + (f" (incl. {minhash_twins} pair twin(s) kept atomic)" if minhash_twins else "")
+        )
 
     all_train = rows + old_rows
     rng.shuffle(all_train)
@@ -609,6 +719,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "total_train": len(all_train),
         "total_val": len(val_rows),
+        "stage1_val_rows_kept_in_val": len(old_val_rows),
         "halluc_rows_in_train": len(rows),
         "halluc_target_vs_filled": {"target": args.halluc_total, "filled": len(rows)},
         "requested_ratios": {
@@ -625,6 +736,9 @@ def main(argv: list[str] | None = None) -> int:
         "achieved_ratios": achieved_ratios,
         "dropped_overlapping_stage1": dropped_old,
         "dropped_duplicate_questions": dropped_self,
+        "dropped_minhash_near_duplicates": minhash_dropped,
+        "dropped_minhash_pair_twins": minhash_twins,
+        "minhash_threshold": args.minhash_threshold,
         "cells": cell_report,
         "train_by_ability": dict(Counter(r["ability"] for r in all_train)),
         "train_by_source": dict(Counter(r["extra_info"].get("source", "") for r in all_train)),

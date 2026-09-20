@@ -33,12 +33,18 @@ import json
 import os
 import random
 import sys
+from itertools import count
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import schema
+
+#: Section 3 makes ``extra_info.task_id`` the globally unique hard-replay dedup
+#: key, and ``validate_rows`` rejects collisions, so the fixture's ids carry a
+#: counter: it deliberately builds several rows per (branch, template, source).
+_ROW_IDS = count(1)
 
 OPTIONS = [
     {"id": "A", "text": "man -> child"},
@@ -51,14 +57,15 @@ PLACEHOLDER_OPTIONS = [{"id": "A", "text": "span A"}, {"id": "B", "text": "span 
 def row(
     gt_kwargs, *, template, branch, data_source=schema.SOURCE_GSMIC, options=None, question_b=None, role_words=None
 ):
-    """Build one row through the public builder, with a valid task_id."""
+    """Build one row through the public builder, with a unique task_id."""
+    task_id = f"t-{branch}-{template}-{data_source}-{next(_ROW_IDS)}"
     return schema.make_row(
         data_source=data_source,
         question="A question?",
         ground_truth=schema.build_ground_truth(**gt_kwargs),
         template=template,
         branch=branch,
-        extra_info={"task_id": f"t-{branch}-{template}-{data_source}"},
+        extra_info={"task_id": task_id},
         options=options,
         question_b=question_b,
         role_words=role_words,

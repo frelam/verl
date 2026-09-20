@@ -219,6 +219,14 @@ TEMPLATE_B = "B"  # no options block, answer or refuse
 TEMPLATE_B_JUDGE = "B_judge"  # no options block, verdict only
 TEMPLATE_C = "C"  # two questions labelled A/B, judge-then-solve (SUM, D23)
 
+TEMPLATES = (TEMPLATE_A, TEMPLATE_B, TEMPLATE_B_JUDGE, TEMPLATE_C)
+
+#: D15 pins k = 3 (1 correct + 2 distractors, ids A/B/C) and requires the same k
+#: across the subsets of one template.  ``validate_row`` enforces it on the
+#: artifact, not just inside the option builders: a block of another size means
+#: an adapter bypassed ``build_options``/``build_pair_options``.
+OPTION_COUNT = 3
+
 # Template A is shared by *every* option-block row -- the four-tier unsolvable
 # rows (FalseQA-fake D21, TreeCut negatives D26) and the solvable rows that
 # carry a placeholder block only to satisfy the D18 isomorphism constraint
@@ -397,6 +405,34 @@ def build_ground_truth(**kwargs) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Where a template's instruction block starts, i.e. where the question ends.
+#: Templates A / B / B_judge render ``{question}\n\n<instruction>``; template C
+#: puts its instructions first and has no terminator here (its whole prompt is
+#: returned by :func:`question_of`).
+_QUESTION_TERMINATORS = (
+    "\n\n请判断该问题是否可解",
+    "\n\n若题目给出的信息不足以确定唯一答案",
+)
+
+
+def question_of(row: dict) -> str:
+    """The row's problem text, with the template's instruction block removed.
+
+    Section 7.2's dedup compares *problems*: every row of a template shares the
+    same instruction block, so keeping it would inflate the similarity of two
+    unrelated rows and dilute that of a genuine near-duplicate.  The K&K role
+    instruction and the SUM pair prompt are returned whole -- they are part of
+    what the model is asked.
+    """
+    content = row["prompt"][0]["content"]
+    cut = len(content)
+    for marker in _QUESTION_TERMINATORS:
+        position = content.find(marker)
+        if position != -1:
+            cut = min(cut, position)
+    return content[:cut].strip()
+
+
 def make_row(
     *,
     data_source: str,
@@ -487,6 +523,19 @@ def validate_row(row: dict) -> list[str]:
         problem("extra_info.task_id is empty (hard-replay dedup key)")
     if info.get("difficulty", "") != "" and not isinstance(info.get("difficulty"), str):
         problem("extra_info.difficulty must be a string (stage 1 stores a string)")
+    # The bookkeeping keys are part of the contract, not free-form metadata: the
+    # quota/monitoring code re-reads them, so an unregistered value would silently
+    # drop the row out of every table-B cell (section 4.8) instead of failing.
+    branch = info.get("branch")
+    if branch not in BRANCHES:
+        problem(f"unknown branch {branch!r} (must be a section 4.8 contract branch)")
+    template = info.get("template")
+    if template not in TEMPLATES:
+        problem(f"unknown template {template!r}")
+    domain = info.get("domain")
+    if domain and row.get("ability") != domain:
+        # Section 3 maps `domain` onto BOTH `ability` and `extra_info.domain`.
+        problem(f"ability {row.get('ability')!r} must mirror extra_info.domain {domain!r}")
 
     options = info.get("options") or []
     ids = [opt.get("id") for opt in options]
@@ -494,6 +543,10 @@ def validate_row(row: dict) -> list[str]:
         problem(f"duplicate option ids: {ids}")
     if ids and ids != list(_OPTION_ID_ALPHABET[: len(ids)]):
         problem(f"option ids must be a prefix of A,B,C...: {ids}")
+    if options and len(options) != OPTION_COUNT:
+        # D15: k is a coverage parameter and every subset of a template must share
+        # it, so a block of another size means an adapter bypassed the builders.
+        problem(f"options block has {len(options)} items; D15 pins k={OPTION_COUNT}")
 
     correct = gt.get("correct_option_id")
     role_words = gt.get("role_words")
@@ -546,7 +599,6 @@ def validate_row(row: dict) -> list[str]:
     # always has an options block and that a solvable A row never carries a
     # correct option.  Template C carries both sides of SUM's pair task by
     # construction (design doc section 4.8).
-    template = info.get("template")
     judgment_only = bool(gt.get("judgment_only"))
     has_options_block = bool(options)
     if template == TEMPLATE_A and not has_options_block:
@@ -578,6 +630,24 @@ def validate_row(row: dict) -> list[str]:
     return problems
 
 
+def _duplicate_task_ids(rows: list[dict]) -> list[str]:
+    """Task ids used by more than one row, in first-seen order.
+
+    Section 3 declares ``extra_info.task_id`` globally unique -- it is hard
+    replay's dedup key -- so a collision is a build bug, not a cosmetic issue.
+    """
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for row in rows:
+        task_id = row.get("extra_info", {}).get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        if task_id in seen and task_id not in duplicates:
+            duplicates.append(task_id)
+        seen.add(task_id)
+    return duplicates
+
+
 def validate_rows(rows: list[dict], *, limit: int = 10) -> None:
     """Raise on the first batch of contract violations (fail closed)."""
     failures: list[str] = []
@@ -585,6 +655,10 @@ def validate_rows(rows: list[dict], *, limit: int = 10) -> None:
         failures.extend(validate_row(row))
         if len(failures) >= limit:
             break
+    duplicates = _duplicate_task_ids(rows)
+    if duplicates:
+        shown = ", ".join(repr(task_id) for task_id in duplicates[:limit])
+        failures.append(f"duplicate extra_info.task_id values ({len(duplicates)}): {shown}")
     if failures:
         head = "\n".join(f"  - {f}" for f in failures[:limit])
         raise ValueError(f"{len(failures)}+ schema violations (showing up to {limit}):\n{head}")

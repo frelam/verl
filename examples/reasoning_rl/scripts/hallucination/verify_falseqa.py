@@ -1062,7 +1062,8 @@ def check_l5_cross_question_control(rows: list[dict], reporter: Reporter) -> Non
         "L5 mirror control: an in-passage distractor identifies the gold by its absence",
         usable >= L1_MIN_SAMPLE and leak_rate >= 0.99,
         f"{usable}/{len(diag)} rows constructible, {leaked}/{usable} leaks "
-        f"(the artifact's own blocks offer 0 such candidates, L4a)",
+        f"(the gate is >= {L1_MIN_SAMPLE} *constructible* rows -- a small artifact fails it "
+        f"whatever the leak rate reads; the artifact's own blocks offer 0 such candidates, L4a)",
     )
 
 

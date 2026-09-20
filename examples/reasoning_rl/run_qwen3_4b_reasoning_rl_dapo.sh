@@ -17,11 +17,15 @@
 # Mid-training hallucination-resistance stage (HALLUCINATION_RL_DESIGN.md):
 #   raw data lives under ~/data/reasoning_rl/halluc/raw (see scripts/hallucination/fetch_raw.py);
 #   build each source adapter, the synthesised distractors, then the stage-2 mix:
-#   for a in kk mip falseqa gsmic sum umwp treecut crepe; do
+#   for a in kk mip falseqa gsm_ic sum umwp treecut crepe; do
 #       python examples/reasoning_rl/scripts/hallucination/${a}_adapter.py ; done
 #   python examples/reasoning_rl/scripts/hallucination/distractor_synth.py
+#   #   pass stage-1's output *directory*: mix_halluc splits train.parquet / val.parquet,
+#   #   keeps the stage-1 val rows in the stage-2 val (old-domain regression signal),
+#   #   and runs the section 7.2 MinHash near-dedup against the stage-1 train rows
+#   #   (--minhash_threshold 0 disables it, --no-dedup disables the exact-text pass).
 #   python examples/reasoning_rl/scripts/hallucination/mix_halluc.py \
-#       --stage1_path $DATA_DIR/train.parquet
+#       --stage1_path $DATA_DIR
 # then resume from the stage-1 checkpoint with the new mix AND the new reward file
 # (see REWARD_PATH below):
 #   TRAIN_FILES="['$HOME/data/reasoning_rl/final_halluc/train.parquet']" \
