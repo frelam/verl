@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FalseQA adapter -- false presuppositions with a *pointer* gold (D13/D14, section 4.4).
+"""FalseQA adapter -- replacement-pair diagnosis (D21) and a two-layer answerable twin (D27).
 
 Source: ``github.com/thunlp/FalseQA`` ``dataset/{train,valid,test}.csv``, three
 columns ``question, answer, label`` (2,374 / 982 / 1,374 rows; each split strictly
@@ -23,71 +23,107 @@ a local rewrite of row ``k`` of the ``label=0`` block.  The file is *blocked*, n
 interleaved -- the first N file rows are all ``label=1`` -- so the pairing is
 ``zip(fake_block, real_block)`` and never ``zip(file, file[:N])``.
 
-Why this source keeps the four-tier diagnosis (design doc section 4.4, D13)
-----------------------------------------------------------------------------
+Both sides enter the pool (design doc section 4.3, D27, which supersedes D22):
+829 ``unsolvable_diag`` rows (table B row 7) and 928 ``solvable_two_layer`` rows
+(table B row 3) on the source's ``train`` split -- see deviation 1 for the funnel
+and the reason the two sides are not the same size.  The two members of one pair
+are twins -- their prompts differ by a single fragment -- so they carry the same
+``extra_info.pair_id`` and the mixer keeps them on the same side of the train/val
+boundary (``mix_halluc.enforce_pair_atomicity``).
 
-MiP's defect is a *deletion*: the removed necessary condition is gone from the
-prompt, so there is nothing to point at (section 4.3, D12).  FalseQA's defect is a
-*replacement or insertion*: the false fragment is sitting in the question, and the
-paired real question says exactly which fragment it is.  So the pointer gold is
-known by construction -- a word-level ``difflib`` diff between the pair's two
-questions -- and FalseQA is the only four-tier (``has_diagnosis_label=true``)
-source whose gold does not have to be invented.
+The adapter applies **no quota**: it emits the whole eligible pool.  Section 4.8's
+928-per-side figures are the mixer's cells, not a cap here -- ``mix_halluc``
+selects, and a build that stopped at 928 would silently discard the rows the
+source's other splits contribute to the same artifact.
 
-Contract produced by this adapter (design doc section 4.9.3 table B, rows 3/5):
+The diagnosis side: the replacement-pair option contract (D21)
+--------------------------------------------------------------
 
-===========================  ========  ===========================================
-branch                       template  gold
-===========================  ========  ===========================================
-``unsolvable_diag``          A         ``\\boxed{UNSOLVABLE: <option id>}``
-``solvable_judge`` (D14)     A         ``\\boxed{SOLVABLE}`` (``judgment_only=true``)
-===========================  ========  ===========================================
+Why this source keeps a four-tier diagnosis (section 4.3): MiP's defect is a
+*deletion*, so there is nothing in the prompt to point at (D12); FalseQA's is a
+*replacement*, the false fragment is sitting in the question, and the paired real
+question says exactly which fragment it is.  The pointer gold is therefore known
+by construction -- a word-level ``difflib`` diff (``autojunk=False``) between the
+pair's two questions -- and the option block is a set of **replacement pairs**::
 
-The D14 isomorphism (the hard constraint of sections 4.4 and 9)
----------------------------------------------------------------
+    A. men -> women
+    B. men -> child
+    C. men -> teacher
 
-Both labels get **template A with the same option count (k=3, D15) and the same
-wording**.  A row's option block is three equal-*token*-length spans of *its own*
-question.  If only ``label=1`` carried an option block, "sees an option block =>
-emit UNSOLVABLE" would be a 100% shortcut and the judgment half of the mix would
-be free; if the two sides offered different option counts, the count itself would
-be the shortcut.  ``verify_falseqa.py`` asserts both.
+* **Gold pair** = ``假前提片段 -> 配对真前提片段``: the single visible diff
+  region's fake-side text (the fragment the model can point at) and its real-side
+  text (the fragment that repairs the premise).  Section 4.3's L1 gates: exactly
+  one contiguous visible region, the fake-side fragment occurs verbatim in the
+  presented question, it carries a content word, its first token locates it
+  unambiguously, the real-side fragment is non-empty and does **not** itself occur
+  in the presented question.
+* **Distractors (k-1 = 2, D15)** share the gold's *left* item, so the left item
+  carries no information, and their right items are **out-of-passage** items of
+  the same word count and the same surface type (capitalisation, digit, suffix
+  class) as the gold right item -- sampled by rule from a bank of word windows
+  taken from the source split's own questions (``build_item_bank``; the absence
+  test excludes the row's passage, so a candidate is never taken from the
+  question it fills).  The candidates closest in *character* length to the gold
+  right item are preferred, so the block's option lengths stay as uninformative as
+  the source allows.
+* **Anti-shortcut argument (section 4.3).**  All three left items are identical
+  -- no information.  All three right items are out-of-passage, so "pick the right
+  item that is not in the passage" hits each option equally (it is undefined, not
+  merely weak: the audit's L4a measures 0).  Had the distractors' right items come
+  from the passage, the gold right item would be the only out-of-passage word and
+  that mirror heuristic would win outright -- which is exactly why the pool is
+  built out-of-passage and gated (``gold_pair_right_in_passage``).
+* **Fail closed.**  A pair whose diff region is not unique splits into no rows; a
+  pair whose gold pair fails an L1 gate (including a pure insertion, whose
+  real-side fragment is empty) drops its diagnosis row; a pair that cannot field
+  ``k-1`` qualifying distractor right items drops its diagnosis row.  Nothing is
+  ever padded and no option text ever comes from another *question's* passage
+  position: distractors are whole word windows of the corpus, which is what the
+  section 4.3 argument requires.
 
-The judgment side has **no correct option** -- its gold is the verdict, and the
-option block exists only so the prompt shape is identical to the diagnosis side.
-Its options are therefore built by :func:`mine_anchor_option_spans`, which applies
-the same rules as ``distractor_mining.mine_option_spans`` (same question, same
-token length, at least one content word, character length within
-``MAX_CHAR_RATIO`` of an anchor span) but needs no gold: the anchor is the
-median-length candidate span, which plays the role the gold plays on the other
-side.  See deviation 4 for why the character-length discipline is mirrored rather
-than dropped.
+The answerable side: a two-layer reward with an isomorphic placeholder block (D27)
+----------------------------------------------------------------------------------
+
+``label=0`` is the repaired twin.  It is a *solvable* row whose gold is the
+source's own ``answer`` field, verbatim, scored by the two-layer
+``solvable_answer`` branch of section 6: ``\\boxed{<answer>}`` = 0.5 for judging
+the question answerable plus 0.5 for a normalised exact match, ``\\boxed{SOLVABLE}``
+= 0.5, a refusal = 0.  ``correct_option_id`` is ``None`` -- there is no correct
+option -- but the row still carries a **placeholder replacement-pair block** so
+that template A looks identical on both sides (section 5.1/5.2, the D18
+isomorphism hard constraint): same wording, same k=3, left item an in-passage
+content phrase, three right items out-of-passage items of one type and one word
+count.  Without it, "the prompt has an option block" would itself give the label
+away.
+
+The placeholder's *shape* is mirrored from the pair's own diagnosis side: each
+answerable row samples a ``(left word count, right word count, right type, right
+character length)`` reference from the region the two members of *its own* pair
+differ by, so the two sides' blocks are not merely the same species but drawn from
+the same shape distribution, pair by pair.  The block is dropped (never padded)
+when the reference cannot be satisfied and the deterministic one-token fallback
+shapes cannot either.
 
 Certificates (fail closed; each is re-derived by ``verify_falseqa.py``)
 ----------------------------------------------------------------------
 
-A row is written only if every certificate below passes; otherwise the row -- or
-the whole pair -- is dropped and counted.  No gold is invented and no option text
-ever comes from another question.
-
-* **Pair (both branches)** -- the split's ``label=1`` and ``label=0`` blocks have
-  the same length, the two questions of a pair differ after whitespace
-  normalisation, and the word-level diff ``real -> fake`` has exactly one changed
-  region *visible on the fake side* (``autojunk=False``; opcodes whose fake-side
-  token range is empty changed nothing the model can see and are excluded before
-  the regions are merged -- including them turns 928 certified pairs into 885).
-* **Pointer (diag)** -- the region's fake-side text is the gold; it must occur
-  verbatim in the question, carry a content word, and its first token must occur
-  exactly once in the question (so the span is locatable by its first word).
-  ``distractor_mining.mine_option_spans`` then has to find two equal-length
-  distractors in the same question.
-* **Uniqueness (diag)** -- the gold must be the **only** option that does *not*
-  occur in the paired real question, and every distractor must occur there.  Text
-  that survived the rewrite cannot be the fragment that made the presupposition
-  false.  This is the exact analogue of ``umwp_adapter``'s L2 certificate and it
-  is a gate here, not a report.
-* **Judgment (judge)** -- the pair's region certificate above, plus three
-  equal-length spans of the real question at the *fake-side gold's* token length.
+* **Pair (both sides)** -- the split's ``label=1`` and ``label=0`` blocks have the
+  same length, the two questions of a pair differ after whitespace normalisation,
+  and the word-level diff ``real -> fake`` has exactly one changed region *visible
+  on the fake side* (``autojunk=False``; opcodes whose fake-side token range is
+  empty changed nothing the model can see and are excluded before the regions are
+  merged -- including them turns 928 certified pairs into 885).
+* **Gold pair (diag)** -- the region's fake-side text is the left item and its
+  real-side text the right item; the left item must occur verbatim in the
+  question, carry a content word, have a first token that occurs exactly once in
+  the question, and the right item must be non-empty and absent from the question
+  (all three rights out-of-passage is what defuses the absence heuristic).
+* **Distractor pool (diag)** -- at least ``k-1`` distinct out-of-passage items
+  with the gold right item's word count and type signature; the closest
+  character-length tier is preferred and the sample is drawn with the row's seed.
+* **Placeholder (answerable)** -- the source's own answer is non-empty, an
+  in-passage content span can be mined at the sampled left word count, and ``k``
+  distinct out-of-passage items exist at the sampled right type and length.
 
 Determinism
 -----------
@@ -100,162 +136,84 @@ a drop anywhere cannot shift the option blocks of later rows.
 DEVIATIONS FROM THE DESIGN DOC
 ------------------------------
 
-Measured against ``HALLUCINATION_RL_DESIGN.md`` section 4.4 and the stage-2 recon
-brief, on all three splits: 1,187 / 491 / 687 pairs, 928 / 377 / 535 certified.
+Measured on all three splits with ``--seed 0`` (numbers printed by the build and
+by ``verify_falseqa.py``; 1,187 / 491 / 687 pairs).
 
-1. **The k=3 funnel is 700, not the doc's 657.**  Section 4.4 says
-   ``1,187 -> 928 -> 657`` ("55.3% raw / 70.8% of the pointer gold").  Measured
-   with the repo's own ``distractor_mining.mine_option_spans``: **928 -> 700**
-   (75.4% of the certified golds), and 288/400 on ``valid``/``test``.  The doc's
-   657 is not reachable by this recipe: the two L1 gold gates leave 887 pairs and
-   the k=3 pool gate 709, both above 657, so no ordering of the gates this adapter
-   applies lands on it.  This adapter uses the repo miner, which is the shared
-   contract, and reports the real number.
+1. **The diagnosis yield is 829 / 336 / 476, not 928 / 377 / 535.**  Section
+   4.3's 928 is the number of pairs with a *region* certificate (reproduced
+   exactly: 928 / 377 / 535 certified).  The D21 option contract needs a usable
+   gold *pair*, and 99 train pairs fail that: 33 are pure insertions on the fake
+   side (the real-side fragment is empty, so there is no replacement to offer),
+   30 have a non-unique first token, 24 have a real-side fragment that already
+   occurs in the presented question (which would make "the right item that *is* in
+   the passage" a defined heuristic), 11 have a stop-word-only fake fragment, and
+   1 cannot field two qualifying distractor items.  The answerable side needs the
+   region certificate and a non-empty source answer, nothing else, so it keeps
+   928 / 377 / 535 rows -- exactly the region-certificate count on all three
+   splits, since no eligible answer was empty and no placeholder pool came up
+   short.  The two pools are deliberately not forced to the same size; the twins
+   stay linked by ``pair_id``.
 
-2. **The ``label=0`` side is 836, and the doc's 851 is only reproducible without
-   the option-shape discipline.**  Section 4.4 allocates 851 judgment rows (71.7%).
-   The recipe that reaches it is: take every pair with a region certificate (928),
-   use the **fake-side gold's token count** as the anchor, and mine three
-   equal-length spans from the **real** question -- measured **850**, one row from
-   the doc's number.  The design doc describes the anchor as the *paired real-side*
-   diff fragment's length/shape; that reading gives **816**, because 40 of the 928
-   pairs have an empty real-side region and no fragment to measure.  The 850 drops
-   to **836** once the judgment block is held to the same character-length
-   discipline as the diagnosis side (deviation 4); the written artifact carries
-   836 rows (345 valid, 483 test).
+2. **The ``label=0`` answer is now the *gold*, not an audit field.**  D22's
+   judgment-only reading stored it in ``ground_truth.answer`` for provenance but
+   scored only the verdict.  D27 puts the free text on the two-layer
+   ``solvable_answer`` branch, so the row is dropped when the field is empty
+   (0 of the eligible train pairs) and the stored value is the raw field with
+   surrounding whitespace stripped.  67.8% of the source's answerable answers are
+   free text, which section 6 scores with ``norm_match``; the paraphrase noise
+   (a correct answer that fails normalised exact match loses 0.5 of 1.0) is the
+   documented trade-off of Q17 and the reason the answer layer is only worth half.
 
-3. **The doc's per-gold-length distribution is right to the row; its total is
-   not.**  Section 4.4 reports 620/201/52 certified golds of 1/2/3 tokens -- both
-   measured (over the 928 certified pairs) and reproduced: **620/200/52**, with
-   **{1: 608, 2: 184, 3: 45, 4: 26, 5: 13, 6: 7, 7: 1, 8: 2, 14: 1}** over the 887
-   golds that clear the L1 gates.  So the doc's probe and this adapter agree on the
-   data and disagree only on what the pool threshold leaves behind.  Its pool table
-   (median 3/1/0, P(pool >= 3) 73.5%/9.0%) is *not* reproduced under any of the
-   four pool definitions the recon tried (exact vs ratio-band character length,
-   overlapping vs greedy spans): the repo miner's own rule gives median 4/4/4 and
-   P(pool >= 3) 0.82/0.85/0.83 for 1/2/3-token golds, while exact character-length
-   equality gives median 0 at every length -- the latter is where a 657-row funnel
-   could come from, but it is not what the shared miner does.
+3. **The placeholder block mirrors the pair's own diagnosis-side shape.**  D27
+   fixes the text ("in-passage left, out-of-passage same-type same-length rights")
+   but not the word-count relation between the left and right items.  On the
+   diagnosis side that relation is data (the fake fragment is a rewrite of the
+   real one; measured 69.7% same word count), so hard-coding "rights match the
+   left" on the answerable side would make that relation a format cue.  Each
+   answerable row instead mirrors the shape of its own twin's region, which
+   removes the difference pair by pair and -- unlike a pool-wide reference --
+   keeps a ``--limit`` slice byte-identical to the full build's prefix.
 
-4. **The judgment option block needs a character-length guard the doc does not
-   mention, and the guard is what makes the two labels isomorphic.**  Without it
-   the judgment blocks' char-length spread (max option / min option) reaches 13.00
-   with p90 2.67 on ``train`` (9.00 and 10.00 on ``valid`` / ``test``), against
-   4.00 / p90 2.00 on the diagnosis side -- "this block's option lengths are wildly
-   unequal" would be a branch-identifying shortcut, exactly the D14 failure the
-   option block exists to prevent.  With ``MAX_CHAR_RATIO=2.0`` mirrored around the
-   anchor span the judgment spread becomes median 1.60 / p90 2.33 / max 3.67,
-   against 1.50 / 2.00 / 4.00 for the diagnosis side, at a cost of 14 rows
-   (850 -> 836 train, 349 -> 345 valid, 493 -> 483 test).
+4. **The distractor right items are corpus word windows, not a hand-written word
+   list.**  Section 4.3 says "从题外词表规则采样"; the "word list" here is every
+   1..10-token window of the same source split, filtered to items that do not
+   occur in the presented question and match the gold right item's word count and
+   surface type.  The rule is therefore reproducible, has no external dependency,
+   and -- because the bank is the source's own vocabulary -- keeps the distractors
+   in the same register as the gold.  Section 9's N=50 manual sample is what
+   checks whether a distractor also repairs the premise (risk 6).
 
-5. **The doc's L1 gates are reproduced, and one of them is now a gate.**  Section
-   4.4 says the gold carries a content word on 98.9% of certified pairs (measured
-   **917/928 = 98.8%**) and that its first word is unique on 96.3% (measured
-   **898/928 = 96.8%**, case-insensitively).  Both are applied in order, so 887
-   golds pass both (95.6% of the certified pairs, 700 written after the L2 gate).
+5. **The type signature is a surface proxy.**  The doc asks for the distractors to
+   be "同类" (same part of speech / entity type) as the gold right item.  No POS
+   tagger is available offline, so ``item_signature`` uses word count,
+   digit-bearing, capitalisation class and a coarse suffix class
+   (``-ing``/``-ed``/``-ly``/``-tion``/``-er``/plural ``-s``/…).  It over-splits
+   rather than under-splits: a candidate that fails the signature is rejected even
+   when a human would call it the same kind of word, so the residual risk is
+   distractor *quality* (risk 6), never gate leakage.
 
-6. **The doc's L2 as written is a pool check, not a uniqueness proof.**  Section
-   4.4 defines L2 as "can k=3 equal-length spans be built from the same question",
-   which certifies nothing about *which* span is the gold.  This adapter adds the
-   ``umwp_adapter`` uniqueness gate of the certificates section: the gold must be
-   the only option absent from the paired real question and every distractor must
-   be present there.  Measured: 9 further rows (train) fail it, 3 on ``valid`` and
-   2 on ``test``; the gate is what makes the pointer gold the only admissible
-   answer, so it is a gate rather than a report.
-
-7. **The doc's L3 "pick the longest" figure measures a degenerate cue, and the
-   character-length cue it misses is worth 39-43%.**  Section 4.4 / section 9
-   report 30.9% for the longest-option heuristic against a 33.3% baseline.  Every
-   option in a block has the same *token* count, so a token-count reading of "the
-   longest" ties everywhere and collapses to first-index ``1/k`` -- which is what
-   30.9% is.  Measured on character length, with the option positions actually
-   shuffled: **39.1% train / 39.6% valid / 42.8% test** against the 43.3% budget,
-   and **43.7% / 41.8% / 46.9%** on the subset whose maximum is unique.  The cue is
-   real: the pointed-at fragment is a rewrite or an insertion, so on **204 of the
-   887** train golds that clear the L1 gates it is *strictly* longer than every
-   other same-token-length window of its own question (23.0%; 25.5% valid, 27.3%
-   test) and longest-or-tied on 298 (33.6%).  Inside the block the adapter writes,
-   the gold is the unique longest option on 547 of 700 diagnosis rows (78%), and
-   that is exactly the 43.7% reading above.  No in-question mining rule removes the
-   cue without dropping those rows.
-   Choosing tie-free blocks (``mine_distinct_block``) is the mitigation that does
-   work -- it removes the first-index tie-break's free wins, 0.4600 -> 0.4275 on
-   ``test`` at seed 0 (mean over seeds 0-3: 0.4371 -> 0.4258) -- and 8 attempts
-   already saturate it (the stated rate is unchanged at 32 and 128 attempts).
-
-   **The audit gates on the stated reading, which clears the budget, and the
-   tie-free reading does not: 0.4369 > 0.4333 on train and 0.4693 > 0.4333 on
-   ``test`` (valid is under, 0.4184).**  The gate is section 9's rule as written --
-   "pick the longest option", first-index tie-break, defined on every row -- and the
-   tie-free reading is a *stricter* rule over a subset (547 of 700 train rows, 309
-   of 400 test).  Gating on the stricter rule would be inventing a check the doc
-   does not state and would fail the artifact on a cue the stated rule cannot
-   express, so the audit prints the tie-free number as a measurement instead of
-   hiding it, and the excess is left visible rather than engineered away by
-   dropping the 23% of pairs whose gold is the strictly longest window (or the 78%
-   of rows whose block has a unique longest option).  This is the one place where
-   the artifact is over a section 9 budget under a defensible reading of the same
-   heuristic; it is recorded here and printed by the audit.  Seed spread on
-   ``test``: the stated
-   reading is 0.4196-0.4325 over seeds 0-3 -- 0.1 points of headroom at the worst
-   seed, 0.6 at the default seed 0 -- and the audit prints all three readings.
-
-8. **The test split's ``answer`` really is a 3-element Python list, and it is
-   still unusable.**  Sample doc section 3.3 says ``test.csv``'s answer is a list
-   repr; measured 687/687 on ``test``'s ``label=1`` block (0/687 on ``label=0``,
-   and 0 lists in train/valid on either side).  The rebuttal is *audit material*
-   only: it is not a span of the question, so it cannot be a gold, and the design
-   doc's D13 ban on cross-question options stands.  The audit's corroboration flag
-   (share of rebuttals naming every content word of the gold) measures 0.720 /
-   0.620 / 0.560 against the doc's 56.8% / 56.2% / 85.3% -- the ``test`` gap is the
-   list parse, where the doc's own rule and this one take different elements.
-
-9. **The D14 judgment branch has no quota cell in ``mix_halluc.py``.**  Section
-   4.9.3 table B row 3 (solvable judgment, with option block) lists UMWP and SUM
-   only, so ``DEFAULT_QUOTA`` has no ``(solvable_judge, halluc_commonsense_falseqa)``
-   entry and the 836 judgment rows this adapter writes are built but never mixed.
-   That is the doc's own table, not a bug in the mix; it is recorded here because
-   the coverage loss is easy to miss.  The judgment rows remain in the artifact so
-   the D14 contract is testable and so a quota can be added without a rebuild.
-
-10. **The doc's H6 numbers are not reproducible as a pair; the AUC row is a fold
-    artefact.**  Section 4.4 claims bag-of-words Naive Bayes balanced accuracy
-    0.765/0.569/0.757 (all / function / content words) with an AUC row of 0.172
-    train.  Measured over the doc's own corpus (train, n=2374) with the repo's
-    estimator: the AUC row reproduces at a 1-document vocabulary under a *random*
-    fold split (**0.152**), where each test question's near-identical twin sits in
-    the training set carrying the opposite label and the score goes
-    anti-correlated.  Under pair-aware folds -- the only reading that measures
-    topic memory rather than twin memorisation -- the same numbers are argmax
-    0.552 / best-threshold 0.559 / AUC 0.580 for all words (and 0.52-0.55 for the
-    two word subsets), and no folding or vocabulary threshold tried reaches the
-    doc's 0.765.  So the judgment metric is *less* learnable by topic memory than
-    the doc warns, not more; ``verify_falseqa.py`` prints both foldings and is
-    explicit that H6 is an interpretation baseline, not a gate.
-
-Module note on L1 and H6
-------------------------
-
-FalseQA's labels are human-constructed (the recon's H6 probe), and the certificates
-above prove that *the recorded region is the only difference between the pair* and
-that the pointer gold is the unique option absent from the original question.  They
-do not prove that every ``label=1`` question really has a false presupposition --
-that is the source's own annotation, and the L1 corroboration flag in
-``verify_falseqa.py`` (what share of the dataset's own rebuttals name the gold
-span) is the audit hook for it, not a gate.  Likewise, the judgment half is
-measurably learnable by topic memory rather than by reasoning (the doc's H6);
-``verify_falseqa.py`` reports the bag-of-words Naive Bayes number so the D14
-metric is never read as a capability number.
+6. **The character-length tier is what keeps the length cue at chance, and a
+   corpus-frequency cue remains.**  Drawing the two distractors from the whole
+   candidate pool would make the gold right item the unique longest option on 82%
+   of rows; restricting the draw to the candidates closest in character length to
+   the gold brings the "pick the longest option" heuristic to 0.31 (chance) with a
+   within-block length spread of 1.00 (median).  The pool is still drawn from a
+   corpus, so the gold right item's *word frequency* is not neutralised: the audit
+   measures "pick the most frequent right item" at 0.46 train / 0.42 test against
+   the 1/3 baseline and prints it as an informational reading rather than a gate
+   (section 9's gate list does not include it; §12 Q9's N=50 manual sample is the
+   hook the doc provides for distractor quality).  Neutralising it would mean a
+   further document-frequency band, which is deliberately not applied: it moves
+   the cue to "pick the rarest item" rather than removing it (measured 0.48-0.56
+   when the band is added) and costs ~4% of the diagnosis yield.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import collections
 import csv
 import difflib
-import functools
 import json
 import os
 import random
@@ -263,11 +221,11 @@ import sys
 
 try:
     import schema
-    from distractor_mining import mine_option_spans, token_spans
+    from distractor_mining import token_spans
 except ImportError:  # pragma: no cover - running as a plain script
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import schema
-    from distractor_mining import mine_option_spans, token_spans
+    from distractor_mining import token_spans
 
 # ---------------------------------------------------------------------------
 # source constants
@@ -293,12 +251,18 @@ DATA_FILE_TEMPLATE = "{split}.csv"
 SPLITS = ("train", "valid", "test")
 DEFAULT_SPLIT = "train"
 
+#: Table B row 7 (unsolvable, four-tier diagnosis) and row 3 (solvable, two-layer
+#: reward) -- see the branch registry of ``schema.py``.
 BRANCH_DIAG = schema.BRANCH_UNSOLVABLE_DIAG
-BRANCH_JUDGE = schema.BRANCH_SOLVABLE_JUDGE
+BRANCH_ANSWERABLE = schema.BRANCH_SOLVABLE_TWO_LAYER
 
 K_OPTIONS = 3  # design decision D15
-MAX_CHAR_RATIO = 2.0  # the character-length discipline distractor_mining enforces
-TIE_RETRIES = 8  # option-sampling attempts spent avoiding a character-length tie
+#: How many source rows are scanned for out-of-passage items.  The observed gold
+#: right items run 1-9 tokens (measured), so 10 is a safety margin, not a knob.
+MAX_ITEM_TOKENS = 10
+#: Placeholder attempts spent sampling a reference shape before the deterministic
+#: fallback list is walked (see ``mine_placeholder_options``).
+PLACEHOLDER_ATTEMPTS = 4
 
 #: ``label`` column values: ``"1"`` is the false presupposition (unsolvable),
 #: ``"0"`` the paired true one.  The column is an unquoted single character.
@@ -306,12 +270,12 @@ LABEL_FALSE = "1"
 LABEL_TRUE = "0"
 
 #: A false presupposition that *can* be pointed at in the prompt -- the D18 defect
-#: slot FalseQA fills (section 4.9.3 table B, 假前提（题面可指认）).  The slug is
-#: deliberately distinct from ``false_premise_unpointable``, which CREPE and KUQ
-#: carry: the balance table keys on these strings.
+#: slot FalseQA fills (section 4.8 table B, 假前提（可指认，替换对）).  The slug is
+#: deliberately distinct from ``false_premise_unpointable``, which CREPE carries:
+#: the balance table keys on these strings.
 ERROR_TYPE = "false_premise_pointable"
 
-#: Section 4.4's delivery constraint: the false fragment contradicts the question's
+#: Section 4.3's delivery constraint: the false fragment contradicts the question's
 #: own premise (it is a rewrite of the paired real question, not an unrelated
 #: inserted sentence).
 PERTURBATION_TYPE = "contradictory_condition"
@@ -328,10 +292,10 @@ SIDE_REAL = "real"
 def normalise_question(text: str) -> str:
     """Collapse whitespace and strip.
 
-    One ``test`` question is not equal to its own ``.strip()`` (recon section 5.2
-    item 10).  Every offset in this module is computed on the *normalised* text,
-    which is also the text rendered into the prompt -- the two must never be
-    mixed, or the gold offsets and the visible question drift apart.
+    One ``test`` question is not equal to its own ``.strip()``, and every offset
+    in this module is computed on the *normalised* text, which is also the text
+    rendered into the prompt -- the two must never be mixed, or the gold offsets
+    and the visible question drift apart.
     """
     return " ".join((text or "").split())
 
@@ -340,9 +304,9 @@ class _Region:
     """One contiguous run of changed word tokens between the two questions.
 
     ``a_*`` is the real (``label=0``) side, ``b_*`` the fake (``label=1``) side,
-    so the diff is always ``real -> fake`` and the gold is always the fake-side
-    text.  ``n_a`` / ``n_b`` are the token counts of the two sides, which the
-    judgment branch reads as its mining anchor.
+    so the diff is always ``real -> fake``: the left item of the gold pair is the
+    fake-side text, the right item the real-side text that repairs it.  ``n_a`` /
+    ``n_b`` are the two sides' token counts.
     """
 
     __slots__ = ("tag", "a_text", "b_text", "a_start", "b_start", "n_a", "n_b")
@@ -350,11 +314,6 @@ class _Region:
     def __init__(self, **kwargs) -> None:
         for key in self.__slots__:
             setattr(self, key, kwargs.get(key, ""))
-
-    @property
-    def visible(self) -> bool:
-        """Whether the region changed anything on the fake side."""
-        return bool(self.b_text)
 
 
 def _token_offsets(text: str) -> list[tuple[str, int, int]]:
@@ -374,7 +333,7 @@ def _merge(opcodes: list[tuple], *, require_visible: bool) -> list[tuple]:
     grouping.  A pure deletion changed the real question but leaves the presented
     (fake) question untouched, so it cannot be pointed at; leaving it in the
     grouping merges it with a neighbouring replace and turns 928 certified pairs
-    into 885 (recon section 5 item 3).
+    into 885.
     """
     runs: list[tuple] = []
     for tag, i1, i2, j1, j2 in opcodes:
@@ -393,8 +352,8 @@ def _merge(opcodes: list[tuple], *, require_visible: bool) -> list[tuple]:
 def word_regions(real_q: str, fake_q: str) -> list[_Region]:
     """The changed regions of ``real_q -> fake_q`` that are visible on the fake side.
 
-    Diffing *token sequences* (``autojunk=False``) rather than characters is what
-    keeps every gold a whole word span.  The returned regions are already merged,
+    Diffing *token sequences* (``autojunk=False``) rather than characters keeps
+    every fragment a whole word span.  The returned regions are already merged,
     and the caller's certificate requires exactly one of them.  When a pair also
     carries a pure deletion elsewhere, that deletion is *not* part of the region
     list -- it cannot be pointed at -- but it is still part of the full defect
@@ -430,9 +389,9 @@ def defect_texts(real_q: str, fake_q: str) -> tuple[str, str]:
     Unlike :func:`word_regions` this keeps the invisible (pure deletion) opcodes,
     so re-applying the recorded edit to the real question rebuilds the fake one
     token for token -- which is what the audit's multiset check re-derives.  The
-    gold is read off :func:`word_regions`, never off this pair of strings: on the
-    43 train pairs that carry an extra invisible deletion the two disagree, and the
-    pointer must be the fragment the model can see.
+    option block is read off :func:`word_regions`, never off this pair of strings:
+    on the train pairs that carry an extra invisible deletion the two disagree,
+    and the pointer must be the fragment the model can see.
     """
     matcher = difflib.SequenceMatcher(
         None, schema.words(real_q), schema.words(fake_q), autojunk=False
@@ -446,6 +405,156 @@ def defect_texts(real_q: str, fake_q: str) -> tuple[str, str]:
         if j2 > j1:
             inserted.append(fake_q[tb[j1][1] : tb[j2 - 1][2]])
     return " ".join(deleted), " ".join(inserted)
+
+
+# ---------------------------------------------------------------------------
+# the out-of-passage item bank and the surface type signature
+# ---------------------------------------------------------------------------
+
+#: Suffix classes, longest suffix first.  A coarse, offline stand-in for the part
+#: of speech the design doc's "同类" asks for (deviation 5): ``-ing`` is a
+#: participle, ``-er``/``-or`` an agent noun, ``-s`` a plural, and so on.  The
+#: table is paired with the same table re-declared in ``verify_falseqa.py`` --
+#: deliberately, so the audit's notion of "same type" is not read out of the code
+#: it audits.
+_SUFFIX_CLASSES = (
+    ("ing", 5),
+    ("ed", 4),
+    ("ly", 4),
+    ("tion", 6),
+    ("sion", 6),
+    ("ness", 6),
+    ("ity", 5),
+    ("ment", 6),
+    ("ance", 6),
+    ("ence", 6),
+    ("ous", 5),
+    ("ive", 5),
+    ("able", 6),
+    ("ible", 6),
+    ("ful", 5),
+    ("less", 6),
+    ("ist", 5),
+    ("ism", 5),
+    ("er", 5),
+    ("or", 5),
+    ("s", 4),
+)
+
+
+def _suffix_class(token: str) -> str:
+    folded = token.casefold()
+    for suffix, minimum in _SUFFIX_CLASSES:
+        if len(folded) >= minimum and folded.endswith(suffix):
+            return suffix
+    return "plain"
+
+
+def _capitalisation_class(tokens: list[str]) -> str:
+    """``lower`` / ``mixed`` / ``title`` -- a proper-noun proxy for the item."""
+    caps = [token[0].isupper() for token in tokens if token]
+    if not caps:
+        return "lower"
+    if all(caps):
+        return "title"
+    return "mixed" if any(caps) else "lower"
+
+
+def item_signature(text: str) -> tuple[int, bool, str, str]:
+    """The surface type of an item: ``(words, digit-bearing, caps, suffix)``.
+
+    Two items with the same signature are the adapter's notion of "same type": a
+    gold right item ``women`` and a distractor ``adults`` agree, ``rainy days``
+    and ``Academy of`` do not.  Word count is part of the signature, so the
+    ``same word count`` rule of section 4.3 is the first coordinate of the type
+    rule rather than a separate check.
+    """
+    tokens = schema.words(text)
+    return (
+        len(tokens),
+        any(ch.isdigit() for ch in text),
+        _capitalisation_class(tokens),
+        _suffix_class(tokens[-1]) if tokens else "plain",
+    )
+
+
+def build_item_bank(questions: list[str], max_tokens: int = MAX_ITEM_TOKENS) -> dict:
+    """``signature -> {casefolded text: text}`` over every window of the corpus.
+
+    The bank is the source split's own vocabulary of 1..``max_tokens``-token word
+    windows (whitespace-normalised, verbatim slices, so the item keeps the
+    corpus's spelling).  Sampling from a bank rather than from a hand-written list
+    is what makes "out-of-passage" a *rule*: any window that does not occur in the
+    presented question is admissible, so the distractor set is never a small fixed
+    vocabulary the model could memorise.
+    """
+    bank: dict[tuple, dict[str, str]] = collections.defaultdict(dict)
+    for question in questions:
+        for size in range(1, max_tokens + 1):
+            for span in token_spans(question, size):
+                text = span.text.strip()
+                if len(schema.words(text)) != size:
+                    continue
+                bank[item_signature(text)].setdefault(text.casefold(), text)
+    return bank
+
+
+def out_of_passage_right_pool(
+    bank: dict,
+    *,
+    signature: tuple,
+    char_len: int,
+    passage: str,
+    exclude: str,
+    minimum: int,
+) -> list[str] | None:
+    """Items matching ``signature`` that do not occur in ``passage``, best first.
+
+    ``exclude`` is the gold right item (it lives in the bank -- it is a window of
+    the paired real question -- and must not be offered as its own distractor).
+    ``passage`` is tested case-insensitively as a substring: a candidate that only
+    occurs inside a longer word counts as present, which is the conservative
+    reading of "题面外".
+
+    The returned pool is the *closest character-length tier* when it is large
+    enough, and the whole candidate list otherwise.  Tiering is what keeps the
+    block's option lengths uninformative: with the tier, the gold right item is
+    the unique longest option on 3% of rows instead of 82%, so "pick the longest"
+    collapses to the first-index tie-break and measures at chance.
+    """
+    items = bank.get(signature) or {}
+    folded_passage = passage.casefold()
+    folded_exclude = exclude.strip().casefold()
+    candidates = [
+        text
+        for folded, text in items.items()
+        if folded not in folded_passage and folded != folded_exclude
+    ]
+    if len(candidates) < minimum:
+        return None
+    candidates.sort(key=lambda text: (abs(len(text) - char_len), text.casefold()))
+    best_delta = abs(len(candidates[0]) - char_len)
+    tier = [text for text in candidates if abs(len(text) - char_len) == best_delta]
+    return tier if len(tier) >= minimum else candidates
+
+
+def mine_content_spans(question: str, n_tokens: int) -> list[str]:
+    """Distinct ``n_tokens``-token spans of ``question`` carrying a content word.
+
+    The answerable side's left item is not a defect: it is an ordinary in-passage
+    phrase, so the only requirements are that it is a verbatim slice of the
+    question (it is, by construction) and that it is not stop-word filler -- the
+    same content-word rule the diagnosis side's fake fragment has to pass.
+    """
+    unique: dict[str, str] = {}
+    if n_tokens <= 0:
+        return []
+    for span in token_spans(question, n_tokens):
+        text = span.text.strip()
+        if not any(schema.is_content_word(token) for token in schema.words(text)):
+            continue
+        unique.setdefault(text.casefold(), text)
+    return [unique[key] for key in sorted(unique)]
 
 
 # ---------------------------------------------------------------------------
@@ -489,182 +598,45 @@ def _pair_blocks(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 # ---------------------------------------------------------------------------
 
 
-def certify_gold(real_q: str, fake_q: str, regions: list[_Region]) -> str | None:
-    """The pointer gold for a certified pair, or ``None`` when it cannot be proved.
+def gold_pair_problem(real_q: str, fake_q: str, regions: list[_Region]) -> str | None:
+    """The first D21 gold-pair certificate this pair fails, or ``None``.
 
-    The gold is the fake-side text of the pair's single visible region.  It must
-    occur verbatim in the presented question (it is a slice of it), carry at least
-    one content word (a bare ``"the"`` makes an option block that is worse than no
-    block at all), and its first token must occur exactly once in the question, so
-    that the span is locatable by its first word rather than by an ambiguous
-    occurrence.
+    Returning the reason (rather than a boolean) is what lets ``build_rows`` print
+    a drop table that says *why* a pair lost its diagnosis row.  The names are
+    the ``DROP_REASONS`` entries.  The gold pair is the single visible region:
+    left = the fake fragment the model can point at, right = the real fragment
+    that repairs it.
     """
     if len(regions) != 1:
-        return None
-    gold = regions[0].b_text.strip()
-    if not gold or gold not in fake_q:
-        return None
-    tokens = schema.words(gold)
-    if not tokens:
-        return None
-    if not any(schema.is_content_word(token) for token in tokens):
-        return None
+        return "multi_region_defect"
+    region = regions[0]
+    left, right = region.b_text.strip(), region.a_text.strip()
+    if not left or left not in fake_q:
+        return "gold_not_verbatim_in_question"
+    tokens = schema.words(left)
+    if not tokens or not any(schema.is_content_word(token) for token in tokens):
+        return "gold_has_no_content_word"
     first = tokens[0].casefold()
     if sum(1 for token in schema.words(fake_q) if token.casefold() == first) != 1:
+        return "gold_first_token_not_unique"
+    if not right:
+        # A pure insertion: the fake question gained a fragment, so there is no
+        # replacement to offer and the pair cannot carry a replacement-pair gold.
+        return "gold_pair_right_empty"
+    if right.casefold() in fake_q.casefold():
+        # The repairing fragment already occurs in the presented question.  All
+        # three right items must be out-of-passage (section 4.3), otherwise "pick
+        # the right item that *is* in the passage" identifies the gold outright.
+        return "gold_pair_right_in_passage"
+    return None
+
+
+def certify_gold_pair(real_q: str, fake_q: str, regions: list[_Region]) -> tuple[str, str] | None:
+    """``(fake fragment, real fragment)`` for a certified pair, or ``None``."""
+    if gold_pair_problem(real_q, fake_q, regions) is not None:
         return None
-    return gold
-
-
-def unique_absent_option(real_q: str, texts: list[str], gold: str) -> bool:
-    """Whether the gold is the only option that did *not* survive the rewrite.
-
-    The L2 uniqueness proof, and the exact analogue of ``umwp_adapter``'s rule:
-    text that still occurs in the paired real question cannot be the fragment that
-    made this question's presupposition false, so a block whose gold is the only
-    absent option has exactly one admissible answer.
-    """
-    if gold in real_q:
-        return False
-    return all(text in real_q for text in texts if text != gold)
-
-
-def mine_anchor_option_spans(
-    question: str,
-    n_tokens: int,
-    k: int = K_OPTIONS,
-    rng: random.Random | None = None,
-    max_char_ratio: float = MAX_CHAR_RATIO,
-) -> list[str] | None:
-    """Mine ``k`` equal-token-length spans of ``question`` with no designated gold.
-
-    The judgment branch has no correct option, so ``mine_option_spans`` cannot be
-    called: it needs a gold substring to rank candidates against.  This function
-    keeps the same three rules -- spans of the same question, the same token
-    length, at least one content word -- and uses the **median-length candidate**
-    as the anchor in the role the gold plays on the diagnosis side: candidates
-    whose character length is more than ``max_char_ratio`` away from the anchor are
-    rejected, and the ones closest to it are preferred.  See deviation 4 of the
-    module docstring for why the character-length discipline is mirrored instead of
-    dropped.
-
-    Args:
-        question: the exact question text that will be rendered into the prompt.
-        n_tokens: the anchor token count (the fake-side gold's length).
-        k: total option count (D15 fixes the default at 3).
-        rng: used to sample among equally close candidates; a fixed seed makes the
-            build reproducible.  ``None`` means the process-wide RNG.
-        max_char_ratio: the character-length band around the anchor, in the same
-            units ``distractor_mining.mine_option_spans`` uses.
-
-    Returns:
-        ``k`` distinct span texts, or ``None`` when the question does not contain
-        ``k`` admissible spans at that token length.
-    """
-    rng = rng or random
-    if n_tokens <= 0:
-        return None
-    unique: dict[str, object] = {}
-    for span in token_spans(question, n_tokens):
-        if not any(schema.is_content_word(token) for token in schema._WORD_RE.findall(span.text)):
-            continue
-        unique.setdefault(span.text.strip().casefold(), span)
-    candidates = sorted(unique.values(), key=lambda span: (span.char_len, span.start))
-    if len(candidates) < k:
-        return None
-    anchor = candidates[len(candidates) // 2]
-    anchor_len = max(anchor.char_len, 1)
-    admissible = [
-        span
-        for span in candidates
-        if 1 / max_char_ratio <= span.char_len / anchor_len <= max_char_ratio
-    ]
-    if len(admissible) < k:
-        return None
-    admissible.sort(key=lambda span: (abs(span.char_len - anchor_len), span.start))
-    best_delta = abs(admissible[0].char_len - anchor_len)
-    best_tier = [span for span in admissible if abs(span.char_len - anchor_len) == best_delta]
-    pool = best_tier if len(best_tier) >= k else admissible
-    return [span.text.strip() for span in rng.sample(pool, k)]
-
-
-def _mine_diag_options(question: str, gold: str, attempt_seed: str) -> list[str] | None:
-    """One sampling attempt of the diagnosis block: the repo miner, texts only."""
-    mined = mine_option_spans(question, gold, k=K_OPTIONS, rng=random.Random(attempt_seed))
-    return None if mined is None else list(mined[0])
-
-
-def _mine_judge_options(question: str, n_tokens: int, attempt_seed: str) -> list[str] | None:
-    """One sampling attempt of the judgment block: the anchored miner, seeded."""
-    return mine_anchor_option_spans(
-        question, n_tokens, k=K_OPTIONS, rng=random.Random(attempt_seed)
-    )
-
-
-def mine_distinct_block(
-    mine,
-    seed_prefix: str,
-    k: int,
-    retries: int = TIE_RETRIES,
-) -> list[str] | None:
-    """Re-roll an option sampler until the block's character lengths are distinct.
-
-    Both labels must offer a block whose option lengths carry as little about the
-    answer as the source text allows.  ``mine_option_spans`` prefers candidates
-    closest in character length to the gold -- deliberately, so the block stays
-    tight -- but that makes a length *tie* common, and a strategy of "pick the
-    first longest option" then wins on ties without knowing anything about the
-    answer: with the tie left in place that rule scores 0.4600 on ``test`` at seed
-    0 (mean 0.4371 over seeds 0-3), over the 0.4333 budget of the section 9 audit,
-    and re-rolling brings it down to 0.4275 (mean 0.4258), while on the rows whose
-    maximum is unique in the first place -- where the cue is a pure length cue --
-    it still scores 0.4693.  The excess is the tie-break rule, not information, so
-    it is sampled away here rather than left for the audit to excuse.  Re-rolling
-    is bounded (``retries`` seeds derived from the row, so the outcome stays
-    deterministic) and a row whose question offers no tie-free block keeps the tie
-    rather than being dropped.
-
-    Args:
-        mine: ``seed -> list[str] | None``, one sampling attempt.
-        seed_prefix: row-identifying string the attempt seeds are derived from.
-        k: total option count, used for the distinctness test.
-        retries: how many attempts before the tie is accepted.
-
-    Returns:
-        The first tie-free block, the first block sampled if none is tie-free, or
-        ``None`` when the sampler itself reports an insufficient pool.
-    """
-    fallback: list[str] | None = None
-    for attempt in range(retries):
-        texts = mine(f"{seed_prefix}:{attempt}")
-        if texts is None:
-            return None
-        if fallback is None:
-            fallback = texts
-        if len({len(text) for text in texts}) == k:
-            return texts
-    return fallback
-
-
-def audit_answer(row: dict) -> str:
-    """The source's own ``answer`` text, for ``ground_truth.answer`` (audit only).
-
-    ``label=0``'s answer is free text ("Because cats are much larger than mice.")
-    about 67.8% of the time and never a usable gold; the judgment branch stores it
-    purely so the artifact is self-describing and the audit can anchor the row to
-    the raw file.  ``test``'s ``label=1`` answers are the repr of a 3-element
-    Python list (measured 687/687), so the list form is parsed and the first
-    element taken -- the sample doc requires it -- though this adapter discards the
-    ``label=1`` answer anyway (an unsolvable row must not carry one).
-    """
-    text = (row.get("answer") or "").strip()
-    if text.startswith("["):
-        try:
-            parsed = ast.literal_eval(text)
-        except (ValueError, SyntaxError):  # pragma: no cover - defensive
-            return text
-        if isinstance(parsed, list | tuple) and parsed:
-            return str(parsed[0]).strip()
-    return text
+    region = regions[0]
+    return region.b_text.strip(), region.a_text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -673,8 +645,20 @@ def audit_answer(row: dict) -> str:
 
 
 def _task_id(side: str, split: str, index: int) -> str:
-    """Stable hard-replay key; carries the side because both sides may be written."""
+    """Stable hard-replay key; carries the side because both sides are written."""
     return f"falseqa-{side}-{split}-{index}"
+
+
+def pair_id(split: str, index: int) -> str:
+    """The D27 pair identity shared by a pair's two rows.
+
+    ``mix_halluc.enforce_pair_atomicity`` groups val rows by this value, so the
+    answerable and unanswerable twins of one index-aligned pair never land on
+    opposite sides of the train/val boundary (design doc section 4.3/9).  The
+    source split is part of the id because index ``k`` of two different CSVs names
+    two different pairs.
+    """
+    return f"{split}:{index}"
 
 
 def _base_extra_info(split: str, index: int, seed: int, partner_question: str) -> dict:
@@ -682,9 +666,10 @@ def _base_extra_info(split: str, index: int, seed: int, partner_question: str) -
         "split": split,
         "index": index,
         "seed": seed,
+        "pair_id": pair_id(split, index),
         "paired_original_text": partner_question,
         "perturbation_family": "",
-        "difficulty": "",  # the source carries no difficulty axis (recon section 4)
+        "difficulty": "",  # the source carries no difficulty axis
     }
 
 
@@ -695,8 +680,7 @@ def _build_diag(
     seed: int,
     question: str,
     partner_question: str,
-    gold: str,
-    texts: list[str],
+    options: list[dict],
     correct: str,
     deleted: str,
     inserted: str,
@@ -714,7 +698,6 @@ def _build_diag(
             "has_diagnosis_label": True,
         }
     )
-    options = [{"id": chr(ord("A") + i), "text": text} for i, text in enumerate(texts)]
     return schema.make_row(
         data_source=DATA_SOURCE,
         question=question,
@@ -732,18 +715,24 @@ def _build_diag(
     )
 
 
-def _build_judge(
+def _build_answerable(
     *,
     split: str,
     index: int,
     seed: int,
     question: str,
     partner_question: str,
-    texts: list[str],
+    options: list[dict],
+    answer: str,
     deleted: str,
     inserted: str,
-    audit: str,
 ) -> dict:
+    """One ``solvable_two_layer`` row: gold is the source's own label=0 answer.
+
+    The option block is a *placeholder*: no option is correct
+    (``correct_option_id`` is ``None``), and the reward never reads it.  It exists
+    so template A has one appearance on both sides of the source (D18).
+    """
     extra = _base_extra_info(split, index, seed, partner_question)
     extra.update(
         {
@@ -754,25 +743,123 @@ def _build_judge(
             "deleted_condition_text": deleted,
             "solvable": True,
             "correct_option_id": "",
-            "judgment_only": True,
+            "has_diagnosis_label": False,
         }
     )
-    options = [{"id": chr(ord("A") + i), "text": text} for i, text in enumerate(texts)]
     return schema.make_row(
         data_source=DATA_SOURCE,
         question=question,
         ground_truth=schema.build_ground_truth(
             solvable=True,
-            answer=audit,
-            judgment_only=True,
+            answer=answer,
+            correct_option_id=None,
             has_diagnosis_label=False,
             perturbation_type=None,
+            solvable_answer=True,
         ),
         template=schema.TEMPLATE_A,
-        branch=BRANCH_JUDGE,
+        branch=BRANCH_ANSWERABLE,
         extra_info=extra,
         options=options,
     )
+
+
+def _reference_of(left_tokens: int, right: str) -> tuple[int, int, tuple, int] | None:
+    """The diagnosis-side shape an answerable placeholder block mirrors.
+
+    ``(left words, right words, right type, right character length)`` -- exactly
+    the four coordinates a diagnosis block's shape is made of.  The reference is
+    taken from the pair's **own** twin (the region the two questions differ by), so
+    the two rows of one pair share a shape and the answerable side's block
+    distribution matches the diagnosis side's by construction.  Coupling it to the
+    rest of the build instead would make a ``--limit`` slice differ from the full
+    build's prefix -- the property the slice builds rely on -- which is why the
+    mirroring is pairwise rather than pool-wide (deviation 3 of the module
+    docstring).
+
+    ``None`` means the pair has no usable reference (an empty repairing fragment):
+    the caller then walks the deterministic one-token fallback shapes.
+    """
+    right = right.strip()
+    if not right or left_tokens <= 0:
+        return None
+    signature = item_signature(right)
+    return left_tokens, signature[0], signature, len(right)
+
+
+def _fallback_references(bank: dict, minimum: int) -> list[tuple[int, int, tuple, int]]:
+    """One-token reference shapes for a question whose sampled shapes fail.
+
+    Ordered by descending pool size and then by signature, so the choice is
+    deterministic and the first entry is the type class the corpus offers most of.
+    """
+    references: list[tuple[int, int, tuple, int]] = []
+    groups = [(len(items), signature) for signature, items in bank.items() if signature[0] == 1]
+    for size, signature in sorted(groups, key=lambda entry: (-entry[0], entry[1])):
+        if size < minimum:
+            continue
+        lengths = sorted(len(text) for text in bank[signature].values())
+        references.append((1, 1, signature, lengths[len(lengths) // 2]))
+    return references
+
+
+def _placeholder_from_reference(
+    question: str,
+    bank: dict,
+    reference: tuple[int, int, tuple, int],
+    rng: random.Random,
+    k: int,
+) -> tuple[list[dict], str, list[str]] | None:
+    """Mine one placeholder block for one reference shape, or ``None``."""
+    n_left, n_right, signature, char_len = reference
+    if signature[0] != n_right:
+        return None
+    lefts = mine_content_spans(question, n_left)
+    if not lefts:
+        return None
+    pool = out_of_passage_right_pool(
+        bank, signature=signature, char_len=char_len, passage=question, exclude="", minimum=k
+    )
+    if pool is None:
+        return None
+    left = rng.choice(lefts)
+    rights = rng.sample(pool, k)
+    texts = [schema.pair_option_text(left, right) for right in rights]
+    return schema.shuffle_options(texts, rng), left, rights
+
+
+def mine_placeholder_options(
+    question: str,
+    bank: dict,
+    references: list[tuple[int, int, tuple, int]],
+    seed_prefix: str,
+    k: int = K_OPTIONS,
+    attempts: int = PLACEHOLDER_ATTEMPTS,
+) -> tuple[list[dict], str, list[str]] | None:
+    """The answerable side's placeholder replacement-pair block, or ``None``.
+
+    ``references`` holds the shape the pair's own region implies (at most one
+    entry, and empty when the pair has no usable region).  The first ``attempts``
+    tries re-sample the left span and the distractors with the row's seed; if the
+    shape cannot be satisfied at all the deterministic one-token fallback list is
+    walked, and a row that still cannot field a block is dropped rather than
+    padded.
+
+    Returns ``(options, left, rights)``.
+    """
+    for attempt in range(attempts):
+        rng = random.Random(f"{seed_prefix}:{attempt}")
+        if not references:
+            break
+        mined = _placeholder_from_reference(question, bank, rng.choice(references), rng, k)
+        if mined is not None:
+            return mined
+    rng = random.Random(f"{seed_prefix}:fallback")
+    for reference in _fallback_references(bank, k):
+        mined = _placeholder_from_reference(question, bank, reference, rng, k)
+        if mined is not None:
+            return mined
+    return None
 
 
 def build_rows(
@@ -786,7 +873,7 @@ def build_rows(
     Args:
         raw_dir: directory holding ``train.csv`` / ``valid.csv`` / ``test.csv``.
         limit: cap on the number of **pairs** (source index ``k``), not on the
-            number of rows.  A pair can yield one row (either branch) or two, so
+            number of rows.  A pair can yield one row (either side) or two, so
             the written count does not equal ``limit``; the pairing is positional
             inside the two label blocks, so a pair cap is well defined and
             independent of the file's blocked layout.  ``None`` writes everything
@@ -830,8 +917,14 @@ def build_rows(
         pairs = pairs[: max(limit, 0)]
     funnel["pairs_after_limit"] = len(pairs)
 
-    certified = 0
+    # The item bank is the split's own vocabulary; the passage test excludes the
+    # presented question, so a candidate is never taken from the row it fills.
+    # It is built from every well-formed row, *before* ``limit`` is applied to the
+    # pairs, so a limited build is byte-identical to the full build's prefix.
+    bank = build_item_bank([normalise_question(row["question"]) for row in well_formed])
+
     built: list[dict] = []
+    certified = 0
     for index, (fake_row, real_row) in enumerate(pairs):
         real_q = normalise_question(real_row["question"])
         fake_q = normalise_question(fake_row["question"])
@@ -844,72 +937,80 @@ def build_rows(
             continue
         certified += 1
         deleted, inserted = defect_texts(real_q, fake_q)
+        real_answer = (real_row.get("answer") or "").strip()
+        region = regions[0]
+        left, right = region.b_text.strip(), region.a_text.strip()
+        # The reference the answerable side's placeholder mirrors: the pair's own
+        # shape, whether or not the diagnosis side can use it as a gold.
+        reference = _reference_of(region.n_b, right)
 
-        gold = certify_gold(real_q, fake_q, regions)
-        if gold is not None:
-            if not any(schema.is_content_word(token) for token in schema.words(gold)):
-                drops["gold_has_no_content_word"] += 1
-            else:
-                texts = mine_distinct_block(
-                    functools.partial(_mine_diag_options, fake_q, gold),
-                    f"{seed}:{BRANCH_DIAG}:{split}:{index}",
-                    K_OPTIONS,
-                )
-                if texts is None:
-                    drops["diag_pool_below_k"] += 1
-                else:
-                    correct = chr(ord("A") + texts.index(gold))
-                    if not unique_absent_option(real_q, texts, gold):
-                        drops["diag_not_unique_absent_option"] += 1
-                    else:
-                        built.append(
-                            _build_diag(
-                                split=split,
-                                index=index,
-                                seed=seed,
-                                question=fake_q,
-                                partner_question=real_q,
-                                gold=gold,
-                                texts=texts,
-                                correct=correct,
-                                deleted=deleted,
-                                inserted=inserted,
-                            )
-                        )
-        elif len(regions) == 1:
-            # The single region failed a gold gate; count which one, in the same
-            # order certify_gold applies them.
-            tokens = schema.words(regions[0].b_text.strip())
-            if not tokens or not any(schema.is_content_word(token) for token in tokens):
-                drops["gold_has_no_content_word"] += 1
-            elif regions[0].b_text.strip() not in fake_q:
-                drops["gold_not_verbatim_in_question"] += 1
-            else:
-                drops["gold_first_token_not_unique"] += 1
-
-        anchor_tokens = regions[0].n_b
-        anchor_texts = mine_distinct_block(
-            functools.partial(_mine_judge_options, real_q, anchor_tokens),
-            f"{seed}:{BRANCH_JUDGE}:{split}:{index}",
-            K_OPTIONS,
-        )
-        if anchor_texts is None:
-            drops["judge_pool_below_k"] += 1
+        problem = gold_pair_problem(real_q, fake_q, regions)
+        if problem is not None:
+            # The pair still has a region certificate, so the answerable side can
+            # be built; only the diagnosis side loses its pointer gold.
+            drops[problem] += 1
         else:
-            built.append(
-                _build_judge(
-                    split=split,
-                    index=index,
-                    seed=seed,
-                    question=real_q,
-                    partner_question=fake_q,
-                    texts=anchor_texts,
-                    deleted=deleted,
-                    inserted=inserted,
-                    audit=audit_answer(real_row),
-                )
+            pool = out_of_passage_right_pool(
+                bank,
+                signature=item_signature(right),
+                char_len=len(right),
+                passage=fake_q,
+                exclude=right,
+                minimum=K_OPTIONS - 1,
             )
+            if pool is None:
+                drops["pair_distractors_below_k"] += 1
+            else:
+                rng = random.Random(f"{seed}:{BRANCH_DIAG}:{split}:{index}")
+                mined = schema.build_pair_options(left, right, pool, K_OPTIONS, rng)
+                if mined is None:  # pragma: no cover - the pool gate already holds
+                    drops["pair_distractors_below_k"] += 1
+                else:
+                    options, correct = mined
+                    built.append(
+                        _build_diag(
+                            split=split,
+                            index=index,
+                            seed=seed,
+                            question=fake_q,
+                            partner_question=real_q,
+                            options=options,
+                            correct=correct,
+                            deleted=deleted,
+                            inserted=inserted,
+                        )
+                    )
 
+        if not real_answer:
+            drops["answer_empty"] += 1
+        else:
+            rng_prefix = f"{seed}:{BRANCH_ANSWERABLE}:{split}:{index}"
+            mined = mine_placeholder_options(
+                real_q,
+                bank,
+                [reference] if reference is not None else [],
+                rng_prefix,
+                K_OPTIONS,
+            )
+            if mined is None:
+                drops["placeholder_pool_below_k"] += 1
+            else:
+                options, _left, _rights = mined
+                built.append(
+                    _build_answerable(
+                        split=split,
+                        index=index,
+                        seed=seed,
+                        question=real_q,
+                        partner_question=fake_q,
+                        options=options,
+                        answer=real_answer,
+                        deleted=deleted,
+                        inserted=inserted,
+                    )
+                )
+
+    built.sort(key=lambda row: (row["extra_info"]["index"], row["extra_info"]["task_id"]))
     funnel["pairs_with_region_certificate"] = certified
     funnel["rows_built"] = len(built)
 
@@ -928,7 +1029,8 @@ def build_rows(
 
 
 #: Every way a row can be dropped.  Kept as a module constant so the funnel prints
-#: a zero for a reason that did not fire instead of silently omitting it.
+#: a zero for a reason that did not fire instead of silently omitting it.  The
+#: first four are pair-level (both rows go), the rest drop one side.
 DROP_REASONS = (
     "malformed_row",
     "unpaired_label_block",
@@ -937,9 +1039,11 @@ DROP_REASONS = (
     "gold_not_verbatim_in_question",
     "gold_has_no_content_word",
     "gold_first_token_not_unique",
-    "diag_pool_below_k",
-    "diag_not_unique_absent_option",
-    "judge_pool_below_k",
+    "gold_pair_right_empty",
+    "gold_pair_right_in_passage",
+    "pair_distractors_below_k",
+    "answer_empty",
+    "placeholder_pool_below_k",
 )
 
 

@@ -11,27 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""KUQ + CREPE adapter -- the two judgment-only sources of design doc section 4.9.1.
+"""CREPE adapter -- the judgment-only source (design doc section 4.6; table B rows 4 and 8).
 
-Both sources answer one question: *is this question answerable at all?*  Neither
-carries a pointer gold, so neither can enter the four-tier diagnosis branch:
-
-* **CREPE** (`tasksource/CREPE`, BSD).  `presuppositions` is a *paraphrase*, not
-  a span: measured 14 of 1,271 single-label train fragments (1.10%) occur
-  verbatim in `question`, so "point at the false premise in the prompt" is
-  impossible.  Judgment only (design doc section 4.9.2 pitfall 2).
-* **KUQ** (`amayuelas/KUQ`, MIT).  No span/offset/highlight column exists at all
-  in `knowns_unknowns.jsonl`, so there is nothing to point at either.
+The source asks one question: *is this question answerable at all?*  It carries
+no pointer gold, so it cannot enter the four-tier diagnosis branch:
+``presuppositions`` is a *paraphrase*, not a span -- measured 14 of 1,271
+single-label train fragments (1.10%) occur verbatim in ``question``, so "point at
+the false premise in the prompt" is impossible (design doc section 4.6, pitfall
+2).
 
 Output: solvable rows on branch ``solvable_judge`` (gold ``\\boxed{SOLVABLE}``,
 ``judgment_only=true``) and unsolvable rows on branch ``unsolvable_bare`` (gold
-``\\boxed{UNSOLVABLE}``, three-tier).  Both branches come from both sources, so
-this one file fills table B's branch 4 (CREPE-normal 500 + KUQ-known 200) and
-branch 6 (CREPE-false-presupposition 400 + KUQ false-assumption/counterfactual
-200) -- 1,300 rows, the two files of the ``raw/kuq_crepe`` recon bundle.
+``\\boxed{UNSOLVABLE}``, three-tier).  Neither side carries an option block: the
+three-tier branch is option-less by D12/D24, and the judgment branch has no
+option semantics to expose, so template ``B_judge`` is the only admissible
+template for both.  Design doc section 4.8 table B assigns this source
+**CREPE-normal 250** (row 4) and **CREPE-FP 400** (row 8) = 650 rows;
+:data:`QUOTAS` is that allocation and nothing else (D25 removed the second
+judgment-only source that an earlier revision shared this file with).
 
 Why the labels are trustworthy (the certificates this adapter enforces)
----------------------------------------------------------------------
+----------------------------------------------------------------------
 
 Every row is dropped unless a *second, independent* source field agrees with the
 label -- fail closed, counted in the funnel:
@@ -42,17 +42,12 @@ source / gold           label evidence              independent corroboration
 CREPE solvable          `labels == ['normal']`      `presuppositions == []`
 CREPE unsolvable        `labels == ['false       `presuppositions` non-empty (the
                         presupposition']`            source states the false premise)
-KUQ solvable            `unknown is False`          non-empty `answer` list and **no**
-                                                    `category` key
-KUQ unsolvable          `unknown is True`           `category` present and
-                                                    `source == 'turk'`
 ======================  ==========================  ==================================
 
 Measured on the raw bundle: the corroboration holds on 100% of the single-label
-rows of both sources (CREPE 8,446 / 8,446; KUQ 6,884 / 6,884), so the certificate
-stage itself drops nothing today -- it is a guard, and it is what lets
-``verify_crepe.py`` re-prove the gold from the raw bytes instead of trusting this
-file.
+rows (8,446 / 8,446), so the certificate stage itself drops nothing today -- it
+is a guard, and it is what lets ``verify_crepe.py`` re-prove the gold from the
+raw bytes instead of trusting this file.
 
 DEVIATIONS FROM THE DESIGN DOC
 ------------------------------
@@ -61,17 +56,16 @@ Each item below is a place where the design doc's number or allocation is
 contradicted by the recon report / by a fresh measurement.  The measured number
 is quoted.
 
-1. **Branch 4 uses template ``B_judge``, not template ``B``** (design doc
-   section 4.9.3 table B row 4 assigns CREPE-normal and KUQ-known to template B
-   with gold ``\\boxed{SOLVABLE}``).  Template B asks for the *answer* and never
-   mentions ``SOLVABLE``, so it cannot express that gold at all -- this is the
-   DESIGN GAP ``schema.py`` documents in its own template comment.  Worse, using
-   B for the unsolvable side and B_judge for the solvable side would make "which
+1. **Rows use template ``B_judge``, not template ``B``** (design doc section 5.2
+   puts the judgment branch on template B plus one added sentence).  Template B
+   asks for the *answer*; the frozen ``schema.py`` spells the judgment variant
+   out as ``B_judge`` because B's "否则…输出你的最终答案" line contradicts the
+   verdict-only instruction.  **Both labels therefore use ``B_judge``**: using B
+   for the unsolvable side and B_judge for the solvable side would make "which
    verdict wording the prompt offers" a 100% label shortcut, which is exactly
-   what D14's isomorphism constraint forbids.  **Both labels therefore use
-   ``B_judge``**, i.e. every row in this file is in the option-less template
-   family, which keeps that family's ``solvable`` split non-degenerate.
-
+   what the D18 isomorphism constraint forbids.  The whole file is in the
+   option-less template family, which keeps that family's ``solvable`` split
+   non-degenerate (design doc sections 5.2 and 9).
 2. **CREPE train false-presupposition count is 907 here, not the doc's 927.**
    The doc's 927 folds in the 20 train rows whose `labels` is
    ``['false presupposition', 'normal']`` (annotator disagreement, measured
@@ -80,55 +74,42 @@ is quoted.
    Re-derived from raw: the space-form string ``'false presupposition'`` matches
    927 train rows (the doc's number, verified) and the underscore form
    ``'false_presupposition'`` matches 0.
-
-3. **KUQ unknown rows are restricted to ``category in {false assumption,
-   counterfactual}``** -- 1,088 of the 3,437 unknown rows.  Table B allocates
-   "KUQ(FA+CF) 200" to the 假前提（不可指认）(unpointable false premise) bucket;
-   the other four native categories (ambiguous 577, controversial 676,
-   future unknown 659, unsolved problem 437 = 2,349 rows) have **no allocation
-   anywhere in table B's defect-class table**, so admitting them would silently
-   corrupt that balance.  They are dropped and counted in the funnel.
-
-4. **The L3 Naive-Bayes gate FAILS on these rows** (measured by
-   ``verify_crepe.py``, which reports it verbatim).  Out-of-fold balanced accuracy
-   with the vocabulary restricted to tokens with train support >= 5:
-   **0.6800 pooled / 0.9067 KUQ-only / 0.6267 CREPE-only at ``--limit 300``**,
-   and **0.6708 pooled / 0.8650 KUQ-only / 0.5978 CREPE-only on the full
-   1,300-row build** (0.7012 / 0.8921 / 0.6228 on the pre-quota candidate pool,
-   which is what these numbers were first probed on), where the gate is <= 0.60.
-   Design doc table A lists
-   KUQ's L3 as 未测 (never measured) and assigns CREPE no L3 figure at all, so
-   this is new information, not a contradiction of a number; it is recorded here
+3. **The L3 Naive-Bayes reading exceeds the 0.60 reference gate on these rows**
+   (measured by ``verify_crepe.py``, which prints it verbatim).  Out-of-fold
+   balanced accuracy with the vocabulary restricted to tokens with train support
+   >= 5: **0.6075** on the 650-row build this adapter produces (the pre-D25
+   ``--limit 300`` artifact read 0.6267 CREPE-only; the seed and the quota
+   composition both move the figure, so re-run the audit rather than quoting
+   this one).  Design doc table A gives CREPE no L3 figure at all, so this is new
+   information rather than a contradiction of a number; it is recorded here
    because it is the single most important caveat on these rows.  Diagnosis: the
-   signal is not in an option block (there is none) -- it is question *style*,
-   which for KUQ is the residue of the recon report's documented metadata leak
-   ``source == 'turk' ⟺ unknown`` (100% on raw): crowd-written unknowns vs
-   Wikipedia-derived knowns read differently.  No adapter-side transformation can
-   remove it without rewriting the question text, which would break the verbatim
-   provenance this adapter guarantees.  Escalate; do not treat it as clean.
-
-5. **CREPE's native three-way split is preserved** in ``extra_info.split``
+   signal is not in an option block (there is none) -- it is question *style*.
+   The doc's section 9 hard gate ("随机基线 + 5pt", fail-closed) is scoped to
+   sources whose enabled **option set** is the only signal; CREPE carries no
+   option block, so the reading is an explicit reported finding, not a gate that
+   decides admission.  ``verify_crepe.py`` labels it as such and does not
+   silently pass or silently fail the run on it.  Escalate; do not treat it as
+   clean.
+4. **CREPE's native three-way split is preserved** in ``extra_info.split``
    (train 3,462 / validation 2,000 / test 3,004) instead of collapsing the source
-   to ``train``; KUQ has no native split, so it is ``"train"``.  The table B
-   quota of a (source, branch) group is filled across that source's native splits
-   in proportion, so the group total is exactly the quota and every row keeps its
-   own split.  The design doc does not say how to treat these splits.
+   to ``train``.  The table B quota of a (source, branch) group is filled across
+   that source's native splits in proportion, so the group total is exactly the
+   quota and every row keeps its own split.  The design doc does not say how to
+   treat these splits.
 
 Other measured facts worth having in the file
 ---------------------------------------------
 
 * ``difficulty`` carries the source's *own* annotation slug rather than an
-  invented tier: ``normal`` / ``false_presupposition`` for CREPE (its label
-  vocabulary), ``known`` / ``false_assumption`` / ``counterfactual`` for KUQ.
+  invented tier: ``normal`` / ``false_presupposition`` (its label vocabulary).
   It is a bucketing key for design doc section 10 monitoring, not a graded
   difficulty.
 * ``perturbation_type`` is ``contradictory_condition`` on the unsolvable rows:
   the premise contradicts the true state of the world, which is the closest of
   the schema's seven values to a false premise; the finer D18 defect class is
-  carried in ``error_type = false_premise_unpointable``.
-* KUQ keys are its *line index* in ``knowns_unknowns.jsonl`` -- the file has no
-  id column, and the index is stable and derived from the source's own ordering.
-  CREPE keys are its own ``id`` column (``dup_ids == 0`` per split).
+  carried in ``error_type = false_premise_unpointable`` (table B row 8's
+  假前提（不可指认）bucket).
+* CREPE keys are its own ``id`` column (``dup_ids == 0`` per split).
 * Determinism: the only randomness is the seeded subsample that fills each
   quota, drawn from its own :class:`random.Random` stream, so
   ``(raw_dir, limit, seed)`` reproduces the rows byte for byte.
@@ -141,7 +122,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import random
 from collections import Counter, OrderedDict, defaultdict
@@ -153,33 +133,24 @@ import schema
 # source constants (all measured on the raw bundle, none guessed)
 # ---------------------------------------------------------------------------
 
-RAW_DIR_DEFAULT = "/home/charles/data/reasoning_rl/halluc/raw/kuq_crepe"
-# Named DEFAULT_OUT like every other adapter, and named after *this* source: the raw
-# directory is shared with the KUQ adapter, but the artifacts are not.
+RAW_DIR_DEFAULT = "/home/charles/data/reasoning_rl/halluc/raw/crepe"
+# Named DEFAULT_OUT like every other adapter, and named after *this* source.
 DEFAULT_OUT = os.path.expanduser("~/data/reasoning_rl/halluc/built/crepe.parquet")
 
 CREPE_SPLITS = ("train", "validation", "test")
 # The space, not the underscore: the upstream README says 'false_presupposition'
-# and that spelling matches 0 rows (design doc section 4.9.2 pitfall 1).
+# and that spelling matches 0 rows (design doc section 4.6, pitfall 1).
 CREPE_NORMAL = "normal"
 CREPE_FALSE_PRESUPPOSITION = "false presupposition"
 CREPE_LABELS = (CREPE_NORMAL, CREPE_FALSE_PRESUPPOSITION)
 CREPE_REQUIRED_COLUMNS = ("id", "question", "labels", "presuppositions")
 
-KUQ_FILE = "knowns_unknowns.jsonl"
-# Table B allocates only the two "false premise" categories of KUQ's six-way
-# annotation to the unpointable-false-premise bucket (deviation 3).
-KUQ_UNKNOWN_CATEGORIES = ("false assumption", "counterfactual")
-KUQ_SOURCE_MARKER = "turk"
-
-# Design doc section 4.9.3 table B: branch 4 takes CREPE-normal 500 +
-# KUQ-known 200, branch 6 takes CREPE-false-presupposition 400 +
-# KUQ false-assumption/counterfactual 200.
+# Design doc section 4.8 table B: row 4 takes CREPE-normal 250 (judgment-only,
+# template B_judge) and row 8 takes CREPE-false-presupposition 400 (three-tier
+# bare, template B_judge with no options).
 QUOTAS: dict[tuple[str, str], int] = {
-    (schema.SOURCE_CREPE, schema.BRANCH_SOLVABLE_JUDGE): 500,
+    (schema.SOURCE_CREPE, schema.BRANCH_SOLVABLE_JUDGE): 250,
     (schema.SOURCE_CREPE, schema.BRANCH_UNSOLVABLE_BARE): 400,
-    (schema.SOURCE_KUQ, schema.BRANCH_SOLVABLE_JUDGE): 200,
-    (schema.SOURCE_KUQ, schema.BRANCH_UNSOLVABLE_BARE): 200,
 }
 
 # Fixed order: it decides the row order of the artifact, the quota RNG streams,
@@ -187,22 +158,23 @@ QUOTAS: dict[tuple[str, str], int] = {
 GROUP_ORDER: tuple[tuple[str, str], ...] = (
     (schema.SOURCE_CREPE, schema.BRANCH_SOLVABLE_JUDGE),
     (schema.SOURCE_CREPE, schema.BRANCH_UNSOLVABLE_BARE),
-    (schema.SOURCE_KUQ, schema.BRANCH_SOLVABLE_JUDGE),
-    (schema.SOURCE_KUQ, schema.BRANCH_UNSOLVABLE_BARE),
 )
 
 # All rows are option-less verdict rows, so one template serves both labels.
 TEMPLATE = schema.TEMPLATE_B_JUDGE
 
-# The D18 defect class both sources fill (design doc section 4.9.3 table B,
+# The D18 defect class this source fills (design doc section 4.8 table B row 8,
 # 假前提（不可指认）: a false premise that cannot be pointed at in the prompt).
 ERROR_TYPE = "false_premise_unpointable"
 # A false premise contradicts the true state of the world; the finer class goes
 # in error_type (see the module docstring).
 UNSOLVABLE_PERTURBATION = "contradictory_condition"
 
-SOURCE_NAMES = (schema.SOURCE_CREPE, schema.SOURCE_KUQ)
-SOURCE_CHOICES = ("both", "crepe", "kuq")
+SOURCE_NAMES = (schema.SOURCE_CREPE,)
+# Single-source file now that D25 removed the other judgment-only source: the
+# flag stays for symmetry with the other adapters and so a bundle subset can
+# still be selected explicitly.
+SOURCE_CHOICES = ("crepe",)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +186,7 @@ SOURCE_CHOICES = ("both", "crepe", "kuq")
 class Candidate:
     """One raw record that may become a row, with its certificate already checked.
 
-    ``label_ok`` and ``certificate_ok`` are computed by the loaders rather than
+    ``label_ok`` and ``certificate_ok`` are computed by the loader rather than
     inside :func:`build_rows` so that each filter stage in the funnel maps to
     exactly one predicate -- which is what makes the funnel auditable.
     """
@@ -227,15 +199,12 @@ class Candidate:
     label_ok: bool
     certificate_ok: bool
     certificate: str
-    category: str | None
     difficulty: str
 
     @property
     def task_id(self) -> str:
         """Stable hard-replay dedup key, derived from the source's own identity."""
-        if self.source == schema.SOURCE_CREPE:
-            return f"crepe:{self.split}:{self.key}"
-        return f"kuq:{self.key}"
+        return f"crepe:{self.split}:{self.key}"
 
     @property
     def branch(self) -> str:
@@ -292,50 +261,6 @@ def _crepe_candidate(split: str, record: dict) -> Candidate:
         label_ok=label_ok,
         certificate_ok=certificate_ok,
         certificate=certificate,
-        category=None,
-        difficulty=difficulty,
-    )
-
-
-def _kuq_candidate(index: int, record: dict) -> Candidate:
-    question = record.get("question") or ""
-    unknown = record.get("unknown")
-    answers = record.get("answer")
-    category = record.get("category") if isinstance(unknown, bool) else None
-    # The file carries no id column, so the line index is the source's own
-    # stable identity for the record.
-    key = f"{index:05d}"
-
-    # L2: KUQ's gold is a plain JSON bool, so it is unique by construction.
-    label_ok = isinstance(unknown, bool)
-    solvable = label_ok and unknown is False
-
-    if not label_ok:
-        certificate_ok = False
-        certificate = "KUQ's 'unknown' flag must be a JSON bool"
-    elif solvable:
-        has_answers = (
-            isinstance(answers, list)
-            and bool(answers)
-            and all(isinstance(a, str) and a.strip() for a in answers)
-        )
-        certificate_ok = has_answers and "category" not in record
-        certificate = "source supplies a non-empty answer list and no unknown-category annotation"
-    else:
-        certificate_ok = bool(category) and record.get("source") == KUQ_SOURCE_MARKER
-        certificate = f"source annotates this question unknown (category={category!r}, crowd-written)"
-
-    difficulty = "known" if solvable else str(category or "").replace(" ", "_")
-    return Candidate(
-        source=schema.SOURCE_KUQ,
-        split="train",
-        key=key,
-        question=question,
-        solvable=solvable,
-        label_ok=label_ok,
-        certificate_ok=certificate_ok,
-        certificate=certificate,
-        category=category if isinstance(category, str) else None,
         difficulty=difficulty,
     )
 
@@ -357,21 +282,6 @@ def load_crepe(raw_dir: str) -> list[Candidate]:
         if missing:
             raise ValueError(f"{path} is missing required columns {missing}")
         candidates.extend(_crepe_candidate(split, record) for record in table.to_pylist())
-    return candidates
-
-
-def load_kuq(raw_dir: str) -> list[Candidate]:
-    """Every KUQ row of ``knowns_unknowns.jsonl`` as a :class:`Candidate`."""
-    path = os.path.join(raw_dir, KUQ_FILE)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"missing KUQ label file: {path}")
-    candidates: list[Candidate] = []
-    with open(path, encoding="utf-8") as handle:
-        for index, line in enumerate(handle):
-            line = line.strip()
-            if not line:
-                continue
-            candidates.append(_kuq_candidate(index, json.loads(line)))
     return candidates
 
 
@@ -463,13 +373,12 @@ def build_rows(
     seed: int = 0,
     sources: tuple[str, ...] = SOURCE_NAMES,
 ) -> tuple[list[dict], OrderedDict[str, int]]:
-    """Build the rows and the filter funnel (design doc sections 4.9.1-4.9.3).
+    """Build the rows and the filter funnel (design doc sections 4.6 and 4.8).
 
     Args:
-        raw_dir: directory holding ``crepe_{train,validation,test}.parquet`` and
-            ``knowns_unknowns.jsonl``.
+        raw_dir: directory holding ``crepe_{train,validation,test}.parquet``.
         limit: cap on the number of emitted rows, applied last; ``None`` emits
-            the full quota (1,300 rows).
+            the full quota (650 rows).
         seed: seed of the quota subsampling; ``(raw_dir, limit, seed)`` is
             reproducible byte for byte.
         sources: which sources to build (``SOURCE_NAMES`` by default).
@@ -493,8 +402,6 @@ def build_rows(
     candidates: list[Candidate] = []
     if schema.SOURCE_CREPE in sources:
         candidates.extend(load_crepe(raw_dir))
-    if schema.SOURCE_KUQ in sources:
-        candidates.extend(load_kuq(raw_dir))
     # A fixed order before any sampling is what makes the outcome reproducible.
     candidates.sort(key=Candidate.order_key)
     funnel["raw_rows"] = len(candidates)
@@ -507,10 +414,6 @@ def build_rows(
 
     stage = [c for c in stage if c.certificate_ok]
     funnel["after_certificate"] = len(stage)
-
-    admissible = (None, *KUQ_UNKNOWN_CATEGORIES)
-    stage = [c for c in stage if c.category in admissible]
-    funnel["after_kuq_category_filter"] = len(stage)
 
     # L2 across the pool: a question whose gold is not unique (it appears on both
     # sides) is admissible under two labels, so every one of its rows goes.
@@ -590,24 +493,21 @@ def _print_breakdown(rows: list[dict]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--raw-dir", default=RAW_DIR_DEFAULT, help="raw kuq_crepe bundle")
+    parser.add_argument("--raw-dir", default=RAW_DIR_DEFAULT, help="raw CREPE bundle")
     parser.add_argument("--limit", type=int, default=None, help="cap on emitted rows")
     parser.add_argument("--out", default=DEFAULT_OUT, help="output parquet path")
     parser.add_argument("--seed", type=int, default=0, help="quota subsampling seed")
     parser.add_argument(
         "--sources",
         choices=SOURCE_CHOICES,
-        default="both",
-        help="which sources to build (both by default); table B allocates both",
+        default=SOURCE_CHOICES[0],
+        help="which source to build; this adapter builds CREPE only",
     )
     args = parser.parse_args()
 
-    if args.sources == "both":
-        sources = SOURCE_NAMES
-    elif args.sources == "crepe":
-        sources = (schema.SOURCE_CREPE,)
-    else:
-        sources = (schema.SOURCE_KUQ,)
+    # Single-source file: argparse's ``choices`` is what rejects anything but
+    # CREPE, and the flag itself is kept for symmetry with the other adapters.
+    sources = SOURCE_NAMES
 
     rows, funnel = build_rows(args.raw_dir, limit=args.limit, seed=args.seed, sources=sources)
     if not rows:

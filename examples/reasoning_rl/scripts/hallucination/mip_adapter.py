@@ -11,35 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""MiP adapter -- the three-tier *bare* unsolvable source (design doc section 4.3 / D12).
+"""MiP adapter -- the three-tier *bare* unsolvable source (design doc section 4.2 / D12).
 
 Source: ``github.com/tianyi-lab/MiP-Overthinking`` ``data/{gsm8k,svamp,math,formula}.json``
 (984 rows; **not** a HF dataset).  Each paired row carries a solvable original
 (``question`` + the source's own ``answer``/``solution``) and its truncated twin
-(``insufficient_question``), so one source row supplies both sides of the
-answerability contrast without a second file.
+(``insufficient_question``), so one source row supplies the deletion the
+answerability signal is built on.
 
 What this adapter emits
 -----------------------
 
-Two branches, both on template B (no option block, D12) and both under
-``data_source=halluc_math_mip``:
+Exactly one branch, under ``data_source=halluc_math_mip``:
 
-=========================  ==========================================  =========
-branch                     gold                                        template
-=========================  ==========================================  =========
-``unsolvable_bare``        ``\\boxed{UNSOLVABLE}`` (answer=None)        B
-``solvable_numeric``       ``\\boxed{<the source's own answer>}``       B
-=========================  ==========================================  =========
+========================  =========================================  =========
+branch                    gold                                       template
+========================  =========================================  =========
+``unsolvable_bare``       ``\\boxed{UNSOLVABLE}`` (``answer=None``)   B
+========================  =========================================  =========
 
-Design doc section 4.3 says both things about the solvable side -- "可解侧用原题
-自带 answer 做 exact-match" / "solvable 两版各出一行" in the implementation
-bullet, but "MiP 可解侧（原题 634 条）默认不进池" in the last bullet.  This
-adapter emits both, because the pair *is* the contrast (§4.9.4 成对性: the same
-base question with and without a necessary premise); the solvable half is
-flagged ``error_type=""`` and can simply be dropped by ``mix_halluc.py`` if the
-quota does not want it.  Solving it does not need the pair to be broken up:
-every solvable row is certifiable on its own (see ``_certify_gsm8k``).
+The solvable twin is **not emitted**: D12 and Q7 keep MiP's solvable side out of
+the pool (it shares its base problems with the stage-1 math pool -- GSM8K/MATH --
+it is small, and the cross-pool de-duplication cost outweighs the benefit).  The
+artifact is therefore single-sided by construction: every row is template B, no
+option block, no ``judgment_only``, and the row count *is* the strict pool size
+(design doc section 4.8 table B row 8, quota 276; see DEVIATIONS 1 for the
+measured 270).
+
+The one pairing constraint MiP still participates in is design doc section
+4.7's 成对性 rule -- the synthesised-distractor rows (D17) must share a base
+distribution with the three-tier sources, or "which base pool is this?" becomes a
+shortcut -- and it holds by construction: MiP's bases are GSM8K/SVAMP/MATH
+questions, the same distribution the 100 main-pool math distractor rows are drawn
+from.
 
 Why no options, and no ``distractor_mining`` import
 ---------------------------------------------------
@@ -68,16 +72,14 @@ fallback, no "probably fine".
    be answerable with a different number);
 7. the deleted value is **necessary**: it occurs in the source's own derivation
    chain (gsm8k ``<<expr=val>>`` annotations, math ``solution``), compared as
-   Decimals with percent folding;
-8. a solvable row additionally needs a gold the source itself recomputes (see
-   the two ``_certify_*`` functions).
+   Decimals with percent folding.
 
 Two claims in the recon are conventions, not measurements, and this adapter
 takes the fail-closed side of both: rows with **no** derivation chain at all (2
 gsm8k rows) and placeholders whose deleted value is *not* used in the chain (3
 rows) are dropped rather than credited.
 
-``verify_mip.py`` re-checks all eight of these from the written artifact alone,
+``verify_mip.py`` re-checks all seven of these from the written artifact alone,
 with its own implementations and in the *opposite* diff direction (it recovers
 the deleted span by diffing ``insufficient -> original``), so nothing here is
 taken on trust.
@@ -91,23 +93,28 @@ The funnel stages are computed with the *same* conventions as
 membership tests on string-normalised numerics (``4.00`` stays ``4.00``, so a
 deleted ``$4.00`` counts as gone), necessity on ``Decimal`` with percent folding
 (``10`` vs ``0.1``).  Mixing the two conventions moves ``gone`` between 298 and
-299 -- the recon needed three attempts to get this right; see §4.1 note 3.
+299 -- the recon needed three attempts to get this right; see the recon's
+section 4.1 note 3.
 
 DEVIATIONS FROM THE DESIGN DOC (recon report wins)
 --------------------------------------------------
 
-1. **Strict pool is 270, not 276** (doc section 4.3: "严口径 276").  Measured
-   with the doc's own stage definitions: 260 pure deletions pass the necessity
-   check, 2 more have *no* ``<<expr=val>>`` chain at all (doc: "另 23 待复核、14
-   占位词型无需链校验"; recon: "260 pass / 24 fail / 2 empty-chain"), and of the
-   14 placeholder rows 10 pass necessity, 3 fail it and 1 is still visible in
-   the truncated question.  260 + 10 = **270**.  The doc's 276 additionally
-   (a) credits the 2 chainless rows, (b) exempts all 14 placeholders from the
-   necessity check and (c) admits a placeholder whose deleted value is still
-   visible.  Recon section 6 hazard 2 says an adapter "must handle a missing
-   chain rather than assume the annotation exists"; this adapter drops instead
-   of crediting, per the fail-closed rule.
-2. **svamp (300) and formula (50) contribute 0 rows**, against doc section 4.3's
+1. **The strict pool is 270, not 276** (doc section 4.2: "严口径 276"; the doc's
+   Q6 records the same 276 -> 299 option).  Measured with the doc's own stage
+   definitions: 260 pure deletions pass the necessity check, 2 more have *no*
+   ``<<expr=val>>`` chain at all (doc: "另 23 待复核、14 占位词型无需链校验";
+   recon: "260 pass / 24 fail / 2 empty-chain"), and of the 14 placeholder rows
+   10 pass necessity, 3 fail it and 1 is still visible in the truncated
+   question.  260 + 10 = **270**.  The doc's 276 additionally (a) credits the 2
+   chainless rows, (b) exempts all 14 placeholders from the necessity check and
+   (c) admits a placeholder whose deleted value is still visible.  Recon section
+   6 hazard 2 says an adapter "must handle a missing chain rather than assume the
+   annotation exists"; this adapter drops instead of crediting, per the
+   fail-closed rule -- i.e. **the code implements the strict口径 and yields 270**.
+   Q6's default is not to backfill the 23 unflagged rows, so 270 is the delivered
+   pool; the 276 in the design doc is the wide口径 upper bound that this adapter
+   deliberately does not reach.
+2. **svamp (300) and formula (50) contribute 0 rows**, against doc section 4.2's
    implementation note "SVAMP 配对成功 → 文本 diff 定位被删条件 ... 写
    extra_info.deleted_condition_text".  Recon section 5: 300/300 svamp rows are
    cross-problem splices (Body of problem A + Question of problem B) with **no
@@ -120,43 +127,25 @@ DEVIATIONS FROM THE DESIGN DOC (recon report wins)
    for the any-absent variant (626/626), i.e. *worse* than the doc's 95.6%.
    Prompt length/template are identical on both sides, so no surface cue was
    added.  See ``verify_mip.py`` check L3 for the re-measurement.
-4. **MiP does contribute to both the solvable and the unsolvable side** (doc
-   section 4.3, last bullet, says the solvable side does not enter the pool).
-   Both are emitted; the mix decides.  This is also what makes the L3
-   balanced-accuracy check meaningful on this source's own rows.
-5. **2 gsm8k solvable rows are dropped** because their answer key contradicts
-   their own derivation (e.g. the chain ends ``24/240 = 0.10`` while ``answer``
-   says ``#### 10``).  254 gsm8k unsolvable rows survive, 252 of them keep their
-   solvable twin (math: 16/16).
-6. **The claim that a support-≥5 vocabulary makes the L3 Naive Bayes sane does
-   not hold on MiP**, and this adapter says so in its artifact rather than
-   hiding it.  Measured by ``verify_mip.py``'s own implementation on the full
-   538-row artifact, the 5-fold out-of-fold balanced accuracy is 0.2566 at
-   train support ≥ 5 and never rises to chance as the vocabulary widens or
-   narrows (support ≥ 1: 0.1192, ≥ 2: 0.1882, ≥ 3: 0.1823, ≥ 10: 0.3345) --
-   *all below chance*, i.e. the estimator sits in the sign-flipped regime the
-   UMWP recon documents (train-fold class separation +0.72 / -0.53 flips to
-   -0.92 / +1.24 held out).  The un-inverted reading is 0.7434.  A length-only
-   threshold already reaches 0.6667 (mean 41.3 question tokens solvable vs
-   31.1 unsolvable): the deletion *is* a visible surface cue.  It is not an
-   option-selection shortcut (there is no option block, D12) and the design
-   accepts it, but it is real -- ``verify_mip.py`` prints the raw number, the
-   inverted reading and the length baseline on every run, so nothing here is
-   decided by the below-chance figure alone.
+4. **The artifact no longer carries a solvable twin.**  An earlier revision
+   emitted both sides of every pair and left the solvable half to the mix; D12
+   and Q7 settle the question the other way (correctly), so the twin, its gold
+   certificates and its ``--limit // 2`` pair accounting are gone.  One
+   consequence: the two-sided bag-of-words reading the earlier revision printed
+   in ``verify_mip.py``'s L3c (the "support >= 5 vocabulary" Naive Bayes) is no
+   longer defined on this artifact -- there is no negative class left -- and that
+   check is now reported as not applicable rather than computed on one side.
 
 Field choices that the schema leaves free (audit-only fields)
 -------------------------------------------------------------
 
 ``paired_original_text`` = the solvable original question; ``deleted_condition_text``
 = the deleted span (word-diff text); ``perturbed_entity_text`` = **the source's
-own derivation text** (the gsm8k ``answer`` field / the math ``solution``).
-The last one repurposes a field the design doc uses for the deleted sentence
-(``halluc_samples.md`` section 5.3) -- that sentence is already carried by
-``deleted_condition_text`` -- so that ``verify_mip.py`` can re-derive both the
-gold answer and the necessity of the deleted value **from the artifact alone**,
-without going back to ``/home/charles/data/...``.  ``canonical_solution`` and
-``role_words`` stay empty (K&K-only), ``distractor_labels`` keeps its fixed
-three-key shape, ``split`` is always ``"train"`` (MiP ships no native splits).
+own derivation text** (the gsm8k ``answer`` field / the math ``solution``),
+which is what ``verify_mip.py`` re-reads to re-prove that the deleted value was
+necessary.  ``canonical_solution`` and ``role_words`` stay empty (K&K-only),
+``distractor_labels`` keeps its fixed three-key shape, ``split`` is always
+``"train"`` (MiP ships no native splits).
 """
 
 from __future__ import annotations
@@ -184,25 +173,24 @@ DEFAULT_RAW_DIR = "/home/charles/data/reasoning_rl/halluc/raw/mip"
 DEFAULT_OUT = "/home/charles/data/reasoning_rl/halluc/built/mip.parquet"
 
 # Every file the source ships; only the two with a paired original can certify a
-# gold (see DEVIATIONS 2), but all four are counted so the funnel starts at the
-# raw row count of 984.
+# deletion (see DEVIATIONS 2), but all four are counted so the funnel starts at
+# the raw row count of 984.
 SOURCE_FILES = ("gsm8k", "svamp", "math", "formula")
 PAIRED_FILES = ("gsm8k", "math")
 
 DATA_SOURCE = schema.SOURCE_MIP
 TEMPLATE = schema.TEMPLATE_B
-SOLVABLE_BRANCH = schema.BRANCH_SOLVABLE_NUMERIC
 UNSOLVABLE_BRANCH = schema.BRANCH_UNSOLVABLE_BARE
 
 PERTURBATION = "missing_condition"
-# D18 defect class: "缺一条必要条件（题面不可见）" -> the three-tier bare bucket.
+# Design doc section 4.8 defect class: "缺一条必要条件（题面不可见）" -> the
+# three-tier bare bucket (table B row 8).
 ERROR_TYPE = "missing_condition"
 FAMILY_DELETION = "deletion"  # the premise was removed outright
 FAMILY_PLACEHOLDER = "placeholder"  # a numeric premise became "many"/"some"/...
 
 TASK_PREFIX = "mip"
 SIDE_UNSOLVABLE = "unsolvable"
-SIDE_SOLVABLE = "solvable"
 
 DIFFICULTY_UNLABELLED = "unlabelled"  # gsm8k ships no native difficulty
 
@@ -228,10 +216,6 @@ FUNNEL_STAGES = PER_ROW_STAGES + (LIMIT_STAGE,)
 _NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 _WS_RE = re.compile(r"\s+")
 _ANN_RE = re.compile(r"<<([^>]*)>>")
-_BOXED_RE = re.compile(r"\\boxed\s*\{")
-_HASH_RE = re.compile(r"####\s*(.+?)\s*$", re.S)
-# The last "= <number>" of the *prose* (annotations are blanked first).
-_TRAILER_RE = re.compile(r"=\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)")
 
 
 def _normalise_ws(text: str) -> str:
@@ -352,112 +336,6 @@ def _diff_regions(original: str, insufficient: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# gold certificates (fail closed: no certificate, no row)
-# ---------------------------------------------------------------------------
-
-
-def _safe_arithmetic(expression: str) -> float | None:
-    """Evaluate a simple ``+ - * / ( )`` expression, or ``None``.
-
-    Digits only, no names: ``eval`` sees a literal-only namespace so this can
-    never do anything but arithmetic (and it is only ever fed the source's own
-    ``<<expr=val>>`` annotation bodies).
-    """
-    cleaned = (expression or "").strip().replace("^", "**")
-    if not cleaned or not re.fullmatch(r"[0-9+\-*/(). ]+", cleaned):
-        return None
-    try:
-        return eval(cleaned, {"__builtins__": {}}, {})  # noqa: S307 - literal-only
-    except Exception:  # noqa: BLE001 - any failure means "cannot certify"
-        return None
-
-
-def _annotation_pairs(answer_text: str) -> list[tuple[str, str]]:
-    pairs = []
-    for body in _ANN_RE.findall(answer_text or ""):
-        if "=" in body:
-            expression, value = body.rsplit("=", 1)
-            pairs.append((expression.strip(), value.strip()))
-    return pairs
-
-
-def _last_boxed(text: str) -> str | None:
-    """The content of the *last* balanced ``\\boxed{...}``, or ``None``."""
-    result: str | None = None
-    for match in _BOXED_RE.finditer(text or ""):
-        start = match.end()
-        depth = 1
-        i = start
-        while i < len(text) and depth:
-            char = text[i]
-            if char == "\\":
-                i += 2
-                continue
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-            i += 1
-        if depth == 0:
-            result = text[start : i - 1]
-    return result
-
-
-def _certify_gsm8k(answer_text: str) -> tuple[str | None, str | None]:
-    """Extract the gsm8k gold and certify it against the source's own arithmetic.
-
-    Two tiers, both a real recomputation rather than a substring test:
-
-    ``T1``  the last ``<<expr=val>>`` annotation evaluates to ``val`` and
-            ``val`` is the ``####`` value;
-    ``T2``  the final ``= <n>`` of the prose that follows the last annotation
-            equals the ``####`` value (the source often does its last step in
-            prose: ``... he has 25-2 = 23 jewels. #### 23``).
-
-    Any row whose gold passes neither tier is dropped: 2 of the 254 gsm8k rows
-    have an answer key that contradicts their own chain (``24/240 = 0.10`` vs
-    ``#### 10``), and a wrong gold in the reward is worse than 2 lost rows.
-    """
-    if not answer_text:
-        return None, None
-    match = _HASH_RE.search(answer_text.strip())
-    if match is None:
-        return None, None
-    gold = match.group(1).strip().replace(",", "").replace("$", "").rstrip(".")
-    gold_value = _decimal(gold)
-    if not gold or gold_value is None:
-        return None, None
-
-    for expression, value in _annotation_pairs(answer_text):
-        evaluated = _safe_arithmetic(expression)
-        if evaluated is None:
-            continue
-        annotated = _decimal(value)
-        if annotated is not None and annotated == gold_value == _decimal(str(evaluated)):
-            return gold, "T1"
-
-    # T2 looks at the *prose* only, so the annotation bodies are blanked first --
-    # otherwise "the number to the right of the last =" would just re-read the
-    # annotation T1 already evaluated, and would not be an independent check.
-    body = _ANN_RE.sub(" ", answer_text[: answer_text.rfind("####")])
-    trailers = _TRAILER_RE.findall(body)
-    if trailers and _decimal(trailers[-1]) == gold_value:
-        return gold, "T2"
-    return None, None
-
-
-def _certify_math(row: dict) -> tuple[str | None, str | None]:
-    """The math gold is the last ``\\boxed{}`` the source's own solution reaches."""
-    answer = (row.get("answer") or "").strip()
-    if not answer:
-        return None, None
-    boxed = _last_boxed(row.get("solution") or "")
-    if boxed is not None and _normalise_ws(boxed) == _normalise_ws(answer):
-        return answer, "solution_boxed"
-    return None, None
-
-
-# ---------------------------------------------------------------------------
 # reading the raw files
 # ---------------------------------------------------------------------------
 
@@ -480,8 +358,10 @@ def _base_task_id(source: str, index: int, row: dict) -> str:
 
     ``math`` ships ``unique_id`` (``test/algebra/478.json``); the other files
     have no id at all, so the file-local row index is the stable key.  The
-    ``-solvable`` / ``-unsolvable`` suffix is what keeps the pair distinct for
-    hard replay's dedup key.
+    ``-unsolvable`` suffix is kept from the revision that also emitted the
+    solvable twin, so a hard-replay dedup key stays stable across the rebuild
+    even though the twin is gone (D12/Q7); it also keeps the branch explicit in
+    the id that ``verify_mip.py`` audits.
     """
     if source == "math" and row.get("unique_id"):
         slug = _math_slug(str(row["unique_id"]))
@@ -538,10 +418,10 @@ def build_rows(
     Args:
         raw_dir: directory holding ``gsm8k.json`` / ``svamp.json`` /
             ``math.json`` / ``formula.json``.
-        limit: cap on the number of **rows** written.  Pairs are admitted whole
-            (an unsolvable row and its solvable twin), so the artifact stays
-            balanced and the effective size is the largest even number
-            ``<= limit``.  ``None`` writes everything the certificates admit.
+        limit: cap on the number of **rows** written (one row per certified
+            deletion; there is no twin to keep whole).  ``None`` writes
+            everything the certificates admit -- the strict pool, measured at
+            270 rows on the current raw bundle (DEVIATIONS 1).
         seed: seeds ``random.Random`` for the output ordering only -- the row
             *set* is fixed by the certificates, so the same seed always yields
             byte-identical rows.
@@ -550,8 +430,8 @@ def build_rows(
         ``(rows, funnel)``.  ``funnel`` is an ordered mapping of stage name ->
         rows remaining after that stage, starting at the raw row count of 984.
     """
-    if limit is not None and limit < 2:
-        raise ValueError(f"limit must be at least 2 (one pair), got {limit}")
+    if limit is not None and limit < 1:
+        raise ValueError(f"limit must be at least 1, got {limit}")
 
     funnel = {name: 0 for name in FUNNEL_STAGES}
     candidates: list[dict] = []
@@ -572,8 +452,9 @@ def build_rows(
             _advance(funnel, "question_differs")
             if diff["bucket"] != "single":
                 # >=2 deleted values, 0 deleted values, or >1 changed region --
-                # the recon's 209 / 55 / 37 buckets (section 4.1 note 1: do NOT
-                # bucket by numeric value alone, that inflates the pool by 12).
+                # the recon's 209 / 55 / 37 buckets (recon section 4.1 note 1:
+                # do NOT bucket by numeric value alone, that inflates the pool
+                # by 12).
                 continue
             _advance(funnel, "single_value_single_region")
             value = next(iter(diff["deleted_values"]))
@@ -585,7 +466,7 @@ def build_rows(
             _advance(funnel, "no_inserted_numeric")
             if _necessary(value, _chain_text(source, row)) is not True:
                 # Includes the chainless rows (None) and the placeholders whose
-                # value the source never used (False): DEVIATIONS 1/6.
+                # value the source never used (False): DEVIATIONS 1.
                 continue
             _advance(funnel, "necessary_value_certified")
             candidates.append(
@@ -612,7 +493,7 @@ def build_rows(
                 candidates.append(by_source[name].pop(0))
 
     if limit is not None:
-        candidates = candidates[: limit // 2]
+        candidates = candidates[:limit]
     funnel[LIMIT_STAGE] = len(candidates)
 
     rng = random.Random(seed)
@@ -620,15 +501,13 @@ def build_rows(
 
     rows: list[dict] = []
     for candidate in candidates:
-        rows.extend(_build_pair(candidate, seed=seed, base_index=len(rows)))
-    for position, row in enumerate(rows):
-        row["extra_info"]["index"] = position
+        rows.append(_build_row(candidate, seed=seed, index=len(rows)))
 
     return rows, funnel
 
 
-def _build_pair(candidate: dict, *, seed: int, base_index: int) -> list[dict]:
-    """The unsolvable row (+ its solvable twin when the gold certifies)."""
+def _build_row(candidate: dict, *, seed: int, index: int) -> dict:
+    """The unsolvable three-tier row for one certified deletion."""
     source = candidate["source"]
     row = candidate["row"]
     base = _base_task_id(source, candidate["index"], row)
@@ -639,7 +518,7 @@ def _build_pair(candidate: dict, *, seed: int, base_index: int) -> list[dict]:
         else DIFFICULTY_UNLABELLED
     )
 
-    unsolvable = schema.make_row(
+    return schema.make_row(
         data_source=DATA_SOURCE,
         question=row["insufficient_question"],
         ground_truth=schema.build_ground_truth(
@@ -653,7 +532,7 @@ def _build_pair(candidate: dict, *, seed: int, base_index: int) -> list[dict]:
         branch=UNSOLVABLE_BRANCH,
         extra_info={
             "split": "train",
-            "index": base_index,
+            "index": index,
             "task_id": f"{base}-{SIDE_UNSOLVABLE}",
             "seed": seed,
             "difficulty": difficulty,
@@ -666,41 +545,6 @@ def _build_pair(candidate: dict, *, seed: int, base_index: int) -> list[dict]:
             "error_type": ERROR_TYPE,
         },
     )
-    out = [unsolvable]
-
-    if source == "gsm8k":
-        gold, _tier = _certify_gsm8k(row.get("answer") or "")
-    else:
-        gold, _tier = _certify_math(row)
-    if gold is None:
-        return out
-
-    solvable = schema.make_row(
-        data_source=DATA_SOURCE,
-        question=row["question"],
-        ground_truth=schema.build_ground_truth(
-            solvable=True,
-            answer=gold,
-            correct_option_id=None,
-            has_diagnosis_label=False,
-            perturbation_type=None,
-        ),
-        template=TEMPLATE,
-        branch=SOLVABLE_BRANCH,
-        extra_info={
-            "split": "train",
-            "index": base_index + 1,
-            "task_id": f"{base}-{SIDE_SOLVABLE}",
-            "seed": seed,
-            "difficulty": difficulty,
-            "solvable": True,
-            "paired_original_text": row["question"],
-            "error_type": "",  # the solvable twin is a well-posed problem
-            "perturbed_entity_text": derivation,
-        },
-    )
-    out.append(solvable)
-    return out
 
 
 def _summarise(rows: list[dict]) -> dict:
@@ -734,7 +578,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=None,
-        help="cap on rows written; pairs are whole, so the size is the largest even number <= limit",
+        help="cap on rows written; one row per certified deletion, no pairing",
     )
     parser.add_argument("--out", default=DEFAULT_OUT, help="output parquet path")
     parser.add_argument("--seed", type=int, default=0, help="ordering seed")
@@ -753,11 +597,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {name:28s} {count}")
     summary = _summarise(rows)
     print(f"rows written: {len(rows)} -> {args.out}")
-    unsolvable = summary["by_branch"].get(UNSOLVABLE_BRANCH, 0)
-    solvable = summary["by_branch"].get(SOLVABLE_BRANCH, 0)
     print(
-        f"  solvable twins dropped (no gold certificate): {unsolvable - solvable}"
-        "  -- the unsolvable row is kept, only the twin is lost"
+        "  every row is the unsolvable three-tier branch (D12/Q7: no solvable twin,"
+        " no options)"
     )
     for key in ("by_branch", "by_template", "by_solvable", "by_source_file"):
         print(f"{key}:")

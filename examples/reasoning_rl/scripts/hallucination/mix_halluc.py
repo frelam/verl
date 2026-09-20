@@ -23,25 +23,35 @@ What is different from ``mix.py``
 ---------------------------------
 
 The hallucination domain is **not** sampled by a single ratio.  Design doc
-section 4.9.3 table B fixes a per-cell quota over ``(branch, data_source)``, and
-the three v0.10 knobs rescale those cells:
+section 4.8 table B fixes a per-cell quota over ``(branch, data_source)``, and
+two knobs rescale those cells:
 
 * ``--halluc_total`` (20,000) -- the size of the whole hallucination domain;
-* ``--halluc_unsolvable_ratio`` (0.6) -- its unsolvable share;
-* ``--halluc_four_tier_ratio`` (0.6) -- the four-tier share *within* the unsolvable side.
+* ``--halluc_unsolvable_ratio`` (0.6) -- its unsolvable share.
 
-``(branch, data_source)`` is a complete key for every cell: the SUM rows that go
-four-tier and the SUM rows that go three-tier differ by branch, and the
-synthesised SUM rows differ again by branch (``solvable_numeric``).  So the quota
-table needs no extra ``error_type`` coupling to the adapters.
+``(branch, data_source)`` is a complete key for every cell: the synthesised
+distractor rows of table B row 1 keep their base pool's data_source while the
+pure rows of the same pool use a different branch (``solvable_two_layer`` for
+UMWP-answerable, ``solvable_roles`` for K&K), and TreeCut's positives and
+negatives differ by branch.  So the quota table needs no extra ``error_type``
+coupling to the adapters.
 
-One cell deviates from the table as printed.  Table B row 1's 2,400 synthesised
-distractor rows are split SUM 1,000 / UMWP 600 / K&K 400 / main pool 400, but a
-K&K question answers with a *role sequence*, so its 400 rows cannot carry
-``solvable_numeric``; they carry ``solvable_roles`` and share a cell with the
-2,000 K&K rows of row 2.  The total is unchanged -- 4,400 + 2,000 stays 6,400,
-and the solvable side stays 8,000 -- only the branch bookkeeping moves.  See
-``distractor_synth.py``, which emits them that way.
+Side weights: SUM's pair rows (table B row 6) carry **both** sides in one row, so
+the 60/40 accounting of section 4.8 counts them 0.5/0.5.  The quota therefore has
+three kinds of cell -- solvable (weight 1 to the solvable side), unsolvable
+(weight 1 to the unsolvable side) and pair (0.5 to each) -- and
+:func:`scaled_quota` apportions **side weight**, not row count.  That is what
+makes the default knobs reproduce table B exactly: 5,000 solvable rows + 6,000
+pair rows = 8,000 solvable-equivalent (40%) and 9,000 unsolvable rows + 6,000 pair
+rows = 12,000 unsolvable-equivalent (60%), 20,000 rows in total.
+
+One cell deviates from the table's *labels*, not its arithmetic.  Table B row 1's
+400 synthesised distractor rows are built on UMWP-answerable 200 / K&K 100 /
+stage-1 main pool 100 (section 4.7).  A K&K question answers with a D19
+``name: role`` mapping, so its 100 rows cannot carry the numeric branch: they
+join the K&K cell (1,600 + 100 = 1,700) and the numeric synth cells hold the
+other 300.  Every side weight is unchanged, so the 40/60 split and the 20,000
+total are exactly the table's.
 
 Two invariants are hard, not advisory, and the mixer refuses to write an artifact
 that violates them:
@@ -49,13 +59,18 @@ that violates them:
 1. every template must carry **both** solvable and unsolvable rows.  If an option
    block or a verdict prompt correlated with solvability the policy could read the
    label off the prompt -- the design doc calls this out as a 100% shortcut.
+   Template C is exempt by construction (every SUM pair row is ``solvable=true``
+   yet contains an unanswerable question too, section 4.8), and ``B_judge`` is
+   counted inside the B family because it is B's verdict-only variant.
 2. a row's branch must agree with its own ``ground_truth.solvable``.
 
 A cell whose pool is smaller than its quota is **filled short and reported**, with
-the leftover budget redistributed to cells on the same side that have surplus.
-Redistribution stays inside a side, so the 60/40 unsolvable split and the
-four-tier/three-tier split survive a shortfall; the total is only allowed to come
-out below ``--halluc_total`` when the pools genuinely cannot fill it.
+the leftover budget redistributed to cells in the same group that have surplus.
+Redistribution stays inside a group (solvable / four-tier / three-tier; the pair
+cell is its own group and never absorbs a deficit), so the 60/40 unsolvable split
+and the four-tier/three-tier composition survive a shortfall; the total is only
+allowed to come out below ``--halluc_total`` when the pools genuinely cannot fill
+it.
 """
 
 from __future__ import annotations
@@ -83,11 +98,26 @@ import schema  # noqa: E402
 # infers from a per-data_source probe instead, which covers every source by
 # construction.
 write_rows_parquet = schema.write_rows_parquet
-from schema import BRANCH_SOLVABLE_JUDGE, BRANCH_SOLVABLE_NUMERIC, BRANCH_SOLVABLE_ROLES  # noqa: E402
+from schema import BRANCH_SOLVABLE_JUDGE, BRANCH_SOLVABLE_NUMERIC, BRANCH_SOLVABLE_PAIR  # noqa: E402
+from schema import BRANCH_SOLVABLE_ROLES, BRANCH_SOLVABLE_TWO_LAYER  # noqa: E402
 from schema import BRANCH_UNSOLVABLE_BARE, BRANCH_UNSOLVABLE_DIAG  # noqa: E402
 
-SOLVABLE_BRANCHES = (BRANCH_SOLVABLE_NUMERIC, BRANCH_SOLVABLE_ROLES, BRANCH_SOLVABLE_JUDGE)
+#: Branches whose rows are solvable end to end (weight 1 to the solvable side).
+SOLVABLE_BRANCHES = (
+    BRANCH_SOLVABLE_NUMERIC,
+    BRANCH_SOLVABLE_ROLES,
+    BRANCH_SOLVABLE_TWO_LAYER,
+    BRANCH_SOLVABLE_JUDGE,
+)
+#: SUM's pair rows: one row carries a solvable and an unanswerable question, so it
+#: counts 0.5 to each side (design doc section 4.8's 60/40 accounting).
+PAIR_BRANCHES = (BRANCH_SOLVABLE_PAIR,)
 UNSOLVABLE_BRANCHES = (BRANCH_UNSOLVABLE_DIAG, BRANCH_UNSOLVABLE_BARE)
+
+#: Side weight of each branch kind (a pair row carries half of each side).
+BRANCH_SIDE_WEIGHT = {branch: 1.0 for branch in SOLVABLE_BRANCHES}
+BRANCH_SIDE_WEIGHT.update({branch: 1.0 for branch in UNSOLVABLE_BRANCHES})
+BRANCH_SIDE_WEIGHT.update({branch: 0.5 for branch in PAIR_BRANCHES})
 
 #: The directory every adapter writes its ``DEFAULT_OUT`` into, and therefore the
 #: default ``--halluc_dir``.  ``test_mix_halluc.py`` asserts the two stay equal for
@@ -96,42 +126,47 @@ UNSOLVABLE_BRANCHES = (BRANCH_UNSOLVABLE_DIAG, BRANCH_UNSOLVABLE_BARE)
 #: missing build rather than a typo.
 DEFAULT_ADAPTER_DIR = "~/data/reasoning_rl/halluc/built"
 
-# Design doc section 4.9.3 table B, at the default knobs (20,000 / 0.6 / 0.6).
-# Keyed by (branch, data_source) -- see the module docstring for why that key is
-# complete.  ``SOURCE_MAIN`` is the stage-1 math pool used for the fourth
-# synthesised-distractor slice; it is absent on a box without stage-1 data, which
+# Design doc section 4.8 table B, at the default knobs (20,000 / 0.6).  Keyed by
+# (branch, data_source) -- see the module docstring for why that key is complete.
+# The rows sum to 20,000: 5,000 pure-solvable + 6,000 pair + 9,000 unsolvable, and
+# the side weights (pair = 0.5 each) give 8,000 / 12,000, i.e. the documented
+# 40% / 60%.  ``SOURCE_MAIN`` is the stage-1 math pool used as a base for the
+# synthesised distractor slice; it is absent on a box without stage-1 data, which
 # the shortfall reporting handles rather than hiding.
-#: The K&K slice of the synthesised distractor pool (400 rows) answers with a role
-#: sequence, not a number, so it carries ``solvable_roles`` rather than
-#: ``solvable_numeric`` -- see ``distractor_synth.py``'s module docstring.  The row
-#: total is unchanged (4,400 + 2,000); only the branch bookkeeping moves, and the
-#: two K&K cells are therefore one cell of 2,400 here.
+#: The K&K cell holds 1,600 pure K&K rows (D20/thresholds of section 4.1) plus the
+#: 100 synthesised-distractor rows whose base question is a K&K puzzle.  Those 100
+#: answer with a D19 name->role mapping, so they cannot carry the numeric branch;
+#: every side weight is unchanged, so table B's 40/60 arithmetic still holds.
 DEFAULT_QUOTA: dict[tuple[str, str], int] = {
-    # solvable numeric + injected distractor -- 4,400
-    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_GSMIC): 2000,
-    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_SUM): 1000,
-    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_UMWP): 600,
-    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_MAIN): 400,
-    # solvable role words -- K&K 2,000 + its 400 synthesised-distractor rows
-    (BRANCH_SOLVABLE_ROLES, schema.SOURCE_KK): 2400,
-    # solvable judgment, option block -- 900
-    (BRANCH_SOLVABLE_JUDGE, schema.SOURCE_UMWP): 550,
-    (BRANCH_SOLVABLE_JUDGE, schema.SOURCE_SUM): 350,
-    # solvable judgment, no option block -- 700
-    (BRANCH_SOLVABLE_JUDGE, schema.SOURCE_CREPE): 500,
-    (BRANCH_SOLVABLE_JUDGE, schema.SOURCE_KUQ): 200,
-    # unsolvable four-tier (diagnosis with options) -- 7,200
-    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_SUM): 5094,
-    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_UMWP): 1449,
-    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_FALSEQA): 657,
-    # unsolvable three-tier (bare) -- 4,800
-    (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_SUM): 2000,
-    (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_TREECUT): 1084,
-    (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_UMWP): 840,
+    # --- table B row 1: solvable numeric, optional injected distractor -- 1,072
+    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_GSMIC): 772,
+    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_UMWP): 200,
+    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_MAIN): 100,
+    # --- table B row 2: solvable name -> role pairs -- 1,700 (1,600 + 100 synth)
+    (BRANCH_SOLVABLE_ROLES, schema.SOURCE_KK): 1700,
+    # --- table B row 3: solvable judgement + answer, placeholder options -- 1,478
+    (BRANCH_SOLVABLE_TWO_LAYER, schema.SOURCE_UMWP): 550,
+    (BRANCH_SOLVABLE_TWO_LAYER, schema.SOURCE_FALSEQA): 928,
+    # --- table B row 4: solvable judgement only -- 250
+    (BRANCH_SOLVABLE_JUDGE, schema.SOURCE_CREPE): 250,
+    # --- table B row 5: solvable numeric with a placeholder option block -- 500
+    (BRANCH_SOLVABLE_NUMERIC, schema.SOURCE_TREECUT): 500,
+    # --- table B row 6: SUM pair task (0.5 solvable / 0.5 unsolvable) -- 6,000
+    (BRANCH_SOLVABLE_PAIR, schema.SOURCE_SUM): 6000,
+    # --- table B row 7: unsolvable four-tier (diagnosis with options) -- 5,835
+    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_FALSEQA): 928,
+    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_TREECUT): 4907,
+    # --- table B row 8: unsolvable three-tier (bare refusal) -- 3,165
+    (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_UMWP): 2489,
     (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_CREPE): 400,
     (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_MIP): 276,
-    (BRANCH_UNSOLVABLE_BARE, schema.SOURCE_KUQ): 200,
 }
+
+#: Groups whose budgets are apportioned independently, i.e. the boundaries a
+#: shortfall may not cross.  The pair cell is alone in its group, so it can never
+#: absorb a solvable or unsolvable deficit (which would silently move the 40/60
+#: accounting).
+QUOTA_GROUPS = ("solvable", "four_tier", "three_tier", "pair")
 
 
 def _largest_remainder(shares: dict, total: int) -> dict:
@@ -149,31 +184,55 @@ def _largest_remainder(shares: dict, total: int) -> dict:
     return floors
 
 
-def scaled_quota(total: int, unsolvable_ratio: float, four_tier_ratio: float) -> dict[tuple[str, str], int]:
-    """Rescale :data:`DEFAULT_QUOTA` to the requested totals.
+def side_weight(cell: tuple[str, str], rows: int) -> float:
+    """Side weight of ``rows`` rows in ``cell`` (pairs count half to each side)."""
+    return rows * BRANCH_SIDE_WEIGHT[cell[0]]
 
-    Groups are apportioned independently -- solvable / unsolvable, then
-    four-tier / three-tier inside the unsolvable side -- and each group is made to
-    sum exactly, so the three knobs are honoured to the row instead of drifting by
-    rounding.
+
+def scaled_quota(total: int, unsolvable_ratio: float) -> dict[tuple[str, str], int]:
+    """Rescale :data:`DEFAULT_QUOTA` to the requested total and side ratio.
+
+    The apportionment is done in **side weight**, not row count (see the module
+    docstring): SUM's pair rows contribute 0.5 to each side, so the requested
+    ``unsolvable_ratio`` describes the artifact the way section 4.8 accounts for
+    it rather than over-counting the pairs as solvable rows.  The pair budget
+    keeps table B's share of the total, then the two sides are apportioned over
+    their own cells in proportion to table B and made to sum exactly, so the
+    default knobs reproduce the table to the row.
     """
     if not 0.0 < unsolvable_ratio < 1.0:
         raise ValueError(f"--halluc_unsolvable_ratio must be in (0, 1), got {unsolvable_ratio}")
-    if not 0.0 < four_tier_ratio < 1.0:
-        raise ValueError(f"--halluc_four_tier_ratio must be in (0, 1), got {four_tier_ratio}")
 
-    n_unsolvable = round(total * unsolvable_ratio)
-    groups: list[tuple[list[tuple[str, str]], int]] = []
-    groups.append(([c for c in DEFAULT_QUOTA if c[0] in SOLVABLE_BRANCHES], total - n_unsolvable))
-    groups.append(([c for c in DEFAULT_QUOTA if c[0] == BRANCH_UNSOLVABLE_DIAG], round(n_unsolvable * four_tier_ratio)))
-    groups.append(
-        ([c for c in DEFAULT_QUOTA if c[0] == BRANCH_UNSOLVABLE_BARE], n_unsolvable - round(n_unsolvable * four_tier_ratio))
-    )
+    default_total = sum(DEFAULT_QUOTA.values())
+    pair_cells = [cell for cell in DEFAULT_QUOTA if cell[0] in PAIR_BRANCHES]
+    pair_rows = round(sum(DEFAULT_QUOTA[cell] for cell in pair_cells) * total / default_total)
+    half_pair = pair_rows / 2.0
+    solvable_weight = (1.0 - unsolvable_ratio) * total - half_pair
+    unsolvable_weight = unsolvable_ratio * total - half_pair
+    if solvable_weight < 0 or unsolvable_weight < 0:
+        raise ValueError(
+            f"halluc_total={total} with unsolvable_ratio={unsolvable_ratio} leaves "
+            f"{solvable_weight:.0f}/{unsolvable_weight:.0f} side weight outside the pair rows; "
+            f"the pair share of the pool is fixed at {pair_rows / total:.2f} of the total"
+        )
 
     quota: dict[tuple[str, str], int] = {}
-    for cells, group_total in groups:
-        quota.update(_largest_remainder({c: DEFAULT_QUOTA[c] for c in cells}, group_total))
+    for group, target in (
+        ("solvable", round(solvable_weight)),
+        ("four_tier", round(unsolvable_weight * _four_tier_share())),
+        ("three_tier", round(unsolvable_weight * (1.0 - _four_tier_share()))),
+    ):
+        cells = [cell for cell in DEFAULT_QUOTA if _group_of(cell[0]) == group]
+        quota.update(_largest_remainder({cell: DEFAULT_QUOTA[cell] for cell in cells}, target))
+    quota.update(_largest_remainder({cell: DEFAULT_QUOTA[cell] for cell in pair_cells}, pair_rows))
     return quota
+
+
+def _four_tier_share() -> float:
+    """Table B's four-tier / three-tier split of the unsolvable side (5,835/9,000)."""
+    four = sum(q for (branch, _), q in DEFAULT_QUOTA.items() if branch == BRANCH_UNSOLVABLE_DIAG)
+    bare = sum(q for (branch, _), q in DEFAULT_QUOTA.items() if branch == BRANCH_UNSOLVABLE_BARE)
+    return four / (four + bare)
 
 
 def index_pool(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
@@ -193,6 +252,10 @@ def index_pool(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
             payload = {}
         solvable = payload.get("solvable")
         if branch in SOLVABLE_BRANCHES and solvable is not True:
+            raise ValueError(f"{info.get('task_id')}: branch {branch!r} but solvable={solvable!r}")
+        if branch in PAIR_BRANCHES and solvable is not True:
+            # A SUM pair row is solvable=true at row level (the pair contains a
+            # solvable question); the 0.5/0.5 split lives in the quota weights.
             raise ValueError(f"{info.get('task_id')}: branch {branch!r} but solvable={solvable!r}")
         if branch in UNSOLVABLE_BRANCHES and solvable is not False:
             raise ValueError(f"{info.get('task_id')}: branch {branch!r} but solvable={solvable!r}")
@@ -234,6 +297,39 @@ def carve_val(
     return val_rows, reduced
 
 
+def _pair_id(row: dict) -> str:
+    """The row's train/val atomicity key (empty when the row stands alone)."""
+    return str(row.get("extra_info", {}).get("pair_id", "") or "")
+
+
+def enforce_pair_atomicity(
+    val_rows: list[dict],
+    pool: dict[tuple[str, str], list[dict]],
+) -> tuple[list[dict], list[dict]]:
+    """Keep a paired row's twins on the same side of the train/val boundary.
+
+    Design doc D27: FalseQA's answerable and unanswerable rows are index-aligned
+    twins whose prompts differ by one fragment, so letting one land in val while
+    the other trains is a near-duplicate leak.  ``carve_val`` samples per pool
+    cell, and the twins live in different cells, so the check has to happen across
+    cells after the carve: a row whose ``pair_id`` appears fewer than twice in val
+    is returned to the train pool.  Rows without a ``pair_id`` are untouched.
+    """
+    counts = Counter(pid for pid in (_pair_id(r) for r in val_rows) if pid)
+    kept: list[dict] = []
+    returned: list[dict] = []
+    for row in val_rows:
+        pid = _pair_id(row)
+        if pid and counts[pid] < 2:
+            returned.append(row)
+        else:
+            kept.append(row)
+    for row in returned:
+        cell = (row["extra_info"]["branch"], row["data_source"])
+        pool.setdefault(cell, []).append(row)
+    return kept, returned
+
+
 def fill_cells(
     pool: dict[tuple[str, str], list[dict]],
     quota: dict[tuple[str, str], int],
@@ -246,15 +342,15 @@ def fill_cells(
     target, the amount filled from its own pool, and how much it received (or
     gave up) in redistribution.
 
-    Redistribution boundaries are the *knob* boundaries, not just the
+    Redistribution boundaries are the *group* boundaries, not just the
     solvable/unsolvable one: by default a four-tier deficit stays inside the
-    four-tier group (and three-tier inside three-tier, solvable inside solvable),
-    so ``--halluc_four_tier_ratio`` still describes the artifact.  Letting a
-    four-tier shortfall spill into three-tier cells would silently move that ratio
-    -- with UMWP's four-tier pool measured at ~670 against a 1,449 quota, the real
-    build would drift from 60/40 to 55/45 without anything in the log saying so.
-    ``spill_across_tiers`` opts in to the total-preserving behaviour instead; the
-    achieved ratios are recorded either way.
+    four-tier group (and three-tier inside three-tier, solvable inside solvable,
+    pair inside pair), so the requested 40/60 split still describes the artifact.
+    Letting a four-tier shortfall spill into three-tier cells would silently move
+    the four-tier/three-tier composition -- the real build would drift without
+    anything in the log saying so.  ``spill_across_tiers`` opts in to the
+    total-preserving behaviour instead; the achieved ratios are recorded either
+    way.
     """
     report: list[dict] = []
     taken: dict[tuple[str, str], list[dict]] = {}
@@ -301,9 +397,13 @@ def fill_cells(
 def _group_of(branch: str) -> str:
     """The apportionment group a branch belongs to -- also a redistribution boundary.
 
-    Three groups, not two: the four-tier/three-tier split is its own knob, so it
-    is its own budget.
+    Four groups, not two: the four-tier/three-tier split is fixed by table B, and
+    the pair cell is a group of its own so a solvable or unsolvable shortfall can
+    never be backfilled with pair rows (which would move the 40/60 accounting
+    without anything in the log saying so).
     """
+    if branch in PAIR_BRANCHES:
+        return "pair"
     if branch in SOLVABLE_BRANCHES:
         return "solvable"
     return "four_tier" if branch == BRANCH_UNSOLVABLE_DIAG else "three_tier"
@@ -312,24 +412,37 @@ def _group_of(branch: str) -> str:
 def check_template_balance(rows: list[dict]) -> dict:
     """Assert each template carries both classes; return the measured table.
 
-    This is design doc section 5.2's hard constraint.  A template that only ever
-    appears on one side of the solvable/unsolvable boundary is a prompt-level label
-    leak, and the fix belongs in the adapters (route some rows of the other side
-    through it), not in a tolerance here.
+    This is design doc sections 4.8/5.2's hard constraint.  A template that only
+    ever appears on one side of the solvable/unsolvable boundary is a prompt-level
+    label leak, and the fix belongs in the adapters (route some rows of the other
+    side through it), not in a tolerance here.
+
+    Two exemptions, both structural rather than tolerances:
+
+    * template C is SUM's pair task: every row is ``solvable=true`` *and* carries
+      an unanswerable question, so it covers both sides by construction
+      (design doc section 4.8's hard-constraint check);
+    * template ``B_judge`` is template B's verdict-only variant, used by the
+      CREPE-normal judgement rows; it is counted inside the B family, which must
+      still carry both classes (B has the numeric/K&K solvable rows and the
+      three-tier unsolvable rows).
     """
     counts: dict[str, Counter] = defaultdict(Counter)
     for row in rows:
         template = row["extra_info"].get("template", "?")
+        family = schema.TEMPLATE_B if template == schema.TEMPLATE_B_JUDGE else template
         solvable = json.loads(row["reward_model"]["ground_truth"]).get("solvable")
-        counts[template]["solvable" if solvable else "unsolvable"] += 1
+        counts[family]["solvable" if solvable else "unsolvable"] += 1
 
-    unbalanced = [t for t, c in counts.items() if not (c["solvable"] and c["unsolvable"])]
+    unbalanced = [
+        t for t, c in counts.items() if t != schema.TEMPLATE_C and not (c["solvable"] and c["unsolvable"])
+    ]
     if unbalanced:
         detail = {t: dict(counts[t]) for t in unbalanced}
         raise ValueError(
             f"template(s) {unbalanced} appear on only one side of the solvable/unsolvable "
-            f"boundary: {detail}. Design doc section 5.2 requires every template to contain "
-            f"both, or the prompt itself leaks the label."
+            f"boundary: {detail}. Design doc section 4.8 requires every non-pair template to "
+            f"contain both, or the prompt itself leaks the label."
         )
     return {t: dict(c) for t, c in sorted(counts.items())}
 
@@ -368,13 +481,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", default="~/data/reasoning_rl/final_halluc")
     parser.add_argument("--halluc_total", type=int, default=20000)
     parser.add_argument("--halluc_unsolvable_ratio", type=float, default=0.6)
-    parser.add_argument("--halluc_four_tier_ratio", type=float, default=0.6)
     parser.add_argument("--old_domain_ratio", type=float, default=0.7, help="stage-1 share of the stage-2 mix")
     parser.add_argument(
         "--spill_across_tiers",
         action="store_true",
         help="Let a four-tier shortfall be covered by three-tier cells. Preserves the total but "
-        "moves the four-tier/three-tier ratio away from --halluc_four_tier_ratio.",
+        "moves the table-B four-tier/three-tier composition.",
     )
     parser.add_argument("--val_size", type=int, default=256, help="hallucination-domain val rows (0 disables)")
     parser.add_argument("--no-dedup", action="store_true", help="skip the section 7.2 exact-text dedup")
@@ -395,7 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"no hallucination rows found under {halluc_dir}")
     print(f"[mix_halluc] {len(halluc_rows)} rows from {len(files)} adapter parquet(s)")
 
-    quota = scaled_quota(args.halluc_total, args.halluc_unsolvable_ratio, args.halluc_four_tier_ratio)
+    quota = scaled_quota(args.halluc_total, args.halluc_unsolvable_ratio)
     pool = index_pool(halluc_rows)
     missing = [cell for cell in quota if cell not in pool]
     if missing:
@@ -403,6 +515,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # Carve val out of the pools first, then fill the train quota (mix.py's order).
     val_rows, pool = carve_val(pool, quota, args.val_size, rng)
+    val_rows, returned = enforce_pair_atomicity(val_rows, pool)
+    if returned:
+        print(f"[mix_halluc] val: returned {len(returned)} row(s) whose pair twin was not in val")
     rows, cell_report = fill_cells(pool, quota, rng, spill_across_tiers=args.spill_across_tiers)
     filled_total = len(rows)
     if filled_total < args.halluc_total:
@@ -461,9 +576,17 @@ def main(argv: list[str] | None = None) -> int:
     templates = check_template_balance(rows)
     n_diag = sum(1 for r in rows if r["extra_info"]["branch"] == BRANCH_UNSOLVABLE_DIAG)
     n_bare = sum(1 for r in rows if r["extra_info"]["branch"] == BRANCH_UNSOLVABLE_BARE)
-    n_solvable = sum(1 for r in rows if r["extra_info"]["branch"] in SOLVABLE_BRANCHES)
+    # Side weights, not row counts: a SUM pair row carries one solvable and one
+    # unanswerable question, so it counts 0.5 to each side (section 4.8).
+    n_solvable_rows = sum(1 for r in rows if r["extra_info"]["branch"] in SOLVABLE_BRANCHES)
+    n_pair = sum(1 for r in rows if r["extra_info"]["branch"] in PAIR_BRANCHES)
+    half_pairs = n_pair * BRANCH_SIDE_WEIGHT[BRANCH_SOLVABLE_PAIR]
+    solvable_weight = n_solvable_rows + half_pairs
+    unsolvable_weight = (len(rows) - n_solvable_rows - n_pair) + half_pairs
+    total_weight = solvable_weight + unsolvable_weight
     achieved_ratios = {
-        "solvable_share": n_solvable / len(rows) if rows else 0.0,
+        "solvable_share": solvable_weight / total_weight if total_weight else 0.0,
+        "unsolvable_share": unsolvable_weight / total_weight if total_weight else 0.0,
         "four_tier_share_of_unsolvable": n_diag / (n_diag + n_bare) if (n_diag + n_bare) else 0.0,
     }
     schema.normalise_extra_info(all_train + val_rows)
@@ -480,7 +603,6 @@ def main(argv: list[str] | None = None) -> int:
         "config": {
             "halluc_total": args.halluc_total,
             "halluc_unsolvable_ratio": args.halluc_unsolvable_ratio,
-            "halluc_four_tier_ratio": args.halluc_four_tier_ratio,
             "old_domain_ratio": args.old_domain_ratio,
             "val_size": args.val_size,
             "seed": args.seed,
@@ -490,8 +612,15 @@ def main(argv: list[str] | None = None) -> int:
         "halluc_rows_in_train": len(rows),
         "halluc_target_vs_filled": {"target": args.halluc_total, "filled": len(rows)},
         "requested_ratios": {
+            # Side weights, so the SUM pairs count 0.5/0.5 the way section 4.8
+            # accounts for them; the four-tier composition is fixed by table B.
             "unsolvable_share": args.halluc_unsolvable_ratio,
-            "four_tier_share_of_unsolvable": args.halluc_four_tier_ratio,
+        },
+        "row_kinds": {
+            "solvable_rows": n_solvable_rows,
+            "pair_rows": n_pair,
+            "unsolvable_rows": len(rows) - n_solvable_rows - n_pair,
+            "side_weights": {"solvable": solvable_weight, "unsolvable": unsolvable_weight},
         },
         "achieved_ratios": achieved_ratios,
         "dropped_overlapping_stage1": dropped_old,

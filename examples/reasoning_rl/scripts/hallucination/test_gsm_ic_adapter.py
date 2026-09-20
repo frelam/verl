@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for ``gsmic_adapter.py`` and the audit in ``verify_gsmic.py``.
+"""Tests for ``gsm_ic_adapter.py`` and the audit in ``verify_gsmic.py``.
 
 Every fixture is inline and tiny.  The source rows are copied verbatim out of
 ``scratch/halluc_recon/gsmic_report.md`` (which quotes the raw files byte for
@@ -53,7 +53,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import gsmic_adapter as ga  # noqa: E402
+import gsm_ic_adapter as ga  # noqa: E402
 import schema  # noqa: E402
 import verify_gsmic as vg  # noqa: E402
 
@@ -354,7 +354,7 @@ GSM8K_CORPUS = {
 }
 
 # Expected funnel for the fixture above, with ``MAX_PER_BASE_QUESTION`` at its
-# default (20).  Every stage drops something, and the two gold-certificate drops
+# default (8).  Every stage drops something, and the two gold-certificate drops
 # (unknown base + wrong answer) land in the same stage.
 EXPECTED_FUNNEL = {
     "raw_rows": 17,
@@ -365,6 +365,13 @@ EXPECTED_FUNNEL = {
     "per_base_capped": 12,
     "limit_applied": 12,
 }
+
+# The measured pool of the current raw bundle: 100 distinct base questions
+# (2step 60 + mstep 40) x the 8-per-base cap = 800 rows, a small buffer over the
+# 772-row quota design doc section 4.8 table B row 1 assigns to GSM-IC after D27.
+DOCUMENTED_CAP = 8
+DOCUMENTED_BASES = 100
+DOCUMENTED_POOL = 800
 
 # The seven base questions that survive; every one is a distinct problem.
 SURVIVING_BASES = (
@@ -597,7 +604,12 @@ class TestRowFilters:
 
     def test_select_for_base_returns_everything_below_the_cap(self):
         candidates = [{"record": STEVE}]
-        assert len(ga._select_for_base(candidates, 20, random.Random(0))) == 1
+        assert len(ga._select_for_base(candidates, ga.MAX_PER_BASE_QUESTION, random.Random(0))) == 1
+
+    def test_the_per_base_cap_is_the_documented_eight(self):
+        """The cap is the knob; the 800-row pool is 100 bases x 8, not an input."""
+        assert ga.MAX_PER_BASE_QUESTION == DOCUMENTED_CAP
+        assert DOCUMENTED_BASES * ga.MAX_PER_BASE_QUESTION == DOCUMENTED_POOL
 
     def test_load_source_numbers_rows_with_their_file_and_ordinal(self, raw_dir):
         candidates = ga.load_source(raw_dir)
@@ -623,7 +635,7 @@ class TestBuildRows:
         _rows, funnel = built
         counts = list(funnel.values())
         assert counts[0] == EXPECTED_FUNNEL["raw_rows"]
-        assert all(later <= earlier for earlier, later in zip(counts, counts[1:]))
+        assert all(later <= earlier for earlier, later in zip(counts, counts[1:], strict=False))
 
     def test_row_counts_match_the_last_funnel_stage(self, built):
         rows, funnel = built
@@ -666,6 +678,19 @@ class TestBuildRows:
         rows, funnel = ga.build_rows(raw_dir, seed=0)
         assert funnel["per_base_capped"] == 7  # seven surviving base questions
         assert set(_count_by_base(rows).values()) == {1}
+
+    @pytest.mark.skipif(
+        not os.path.isdir(ga.DEFAULT_RAW_DIR),
+        reason="raw GSM-IC bundle not downloaded; the measured pool cannot be rebuilt",
+    )
+    def test_documented_pool_is_100_bases_times_the_cap(self):
+        """The full build yields the documented pool: 100 bases x 8 = 800 rows."""
+        rows, funnel = ga.build_rows(ga.DEFAULT_RAW_DIR, seed=0)
+        assert funnel["per_base_capped"] == DOCUMENTED_POOL
+        counts = _count_by_base(rows)
+        assert len(counts) == DOCUMENTED_BASES
+        assert set(counts.values()) == {DOCUMENTED_CAP}
+        assert len(rows) == DOCUMENTED_POOL
 
     def test_the_interleave_keeps_a_truncated_build_diverse(self, raw_dir):
         rows, _funnel = ga.build_rows(raw_dir, seed=0)
@@ -994,7 +1019,7 @@ class TestEndToEnd:
     def test_main_writes_a_valid_readable_parquet(self, raw_dir, tmp_path, monkeypatch, capsys):
         out = tmp_path / "built" / "gsmic.parquet"
         monkeypatch.setattr(
-            sys, "argv", ["gsmic_adapter.py", "--raw-dir", raw_dir, "--out", str(out)]
+            sys, "argv", ["gsm_ic_adapter.py", "--raw-dir", raw_dir, "--out", str(out)]
         )
         ga.main()
         captured = capsys.readouterr().out
@@ -1013,7 +1038,7 @@ class TestEndToEnd:
             sys,
             "argv",
             [
-                "gsmic_adapter.py",
+                "gsm_ic_adapter.py",
                 "--raw-dir",
                 raw_dir,
                 "--limit",
@@ -1037,7 +1062,7 @@ class TestEndToEnd:
         monkeypatch.setattr(
             sys,
             "argv",
-            ["gsmic_adapter.py", "--raw-dir", str(directory), "--out", str(tmp_path / "x.parquet")],
+            ["gsm_ic_adapter.py", "--raw-dir", str(directory), "--out", str(tmp_path / "x.parquet")],
         )
         with pytest.raises(SystemExit):
             ga.main()

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Download every raw file the hallucination build needs (design doc section 4.9.1).
+"""Download every raw file the hallucination build needs (design doc section 4).
 
 One-shot and idempotent: a file that already exists with a non-zero size is left
 alone unless ``--force`` is passed, so re-running after a partial failure only
@@ -19,6 +19,10 @@ fetches what is missing.  Every completed download is recorded in
 ``raw_manifest.json`` next to the data with its URL, byte count and sha256, which
 is what makes a later build reproducible and lets :mod:`verify_*` scripts state
 which bytes they audited.
+
+The pool is the sources of design doc section 4.8 table B; D25 removed the one
+source whose judgement signal carried no verifiable answer layer, so nothing is
+fetched for it here.
 
 Usage::
 
@@ -28,9 +32,9 @@ Usage::
 
 Licence note: each source carries its upstream licence in ``FileSpec.license``.
 They are *not* uniform -- UMWP is CC-BY-SA-4.0 (share-alike, and the repo ships
-no LICENSE file at all), KUQ is MIT and CREPE is BSD.  Anything redistributed
-downstream has to reconcile those, so the field is recorded here rather than
-left in a README somewhere.
+no LICENSE file at all) while CREPE is BSD.  Anything redistributed downstream
+has to reconcile those, so the field is recorded here rather than left in a
+README somewhere.
 """
 
 from __future__ import annotations
@@ -70,8 +74,8 @@ class FileSpec:
     """One downloadable artifact.
 
     ``name`` is the local filename; ``subdir`` is the directory under the
-    destination root.  Keeping several sources in one ``subdir`` (KUQ and CREPE in
-    ``kuq_crepe``) mirrors the recon layout the reports were written against.
+    destination root.  One ``subdir`` per source mirrors the recon layout the
+    reports were written against.
     """
 
     subdir: str
@@ -135,15 +139,10 @@ FILES: list[FileSpec] = [
     # --- SUM ---
     FileSpec("sum", "train.parquet", f"{_HF}/lime-nlp/Synthetic_Unanswerable_Math/resolve/refs%2Fconvert%2Fparquet/synthetic_unanswerable_math/train/0000.parquet", "Apache-2.0", "synthetic unanswerable math"),
     FileSpec("sum", "test.parquet", f"{_HF}/lime-nlp/Synthetic_Unanswerable_Math/resolve/refs%2Fconvert%2Fparquet/synthetic_unanswerable_math/test/0000.parquet", "Apache-2.0", "synthetic unanswerable math"),
-    # --- KUQ ---
-    FileSpec("kuq_crepe", "knowns_unknowns.jsonl", f"{_HF}/amayuelas/KUQ/resolve/main/knowns_unknowns.jsonl", "MIT", "6,884 rows, known 3,447 / unknown 3,437"),
-    FileSpec("kuq_crepe", "modified_knowns_unknowns.jsonl", f"{_HF}/amayuelas/KUQ/resolve/main/modified_knowns_unknowns.jsonl", "MIT", "same 5-field schema", optional=True),
-    # NOTE: unknowns_all.jsonl is deliberately NOT fetched. Its 12-field schema and
-    # different category vocabulary are not joinable with the other two files.
     # --- CREPE ---
-    FileSpec("kuq_crepe", "crepe_train.parquet", f"{_HF}/tasksource/CREPE/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet", "BSD", "3,462 rows"),
-    FileSpec("kuq_crepe", "crepe_validation.parquet", f"{_HF}/tasksource/CREPE/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet", "BSD", "2,000 rows (upstream calls it dev)"),
-    FileSpec("kuq_crepe", "crepe_test.parquet", f"{_HF}/tasksource/CREPE/resolve/refs%2Fconvert%2Fparquet/default/test/0000.parquet", "BSD", "3,004 rows"),
+    FileSpec("crepe", "crepe_train.parquet", f"{_HF}/tasksource/CREPE/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet", "BSD", "3,462 rows"),
+    FileSpec("crepe", "crepe_validation.parquet", f"{_HF}/tasksource/CREPE/resolve/refs%2Fconvert%2Fparquet/default/validation/0000.parquet", "BSD", "2,000 rows (upstream calls it dev)"),
+    FileSpec("crepe", "crepe_test.parquet", f"{_HF}/tasksource/CREPE/resolve/refs%2Fconvert%2Fparquet/default/test/0000.parquet", "BSD", "3,004 rows"),
 ] + _kk_specs()
 
 # TreeCut is not listed above: its HF mirror (`jouyang/treecut-math`) has no

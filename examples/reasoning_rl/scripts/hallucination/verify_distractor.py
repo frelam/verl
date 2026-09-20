@@ -36,12 +36,12 @@ answer depends on.  For **every** row (not a sample -- the check is cheap):
   raw file is a FAIL, as is a row whose ``paired_original_text`` is not the raw
   file's own question text.
 * **the gold is upstream's gold.**  The gold is re-read from the raw row with this
-  file's own value handling (SUM's ``ground_truth`` string, UMWP's ``answer``
-  array, and K&K's knight/knave mapping re-implemented from ``names`` order,
-  ``solution`` flags and the row's own ``knight_knave`` word pair).  It must equal
-  the row's ``ground_truth`` answer byte for byte.  This is the check that makes
-  the branch a *distractor* branch: the gold was never recomputed, and the
-  sentence was never allowed to move it.
+  file's own value handling (UMWP's ``answer`` array, and K&K's ``name -> surface
+  role word`` mapping re-implemented from ``names`` order, ``solution`` flags and
+  the row's own ``knight_knave`` word pair, D19).  It must equal the row's
+  ``ground_truth`` answer byte for byte.  This is the check that makes the branch
+  a *distractor* branch: the gold was never recomputed, and the sentence was never
+  allowed to move it.
 * **the sentence is an insertion, not a rewrite.**  The stored ``distractor_text``
   must occur verbatim in the prompt, and deleting it must restore the base
   question.  Note the direction that matters: the base is *not* a contiguous span
@@ -64,6 +64,20 @@ answer depends on.  For **every** row (not a sample -- the check is cheap):
   with the base at all: restating a property the problem has already fixed is how a
   distractor turns into a contradiction.  This is also the premise the design's
   structural law rests on (an overlapped fill is necessarily out-of-topic).
+* **the ``{number}`` never enters the answer.**  The recovered template must be
+  answer-preserving: a comparative or aggregating sentence adds a constraint, which
+  would make the substituted number load-bearing and the gold answer the raw row's
+  no longer (the module's own ``unsafe_reason`` funnel exists for exactly this, and
+  its marker rules are re-derived here).  With L1c on top -- the gold byte-equal to
+  the upstream row's -- the number cannot have participated in the answer.
+* **the base comes from the same source split as its control source.**  D17's
+  pairing (design doc section 4.7) is distractor (one irrelevant condition added)
+  against missing-premise source (one necessary premise removed), and the pair is
+  only a control if both are built on the same base distribution.  The audit
+  re-derives the pool from ``data_source``, looks up the control source and split in
+  its own table, and requires the row's declared pairing, ``extra_info.split`` and
+  the *joined raw row's own* provenance to agree.  An implicit convention here
+  would let "which base pool is this" become the shortcut the pairing removes.
 
 L2 -- distribution and determinism
 ----------------------------------
@@ -80,10 +94,13 @@ L2 -- distribution and determinism
   and the ``sentence_label`` exactly (the skeleton's topic words intersected with
   the base's content words).  Rows whose fill could not be recovered are counted and
   reported, never silently passed.
+* the three named pools' quota must be the D17 total of exactly **400**
+  (UMWP-answerable 200 / K&K 100 / stage-1 math 100, design doc section 4.7), and no
+  pool may hold more rows than its quota.
 * ``task_id`` and ``prompt`` must be unique, and no base may be used twice.  This
   is not ceremonial: K&K's five per-size parquet files each number their rows from
   0, so ``index`` alone collides five-fold within the pool, and a ``task_id`` built
-  from it silently maps 61 of the 2,000 rows onto the wrong base.
+  from it silently maps rows onto the wrong base.
 * re-running the synthesis with the observed per-pool counts must reproduce the
   same rows.  A branch whose balance depends on a random walk that cannot be
   replayed is not auditable, and the D17 margins are close enough to the +-5pt
@@ -105,10 +122,10 @@ reading -- the failure mode the UMWP recon report documents for an unfiltered
 multinomial NB (class score flips sign out of fold).
 
 Also reported, and **not** gated, because it is a property of this machine rather
-than of D17: the fourth pool (the stage-1 math slice, 400 rows of the design's
-2,400) has no source file here, so it is unbuilt.  The summary line states the
-built fraction against the design quota so the gap cannot be mistaken for a
-complete branch.
+than of D17: the stage-1 math slice (100 of the design's 400 rows) has no source
+file here, so it is unbuilt.  The summary line states the built fraction against
+the design quota so the gap cannot be mistaken for a complete branch.  Pass
+``--stage1-path`` to make those rows joinable and audited like every other row.
 
 The L0 layer asserts :func:`schema.validate_row` on every row.
 """
@@ -147,7 +164,6 @@ TASK_ID_PREFIX = "d17:"
 # rather than imported: an audit that took the key format from the code under
 # audit could not catch a change to it.
 POOL_KEYS = {
-    ds.POOL_SUM: "sum:{split}:{index}",
     ds.POOL_UMWP: "umwp:{line}",
     ds.POOL_KK: "kk:{stem}:{index}",
     ds.POOL_MAIN: "main:{row}",
@@ -155,18 +171,58 @@ POOL_KEYS = {
 # The pool titles, also part of that contract (the branch name is reported by
 # `data_source`, which is what the mixer and the reward see).
 POOL_TITLES = {
-    ds.POOL_SUM: ds.POOL_SUM,
     ds.POOL_UMWP: ds.POOL_UMWP,
     ds.POOL_KK: ds.POOL_KK,
     ds.POOL_MAIN: ds.POOL_MAIN,
 }
+# The data_source each pool's rows must carry.  The constants come from `schema`
+# (the frozen contract) rather than from `distractor_synth`, so a drift in the
+# builder's own table cannot hide behind this audit's copy of it.  The default
+# `halluc_math_main` literal is *not* repeated here.
 DATA_SOURCE_OF_POOL = {
-    ds.POOL_SUM: "halluc_math_sum",
-    ds.POOL_UMWP: "halluc_math_umwp",
-    ds.POOL_KK: "halluc_logic_kk",
-    ds.POOL_MAIN: "halluc_math_main",
+    ds.POOL_UMWP: schema.SOURCE_UMWP,
+    ds.POOL_KK: schema.SOURCE_KK,
+    ds.POOL_MAIN: schema.SOURCE_MAIN,
 }
 POOL_OF_DATA_SOURCE = {source: pool for pool, source in DATA_SOURCE_OF_POOL.items()}
+
+# The upstream file each pool's bases are read from, by pool -- the *left* side of
+# the same-source pairing.  Written out here as the audit's own claim.
+BASE_UPSTREAM_OF_POOL = {
+    ds.POOL_UMWP: "umwp/StandardDataset.jsonl",
+    ds.POOL_KK: "kk/clean__train__*ppl.parquet",
+    ds.POOL_MAIN: "stage-1 math parquet (--stage1-path)",
+}
+# The missing-premise control source each distractor pool is the added-condition
+# control of (D17, design doc section 4.7), as ``pool -> (control data_source,
+# split both sides' base questions come from)``.  Re-derived here, not imported:
+# the pairing is exactly what this check is for.
+CONTROL_OF_POOL = {
+    ds.POOL_UMWP: (schema.SOURCE_UMWP, "train"),  # UMWP's unanswerable half
+    ds.POOL_KK: (schema.SOURCE_KK, "train"),  # K&K perturbed rows (D20)
+    ds.POOL_MAIN: (schema.SOURCE_MIP, "train"),  # MiP = stage-1 math distribution
+}
+
+# The answer-preserving rule the recovered template must satisfy: a comparative
+# or aggregating sentence adds a constraint, which is what would make the
+# substituted {number} participate in the answer.  `distractor_synth.unsafe_reason`
+# is the builder's own filter; the markers are re-derived here so a drift in that
+# filter cannot pass unnoticed.
+_CONSTRAINT_MARKERS = (
+    " than ",
+    "in total",
+    "altogether",
+    "combined",
+    "together",
+    "in all",
+    "times as many",
+    "times more",
+    "times less",
+    "as many as",
+    "as much as",
+    "twice as",
+    "half as",
+)
 
 _APOSTROPHE_RE = re.compile(r"[‘’ʼ`]")
 _NB_CHANCE = 0.50
@@ -194,26 +250,6 @@ def _literal(value):
         except (ValueError, SyntaxError):
             return value
     return value
-
-
-def read_sum_bases(raw_dir: str) -> dict[str, dict]:
-    """SUM's answerable rows, keyed by this audit's own uid."""
-    import pyarrow.parquet as pq
-
-    rows = pq.read_table(
-        os.path.join(raw_dir, "sum", "train.parquet"),
-        columns=["answerable_question", "ground_truth"],
-    ).to_pylist()
-    bases: dict[str, dict] = {}
-    for index, row in enumerate(rows):
-        question = (row["answerable_question"] or "").strip()
-        if not question:
-            continue
-        bases[POOL_KEYS[ds.POOL_SUM].format(split="train", index=index)] = {
-            "question": question,
-            "answer": (row["ground_truth"] or "").strip(),
-        }
-    return bases
 
 
 def read_umwp_bases(raw_dir: str) -> dict[str, dict]:
@@ -244,12 +280,17 @@ def read_umwp_bases(raw_dir: str) -> dict[str, dict]:
             bases[POOL_KEYS[ds.POOL_UMWP].format(line=line_number)] = {
                 "question": question,
                 "answer": answer,
+                # The row's own provenance: which upstream file/split these bytes
+                # came from, so the same-source pairing is checked against the raw
+                # row and not only against the artifact's own declaration.
+                "data_source": schema.SOURCE_UMWP,
+                "split": "train",
             }
     return bases
 
 
 def read_kk_bases(raw_dir: str) -> dict[str, dict]:
-    """K&K's clean 4+-inhabitant puzzles, with the answer mapped here from scratch."""
+    """K&K's clean 4+-inhabitant puzzles, with the D19 mapping built from scratch."""
     import glob
 
     import pyarrow.parquet as pq
@@ -278,16 +319,62 @@ def read_kk_bases(raw_dir: str) -> dict[str, dict]:
             lie = roles.get("knave") or "knave"
             bases[POOL_KEYS[ds.POOL_KK].format(stem=stem, index=row["index"])] = {
                 "question": quiz,
-                "answer": " ".join(truth if flag else lie for flag in solution),
+                # D19: a name -> surface role word mapping, re-derived from the
+                # raw row's own word pair.  A bare sequence here would reproduce
+                # the superseded gold shape instead of checking the new one.
+                "answer": {
+                    str(name): truth if flag else lie
+                    for name, flag in zip(names, solution, strict=False)
+                },
+                "data_source": schema.SOURCE_KK,
+                "split": "train",
             }
     return bases
 
 
-def read_raw_bases(raw_dir: str) -> dict[str, dict]:
-    """All three present pools under one ``uid -> {question, answer}`` map."""
+def read_main_bases(stage1_path: str) -> dict[str, dict]:
+    """The stage-1 math pool rows ``distractor_synth.load_main_pool`` accepts.
+
+    Same acceptance rules as the builder (non-empty prompt, parseable payload with
+    a truthy ``answer``), with the filter re-written here, and the same physical
+    row ordinal in the key.  The stage-1 parquet is optional: without
+    ``--stage1-path`` the main pool's rows cannot be joined, which L1a reports
+    rather than excuses.
+    """
+    import pyarrow.parquet as pq
+
     bases: dict[str, dict] = {}
-    for reader in (read_sum_bases, read_umwp_bases, read_kk_bases):
+    if not stage1_path:
+        return bases
+    for row_number, row in enumerate(pq.read_table(stage1_path).to_pylist()):
+        prompt = row.get("prompt") or []
+        if not prompt:
+            continue
+        question = (prompt[0].get("content") or "").strip()
+        if not question:
+            continue
+        try:
+            payload = json.loads(row["reward_model"]["ground_truth"])
+        except (ValueError, KeyError, TypeError):
+            continue
+        answer = payload.get("answer")
+        if not answer:
+            continue
+        bases[POOL_KEYS[ds.POOL_MAIN].format(row=row_number)] = {
+            "question": question,
+            "answer": str(answer),
+            "data_source": schema.SOURCE_MAIN,
+            "split": str((row.get("extra_info") or {}).get("split", "train")),
+        }
+    return bases
+
+
+def read_raw_bases(raw_dir: str, stage1_path: str = "") -> dict[str, dict]:
+    """All three pools under one ``uid -> {question, answer, provenance}`` map."""
+    bases: dict[str, dict] = {}
+    for reader in (read_umwp_bases, read_kk_bases):
         bases.update(reader(raw_dir))
+    bases.update(read_main_bases(stage1_path))
     return bases
 
 
@@ -435,7 +522,7 @@ class TemplateMatcher:
                 role: str | None = None
                 number: str | None = None
                 consistent = True
-                for name, value in zip(names, match.groups()):
+                for name, value in zip(names, match.groups(), strict=False):
                     if name.startswith("{number"):
                         consistent = consistent and (number is None or number == value)
                         number = number or value
@@ -533,6 +620,68 @@ def role_pool_of(templates: list) -> list[str]:
     return sorted({template.role for template in templates if template.role})
 
 
+def constraint_markers(template: str) -> list[str]:
+    """Comparison/aggregation markers in a recovered template -- the number's bite.
+
+    A sentence with one of these adds a *constraint* instead of an irrelevant
+    fact, which is what would make the substituted ``{number}`` participate in the
+    answer.  The list is the audit's own (see ``_CONSTRAINT_MARKERS``); the builder
+    filters these out in ``distractor_synth.unsafe_reason``, and this is the
+    independent re-derivation of that claim.
+    """
+    lowered = (template or "").casefold()
+    return sorted({marker.strip() for marker in _CONSTRAINT_MARKERS if marker in lowered})
+
+
+def same_source_problem(row: dict, base: dict | None) -> str | None:
+    """D17's same-source base pairing for one row, or ``None`` when it holds.
+
+    The distractor row is the *added-condition* control of a missing-premise
+    source, and the pairing is only a control if both sides' base questions come
+    from the same source split (design doc section 4.7).  Re-derived here from the
+    row's ``data_source`` -- never from the builder's own table:
+
+    * the pool's declared ``control_source`` / ``control_split`` must be the ones
+      this audit's :data:`CONTROL_OF_POOL` names;
+    * ``extra_info.split`` must be that same split;
+    * and, when the raw row joins, the *raw row's own* provenance (which file it
+      was read from and its split) must agree as well.
+
+    ``base`` is ``None`` for a row whose key did not resolve; L1a owns that
+    failure, so only the declared half is checked here.
+    """
+    info = row.get("extra_info") or {}
+    uid = _uid(row)
+    pool = POOL_OF_DATA_SOURCE.get(row.get("data_source"))
+    if pool is None:
+        return f"{uid}: unknown data_source {row.get('data_source')!r}"
+    control_source, control_split = CONTROL_OF_POOL[pool]
+    declared = (info.get("control_source"), info.get("control_split"))
+    if declared != (control_source, control_split):
+        return (
+            f"{uid}: declares control {declared!r}, but pool {pool!r} pairs with "
+            f"{(control_source, control_split)!r}"
+        )
+    if (info.get("split") or "") != control_split:
+        return (
+            f"{uid}: extra_info.split {info.get('split')!r} is not the control "
+            f"source split {control_split!r}"
+        )
+    if base is None:
+        return None
+    if base.get("data_source") != DATA_SOURCE_OF_POOL[pool]:
+        return (
+            f"{uid}: raw key resolves into {base.get('data_source')!r}, not "
+            f"{BASE_UPSTREAM_OF_POOL[pool]}"
+        )
+    if base.get("split") != control_split:
+        return (
+            f"{uid}: raw row split {base.get('split')!r} is not the control source "
+            f"split {control_split!r} of {control_source}"
+        )
+    return None
+
+
 def positive_control(seed: int = 0) -> float:
     """A separable synthetic task the NB must solve, else the estimator is broken."""
     rng = random.Random(seed)
@@ -599,6 +748,8 @@ def audit(
     seed: int,
     replay: bool,
     sample: int,
+    raw_dir: str = DEFAULT_RAW_DIR,
+    stage1_path: str = "",
 ) -> Audit:
     audit = Audit()
     total = len(rows)
@@ -626,12 +777,37 @@ def audit(
     sentence_in_base: list[str] = []
     overlap_contradiction: list[str] = []
     unrecovered: list[str] = []
+    constrained_template: list[str] = []
+    same_source: list[str] = []
     recovered_by_uid: dict[str, list[RecoveredFill]] = {}
 
     for row in rows:
         info = row["extra_info"]
         uid = _uid(row)
         base = raw_bases.get(uid)
+
+        # Recover the substitution first: it needs neither the raw row nor the
+        # artifact's own labels, and two of the checks below read it.
+        fills = matcher.candidates(info.get("distractor_text") or "")
+        if not fills:
+            unrecovered.append(uid)
+        else:
+            recovered_by_uid[uid] = fills
+            # The ``{number}`` must be inert: a recovered template that compares or
+            # aggregates adds a constraint, and *that* is what would let the
+            # substituted number participate in the answer.  Combined with L1c
+            # (the gold is the raw row's own) this is the D17 answer-invariance
+            # claim for the number.
+            markers = sorted({m for fill in fills for m in constraint_markers(fill.template)})
+            if markers:
+                constrained_template.append(f"{uid}: {markers}")
+
+        # D17's same-source pairing is checked even when the join fails: half of it
+        # is the artifact's own declaration, and the other half needs the raw row.
+        problem = same_source_problem(row, base)
+        if problem:
+            same_source.append(problem)
+
         if base is None:
             unjoined.append(uid or repr(info.get("task_id")))
             continue
@@ -655,14 +831,7 @@ def audit(
         if payload.get("answer") != base["answer"]:
             gold_mismatch.append(uid)
 
-        # Recover the substitution before reading any label off the text: the
-        # actor belongs to the fill, and a reading that counts it as one of the
-        # sentence's own words is wrong in the direction that hides an overlap.
-        fills = matcher.candidates(info.get("distractor_text") or "")
-        if not fills:
-            unrecovered.append(uid)
-        else:
-            recovered_by_uid[uid] = fills
+        if fills:
             labels = info.get("distractor_labels") or {}
             if labels.get("role_label") == "overlapped":
                 # Restating a fixed property is the one way this sentence could
@@ -718,6 +887,16 @@ def audit(
         not unrecovered,
         summarise(unrecovered),
     )
+    audit.check(
+        "L1j the recovered template is answer-preserving (the {number} is inert)",
+        not constrained_template,
+        summarise(constrained_template),
+    )
+    audit.check(
+        "L1k the base question comes from its control source's own source split",
+        not same_source,
+        summarise(same_source),
+    )
     template_roles = {role.casefold() for role in matcher.role_pool}
     actors = {fill.role for fills in recovered_by_uid.values() for fill in fills}
     ambiguous = sum(1 for fills in recovered_by_uid.values() if len(fills) > 1)
@@ -751,6 +930,34 @@ def audit(
         "L2c no base is used twice",
         not reused,
         f"{len(used_bases)} distinct bases" + (f"; e.g. {reused[:3]}" if reused else ""),
+    )
+
+    # -- L2j: the three named pools, and the D17 total of exactly 400 ---------
+    # The quota is a design claim of table B row 1 (design doc section 4.7), not a
+    # property of the bytes, so it is gated first and independently of the build:
+    # the audit's own pool table must name exactly the three pools the builder
+    # does, and they must add up to 400.
+    observed = observed_by_pool(rows)
+    audit.check(
+        "L2j the D17 quota is the three named pools totalling 400",
+        set(POOL_TITLES) == set(ds.POOLS)
+        and set(ds.DEFAULT_POOL_QUOTA) == set(POOL_TITLES)
+        and sum(ds.DEFAULT_POOL_QUOTA[pool] for pool in POOL_TITLES) == 400,
+        " + ".join(
+            f"{POOL_TITLES[pool]} {ds.DEFAULT_POOL_QUOTA.get(pool, 0)}" for pool in POOL_TITLES
+        )
+        + f" = {sum(ds.DEFAULT_POOL_QUOTA.get(pool, 0) for pool in POOL_TITLES)}",
+    )
+    over_quota = {
+        pool: count
+        for pool, count in observed.items()
+        if count > ds.DEFAULT_POOL_QUOTA.get(pool, 0)
+    }
+    audit.check(
+        "L2k no pool holds more than its D17 quota",
+        not over_quota,
+        f"{observed}"
+        + (f"; over quota: {over_quota}" if over_quota else ""),
     )
 
     by_pool = collections.defaultdict(list)
@@ -836,8 +1043,11 @@ def audit(
     if replay:
         observed = observed_by_pool(rows)
         quota = {pool: int(observed.get(pool, 0)) for pool in ds.POOLS}
-        pools, _notes = ds.load_pools(ds.DEFAULT_RAW_DIR, None)
-        templates, _report = ds.load_safe_templates()
+        # The replay re-runs the builder with the *observed* per-pool counts, so
+        # the stage-1 slice has to be reachable here too -- otherwise an artifact
+        # that included it could never replay.
+        pools, _notes = ds.load_pools(raw_dir, stage1_path or None)
+        templates, _report = ds.load_safe_templates(raw_dir)
         replayed, _replay_report = ds.synthesise(pools, templates=templates, quota=quota, seed=seed)
         replay_map = {row["extra_info"]["task_id"]: row for row in replayed}
         mismatched = [
@@ -886,7 +1096,7 @@ def audit(
             f"{_NB_MIN_DOC_SUPPORT}",
         )
 
-    # -- reporting only: the unbuilt fourth pool -----------------------------
+    # -- reporting only: the unbuilt stage-1 pool -----------------------------
     quota_total = sum(ds.DEFAULT_POOL_QUOTA.values())
     audit.note(
         "summary",
@@ -901,8 +1111,8 @@ def audit(
                 f"summary {pool}",
                 f"{got}/{want} rows -- short by {want - got}"
                 + (
-                    " (no stage-1 pool on this machine: --stage1-path was never given)"
-                    if pool == ds.POOL_MAIN
+                    " (--stage1-path was not given, so the main pool could not be built)"
+                    if pool == ds.POOL_MAIN and not stage1_path
                     else ""
                 ),
             )
@@ -921,6 +1131,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--rows", default=DEFAULT_ROWS, help="distractor_synth.py output parquet")
     parser.add_argument("--raw-dir", default=DEFAULT_RAW_DIR, help="raw upstream files")
+    parser.add_argument(
+        "--stage1-path",
+        default="",
+        help="the stage-1 math parquet the main-pool rows were built from; without it "
+        "those rows cannot be joined (L1a) and are reported as unbuilt",
+    )
     parser.add_argument("--seed", type=int, default=42, help="the seed the branch was built with")
     parser.add_argument("--skip-replay", action="store_true", help="skip the determinism replay")
     parser.add_argument("--sample", type=int, default=50, help="unused; kept for CLI parity")
@@ -929,7 +1145,7 @@ def main() -> None:
     rows = schema.read_parquet_rows(args.rows)
     if not rows:
         raise SystemExit(f"no rows in {args.rows}")
-    raw_bases = read_raw_bases(args.raw_dir)
+    raw_bases = read_raw_bases(args.raw_dir, args.stage1_path)
     templates, _report = ds.load_safe_templates(args.raw_dir)
     matcher = TemplateMatcher(templates)
 
@@ -943,6 +1159,8 @@ def main() -> None:
         seed=args.seed,
         replay=not args.skip_replay,
         sample=args.sample,
+        raw_dir=args.raw_dir,
+        stage1_path=args.stage1_path,
     )
     result.flush()
 

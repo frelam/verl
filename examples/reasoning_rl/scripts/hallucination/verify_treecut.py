@@ -19,26 +19,34 @@ Usage::
 
 Reads only the artifact: every check re-derives its answer from the text the row
 itself carries (``prompt`` question + ``extra_info.paired_original_text``, the
-recorded ``deleted_condition_text`` and ``proof``) and from the gold fields, and
-never trusts the adapter's own verdict.  Prints ``PASS``/``FAIL`` per check and
+recorded ``deleted_condition_text``, ``proof``, ``options`` and the gold fields),
+and never trusts the adapter's own verdict.  Prints ``PASS``/``FAIL`` per check and
 exits non-zero if any check fails.
 
-A TreeCut row is a *pair*: the shipped member (an edge the answer's derivation
-needs was deleted, so nothing grounds the answer) and the counterpart
-(``paired_original_text``: one edge the derivation does **not** use was deleted,
-so it stays solvable).  The two members come from one shared render, which is why
-the pair is a fair length-matched control and why the certificate below can be
-re-derived from either side.
+A TreeCut row is one side of a *pair* (D26 ships both sides, table B rows 5 and 7):
+
+* the **negative** (branch ``unsolvable_diag``) is the member whose cut took an
+  edge the answer's derivation needs -- nothing grounds the answer, so its gold is
+  ``\\boxed{UNSOLVABLE: <选项ID>}`` and the option block holds candidate missing
+  conditions;
+* the **positive** (branch ``solvable_numeric``) is the counterpart, whose cut took
+  an edge the derivation does not use, so it stays solvable and ships the
+  generator's answer as a numeric gold with a *placeholder* option block.
+
+Both members come from one shared render, which is why the pair is a fair
+length-matched control and why the certificate can be re-derived from either side.
 
 Layers
 ------
 
 **Prompt binding.**  The stored prompt must be exactly ``schema.render_prompt``'s
-output for the row's own question under the row's recorded ``template`` -- the
-prompt is frozen at write time, so the wording the model sees can be re-derived
-from the row.  This is what ties the gold to the question: a prompt rewritten to
-another template while the gold stayed the bare refusal is a row that never asks
-for its own answer, and it fails here.
+output for the row's own question under the row's recorded ``template`` and
+``options`` -- the prompt is frozen at write time, so the wording the model sees
+can be re-derived from the row.  This is what ties the gold to the question: a
+prompt rewritten to another template while the gold stayed the four-tier refusal
+is a row that never asks for its own answer, and it fails here.  Both sides must
+render template A with exactly k=3 option lines and the same instruction preamble
+(the D18 isomorphism D26 re-states).
 
 **Source anchor.**  The row's texts are proved against the source itself, and the
 anchor fails closed: if ``<raw_dir>/repo/treecut/entities_items.py`` cannot be
@@ -59,7 +67,7 @@ read, the check is a ``FAIL``, not a skip.  Two parts:
   source -- text-to-graph parsing, reachability, the N/M tree identity -- against
   ground truth the adapter did not produce.
 
-**L1 -- proof certificate** (design doc section 9, check 1).  Every row's
+**L1 -- proof certificate** (design doc section 9, D26).  Every *negative* row's
 ``proof`` must carry the generator's disproof certificate: "There are N variables
 but only M linear formula(s), so we cannot calculate the price of <asked>", with
 ``M == N - 1 < N``.  Re-derived from the row's own text: the certificate's
@@ -70,65 +78,117 @@ quotes the sentences as ``l0(sentence[:-1])`` -- must actually **appear in the
 recorded ``proof`` string**.  That last comparison is deliberately against the
 proof and not against the graph the clauses were derived from: matching a clause
 to the graph it came from is a tautology, so it could never catch a certificate
-whose quoted justification had been fabricated or copied from another row.  A
-proof that does not quote the clauses its own component rests on is the adapter
-inventing its own justification, which is what this check exists to catch.
+whose quoted justification had been fabricated or copied from another row.  The
+positive side carries no proof of its own (it is solvable) and must say so.
 
-**L2 -- pair certificate** (design doc section 9, check 3).  Re-derived from the
-two texts alone:
+**L2 -- pair certificate** (design doc section 9, D26).  Re-derived from the two
+texts alone, and symmetric in the two sides (a row's own side is whichever member
+is reachable from a root fact):
 
 * the symmetric difference of the two bodies is exactly one sentence each way;
-  the shipped side's is ``deleted_condition_text``, it is absent from the shipped
-  body, and the counterpart's own lost sentence is absent from the counterpart;
-* the shipped member has **no** fact-to-answer chain (unsolvable), and the
-  counterpart has one of exactly ``ansDepth - 1`` hops;
-* the counterpart's derivation does not use the sentence the *counterpart* lost
-  ("the removed edge is provably irrelevant": the only edge whose removal changes
-  solvability is the shipped member's);
-* adding the recorded ``deleted_condition_text`` back to the shipped text makes
-  the answer reachable at ``ansDepth - 1`` hops -- the pivot proves itself, using
-  nothing but the shipped row's own fields;
+  a row's own lost sentence is its recorded ``deleted_condition_text`` and is
+  absent from its own body;
+* exactly one member is solvable (the two texts must not agree on reachability),
+  the unsolvable member has **no** fact-to-answer chain and the solvable one has
+  one of exactly ``ansDepth - 1`` hops;
+* the solvable member's derivation does not use the sentence the *solvable* member
+  lost ("the removed edge is provably irrelevant": the only edge whose removal
+  changes solvability is the unsolvable member's);
+* adding the *unsolvable* member's recorded lost sentence back to its own text
+  makes the answer reachable at ``ansDepth - 1`` hops -- the pivot proves itself,
+  using nothing but the row's own fields;
 * the pair is one scenario: same asked variable, same variable set, same sentence
   count (``numVars - 1`` per member), and the same configuration.  ``theme`` is
   checked from the text, ``numVars`` from the variable count, ``ansDepth`` from
-  the counterpart's hop count; ``order`` is recorded and cannot be recovered from
-  a shuffled body, so it is only checked to be a legal value (see the note in
+  the solvable member's hop count; ``order`` is recorded and cannot be recovered
+  from a shuffled body, so it is only checked to be a legal value (see the note in
   ``main()``).
 
-**L3 -- anti-cheat gate** (design doc section 9, check 2).  Section 4.9.2 pit 3
-measured the stock generator's pair as leaking: the cut member loses a whole
-sentence, so the two classes separate on length and on a bag of words.  This file
-re-measures the gate on the **built** rows, as the doc requires:
+**L2b -- answer certificate** (design doc section 6 / 9, D26).  The positive's
+gold is a number, so the artifact must prove it.  This layer re-derives it from
+the positive's own passage: walk the certified fact-to-answer chain, decode each
+step by enumerating the formulas the pinned renderer could have produced for that
+exact sentence (``x, y`` over the generator's ``+/-1..3`` space, the sentence's own
+numbers plus ``+/-1``/0 as candidate results), and require the propagated value to
+equal the recorded gold.  The decoder is the source's *own renderer*, so this is
+not a second prose grammar; it is the same computation the adapter performs,
+repeated from the artifact.
+
+**L3 -- anti-cheat gate** (design doc section 9, check 2; section 11 risk 1).  The
+two shipped sides are the corpus: negative rows (label 0) against positive rows
+(label 1).  Section 4.6 measured the stock generator's pair as leaking (the cut
+member loses a whole sentence, so the two classes separate on length and on a bag
+of words); this file re-measures the gate on the **built** rows, as the doc
+requires:
 
 * a 1-D length threshold, 5-fold out of fold, must read balanced accuracy
   ``<= 0.55`` (random + 5 points);
 * a Bernoulli bag-of-words Naive Bayes, same folds, must read ``<= 0.55``;
-* the pair must actually be length-matched: mean ``|word-count delta| <= 2``.
+* the shipped pair must actually be length-matched: mean ``|word-count delta| <= 2``.
 
 Both raw numbers, a pair-aligned shuffled-label null control (the labels are
-flipped *within* each pair, so the estimator sees the same pairs with random
-sides) and the length-alignment summary are printed pass or fail.  The
+flipped *within* each shipped pair, so the estimator sees the same pairs with
+random sides) and the length-alignment summary are printed pass or fail.  The
 Bernoulli reading is reported with its known pathology: on near-identical
 corpora it can read *below* chance (as it does here and as UMWP's verifier
 records for that corpus), so a sub-0.5 reading is not evidence of anything by
 itself -- the control is what makes it interpretable.
 
+**L4 -- the D26 option contract and the leak gate** (design doc section 9, D26,
+section 11 risk 1).  Every row carries template A with k=3 options (D15), and the
+two sides look structurally identical (D18).  Per side:
+
+* *negative*: exactly three options, ids A/B/C, pairwise distinct, **every option
+  absent from the shipped passage verbatim**, each one a same-family condition
+  (it parses under the row's own theme vocabulary and names a variable), and
+  ``correct_option_id`` pointing at the option whose text is the recorded
+  ``deleted_condition_text`` -- i.e. at the generator's own cut edge;
+* *positive*: exactly three options, pairwise distinct, every one absent from the
+  passage, ``correct_option_id`` null, and every one re-derivable from a passage
+  sentence by **exactly one** variable-name swap or one variable-value swap (Q16;
+  the mode balance is reported);
+* *leak heuristic*: choosing uniformly among the options that are not in the
+  passage must hit the gold at most ``1/k + 5pt = 38.3%``.  Because all three
+  options of a negative are out of passage, the heuristic has no signal and reads
+  ~k^-1; if an option were a passage condition the heuristic would collapse onto
+  the gold (MiP's measured 95.6%, section 4.2).
+* *option-shuffle invariance*: permuting a row's options and moving
+  ``correct_option_id`` to the option that still holds the gold text must leave the
+  **reward** unchanged -- checked against the frozen dispatcher, not a copy of its
+  table.
+
+**L5 -- the branch-dependent bare refusal** (design doc sections 5.1 and 6, D26).
+``\\boxed{UNSOLVABLE}`` scores +1 on a three-tier source and **0** on TreeCut's
+four-tier negatives -- the easiest cell in the matrix to get wrong.  This layer
+runs the frozen dispatcher on a real TreeCut negative and on a three-tier payload,
+and prints both data sources in the message.
+
+**L5b -- the TreeCut positive's reward cells** (design doc section 9 matrix, D26).
+The solvable side is an ordinary numeric row behind a placeholder block: the gold
+answer scores +1, while a misrefusal (``\\boxed{UNSOLVABLE}``, with or without an
+option id) and a placeholder pick (``\\boxed{B}``) score **0** -- never -1 -- and an
+empty response scores 0.  The placeholder block is never read by the reward, which
+is what this check pins down.
+
 What is *not* re-derivable, stated plainly
-------------------------------------------
+-----------------------------------------
 
 * ``order``: only the shuffle's output survives in the text, so a ``random``
   label cannot be proved from the artifact.  The pair shares it by construction
   (both members are filtered out of one render before the same transform).
-* ``proof``'s numeric values are *not* checked against arithmetic: the shipped
-  row's gold is the refusal, the counterpart is audit-only, and no per-row source
-  record exists to anchor a number.  What is checked is the *shape* (N/M/asked
-  variable/clauses), which is this source's whole certificate.
+* the negative's distractors are sibling cuts: that they come from the *same grid
+  cell* is a build-time property of the generator's configuration, not recoverable
+  from a single row.  What is checked instead is the property the leak defence
+  rests on (every option out of passage, same-family sentence shapes).
+* sentences **off** the positive's derivation chain are not checked against the
+  same value assignment (that would need the generator's per-row formula record,
+  which the source does not ship); the gold is derived from the chain only.
 * the released HF files under ``<raw_dir>/hf`` are printed as a pre-fix
   reference for the section 9 gate.  They measure the *source*, not this build,
   and are informational: the doc quotes the stock leak as length 0.726 / BoW NB
-  0.755, and the pooled release reads 0.5670 on length (see the adapter's
-  DEVIATIONS item 5).  Both exceed the gate, which is why the pair construction
-  exists.
+  0.755 (section 4.6 / section 11 risk 1), and the pooled release reads 0.5670 on
+  length (see the adapter's DEVIATIONS item 5).  Both exceed the gate, which is
+  why the pair construction exists.
 """
 
 from __future__ import annotations
@@ -152,16 +212,27 @@ except ImportError:  # pragma: no cover - running as a plain script
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import schema
 
-BRANCH_BARE = schema.BRANCH_UNSOLVABLE_BARE
-TEMPLATE_B = schema.TEMPLATE_B
+BRANCH_DIAG = schema.BRANCH_UNSOLVABLE_DIAG
+BRANCH_POSITIVE = schema.BRANCH_SOLVABLE_NUMERIC
+TEMPLATE_A = schema.TEMPLATE_A
 
 DEFAULT_RAW_DIR = "/home/charles/data/reasoning_rl/halluc/raw/treecut"
 REPO_SUBDIR = os.path.join("repo", "treecut")
 ENTITIES_FILE = "entities_items.py"
+REWARD_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "reward", "hallucination_compute_score.py",
+)
 
-#: Section 9's hard gate: random + 5 points on balanced accuracy.
+#: D15: every option block is exactly k = 3.
+K_OPTIONS = 3
+#: Section 9's hard gate on the two shipped sides: random + 5 points.
 L3_MAX_BALANCED_ACCURACY = 0.55
 L3_MIN_SUPPORT = 5
+#: Section 9 / D26 / section 11 risk 1's option-leak gate: 1/k + 5pt = 38.3%.
+LEAK_MAX_HIT_RATE = 1.0 / K_OPTIONS + 0.05
+#: Q16's two placeholder modes.
+PLACEHOLDER_MODES = ("variable_name", "variable_value")
 #: The pair must be length-matched in words, not merely similar in characters.
 ALIGNMENT_MAX_WORD_DELTA = 2.0
 
@@ -174,6 +245,8 @@ PROOF_ASKED_RE = re.compile(r"the price of (.+?)\.\s*$")
 #: "numVars-4_ansDepth-2" and "_hallu-True" out of a released file name.
 HF_CONFIG_RE = re.compile(r"_numVars-(\d+)_ansDepth-(\d+)")
 HF_CUT_RE = re.compile(r"_hallu-(True|False)")
+#: Numeric literals, with their spans, for the placeholder-value re-derivation.
+NUMBER_SPAN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
 
 ORDER_VALUES = ("forward", "backward", "random")
 
@@ -232,6 +305,69 @@ def question_or_empty(row: dict) -> str:
 
 def _text_of(value) -> str:
     return value if isinstance(value, str) else ""
+
+
+def ground_truth_of(row: dict) -> dict:
+    """The row's parsed ``ground_truth`` payload (``{}`` when unreadable).
+
+    Every layer that reads a gold field goes through this, so a malformed payload
+    is reported by the contract check and then treated as "no gold" rather than
+    crashing the audit.
+    """
+    payload = row.get("reward_model", {}).get("ground_truth")
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, str):
+        return {}
+    try:
+        parsed = json.loads(payload)
+    except ValueError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def is_positive(row: dict) -> bool:
+    """Whether the row is the solvable side of its pair (D26's table B row 5)."""
+    return bool(ground_truth_of(row).get("solvable"))
+
+
+def task_base(task_id: str) -> str:
+    """A row's pair key: the positive's ``task_id`` minus its ``-pos`` suffix."""
+    return task_id[:-4] if task_id.endswith("-pos") else task_id
+
+
+def shipped_pairs(rows: list) -> dict:
+    """``{task_base: (negative_row, positive_row)}`` for the pairs that shipped both sides."""
+    pairs: dict = {}
+    for row in rows:
+        base = task_base(row["extra_info"].get("task_id", ""))
+        entry = pairs.setdefault(base, {"negative": None, "positive": None})
+        entry["positive" if is_positive(row) else "negative"] = row
+    return {base: (entry["negative"], entry["positive"])
+            for base, entry in pairs.items() if entry["negative"] and entry["positive"]}
+
+
+# ---------------------------------------------------------------------------
+# the frozen reward dispatcher (the L4 / L5 assertions run the real table)
+# ---------------------------------------------------------------------------
+
+
+def load_reward_module():
+    """Import ``reward/hallucination_compute_score.py`` (the frozen dispatcher).
+
+    The option-shuffle invariance and the branch-dependent bare refusal are
+    statements about the *reward*, so they are checked against the shipped
+    dispatcher instead of against a copy of its decision table.  The module is
+    loaded by path because this file lives under ``scripts/hallucination`` while
+    the dispatcher lives under ``reward``; its own import fallback puts its
+    directory on ``sys.path``, so it loads either way.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("hallucination_compute_score", REWARD_FILE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 # ---------------------------------------------------------------------------
@@ -399,16 +535,20 @@ def _literal_value(node, namespace: dict):
     if isinstance(node, ast.Dict):
         return {
             _literal_value(key, namespace): _literal_value(value, namespace)
-            for key, value in zip(node.keys, node.values)
+            for key, value in zip(node.keys, node.values, strict=False)
         }
     raise ValueError(f"unsupported literal node {type(node).__name__} in {ENTITIES_FILE}")
 
 
 def load_vocabulary(raw_dir: str) -> dict:
-    """``{theme: {canonical variable: [surface spellings]}}``, parsed with :mod:`ast`.
+    """``{theme: {"forms", "pairs", "item_dict"}}``, parsed with :mod:`ast`.
 
     The file is never imported: the adapter imports it (executing the module), so
     reading it as literals is this file's independent route to the same names.
+    ``forms`` is what the text parser matches on, ``pairs`` is the generator's
+    ``node2var`` value for each canonical variable and ``item_dict`` its plural
+    table -- the two extra pieces the answer certificate's decoder needs to hand
+    the pinned renderer a synthetic edge.
     """
     path = os.path.join(raw_dir, REPO_SUBDIR, ENTITIES_FILE)
     with open(path, encoding="utf-8") as handle:
@@ -428,11 +568,13 @@ def load_vocabulary(raw_dir: str) -> dict:
         if not isinstance(table, dict):
             raise ValueError(f"{ENTITIES_FILE} has no {theme} table")
         forms: dict = {}
+        pairs: dict = {}
         for entity in table["entities"]:
             for item, plural in table["item_dict"].items():
                 key = f"{item} at {entity}"
                 forms[key] = [key, f"{plural} at {entity}"]
-        vocabulary[theme] = forms
+                pairs[key] = (entity, item)
+        vocabulary[theme] = {"forms": forms, "pairs": pairs, "item_dict": table["item_dict"]}
     return vocabulary
 
 
@@ -446,7 +588,8 @@ def compile_matcher(forms: dict) -> tuple:
 
 
 def matchers_for(vocabulary: dict) -> dict:
-    return {theme: compile_matcher(forms) for theme, forms in vocabulary.items()}
+    """``{theme: matcher}`` out of :func:`load_vocabulary`'s rich entries."""
+    return {theme: compile_matcher(entry["forms"]) for theme, entry in vocabulary.items()}
 
 
 def themes_of(text: str, matchers: dict) -> set:
@@ -529,7 +672,15 @@ def load_generator(raw_dir: str) -> dict:
     import gen_data  # noqa: PLC0415 - imported from the downloaded repo
     import gen_questions  # noqa: PLC0415
 
-    return {"generate_qa": gen_data.generate_qa, "gen_disproof": gen_questions.gen_disproof}
+    return {
+        "generate_qa": gen_data.generate_qa,
+        "gen_disproof": gen_questions.gen_disproof,
+        # The answer certificate's decoder: the source's own sentence renderer and
+        # formula record, so a derivation step is decoded by re-rendering it rather
+        # than by a second prose grammar implemented here.
+        "formula": gen_questions.Formula,
+        "render_sentence": gen_questions.edge_and_formula_to_sentence,
+    }
 
 
 def check_source_generator(rows: list, reporter: Reporter, raw_dir: str,
@@ -676,7 +827,9 @@ def _proof_failures(proof: str, graph: dict, label: str) -> list:
 
 
 def check_l1_proof(rows: list, reporter: Reporter, matchers: dict) -> None:
+    """The four-tier negatives' proof certificate; the positives carry none."""
     failures: list = []
+    negatives = 0
     for row in rows:
         info = row["extra_info"]
         task_id = info["task_id"]
@@ -692,12 +845,22 @@ def check_l1_proof(rows: list, reporter: Reporter, matchers: dict) -> None:
             failures.append(f"{task_id}: recorded asked_variable "
                             f"{info.get('asked_variable')!r} is not the variable the "
                             f"question asks about ({graph['asked']!r})")
-        failures.extend(_proof_failures(info.get("proof", ""), graph, task_id))
+        proof = _text_of(info.get("proof"))
+        if is_positive(row):
+            if proof:
+                failures.append(f"{task_id}: the solvable side carries a disproof certificate")
+            continue
+        negatives += 1
+        if not proof:
+            failures.append(f"{task_id}: the four-tier negative carries no proof certificate")
+            continue
+        failures.extend(_proof_failures(proof, graph, task_id))
     reporter.check(
         "L1 proof certificate (N variables, M == N - 1 formulas, component, clauses)",
         not failures,
-        f"{len(rows)} rows re-derived from their own proof, text and asked variable, "
-        f"{len(failures)} failures" + (f"; first: {failures[:3]}" if failures else ""),
+        f"{negatives} negatives re-derived from their own proof, text and asked variable "
+        f"({len(rows) - negatives} positives carry none), {len(failures)} failures"
+        + (f"; first: {failures[:3]}" if failures else ""),
     )
 
 
@@ -707,7 +870,12 @@ def check_l1_proof(rows: list, reporter: Reporter, matchers: dict) -> None:
 
 
 def _pair_failures(row: dict, matcher: tuple) -> list:
-    """Re-derive the certificate of one row's pair, from the row's own text."""
+    """Re-derive the certificate of one row's pair, from the row's own text.
+
+    Symmetric in the two sides (D26 ships both): the row's own member is whichever
+    text is reachable from a root fact, and the checks then apply to that member
+    and to its counterpart by role rather than by which one happens to be shipped.
+    """
     info = row["extra_info"]
     task_id = info["task_id"]
     shipped_text = question_or_empty(row)
@@ -732,14 +900,15 @@ def _pair_failures(row: dict, matcher: tuple) -> list:
         )
     else:
         if lost_by_shipped[0] != deleted:
-            problems.append(f"{task_id}: deleted_condition_text is not the sentence the "
-                            "question lost")
+            problems.append(f"{task_id}: deleted_condition_text is not the sentence this "
+                            "row lost")
         if deleted in shipped_counts:
-            problems.append(f"{task_id}: the deleted sentence is still present in the question")
+            problems.append(f"{task_id}: the deleted sentence is still present in this row's "
+                            "own text")
 
     shipped_graph = text_graph(shipped_text, matcher)
     counterpart_graph = text_graph(counterpart_text, matcher)
-    for label, graph in (("shipped", shipped_graph), ("counterpart", counterpart_graph)):
+    for label, graph in (("this row", shipped_graph), ("counterpart", counterpart_graph)):
         if graph["malformed"]:
             problems.append(f"{task_id}: {label} has {len(graph['malformed'])} unparsable "
                             f"sentence(s): {graph['malformed'][0][:60]!r}")
@@ -764,21 +933,33 @@ def _pair_failures(row: dict, matcher: tuple) -> list:
         return problems
 
     asked = shipped_graph["asked"]
-    if _reachable(shipped_graph, asked):
-        problems.append(f"{task_id}: the shipped member is solvable -- the answer is reachable "
-                        "from a root fact")
-    hops, trail = _derivation(counterpart_graph, asked)
+    row_solvable = _reachable(shipped_graph, asked)
+    counterpart_solvable = _reachable(counterpart_graph, asked)
+    if row_solvable == counterpart_solvable:
+        problems.append(f"{task_id}: both members are "
+                        f"{'solvable' if row_solvable else 'unsolvable'} -- a pair is one of each")
+        return problems
+    # The solvable member must derive the answer at ansDepth - 1 hops from a fact
+    # without leaning on the sentence it itself lost; the unsolvable member must
+    # become solvable again when its own lost sentence is put back (the pivot).
+    if row_solvable:
+        solvable_graph, solvable_lost = shipped_graph, lost_by_shipped
+        unsolvable_text, unsolvable_lost = counterpart_text, lost_by_counterpart
+    else:
+        solvable_graph, solvable_lost = counterpart_graph, lost_by_counterpart
+        unsolvable_text, unsolvable_lost = shipped_text, lost_by_shipped
+    hops, trail = _derivation(solvable_graph, asked)
     if hops != ans_depth - 1:
-        problems.append(f"{task_id}: the counterpart's derivation is {hops} hops, expected "
-                        f"ans_depth - 1 ({ans_depth - 1})")
-    elif lost_by_counterpart and lost_by_counterpart[0] in trail:
-        problems.append(f"{task_id}: the counterpart's derivation uses the sentence the "
-                        "counterpart itself lost")
-    body, question = split_body(shipped_text)
-    repaired = text_graph(f"{body} {deleted} {question}", matcher)
+        problems.append(f"{task_id}: the solvable member's derivation is {hops} hops, "
+                        f"expected ans_depth - 1 ({ans_depth - 1})")
+    elif solvable_lost and solvable_lost[0] in trail:
+        problems.append(f"{task_id}: the solvable member's derivation uses the sentence the "
+                        "solvable member itself lost")
+    body, question = split_body(unsolvable_text)
+    repaired = text_graph(f"{body} {unsolvable_lost[0]} {question}", matcher)
     repaired_hops, _ = _derivation(repaired, asked)
     if repaired_hops != ans_depth - 1:
-        problems.append(f"{task_id}: adding the recorded deleted sentence back gives "
+        problems.append(f"{task_id}: adding the unsolvable member's lost sentence back gives "
                         f"{repaired_hops} hops, expected {ans_depth - 1}")
     return problems
 
@@ -792,10 +973,12 @@ def check_l2_pair(rows: list, reporter: Reporter, matchers: dict) -> None:
             failures.append(f"{info['task_id']}: recorded theme {theme!r} has no vocabulary")
             continue
         failures.extend(_pair_failures(row, matchers[theme]))
+    pairs = len(shipped_pairs(rows))
     reporter.check(
-        "L2 pair certificate (1/1 sentence swap, unsolvable, counterpart solvable at ad - 1)",
+        "L2 pair certificate (1/1 sentence swap, one solvable side, derivation at ad - 1, pivot)",
         not failures,
-        f"{len(rows)} pairs re-derived from their own two texts, {len(failures)} failures"
+        f"{len(rows)} rows ({pairs} with both sides shipped) re-derived from their own two "
+        f"texts, {len(failures)} failures"
         + (f"; first: {failures[:3]}" if failures else ""),
     )
 
@@ -812,6 +995,525 @@ def check_l2_pair(rows: list, reporter: Reporter, matchers: dict) -> None:
     )
     reporter.note("L2 configuration: order is a recorded value only -- both members come "
                   "from one shuffled render, but a shuffled order cannot be proved from it")
+
+
+# ---------------------------------------------------------------------------
+# L2b -- the answer certificate (section 6 / 9, D26)
+# ---------------------------------------------------------------------------
+
+
+def _candidate_results(sentence: str) -> list:
+    """The values a sentence could encode: its numbers, their negatives, +/-1, 0.
+
+    ``+/-1`` is always a candidate because the renderer spells it "a dollar"
+    instead of "1 dollar"; 0 is the "is the same as that of" form, which carries no
+    number at all.
+    """
+    values: list = [1, -1]
+    for token in schema.numbers_in(sentence):
+        if token.isdigit():
+            values.extend([int(token), -int(token)])
+    values.append(0)
+    return list(dict.fromkeys(values))
+
+
+def _chain_to_ask(graph: dict) -> list:
+    """The shortest fact-to-answer chain as ``[(variable, sentence), ...]``, or ``[]``."""
+    asked = graph["asked"]
+    if asked is None:
+        return []
+    neighbours: dict = collections.defaultdict(list)
+    for sentence, left, right in graph["links"]:
+        neighbours[left].append((right, sentence))
+        neighbours[right].append((left, sentence))
+    parent: dict = {}
+    seen: set = set()
+    queue: deque = deque()
+    for sentence, variable in graph["facts"]:
+        parent[variable] = (None, sentence)
+        seen.add(variable)
+        queue.append(variable)
+    while queue:
+        node = queue.popleft()
+        if node == asked:
+            chain: list = []
+            current = node
+            while current is not None:
+                previous, sentence = parent[current]
+                chain.append((current, sentence))
+                current = previous
+            chain.reverse()
+            return chain
+        for other, sentence in neighbours[node]:
+            if other not in seen:
+                seen.add(other)
+                parent[other] = (node, sentence)
+                queue.append(other)
+    return []
+
+
+def answer_failures(row: dict, entry: dict, generator: dict) -> list:
+    """Re-derive the positive's numeric gold from its own passage; ``[]`` == certified.
+
+    The decoder is the pinned generator's own ``edge_and_formula_to_sentence``: a
+    derivation step is decoded by asking which formula would have rendered that
+    exact sentence (``x, y`` over the generator's ``+/-1..3`` space, the sentence's
+    own numbers plus ``+/-1``/0 as candidate results), and the value is propagated
+    down the chain.  Nothing here trusts the adapter's certificate -- the ground
+    truth is the renderer.
+    """
+    info = row["extra_info"]
+    task_id = info["task_id"]
+    matcher = compile_matcher(entry["forms"])
+    graph = text_graph(question_or_empty(row), matcher)
+    if graph["malformed"]:
+        return [f"{task_id}: the passage has {len(graph['malformed'])} unparsable sentence(s)"]
+    if graph["asked"] is None:
+        return [f"{task_id}: the question sentence names no known variable"]
+    asked = graph["asked"]
+    if asked not in entry["pairs"]:
+        return [f"{task_id}: asked variable {asked!r} is not in the theme's vocabulary"]
+    chain = _chain_to_ask(graph)
+    if not chain:
+        return [f"{task_id}: the solvable member has no fact-to-answer chain"]
+    fact_variable, fact_sentence = chain[0]
+    if fact_variable not in entry["pairs"]:
+        return [f"{task_id}: fact variable {fact_variable!r} is not in the theme's vocabulary"]
+
+    facts = [
+        res for res in _candidate_results(fact_sentence)
+        if generator["render_sentence"](
+            ("ROOT", "C"), generator["formula"]((1,), res),
+            {"ROOT": "ROOT", "C": entry["pairs"][fact_variable]}, entry["item_dict"]
+        ) == fact_sentence
+    ]
+    if len(facts) != 1:
+        return [f"{task_id}: the root fact decodes to {len(facts)} values, not 1: "
+                f"{fact_sentence[:60]!r}"]
+    value = facts[0]
+    previous = fact_variable
+    for variable, sentence in chain[1:]:
+        if variable not in entry["pairs"]:
+            return [f"{task_id}: chain variable {variable!r} is not in the theme's vocabulary"]
+        node2var = {"ROOT": "ROOT", "P": entry["pairs"][previous], "C": entry["pairs"][variable]}
+        steps = []
+        for x in (1, -1, 2, -2, 3, -3):
+            for y in (1, -1, 2, -2, 3, -3):
+                for res in _candidate_results(sentence):
+                    rendered = generator["render_sentence"](
+                        ("P", "C"), generator["formula"]((x, y), res), node2var, entry["item_dict"]
+                    )
+                    if rendered != sentence:
+                        continue
+                    numerator = res - x * value
+                    if numerator % y:
+                        continue
+                    candidate = numerator // y
+                    if candidate > 0:
+                        steps.append(candidate)
+        steps = list(dict.fromkeys(steps))
+        if len(steps) != 1:
+            return [f"{task_id}: the chain step decodes to {len(steps)} values, not 1: "
+                    f"{sentence[:60]!r}"]
+        value = steps[0]
+        previous = variable
+
+    gold = ground_truth_of(row).get("answer")
+    if str(gold).strip() != str(value):
+        return [f"{task_id}: the chain derives {value}, the recorded gold is {gold!r}"]
+    return []
+
+
+def check_answer_gold(rows: list, reporter: Reporter, vocabulary: dict,
+                      generator: dict | None) -> None:
+    """Every positive's number must be re-derivable from its own text."""
+    positives = [row for row in rows if is_positive(row)]
+    if not positives:
+        reporter.check("L2b answer certificate (gold re-derived from the passage)", False,
+                       "no positive rows in the artifact")
+        return
+    if generator is None:
+        reporter.check(
+            "L2b answer certificate (gold re-derived from the passage)",
+            False,
+            "the pinned generator could not be imported, so the renderer that decodes a "
+            "chain step is unavailable; point --raw-dir at the downloaded treecut directory",
+        )
+        return
+    failures: list = []
+    for row in positives:
+        entry = vocabulary.get(row["extra_info"].get("theme"))
+        if not entry:
+            failures.append(f"{row['extra_info']['task_id']}: recorded theme has no vocabulary")
+            continue
+        failures.extend(answer_failures(row, entry, generator))
+    reporter.check(
+        "L2b answer certificate (gold re-derived from the passage)",
+        not failures,
+        f"{len(positives)} positives decoded step by step with the pinned renderer, "
+        f"{len(failures)} failures" + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+
+# ---------------------------------------------------------------------------
+# L4 -- the D26 option contract and the leak gate (section 9, D26, section 11)
+# ---------------------------------------------------------------------------
+
+
+def _mask_numbers(text: str) -> str:
+    return NUMBER_SPAN_RE.sub("\x00", text)
+
+
+def _mask_variables(text: str, matcher: tuple) -> str:
+    return matcher[0].sub("\x00", text)
+
+
+def _number_tokens(text: str) -> list:
+    return NUMBER_SPAN_RE.findall(text)
+
+
+def _variable_spellings(text: str, matcher: tuple) -> list:
+    return [match.group(0) for match in matcher[0].finditer(text)]
+
+
+def placeholder_mode_of(option: str, passage: str, matcher: tuple) -> str | None:
+    """Which Q16 swap turns a passage sentence into ``option``?  ``None`` if neither.
+
+    The reading is exact rather than masked-only: a *name* swap keeps the sentence's
+    numbers (in order) and changes a variable spelling while leaving everything else
+    byte-identical; a *value* swap keeps the variable spellings (in order) and
+    changes a number.  Anything else is not the placeholder shape D26 asks for.
+    """
+    for sentence in sentences_of(passage):
+        if sentence == option:
+            continue
+        if (_number_tokens(sentence) == _number_tokens(option)
+                and _variable_spellings(sentence, matcher) != _variable_spellings(option, matcher)
+                and _mask_variables(sentence, matcher) == _mask_variables(option, matcher)):
+            return PLACEHOLDER_MODES[0]
+        if (_variable_spellings(sentence, matcher) == _variable_spellings(option, matcher)
+                and _number_tokens(sentence) != _number_tokens(option)
+                and _mask_numbers(sentence) == _mask_numbers(option)):
+            return PLACEHOLDER_MODES[1]
+    return None
+
+
+def _negative_option_failures(row: dict, matcher: tuple) -> list:
+    info = row["extra_info"]
+    task_id = info["task_id"]
+    passage = question_or_empty(row)
+    options = info.get("options") or []
+    gt = ground_truth_of(row)
+    problems: list = []
+    if len(options) != K_OPTIONS:
+        return [f"{task_id}: {len(options)} options, expected k={K_OPTIONS}"]
+    ids = [opt.get("id") for opt in options]
+    if ids != list("ABCDEFG"[:K_OPTIONS]):
+        problems.append(f"{task_id}: option ids {ids} are not A/B/C")
+    texts = [opt.get("text") or "" for opt in options]
+    if len(set(texts)) != len(texts):
+        problems.append(f"{task_id}: option texts are not pairwise distinct")
+    inside = [text[:40] for text in texts if text and text in passage]
+    if inside:
+        problems.append(f"{task_id}: {len(inside)} option(s) appear in the passage verbatim: "
+                        f"{inside}")
+    for text in texts:
+        graph = text_graph(text, matcher)
+        named = list(dict.fromkeys(_variables_in(text, matcher)))
+        if graph["malformed"] or not named or len(named) > 2:
+            problems.append(f"{task_id}: option {text[:50]!r} is not a same-family condition")
+            break
+    correct = gt.get("correct_option_id")
+    if correct not in ids:
+        problems.append(f"{task_id}: correct_option_id {correct!r} is not among {ids}")
+    else:
+        gold_text = next(opt["text"] for opt in options if opt["id"] == correct)
+        if gold_text != _text_of(info.get("deleted_condition_text")):
+            problems.append(f"{task_id}: correct_option_id points at {gold_text[:50]!r}, "
+                            "not at the generator's cut edge")
+    return problems
+
+
+def _positive_option_failures(row: dict, matcher: tuple) -> list:
+    info = row["extra_info"]
+    task_id = info["task_id"]
+    passage = question_or_empty(row)
+    options = info.get("options") or []
+    gt = ground_truth_of(row)
+    problems: list = []
+    if len(options) != K_OPTIONS:
+        return [f"{task_id}: {len(options)} options, expected k={K_OPTIONS}"]
+    ids = [opt.get("id") for opt in options]
+    if ids != list("ABCDEFG"[:K_OPTIONS]):
+        problems.append(f"{task_id}: option ids {ids} are not A/B/C")
+    texts = [opt.get("text") or "" for opt in options]
+    if len(set(texts)) != len(texts):
+        problems.append(f"{task_id}: option texts are not pairwise distinct")
+    inside = [text[:40] for text in texts if text and text in passage]
+    if inside:
+        problems.append(f"{task_id}: {len(inside)} placeholder(s) appear in the passage "
+                        f"verbatim: {inside}")
+    if gt.get("correct_option_id") is not None or info.get("correct_option_id") not in ("", None):
+        problems.append(f"{task_id}: a placeholder block must carry no correct option "
+                        f"(gold {gt.get('correct_option_id')!r}, extra_info "
+                        f"{info.get('correct_option_id')!r})")
+    modes = [placeholder_mode_of(text, passage, matcher) for text in texts]
+    if any(mode is None for mode in modes):
+        problems.append(f"{task_id}: an option is not one name/value swap away from any "
+                        f"passage sentence: {[t[:40] for t, m in zip(texts, modes, strict=False) if m is None]}")
+    return problems
+
+
+def check_option_structure(rows: list, reporter: Reporter, matchers: dict) -> None:
+    """(a)/(c) per-side option contract: k=3, distinct, out of passage, gold pointer."""
+    negatives = [row for row in rows if not is_positive(row)]
+    positives = [row for row in rows if is_positive(row)]
+    failures: list = []
+    for row in negatives:
+        matcher = matchers.get(row["extra_info"].get("theme"))
+        if matcher is None:
+            failures.append(f"{row['extra_info']['task_id']}: no vocabulary for the theme")
+            continue
+        failures.extend(_negative_option_failures(row, matcher))
+    reporter.check(
+        "L4a negatives: k=3 candidate missing conditions, all out of passage, gold = cut edge",
+        not failures and bool(negatives),
+        f"{len(negatives)} negative rows, {len(failures)} failures"
+        + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+    positives = [row for row in rows if is_positive(row)]
+    failures = []
+    for row in positives:
+        matcher = matchers.get(row["extra_info"].get("theme"))
+        if matcher is None:
+            failures.append(f"{row['extra_info']['task_id']}: no vocabulary for the theme")
+            continue
+        failures.extend(_positive_option_failures(row, matcher))
+    reporter.check(
+        "L4c positives: k=3 placeholders, all out of passage, no correct option",
+        not failures and bool(positives),
+        f"{len(positives)} positive rows, {len(failures)} failures"
+        + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+    modes: collections.Counter = collections.Counter()
+    for row in positives:
+        matcher = matchers.get(row["extra_info"].get("theme"))
+        if matcher is None:
+            continue
+        passage = question_or_empty(row)
+        for opt in row["extra_info"].get("options") or []:
+            mode = placeholder_mode_of(opt.get("text") or "", passage, matcher)
+            if mode:
+                modes[mode] += 1
+    reporter.note(
+        "L4c placeholder modes (Q16, 50/50 per option): "
+        + ", ".join(f"{mode}={modes.get(mode, 0)}" for mode in PLACEHOLDER_MODES)
+    )
+
+
+def leak_heuristic_hit_rate(rows: list, seed: int = 0) -> tuple:
+    """``(hit rate, negative rows, rows with a unique absent option)``.
+
+    The heuristic is MiP's "pick the sentence you cannot find in the passage"
+    (section 4.2), applied to TreeCut's option blocks: guess uniformly among the
+    options that are absent from the passage.  All three of a negative's options
+    are out of passage by construction, so the guess carries no signal and the rate
+    sits at ~1/k; a row with exactly one absent option would hand the heuristic the
+    gold, which is what the section 9 gate (``<= 1/k + 5pt``) exists to catch.
+    """
+    rng = random.Random(seed)
+    negatives = [row for row in rows if not is_positive(row)]
+    if not negatives:
+        return 0.0, 0, 0
+    hits = 0
+    unique = 0
+    for row in negatives:
+        passage = question_or_empty(row)
+        options = row["extra_info"].get("options") or []
+        absent = [opt["id"] for opt in options if (opt.get("text") or "") not in passage]
+        if len(absent) == 1:
+            unique += 1
+        if not absent:
+            continue
+        guess = rng.choice(absent)
+        hits += int(guess == ground_truth_of(row).get("correct_option_id"))
+    return hits / len(negatives), len(negatives), unique
+
+
+def check_option_leak(rows: list, reporter: Reporter, *, seed: int) -> None:
+    """(b) the leak heuristic must read at most 1/k + 5pt = 38.3%."""
+    rate, count, unique = leak_heuristic_hit_rate(rows, seed=seed)
+    if not count:
+        reporter.check("L4b option leak heuristic <= 1/k + 5pt", False,
+                       "no negative rows in the artifact")
+        return
+    reporter.note(f"L4b analytic chance level is 1/k = {1.0 / K_OPTIONS:.4f}; rows with a "
+                  f"unique out-of-passage option: {unique}")
+    reporter.check(
+        f"L4b option leak heuristic ('pick the option not in the passage') <= "
+        f"{LEAK_MAX_HIT_RATE:.4f}",
+        rate <= LEAK_MAX_HIT_RATE and unique == 0,
+        f"hit rate {rate:.4f} over {count} negative rows ({unique} rows where the heuristic "
+        f"is forced onto the gold); section 4.2 measured MiP's version at 0.956",
+    )
+
+
+def option_shuffle_failures(row: dict, reward, rng: random.Random) -> list:
+    """One row's option-shuffle invariance against the frozen dispatcher.
+
+    Permuting the option block while moving ``correct_option_id`` to the option that
+    still holds the gold text must not change the reward: that is the adapter-side
+    companion of section 9's "reward only compares the option id" rule, and it
+    catches a positional-index bug that a text-only audit would miss.
+    """
+    info = row["extra_info"]
+    task_id = info["task_id"]
+    options = info.get("options") or []
+    gt = ground_truth_of(row)
+    ids = [opt.get("id") for opt in options]
+    correct = gt.get("correct_option_id")
+    if len(options) < 2 or correct not in ids:
+        return [f"{task_id}: no scorable option block to permute ({ids}, gold {correct!r})"]
+    texts = [opt["text"] for opt in options]
+    gold_text = next(opt["text"] for opt in options if opt["id"] == correct)
+    rng.shuffle(texts)
+    problems: list = []
+    if sorted(texts) != sorted(opt["text"] for opt in options):
+        problems.append(f"{task_id}: the permutation lost or duplicated an option text")
+    moved = dict(gt)
+    moved["correct_option_id"] = next(ids[index] for index, text in enumerate(texts)
+                                      if text == gold_text)
+    before = reward.score_from_status(gt, reward.STATUS_UNSOLVABLE_OPTION, None, correct)
+    after = reward.score_from_status(moved, reward.STATUS_UNSOLVABLE_OPTION, None,
+                                     moved["correct_option_id"])
+    if before != 1.0:
+        problems.append(f"{task_id}: the recorded gold scores {before}, expected +1")
+    if after != 1.0:
+        problems.append(f"{task_id}: after permuting the block the gold text scores {after}, "
+                        "expected +1 (the id moved with the text)")
+    wrong = next((option_id for option_id in ids if option_id != moved["correct_option_id"]), None)
+    if wrong is not None:
+        wrong_score = reward.score_from_status(moved, reward.STATUS_UNSOLVABLE_OPTION, None, wrong)
+        if wrong_score != 0.0:
+            problems.append(f"{task_id}: a wrong option id scores {wrong_score}, expected 0")
+    return problems
+
+
+def check_option_shuffle(rows: list, reporter: Reporter, reward, *, seed: int) -> None:
+    """(d) the option-shuffle invariance check on every four-tier negative."""
+    negatives = [row for row in rows if not is_positive(row)]
+    if not negatives:
+        reporter.check("L4d option-shuffle invariance (reward unchanged)", False,
+                       "no negative rows in the artifact")
+        return
+    failures: list = []
+    for index, row in enumerate(negatives):
+        failures.extend(option_shuffle_failures(row, reward, random.Random(f"{seed}:{index}")))
+    reporter.check(
+        "L4d option-shuffle invariance (reward unchanged when the block is permuted)",
+        not failures,
+        f"{len(negatives)} negative rows permuted against "
+        f"{os.path.basename(REWARD_FILE)}, {len(failures)} failures"
+        + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+
+def check_bare_unsolvable(rows: list, reporter: Reporter, reward) -> None:
+    """(e) the branch-dependent bare refusal, both directions, with data_source.
+
+    ``\\boxed{UNSOLVABLE}`` is +1 on a three-tier source (MiP, UMWP-unanswerable,
+    CREPE-FP) and **0** on TreeCut's four-tier negatives (D26, sections 5.1 / 6).
+    The same string, two scores: the check runs the frozen dispatcher on a real
+    TreeCut negative and on a three-tier payload, and names both data sources.
+    """
+    negatives = [row for row in rows if not is_positive(row)]
+    if not negatives:
+        reporter.check("L5 bare UNSOLVABLE is branch-dependent", False,
+                       "no negative rows in the artifact")
+        return
+    reply = "<think>\nThe conditions given are not sufficient.\n</think>\n\\boxed{UNSOLVABLE}"
+    failures: list = []
+    for row in negatives:
+        source = row.get("data_source", "")
+        score = reward.score_halluc_row(source, reply, row["reward_model"]["ground_truth"])
+        if score != 0.0:
+            failures.append(f"{source}: bare \\boxed{{UNSOLVABLE}} on the four-tier negative "
+                            f"{row['extra_info']['task_id']} scored {score}, expected 0")
+            break
+    three_tier = schema.build_ground_truth(
+        solvable=False, answer=None, correct_option_id=None, has_diagnosis_label=False,
+        perturbation_type="missing_condition",
+    )
+    three_score = reward.score_halluc_row(schema.SOURCE_MIP, reply, three_tier)
+    if three_score != 1.0:
+        failures.append(f"{schema.SOURCE_MIP}: bare \\boxed{{UNSOLVABLE}} on the three-tier "
+                        f"payload scored {three_score}, expected +1")
+    correctness: list = []
+    sample = negatives[0]
+    gold = ground_truth_of(sample).get("correct_option_id")
+    option_reply = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
+                    f"\\boxed{{UNSOLVABLE: {gold}}}")
+    option_score = reward.score_halluc_row(sample["data_source"], option_reply,
+                                           sample["reward_model"]["ground_truth"])
+    if option_score != 1.0:
+        correctness.append(f"{sample['data_source']}: \\boxed{{UNSOLVABLE: {gold}}} scored "
+                           f"{option_score}, expected +1")
+    answer_score = reward.score_halluc_row(
+        sample["data_source"], "<think>\nForty-two.\n</think>\n\\boxed{42}",
+        sample["reward_model"]["ground_truth"],
+    )
+    if answer_score != -1.0:
+        correctness.append(f"{sample['data_source']}: fabricating an answer scored "
+                           f"{answer_score}, expected -1")
+    reporter.check(
+        "L5 bare UNSOLVABLE is branch-dependent (four-tier 0, three-tier +1)",
+        not failures and not correctness,
+        f"TreeCut negatives ({sample['data_source']}) -> 0, {schema.SOURCE_MIP} (three-tier) "
+        f"-> +1; the diagnosed refusal -> +1 and a fabricated answer -> -1 on the same "
+        f"four-tier row, {len(failures) + len(correctness)} failures"
+        + (f"; first: {(failures + correctness)[:3]}" if failures or correctness else ""),
+    )
+
+
+def check_positive_reward(rows: list, reporter: Reporter, reward) -> None:
+    """The TreeCut positive's reward cells (design doc sections 6 and 9, D26).
+
+    The solvable side is an ordinary numeric row with a placeholder block: the gold
+    answer scores +1, and a misrefusal -- ``\\boxed{UNSOLVABLE}`` or a bare option id
+    -- scores **0**, never -1.  The block is never read by the reward, which is why
+    picking a placeholder earns nothing rather than earning a wrong-answer penalty.
+    """
+    positives = [row for row in rows if is_positive(row)]
+    if not positives:
+        reporter.check("L5b TreeCut positives score on the numeric branch", False,
+                       "no positive rows in the artifact")
+        return
+    row = positives[0]
+    source = row.get("data_source", "")
+    gold = ground_truth_of(row).get("answer")
+    cases = [
+        (f"\\boxed{{{gold}}}", 1.0, "the gold answer"),
+        ("\\boxed{UNSOLVABLE}", 0.0, "a misrefusal"),
+        ("\\boxed{UNSOLVABLE: B}", 0.0, "a diagnosed misrefusal"),
+        ("\\boxed{B}", 0.0, "a placeholder pick"),
+        ("no box at all", 0.0, "an empty response"),
+    ]
+    failures: list = []
+    for reply, expected, label in cases:
+        solution = f"<think>\nWorking.\n</think>\n{reply}"
+        score = reward.score_halluc_row(source, solution, row["reward_model"]["ground_truth"])
+        if score != expected:
+            failures.append(f"{row['extra_info']['task_id']}: {label} scored {score}, "
+                            f"expected {expected}")
+    reporter.check(
+        "L5b TreeCut positives score on the numeric branch (gold +1, misrefusal 0, "
+        "placeholder pick 0)",
+        not failures,
+        f"{source} ({len(positives)} positives; checked {row['extra_info']['task_id']}), "
+        f"{len(failures)} failures" + (f"; first: {failures[:3]}" if failures else ""),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -911,7 +1613,7 @@ def bernoulli_nb_oof(texts: list, labels: list, *, folds: int = 5, seed: int = 0
         if not vocabulary:
             continue
 
-        def presence(indices) -> np.ndarray:
+        def presence(indices, vocabulary=vocabulary) -> np.ndarray:
             matrix = np.zeros((len(indices), len(vocabulary)), dtype=np.float64)
             for row_index, doc_index in enumerate(indices):
                 for token in set(documents[doc_index]):
@@ -945,70 +1647,80 @@ def bernoulli_nb_oof(texts: list, labels: list, *, folds: int = 5, seed: int = 0
 
 
 def _l3_corpus(rows: list) -> tuple:
-    """``(texts, labels)`` of the pair corpus: counterparts are the solvable side."""
+    """``(texts, labels)`` of the two **shipped** sides: labels 1 are the positives.
+
+    The corpus is the artifact as the model would see it -- TreeCut's negatives
+    (label 0) against the TreeCut positives that shipped (label 1) -- not the
+    build-time pair, because the leak the gate measures is the one the pool carries.
+    """
     texts: list = []
     labels: list = []
     for row in rows:
         texts.append(question_or_empty(row))
-        labels.append(0)
-        texts.append(_text_of(row["extra_info"].get("paired_original_text")))
-        labels.append(1)
+        labels.append(1 if is_positive(row) else 0)
     return texts, labels
 
 
 def check_l3_alignment(rows: list, reporter: Reporter) -> None:
-    if not rows:
-        reporter.check("L3c the pair is length-matched", False, "no rows to measure")
+    """The 500 shipped pairs must be length-matched (mean |word delta| <= 2)."""
+    pairs = shipped_pairs(rows)
+    if not pairs:
+        reporter.check("L3c the shipped pair is length-matched", False,
+                       "the artifact ships no complete pair (both sides)")
         return
-    word_delta = [
-        abs(len(schema.words(row["extra_info"].get("paired_original_text") or ""))
-            - len(schema.words(question_or_empty(row))))
-        for row in rows
-    ]
-    char_delta = [
-        len(row["extra_info"].get("paired_original_text") or "") - len(question_or_empty(row))
-        for row in rows
-    ]
-    mean_words = float(np.mean(word_delta)) if word_delta else float("nan")
-    mean_chars = float(np.mean(char_delta)) if char_delta else float("nan")
+    word_delta = []
+    char_delta = []
+    for negative, positive in pairs.values():
+        negative_words = len(schema.words(question_or_empty(negative)))
+        positive_words = len(schema.words(question_or_empty(positive)))
+        word_delta.append(abs(positive_words - negative_words))
+        char_delta.append(len(question_or_empty(positive)) - len(question_or_empty(negative)))
+    mean_words = float(np.mean(word_delta))
+    mean_chars = float(np.mean(char_delta))
     reporter.note(
-        f"L3 alignment: {len(rows)} pairs, mean |word delta| {mean_words:.3f}, mean char "
-        f"delta {mean_chars:+.2f}, deleted sentence mean "
-        f"{np.mean([len(row['extra_info'].get('deleted_condition_text') or '') for row in rows]):.2f} chars"
+        f"L3 alignment: {len(pairs)} shipped pairs, mean |word delta| {mean_words:.3f}, mean "
+        f"char delta {mean_chars:+.2f}, negative deleted sentence mean "
+        f"{np.mean([len(r['extra_info'].get('deleted_condition_text') or '') for r, _ in pairs.values()]):.2f} "
+        f"chars, positive deleted sentence mean "
+        f"{np.mean([len(p['extra_info'].get('deleted_condition_text') or '') for _, p in pairs.values()]):.2f} "
+        f"chars"
     )
     reporter.check(
-        "L3c the pair is length-matched (mean |word-count delta| <= "
+        "L3c the shipped pair is length-matched (mean |word-count delta| <= "
         f"{ALIGNMENT_MAX_WORD_DELTA:.0f})",
         mean_words <= ALIGNMENT_MAX_WORD_DELTA,
-        f"mean |word delta| {mean_words:.3f} over {len(rows)} pairs",
+        f"mean |word delta| {mean_words:.3f} over {len(pairs)} shipped pairs",
     )
 
 
 def check_l3_gate(rows: list, reporter: Reporter, *, folds: int, seed: int,
                   min_support: int) -> None:
+    """L3a/L3b: the two shipped sides must not separate on length or on a bag of words."""
     texts, labels = _l3_corpus(rows)
     positives = sum(labels)
     reporter.note(
-        f"L3 corpus: n={len(texts)} (shipped={len(texts) - positives}, counterpart={positives}), "
-        f"folds={folds}, vocabulary support >= {min_support} docs, alpha=1.0"
+        f"L3 corpus (the shipped sides): n={len(texts)} (negatives={len(texts) - positives}, "
+        f"positives={positives}), folds={folds}, vocabulary support >= {min_support} docs, "
+        f"alpha=1.0"
     )
     if positives == 0 or positives == len(texts):
         reporter.check(
-            "L3a length-only out-of-fold balanced accuracy <= 0.55",
+            f"L3a length-only out-of-fold balanced accuracy <= {L3_MAX_BALANCED_ACCURACY:.2f}",
             False,
-            "only one label side present in the artifact -- every row carries both "
-            "members, so the artifact is incomplete",
+            "only one label side shipped -- the two-sided interleave is broken, so the "
+            "gate cannot be measured",
         )
         return
 
     lengths = [len(text) for text in texts]
     length_accuracy = length_only_oof(lengths, labels, folds=folds, seed=seed)
-    reporter.note(f"L3a raw out-of-fold balanced accuracy = {length_accuracy:.4f} (chance 0.5)")
+    reporter.note(f"L3a length-only out-of-fold balanced accuracy = {length_accuracy:.4f} "
+                  f"(chance 0.5)")
     reporter.check(
         f"L3a length-only out-of-fold balanced accuracy <= {L3_MAX_BALANCED_ACCURACY:.2f}",
         length_accuracy <= L3_MAX_BALANCED_ACCURACY,
-        f"balanced accuracy {length_accuracy:.4f} on {len(rows)} pairs "
-        f"(section 4.9.2 measured the stock pair at 0.726)",
+        f"balanced accuracy {length_accuracy:.4f} on the {len(rows)} shipped rows "
+        f"(section 4.6 measured the stock pair at 0.726; section 11 risk 1)",
     )
 
     accuracy = bernoulli_nb_oof(texts, labels, folds=folds, seed=seed, min_support=min_support)
@@ -1026,8 +1738,9 @@ def check_l3_gate(rows: list, reporter: Reporter, *, folds: int, seed: int,
         f"L3b Bernoulli bag-of-words out-of-fold balanced accuracy <= "
         f"{L3_MAX_BALANCED_ACCURACY:.2f}",
         accuracy <= L3_MAX_BALANCED_ACCURACY,
-        f"balanced accuracy {accuracy:.4f} on {len(rows)} pairs (control {control:.4f}; "
-        "section 4.9.2 measured the stock pair at 0.755)",
+        f"balanced accuracy {accuracy:.4f} on the {len(rows)} shipped rows "
+        f"(control {control:.4f}; section 4.6 measured the stock pair at 0.755; "
+        "section 11 risk 1)",
     )
 
 
@@ -1035,7 +1748,7 @@ def pre_fix_reference(raw_dir: str, reporter: Reporter, *, folds: int, seed: int
     """Print the released files' own leak as information -- not a gate on this build.
 
     The released HF mirror is the *stock* generator's output, which is the thing
-    section 4.9.2 measures; the gate above is on the built rows.  Reading it here
+    section 4.6 measures; the gate above is on the built rows.  Reading it here
     is what keeps the doc's 0.726/0.755 honest: the release's pooled length
     reading is far below those figures, but still above the 0.55 gate, so the doc's
     conclusion (fix before pooling) holds while its exact numbers do not.
@@ -1090,7 +1803,7 @@ def pre_fix_reference(raw_dir: str, reporter: Reporter, *, folds: int, seed: int
     )
     reporter.note(
         f"pre-fix reference: pooled length-only OOF balanced accuracy = {pooled:.4f} "
-        f"(section 4.9.1 quotes 0.726; the worst per-config reading is {worst[-1][0]:.4f} "
+        f"(section 4.6 / section 11 risk 1 quotes 0.726; the worst per-config reading is {worst[-1][0]:.4f} "
         f"at {worst[-1][1]})"
     )
     recorded = os.path.join(raw_dir, "hf_stats.json")
@@ -1106,7 +1819,7 @@ def pre_fix_reference(raw_dir: str, reporter: Reporter, *, folds: int, seed: int
             )
             reporter.note(
                 "pre-fix reference: the recon's recorded pooled BoW NB = "
-                f"{pooled_bow} (section 4.9.2 quotes 0.755; its multinomial variant "
+                f"{pooled_bow} (section 4.6 / section 11 risk 1 quotes 0.755; its multinomial variant "
                 f"reads {stats.get('HF_all_rows', {}).get('bow_mnb_ba')}; the worst "
                 f"per-config reading it recorded is {worst_bow[0]} at {worst_bow[1]})"
             )
@@ -1120,6 +1833,7 @@ def pre_fix_reference(raw_dir: str, reporter: Reporter, *, folds: int, seed: int
 
 
 def check_contract(rows: list, reporter: Reporter) -> None:
+    """Schema validity plus the per-side contract fields (table B rows 5 and 7)."""
     violations: list = []
     for row in rows:
         violations.extend(schema.validate_row(row))
@@ -1131,34 +1845,25 @@ def check_contract(rows: list, reporter: Reporter) -> None:
     )
 
     failures: list = []
+    ability, source_label = schema.SOURCES[schema.SOURCE_TREECUT]
     for row in rows:
         info = row["extra_info"]
         task_id = info["task_id"]
-        truth = json.loads(row["reward_model"]["ground_truth"])
+        truth = ground_truth_of(row)
+        positive = is_positive(row)
         if row.get("data_source") != schema.SOURCE_TREECUT:
             failures.append(f"{task_id}: data_source {row.get('data_source')!r}")
-        if info.get("branch") != BRANCH_BARE or info.get("template") != TEMPLATE_B:
-            failures.append(f"{task_id}: branch/template {info.get('branch')!r}/"
-                            f"{info.get('template')!r}")
-        if info.get("solvable") or truth.get("solvable"):
-            failures.append(f"{task_id}: this source only ships the unanswerable member")
-        if truth.get("answer") is not None:
-            failures.append(f"{task_id}: an unsolvable row carries an answer")
-        if truth.get("correct_option_id") is not None or info.get("correct_option_id") not in ("", None):
-            failures.append(f"{task_id}: a bare row carries a correct option")
-        if truth.get("has_diagnosis_label") or info.get("options"):
-            failures.append(f"{task_id}: a bare row offers options")
-        if truth.get("perturbation_type") != "missing_condition":
-            failures.append(f"{task_id}: perturbation_type {truth.get('perturbation_type')!r}")
-        if info.get("error_type") != "key_information_missing":
-            failures.append(f"{task_id}: error_type {info.get('error_type')!r}")
-        # The gold's perturbation_type is checked below; the *extra_info* copy is
-        # what the D18 balance table reads, so a row whose two copies disagree
-        # would silently mis-tabulate the defect mix while passing everything else.
-        if info.get("perturbation_type") != "missing_condition":
-            failures.append(f"{task_id}: extra_info.perturbation_type "
-                            f"{info.get('perturbation_type')!r}")
-        ability, source_label = schema.SOURCES[schema.SOURCE_TREECUT]
+        if info.get("template") != TEMPLATE_A:
+            failures.append(f"{task_id}: template {info.get('template')!r}, expected A")
+        if info.get("options") is None or len(info.get("options") or []) != K_OPTIONS:
+            failures.append(f"{task_id}: {len(info.get('options') or [])} options, expected "
+                            f"k={K_OPTIONS}")
+        if not _text_of(info.get("paired_original_text")):
+            failures.append(f"{task_id}: no counterpart text")
+        if not _text_of(info.get("deleted_condition_text")):
+            failures.append(f"{task_id}: no deleted sentence")
+        if info.get("paired_original_text") == question_or_empty(row):
+            failures.append(f"{task_id}: the pair's two members are the same text")
         if info.get("source") != source_label:
             failures.append(f"{task_id}: extra_info.source {info.get('source')!r} "
                             f"(expected {source_label!r})")
@@ -1166,16 +1871,61 @@ def check_contract(rows: list, reporter: Reporter) -> None:
             failures.append(f"{task_id}: extra_info.domain {info.get('domain')!r} "
                             f"(expected {ability!r})")
         if row.get("ability") != ability:
-            failures.append(f"{task_id}: ability {row.get('ability')!r} "
-                            f"(expected {ability!r})")
-        if not _text_of(info.get("paired_original_text")):
-            failures.append(f"{task_id}: no counterpart text")
-        if not _text_of(info.get("proof")) or not _text_of(info.get("deleted_condition_text")):
-            failures.append(f"{task_id}: no proof or no deleted sentence")
-        if info.get("paired_original_text") == question_or_empty(row):
-            failures.append(f"{task_id}: the pair's two members are the same text")
+            failures.append(f"{task_id}: ability {row.get('ability')!r} (expected {ability!r})")
+
+        if positive:
+            # Table B row 5: a solvable numeric row with a placeholder block.  The
+            # placeholders exist only for the D18 isomorphism, so the gold must be
+            # an answer, the diagnosis fields must be empty, and the row must be on
+            # the numeric branch.
+            if info.get("branch") != BRANCH_POSITIVE or truth.get("solvable") is not True:
+                failures.append(f"{task_id}: positive branch/solvable "
+                                f"{info.get('branch')!r}/{truth.get('solvable')!r}")
+            if not truth.get("answer"):
+                failures.append(f"{task_id}: the solvable row carries no answer")
+            if truth.get("correct_option_id") is not None or info.get("correct_option_id") not in ("", None):
+                failures.append(f"{task_id}: a placeholder row carries a correct option")
+            if truth.get("has_diagnosis_label") or info.get("has_diagnosis_label"):
+                failures.append(f"{task_id}: a solvable row carries a diagnosis label")
+            if truth.get("perturbation_type") is not None or info.get("perturbation_type"):
+                failures.append(f"{task_id}: a solvable row carries a perturbation type")
+            if info.get("error_type") != "":
+                failures.append(f"{task_id}: a solvable row carries error_type "
+                                f"{info.get('error_type')!r}")
+            if info.get("option_kind") != "placeholder":
+                failures.append(f"{task_id}: option_kind {info.get('option_kind')!r}")
+            if _text_of(info.get("proof")):
+                failures.append(f"{task_id}: the solvable side carries a disproof certificate")
+            if str(info.get("answer", "")) != str(truth.get("answer")):
+                failures.append(f"{task_id}: extra_info.answer {info.get('answer')!r} is not "
+                                f"the gold {truth.get('answer')!r}")
+        else:
+            # Table B row 7: the four-tier negative (D26).
+            if info.get("branch") != BRANCH_DIAG or truth.get("solvable") is not False:
+                failures.append(f"{task_id}: negative branch/solvable "
+                                f"{info.get('branch')!r}/{truth.get('solvable')!r}")
+            if truth.get("answer") is not None:
+                failures.append(f"{task_id}: an unsolvable row carries an answer")
+            if truth.get("correct_option_id") is None:
+                failures.append(f"{task_id}: a four-tier row carries no correct option")
+            if not truth.get("has_diagnosis_label") or not info.get("has_diagnosis_label"):
+                failures.append(f"{task_id}: a four-tier row carries no diagnosis label")
+            if truth.get("perturbation_type") != "missing_condition":
+                failures.append(f"{task_id}: perturbation_type {truth.get('perturbation_type')!r}")
+            # The gold's perturbation_type is checked above; the *extra_info* copy is
+            # what the D18 balance table reads, so a row whose two copies disagree
+            # would silently mis-tabulate the defect mix while passing everything else.
+            if info.get("perturbation_type") != "missing_condition":
+                failures.append(f"{task_id}: extra_info.perturbation_type "
+                                f"{info.get('perturbation_type')!r}")
+            if info.get("error_type") != "key_information_missing":
+                failures.append(f"{task_id}: error_type {info.get('error_type')!r}")
+            if info.get("option_kind") != "missing_condition":
+                failures.append(f"{task_id}: option_kind {info.get('option_kind')!r}")
+            if not _text_of(info.get("proof")):
+                failures.append(f"{task_id}: the four-tier negative carries no proof")
     reporter.check(
-        "contract: bare branch, template B, refusal gold, source metadata, pairing fields",
+        "contract: table B rows 5/7 fields, source metadata, pairing fields, option kind",
         not failures,
         f"{len(rows)} rows, {len(failures)} violations"
         + (f"; first: {failures[:3]}" if failures else ""),
@@ -1191,10 +1941,20 @@ def check_contract(rows: list, reporter: Reporter) -> None:
         f"{len(ids)} rows, {len(bad)} bad ids" + (f"; first: {bad[:3]}" if bad else ""),
     )
 
+    pairs = shipped_pairs(rows)
+    positives = [row for row in rows if is_positive(row)]
+    orphans = sorted({task_base(row["extra_info"]["task_id"]) for row in positives} - set(pairs))
+    reporter.check(
+        "contract: every shipped positive has its negative partner in the artifact",
+        not orphans,
+        f"{len(pairs)} complete pairs, {len(positives)} positive rows, {len(orphans)} orphan(s)"
+        + (f"; first: {orphans[:3]}" if orphans else ""),
+    )
+
     branches = dict(sorted(collections.Counter(
         row["extra_info"]["branch"] for row in rows
     ).items()))
-    reporter.note(f"branch -> rows: {branches} (this source cannot fill the other four)")
+    reporter.note(f"branch -> rows: {branches} (this source fills rows 5 and 7)")
 
 
 def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
@@ -1202,10 +1962,11 @@ def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
 
     Every gold in this pool is only meaningful if the prompt asks for it, and the
     prompt is frozen at write time by ``schema.make_row``.  Rebuilding it here with
-    the contract's own ``render_prompt`` is what binds the wording to the row: a
-    prompt whose tail was rewritten (to template A's option block, say) while the
-    gold stayed the bare refusal, or a ``template`` field that no longer describes
-    the text the model actually sees, both fail here and nowhere else.
+    the contract's own ``render_prompt`` -- **including the row's own options**, which
+    is what template A needs -- binds the wording to the row: a prompt whose tail was
+    rewritten (to another template, or with someone else's option block) while the
+    gold stayed put, or a ``template`` field that no longer describes the text the
+    model actually sees, both fail here and nowhere else.
     """
     failures: list = []
     for row in rows:
@@ -1220,18 +1981,62 @@ def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
                             f"({error})")
             continue
         try:
-            expected = schema.render_prompt(question, template)
+            expected = schema.render_prompt(question, template, options=info.get("options"),
+                                            role_words=info.get("role_words"))
         except ValueError as error:
             failures.append(f"{task_id}: recorded template {template!r} cannot "
                             f"render this question ({error})")
             continue
         if content != expected:
             failures.append(f"{task_id}: the prompt is not template {template!r}'s "
-                            f"rendering of the row's own question")
+                            f"rendering of the row's own question and options")
     reporter.check(
-        "prompt: the stored prompt is the recorded template's rendering of the question",
+        "prompt: the stored prompt is the recorded template's rendering of question + options",
         not failures,
         f"{len(rows)} prompts rebuilt with schema.render_prompt, {len(failures)} failures"
+        + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+    # Per-branch wording: the four-tier negative's prompt must ask for the diagnosis
+    # and the solvable row's for an answer, while the two sides share one instruction
+    # preamble and one k=3 block shape (the D18/D26 isomorphism).
+    failures = []
+    preamble = None
+    for row in rows:
+        info = row["extra_info"]
+        task_id = info.get("task_id", "<missing>")
+        content = row["prompt"][0]["content"]
+        options = info.get("options") or []
+        _, sep, tail = content.partition("\n\n")
+        if not sep:
+            failures.append(f"{task_id}: the prompt has no question/template seam")
+            continue
+        lines = tail.split("\n")
+        block_start = next((index for index, line in enumerate(lines) if line == "选项："), None)
+        if block_start is None:
+            failures.append(f"{task_id}: the prompt has no 选项： block")
+            continue
+        head = "\n".join(lines[: block_start + 1])
+        if preamble is None:
+            preamble = head
+        elif head != preamble:
+            failures.append(f"{task_id}: the template-A preamble differs from the first row's")
+        block = lines[block_start + 1:]
+        if len(block) != K_OPTIONS or any(
+                not line.startswith(f"{opt['id']}. ") for line, opt in zip(block, options, strict=False)):
+            failures.append(f"{task_id}: the rendered option block is not the row's k="
+                            f"{K_OPTIONS} options")
+        if is_positive(row):
+            if "\\boxed{<答案>}" not in content:
+                failures.append(f"{task_id}: the solvable prompt does not ask for an answer")
+        else:
+            if "\\boxed{UNSOLVABLE: <选项ID>}" not in content:
+                failures.append(f"{task_id}: the four-tier prompt does not ask for the diagnosis")
+    reporter.check(
+        "prompt: template A is isomorphic across the two sides (same preamble, k=3 block) "
+        "and asks each side for its own gold",
+        not failures,
+        f"{len(rows)} prompts checked, {len(failures)} failures"
         + (f"; first: {failures[:3]}" if failures else ""),
     )
 
@@ -1249,7 +2054,7 @@ def main() -> None:
         default=DEFAULT_RAW_DIR,
         help="downloaded TreeCut directory; the vocabulary and the generator are proved here",
     )
-    parser.add_argument("--seed", type=int, default=0, help="fold + control seed")
+    parser.add_argument("--seed", type=int, default=0, help="fold + control + heuristic seed")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--min-support", type=int, default=L3_MIN_SUPPORT)
     args = parser.parse_args()
@@ -1258,7 +2063,9 @@ def main() -> None:
     if not rows:
         print(f"[FAIL] {args.rows} holds no rows")
         raise SystemExit(1)
-    print(f"rows    : {args.rows} ({len(rows)} rows)")
+    negatives = sum(1 for row in rows if not is_positive(row))
+    print(f"rows    : {args.rows} ({len(rows)} rows: {negatives} negatives, "
+          f"{len(rows) - negatives} positives)")
     print(f"raw dir : {args.raw_dir}")
 
     try:
@@ -1266,7 +2073,19 @@ def main() -> None:
         matchers = matchers_for(vocabulary)
     except (OSError, SyntaxError, ValueError, KeyError) as error:
         print(f"cannot read the source's entity tables ({error})")
-        matchers = {}
+        vocabulary, matchers = {}, {}
+
+    generator = None
+    try:
+        generator = load_generator(args.raw_dir)
+    except (FileNotFoundError, ImportError, ValueError) as error:
+        print(f"cannot import the pinned generator ({error})")
+
+    reward = None
+    try:
+        reward = load_reward_module()
+    except Exception as error:  # noqa: BLE001 - reported as a FAIL below
+        print(f"cannot import the frozen reward dispatcher from {REWARD_FILE} ({error})")
 
     reporter = Reporter()
     check_contract(rows, reporter)
@@ -1275,6 +2094,27 @@ def main() -> None:
     check_source_generator(rows, reporter, args.raw_dir, matchers)
     check_l1_proof(rows, reporter, matchers)
     check_l2_pair(rows, reporter, matchers)
+    check_answer_gold(rows, reporter, vocabulary, generator)
+    check_option_structure(rows, reporter, matchers)
+    check_option_leak(rows, reporter, seed=args.seed)
+    if reward is None:
+        reporter.check(
+            "L4d option-shuffle invariance (reward unchanged when the block is permuted)",
+            False, f"cannot import the frozen dispatcher at {REWARD_FILE}",
+        )
+        reporter.check(
+            "L5 bare UNSOLVABLE is branch-dependent (four-tier 0, three-tier +1)",
+            False, f"cannot import the frozen dispatcher at {REWARD_FILE}",
+        )
+        reporter.check(
+            "L5b TreeCut positives score on the numeric branch (gold +1, misrefusal 0, "
+            "placeholder pick 0)",
+            False, f"cannot import the frozen dispatcher at {REWARD_FILE}",
+        )
+    else:
+        check_option_shuffle(rows, reporter, reward, seed=args.seed)
+        check_bare_unsolvable(rows, reporter, reward)
+        check_positive_reward(rows, reporter, reward)
     check_l3_alignment(rows, reporter)
     check_l3_gate(rows, reporter, folds=args.folds, seed=args.seed,
                   min_support=args.min_support)

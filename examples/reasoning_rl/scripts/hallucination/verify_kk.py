@@ -43,8 +43,9 @@ JSON), brute-forces all ``2**N`` assignments with its own evaluator, and demands
 * **exactly one** solution -- 0 or >= 2 is a fail, not a guess;
 * that solution is the source's own ``solution`` field;
 * that solution is the artifact's own ``extra_info.canonical_solution``;
-* the artifact's ``ground_truth.answer`` is the surface sequence built from it with
-  the artifact's own ``role_words``.
+* the artifact's ``ground_truth.answer`` is the **name -> surface role word
+  mapping** of D19, built from the source's ``names`` + that solution + the
+  artifact's own ``role_words`` -- per inhabitant, keys and values both.
 
 **Sentence oracles** (every row).  The two sentences the dataset ships --
 ``solution_text`` and ``solution_text_format`` -- are rebuilt from the artifact's
@@ -59,33 +60,39 @@ the question in the prompt must be the source's own ``quiz`` for that
 ``(family, len(names), index)``, ``role_words`` must be that row's
 ``knight_knave`` pair, ``extra_info.canonical_solution`` must be the source's own
 ``solution``, the source's own ``statements`` must enumerate to exactly that one
-solution, the stored gold must be its surface sequence, and a perturbed row's
-``paired_original_text`` must be the clean member of the same group.  Without the
-raw files nothing here can be proved, so a missing ``--raw-dir`` is a FAIL, not a
-skip.
+solution, the stored gold must be that D19 mapping, and -- D20 -- the row must be a
+*perturbed* variant whose ``paired_original_text`` is the clean member of the same
+group.  Without the raw files nothing here can be proved, so a missing ``--raw-dir``
+is a FAIL, not a skip.
 
 **L2 -- gold uniqueness.**  ``(len(names), index)`` is the group key of design doc
-section 4.2: the enumerator must find one solution (the puzzle is uniquely
+section 4.1: the enumerator must find one solution (the puzzle is uniquely
 determined), and the artifact must hold **at most one** row per group -- the
-variants of one abstract problem are sevenfold restatements, so two of them in the
-pool is a leak even before they can straddle a split.  The key is re-derived from
-``task_id`` alone, because ``mix_halluc`` overwrites ``extra_info.index``
-downstream.
+variants of one abstract problem are sevenfold restatements, and D20 admits only
+the perturbed ones, so two of them in the pool is a leak even before they can
+straddle a split.  The key is re-derived from ``task_id`` alone, because
+``mix_halluc`` overwrites ``extra_info.index`` downstream.
 
 **L3 -- anti-cheat.**  The design doc defines no L3 for K&K (no options block, no
 binary label, so the BoW-NB yardstick of the other sources does not exist).  The
-analogous floor for a *sequence* answer is used instead:
+gold is a per-inhabitant mapping (D19), so the analogous floor is scored **per
+person**:
 
-* **a. no inverted gold** -- for every row whose role words are not
-  ``knight/knave``, the gold must be re-derivable from the source's *formula* under
-  those words.  This is design risk 9 as a check: a canonical-code gold, or one
-  built from the wrong side of ``flip_role``, lands here.  It runs over **every**
-  row, not a sample, and enumerates the puzzle rather than trusting the source's
-  stored ``solution`` field.
-* **b. single-word heuristics** -- "answer every inhabitant the truth word" and
-  "answer every inhabitant the lie word" must stay near the ``2**-L`` floor.
-* **c. per-position majority** -- the strongest position-wise guess must also stay
-  near that floor.
+* **a. no inverted gold** -- every row's mapping is re-derived from the source's
+  *formula* under the artifact's own ``role_words`` and compared inhabitant by
+  inhabitant.  This is design risk 5 as a check: a canonical-code gold, one built
+  from the wrong side of ``flip_role``, a bare sequence or a wrong name set lands
+  here.  It runs over **every** row, not a sample, and enumerates the puzzle rather
+  than trusting the source's stored ``solution`` field.
+* **b. constant per-person label assignments** -- "every inhabitant is the truth
+  word" and "every inhabitant is the lie word", scored against the gold mapping.
+  Their whole-mapping hit rate must stay at/below the ``2**-L`` floor bound, so a
+  prompt whose answer is always "everyone tells the truth" cannot pass.
+* **c. per-position majority** -- the strongest roster-position guess inside each
+  size tier, again scored per person.  Its whole-mapping rate must stay at/below
+  the same bound, and its per-person rate must not beat the better constant
+  assignment by more than ``L3_CONSTANT_MARGIN`` (5pt): roster order may not leak
+  more than the class prior.
 
 The measured numbers are printed pass or fail, so the report carries the actual
 rate rather than a verdict.
@@ -120,6 +127,12 @@ CANONICAL_ROLE_WORDS = kk_adapter.CANONICAL_ROLE_WORDS
 
 L1_MIN_SAMPLE = 50
 L3_MAX_HEURISTIC_ACCURACY = 0.25
+#: How much a position-wise guess may beat the better constant (class-prior)
+#: assignment per person before it counts as a leak.  Design doc Q8 fixes the
+#: analogous L3 budget for the sources that have one at "random + 10pt"; 5pt is the
+#: stricter reading of section 9's "near the floor" and still clears the measured
+#: corpus (best constant 0.5448, per-position majority 0.5484).
+L3_CONSTANT_MARGIN = 0.05
 #: A majority sequence over a handful of rows is noise, not a heuristic a model
 #: could exploit; a tier is only measured once it has this many rows.  Measured:
 #: every tier in the shipped pool has 1,000 rows, so this bound never bites there.
@@ -177,7 +190,7 @@ def normalise(text: str) -> str:
 # ---------------------------------------------------------------------------
 # None of this calls ``kk_adapter``.  A verifier that re-derives the gold with the
 # code that produced it proves only that the code is self-consistent -- and a
-# mirrored bug is precisely design risk 9 (the surface/canonical role-word trap).
+# mirrored bug is precisely design risk 5 (the surface/canonical role-word trap).
 # Everything the audit asserts about a gold is computed below, from the raw row and
 # the artifact, by this file.
 
@@ -284,10 +297,27 @@ def role_words_own(row: dict) -> tuple[str, str] | None:
     return truth_word, lie_word
 
 
-def surface_gold_own(solution: list[bool], role_words: list[str]) -> str:
-    """The surface role-word sequence, in roster order."""
+def answer_mapping_own(names: list[str], solution: list[bool], role_words: list[str]) -> dict[str, str]:
+    """The D19 gold: ``{name: surface role word}``, one entry per inhabitant.
+
+    Index ``i`` pairs ``names[i]`` with the truth-teller word when ``solution[i]``
+    is True and with the liar word otherwise.  Recomputed here from the raw row, so
+    it disagrees with the artifact whenever the artifact used canonical words, the
+    wrong side of a flipped mapping, or a name set that is not the source's.
+    """
     truth_word, lie_word = role_words
-    return " ".join(truth_word if flag else lie_word for flag in solution)
+    return {name: (truth_word if flag else lie_word) for name, flag in zip(names, solution, strict=False)}
+
+
+def mapping_diff(actual: object, expected: dict[str, str]) -> list[str]:
+    """The inhabitants on which an answer mapping disagrees with the expected one."""
+    if not isinstance(actual, dict):
+        return ["<not a name -> role mapping>"]
+    shared = sorted(set(actual) & set(expected))
+    diff = [f"{name}:{actual[name]!r} != {expected[name]!r}" for name in shared if actual[name] != expected[name]]
+    diff += [f"missing {name!r}" for name in sorted(set(expected) - set(actual))]
+    diff += [f"unexpected {name!r}" for name in sorted(set(actual) - set(expected))]
+    return diff
 
 
 def solution_text_own(row: dict, witness: list[bool]) -> str:
@@ -398,6 +428,8 @@ def check_contract(rows: list[dict], reporter: Reporter) -> None:
             failures.append(f"{task_id}: judgment_only on an answer branch")
         if info.get("perturbation_family") != family:
             failures.append(f"{task_id}: perturbation_family {info.get('perturbation_family')!r} != task_id")
+        if family == kk_adapter.FAMILY_CLEAN:
+            failures.append(f"{task_id}: a clean row is in the pool (D20 ships perturbed rows only)")
         if info.get("difficulty") != f"{count}ppl":
             failures.append(f"{task_id}: difficulty {info.get('difficulty')!r} != {count}ppl")
         if info.get("index") != raw_index and info.get("index") is not None:
@@ -407,15 +439,27 @@ def check_contract(rows: list[dict], reporter: Reporter) -> None:
             failures.append(f"{task_id}: role_words {words!r}")
         elif words[0].casefold() == words[1].casefold():
             failures.append(f"{task_id}: role_words are the same word")
-        answer = payload.get("answer")
-        if not isinstance(answer, str) or not answer:
-            failures.append(f"{task_id}: no answer")
-        elif payload.get("role_words") != words:
+        if payload.get("role_words") != words:
             failures.append(f"{task_id}: ground_truth.role_words != extra_info.role_words")
-        elif len(answer.split()) != count:
-            failures.append(f"{task_id}: answer has {len(answer.split())} words, expected {count}")
-        elif set(answer.split()) - set(words):
+        answer = payload.get("answer")
+        if not isinstance(answer, dict) or not answer:
+            # D19: the gold is a per-inhabitant mapping; a bare sequence or a coded
+            # string is the superseded format and must fail here.
+            failures.append(f"{task_id}: answer is not a non-empty name -> role mapping")
+        elif any(not isinstance(name, str) or not name.strip() for name in answer):
+            failures.append(f"{task_id}: answer mapping has an empty name")
+        elif len(answer) != count:
+            failures.append(f"{task_id}: answer mapping has {len(answer)} entries, expected {count}")
+        elif set(answer.values()) - set(words):
             failures.append(f"{task_id}: answer uses words outside role_words")
+        else:
+            try:
+                roster = names_in_question(question_of(row))
+            except ValueError as exc:
+                failures.append(f"{task_id}: {exc}")
+            else:
+                if set(answer) != set(roster):
+                    failures.append(f"{task_id}: answer names {sorted(answer)} != the question's roster {roster}")
         prompt = row["prompt"][0]["content"]
         for word in words:
             if word not in prompt:
@@ -513,9 +557,12 @@ def check_source_anchor(rows: list[dict], index: dict, raw_dir: str, reporter: R
         if words is None or list(words) != list(info["role_words"]):
             failures.append(f"{task_id}: role_words {info['role_words']!r} != source {words!r}")
             continue
-        expected = surface_gold_own([bool(f) for f in source["solution"]], list(words))
+        expected = answer_mapping_own(
+            list(source["names"]), [bool(f) for f in source["solution"]], list(words)
+        )
         if payload_of(row).get("answer") != expected:
-            failures.append(f"{task_id}: gold {payload_of(row).get('answer')!r} != surface sequence {expected!r}")
+            diff = mapping_diff(payload_of(row).get("answer"), expected)[:3]
+            failures.append(f"{task_id}: gold differs from the D19 mapping on {diff}")
             continue
         if [bool(f) for f in source["solution"]] != [bool(f) for f in info["canonical_solution"]]:
             failures.append(f"{task_id}: canonical_solution differs from the source's solution")
@@ -536,8 +583,7 @@ def check_source_anchor(rows: list[dict], index: dict, raw_dir: str, reporter: R
             failures.append(f"{task_id}: enumerating the source formula contradicts its stored solution")
             continue
         if family == kk_adapter.FAMILY_CLEAN:
-            if normalise(info.get("paired_original_text", "")):
-                failures.append(f"{task_id}: a clean row must not carry a paired original")
+            failures.append(f"{task_id}: a clean row is in the pool (D20 emits perturbed rows only)")
             continue
         sibling = clean_quiz(index, count, raw_index)
         if sibling is None:
@@ -594,22 +640,25 @@ def check_l1(sampled: list[dict], index: dict, reporter: Reporter) -> None:
         if witness != [bool(flag) for flag in info["canonical_solution"]]:
             failures.append(f"{task_id}: artifact canonical_solution != the enumerated solution")
             continue
-        expected = surface_gold_own(witness, list(info["role_words"]))
+        expected = answer_mapping_own(list(source["names"]), witness, list(info["role_words"]))
         if payload_of(row).get("answer") != expected:
-            failures.append(f"{task_id}: gold {payload_of(row).get('answer')!r} != {expected!r}")
+            diff = mapping_diff(payload_of(row).get("answer"), expected)[:3]
+            failures.append(f"{task_id}: gold differs from the D19 mapping on {diff}")
     detail = (
         f"{len(sampled)} sampled rows re-derived (0-solution {zero}, multi-solution {multi}, "
         f"field mismatch {mismatch}), {len(failures)} failures"
     )
     if failures:
         detail += "; first: " + " | ".join(failures[:3])
-    reporter.check("L1 gold certificate (independent enumerator, source solution, surface gold)", not failures, detail)
+    reporter.check(
+        "L1 gold certificate (independent enumerator, source solution, D19 mapping)", not failures, detail
+    )
 
 
 def names_in_question(question: str) -> list[str]:
     """The roster the question names, in the order the question names it.
 
-    Both the surface gold and the sentence oracles are ordered by the roster, so a
+    Both the gold mapping and the sentence oracles are ordered by the roster, so a
     question that lists the inhabitants differently would make every one of them read
     against the wrong person.
     """
@@ -625,7 +674,7 @@ def check_sentence_oracles(rows: list[dict], index: dict, reporter: Reporter) ->
 
     These are the strings the reward matches the model's answer against, so they must
     agree with the source's own ``solution_text`` / ``solution_text_format`` for the
-    sequence the artifact stores -- if the artifact wrote a canonical-word gold under
+    canonical_solution the artifact stores -- if the artifact wrote a canonical-word gold under
     a ``flip_role`` mapping, the sentences built from the *source's* words will not
     match the ones built from the artifact's.
     """
@@ -738,20 +787,68 @@ def check_l2(rows: list[dict], sampled: list[dict], index: dict, reporter: Repor
 # ---------------------------------------------------------------------------
 
 
+def _role_flag(role: object, role_words: list[str]) -> bool | None:
+    """One surface role word -> canonical truth-teller bool for that row, or None."""
+    value = " ".join(str(role).casefold().split())
+    truth_word = " ".join(str(role_words[0]).casefold().split())
+    lie_word = " ".join(str(role_words[1]).casefold().split())
+    if value == truth_word:
+        return True
+    if value == lie_word:
+        return False
+    return None
+
+
+def gold_vector(row: dict) -> list[bool] | None:
+    """The artifact's gold mapping as canonical booleans in the question's roster order.
+
+    D19's mapping is keyed by name, so every heuristic below has to read it *per
+    person*: this resolves each roster name through the row's own ``role_words`` and
+    returns ``None`` (counted as a miss by the caller) when the mapping is not a
+    readable per-inhabitant answer.
+    """
+    answer = payload_of(row).get("answer")
+    if not isinstance(answer, dict) or not answer:
+        return None
+    words = list(row["extra_info"].get("role_words") or [])
+    if len(words) != 2:
+        return None
+    try:
+        roster = names_in_question(question_of(row))
+    except ValueError:
+        return None
+    vector: list[bool] = []
+    for name in roster:
+        if name not in answer:
+            return None
+        flag = _role_flag(answer[name], words)
+        if flag is None:
+            return None
+        vector.append(flag)
+    return vector
+
+
 def check_l3(rows: list[dict], index: dict, reporter: Reporter) -> None:
-    """The anti-cheat layer the design doc does not define for K&K."""
-    # a. no inverted gold.  Every row, not a sample: this is design risk 9.
+    """The anti-cheat layer the design doc does not define for K&K.
+
+    Every row is re-derived against the source formula (L3a, design risk 5), and
+    the prompt-independent guess baselines (L3b/L3c) are scored **per person**
+    against the D19 gold mapping -- the mapping is keyed by name, so a
+    position-wise guess has to be evaluated person by person rather than as a
+    role-word sequence.
+    """
+    # a. no inverted gold.  Every row, not a sample: this is design risk 5.
     inverted: list[str] = []
     non_canonical = 0
     for row in rows:
         info = row["extra_info"]
         task_id = info["task_id"]
         words = list(info["role_words"])
-        if tuple(words) == CANONICAL_ROLE_WORDS:
-            continue
-        non_canonical += 1
+        if tuple(words) != CANONICAL_ROLE_WORDS:
+            non_canonical += 1
         parsed = kk_adapter.parse_task_id(task_id)
         if parsed is None:
+            inverted.append(f"{task_id}: unparseable task_id")
             continue
         family, count, raw_index = parsed
         source = index.get((family, count, raw_index))
@@ -770,41 +867,60 @@ def check_l3(rows: list[dict], index: dict, reporter: Reporter) -> None:
         if len(solutions) != 1:
             inverted.append(f"{task_id}: the source puzzle has {len(solutions)} solutions")
             continue
-        expected = surface_gold_own([bool(flag) for flag in solutions[0]], words)
-        if payload_of(row).get("answer") != expected:
-            inverted.append(f"{task_id}: {payload_of(row).get('answer')!r} != {expected!r}")
+        expected = answer_mapping_own(list(source["names"]), [bool(flag) for flag in solutions[0]], words)
+        answer = payload_of(row).get("answer")
+        if answer != expected:
+            inverted.append(f"{task_id}: " + ", ".join(mapping_diff(answer, expected)[:3]))
     reporter.check(
-        "L3a no inverted gold on non-canonical role words",
+        "L3a no inverted gold (every row re-derived per inhabitant from the source formula)",
         not inverted,
-        f"{non_canonical} non-canonical rows re-derived against the source, "
-        f"{len(inverted)} inverted" + (f"; first: {inverted[:3]}" if inverted else ""),
+        f"{len(rows)} rows re-derived against the source ({non_canonical} with non-canonical "
+        f"role words), {len(inverted)} inverted" + (f"; first: {inverted[:3]}" if inverted else ""),
     )
 
-    # b/c. surface heuristics on the answer sequence.
-    answers = [payload_of(row).get("answer", "").split() for row in rows]
-    all_truth = all_lie = 0
-    for row, tokens in zip(rows, answers):
-        truth_word, lie_word = row["extra_info"]["role_words"]
-        all_truth += tokens == [truth_word] * len(tokens)
-        all_lie += tokens == [lie_word] * len(tokens)
-    total = max(len(rows), 1)
+    # b/c. prompt-independent guess baselines, scored per person against the mapping.
+    vectors: list[tuple[int, list[bool]]] = []
+    unreadable = 0
+    for row in rows:
+        vector = gold_vector(row)
+        if vector is None:
+            unreadable += 1
+            continue
+        vectors.append((len(vector), vector))
+    if unreadable:
+        reporter.note(f"L3b/c: {unreadable} rows without a readable mapping gold are counted as misses")
+
+    total = max(len(vectors) + unreadable, 1)
+    person_total = max(sum(width for width, _ in vectors), 1)
+    constant_rows: dict[str, int] = {}
+    constant_people: dict[str, float] = {}
+    for label, value in (("truth word", True), ("lie word", False)):
+        rows_hit = sum(1 for _, vector in vectors if all(flag == value for flag in vector))
+        people_hit = sum(sum(1 for flag in vector if flag == value) for _, vector in vectors)
+        constant_rows[label] = rows_hit
+        constant_people[label] = people_hit / person_total
+        reporter.note(
+            f"L3b everyone-the-{label}: {rows_hit}/{len(vectors)} whole mappings = "
+            f"{rows_hit / total:.4f}, per person {constant_people[label]:.4f}"
+        )
+    best_constant_rows = max(constant_rows.values())
+    best_constant_people = max(constant_people.values())
     reporter.check(
-        "L3b single-word heuristics stay near the 2**-L floor",
-        max(all_truth, all_lie) / total <= L3_MAX_HEURISTIC_ACCURACY,
-        f"answer-everyone-the-truth-word {all_truth}/{len(rows)} = {all_truth / total:.4f}, "
-        f"answer-everyone-the-lie-word {all_lie}/{len(rows)} = {all_lie / total:.4f} "
-        f"(threshold {L3_MAX_HEURISTIC_ACCURACY:.2f})",
+        "L3b constant label assignments stay near the 2**-L floor",
+        best_constant_rows / total <= L3_MAX_HEURISTIC_ACCURACY,
+        f"best constant assignment matches {best_constant_rows}/{total} = "
+        f"{best_constant_rows / total:.4f} whole mappings (per person {best_constant_people:.4f}, "
+        f"threshold {L3_MAX_HEURISTIC_ACCURACY:.2f})",
     )
 
     # The pool mixes the five size tiers (L = 4..8), and a position-wise guess only
-    # makes sense inside one tier -- an answer of the wrong length cannot match
-    # anything.  ``hits`` counts only rows whose own tier's majority sequence they
-    # reproduce, so the rate is comparable with the 2**-L floor of that tier.
-    by_length: dict[int, list[list[str]]] = collections.defaultdict(list)
-    for tokens in answers:
-        by_length[len(tokens)].append(tokens)
-    hits = 0
-    counted = 0
+    # makes sense inside one tier.  ``hits`` counts rows whose own tier's majority
+    # mapping they reproduce (the whole task), ``person_hits`` the individual
+    # inhabitant decisions, so the rate is comparable with the 2**-L floor.
+    by_length: dict[int, list[list[bool]]] = collections.defaultdict(list)
+    for width, vector in vectors:
+        by_length[width].append(vector)
+    hits = person_hits = counted = person_counted = 0
     floors: dict[int, float] = {}
     for width, group in sorted(by_length.items()):
         if len(group) < L3_MIN_TIER_ROWS:
@@ -814,25 +930,34 @@ def check_l3(rows: list[dict], index: dict, reporter: Reporter) -> None:
             )
             continue
         majority = [
-            collections.Counter(tokens[position] for tokens in group).most_common(1)[0][0]
+            collections.Counter(vector[position] for vector in group).most_common(1)[0][0]
             for position in range(width)
         ]
-        matched = sum(1 for tokens in group if tokens == majority)
+        matched = sum(1 for vector in group if all(vector[p] == majority[p] for p in range(width)))
+        matched_people = sum(sum(1 for p in range(width) if vector[p] == majority[p]) for vector in group)
         hits += matched
+        person_hits += matched_people
         counted += len(group)
+        person_counted += len(group) * width
         floors[width] = 2.0**-width
         reporter.note(
-            f"L3c L={width}: majority {' '.join(majority)} matches {matched}/{len(group)} "
-            f"= {matched / len(group):.4f} (chance {floors[width]:.4f}, "
-            f"best floor {max(floors.values()):.4f})"
+            f"L3c L={width}: majority per-person {matched_people / (len(group) * width):.4f}, "
+            f"whole mappings {matched}/{len(group)} = {matched / len(group):.4f} "
+            f"(chance {floors[width]:.4f})"
         )
-    denominator = max(counted, 1)
+    # A row whose gold is unreadable cannot be reproduced by any position-wise
+    # guess, so it is counted as a miss rather than dropped from the denominator.
+    denominator = max(counted + unreadable, 1)
+    exact_rate = (hits + unreadable) / denominator
+    position_people = person_hits / max(person_counted, 1)
     reporter.check(
         "L3c per-position majority stays near the 2**-L floor",
-        hits / denominator <= L3_MAX_HEURISTIC_ACCURACY,
-        f"per-position majority {hits}/{counted} measured rows = {hits / denominator:.4f} "
-        f"<= {L3_MAX_HEURISTIC_ACCURACY:.2f} (chance floor for the easiest tier "
-        f"{max(floors.values()) if floors else float('nan'):.4f})",
+        exact_rate <= L3_MAX_HEURISTIC_ACCURACY
+        and position_people <= best_constant_people + L3_CONSTANT_MARGIN,
+        f"per-position majority {hits + unreadable}/{denominator} whole mappings = {exact_rate:.4f} "
+        f"<= {L3_MAX_HEURISTIC_ACCURACY:.2f} (2**-L floor for the easiest tier "
+        f"{max(floors.values()) if floors else float('nan'):.4f}); per person {position_people:.4f} "
+        f"vs best constant {best_constant_people:.4f} + {L3_CONSTANT_MARGIN:.2f}",
     )
 
 

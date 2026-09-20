@@ -20,7 +20,7 @@ Source
 Measured: 34,220 + 23,832 = **58,052 rows**, matching the recon report exactly.
 
 Each row is a GSM8K grade-school problem with **one irrelevant sentence spliced
-in**; the gold answer is unchanged (design doc section 4.5, D17).  So every row
+in**; the gold answer is unchanged (design doc section 4.4, D17).  So every row
 here is ``solvable=True`` on ``halluc_math_gsmic``, ``template`` B (no options
 block), ``perturbation_type="distracting_condition"``, ``branch=
 solvable_numeric``; the reward routes it through the ordinary math matcher.
@@ -64,17 +64,20 @@ The per-base-question cap (the one real design decision here)
 The 58,052 rows are **not 58,052 problems**.  They collapse to **100 distinct
 ``original_question`` values** (2step 60 + mstep 40), each replicated up to
 **640 times** by varying the injected role/number; the headline count overstates
-effective diversity by ~580x (recon hazard 5).  Sampling 2,000 rows uniformly --
-which is what the design doc's D18 quota asks for -- would feed the model the
-same 100 grade-school problems ~20 times each.
+effective diversity by ~580x (recon hazard 5).  A flat row quota over the pool
+would feed the model the same 100 grade-school problems dozens of times each --
+at the pre-D27 2,000-row quota, ~20 times each.
 
 So the cap is made explicit instead of implicit: at most
 :data:`MAX_PER_BASE_QUESTION` rows survive per base question, sampled flat from
-that question's certified variants.  With 100 bases and a cap of 20 that lands on
-**exactly 2,000 rows**, i.e. the same quota D18 asks for, reached with a flat
-per-problem budget rather than a lopsided one.  The cap is the knob; 2,000 is a
-consequence, not an input.  Why flat sampling and not a per-template round-robin
-is a measured trade-off -- see :func:`_select_for_base`.
+that question's certified variants.  With 100 bases and a cap of **8** that lands
+on **800 rows** -- deliberately a little above the 772-row quota that design doc
+section 4.8 table B row 1 assigns to GSM-IC after D27 gave 428 rows back to
+FalseQA-answerable and TreeCut.  The adapter builds a small buffer over the mix
+quota so ``mix_halluc.py``'s proportional draw never runs short, and the mix --
+not the adapter -- does the final trimming.  The cap is the knob; the pool size
+is a consequence, not an input.  Why flat sampling and not a per-template
+round-robin is a measured trade-off -- see :func:`_select_for_base`.
 
 DEVIATIONS FROM THE DESIGN DOC
 ------------------------------
@@ -83,7 +86,7 @@ Each of these is a place the design doc (``HALLUCINATION_RL_DESIGN.md``) states
 a number or shape that the raw bytes contradict.  Every measurement below was
 reproduced by this adapter's own loader, not copied from the recon report.
 
-1. **Template inventory is 394, not 242.**  Doc sections 4.5 and D17 say
+1. **Template inventory is 394, not 242.**  Doc sections 4.4 and D17 say
    "58,052 行里共 242 个不同模板" / "规则复用 GSM-IC 的 242 条
    ``sentence_template``".  242 is the *2step-only* count.  Measured: 2step 242,
    mstep 161, **union 394** (9 shared).  Any consumer of the template engine
@@ -104,28 +107,30 @@ reproduced by this adapter's own loader, not copied from the recon report.
    ``role == "n/a"`` in 480 rows, exactly matching the ``role_label``/
    ``number_label`` ``"n/a"`` counts.  A generator that always varies the role
    crashes or writes ``"... is n/a ..."`` on those rows.
-5. **There is an unreported 10th field, ``n_steps`` (int).**  Doc section 4.5
+5. **There is an unreported 10th field, ``n_steps`` (int).**  Doc section 4.4
    lists nine fields.  All 58,052 rows carry ``n_steps`` too (2step constant 2;
    mstep in {3,4,5,6,7}).  Only ``n_steps`` is projected into
    ``extra_info.difficulty``; the projection is explicit, because ``dict(row)``
    or a field loop would silently carry the extra key.
 6. **``sentence_label`` is ``in_topic`` / ``out_topic``, not
-   ``out_of_topic``.**  Doc section 4.5 says the labels are "``in_topic`` 还是
+   ``out_of_topic``.**  Doc section 4.4 says the labels are "``in_topic`` 还是
    ``out_of_topic``".  Measured: only ``in_topic`` (26,756) and ``out_topic``
    (31,296) ever occur -- a filter written against the doc's spelling matches
    0 rows.
-7. **640 answers are comma-grouped and are normalised here.**  Doc section 4.5
+7. **640 answers are comma-grouped and are normalised here.**  Doc section 4.4
    treats ``answer`` as a plain number.  Measured: 640 2step rows carry a
    thousands separator (``"845,640"``), on which ``float(answer)`` raises
    ``ValueError``.  The adapter strips the separator, so the stored gold is the
    numerically identical plain digit string (``"845640"``); the reward's matcher
    never sees a comma-formatted gold.
-8. **The doc's own "2,000 GSM-IC rows" quota silently means 100 problems x 20.**
-   Doc section 4.9.3 table B row 1 and section 4.5 cap GSM-IC at 2,000 rows and
-   say nothing about the 100-distinct-base collapse (recon hazard 5) or the
-   9.5x-640x per-problem replication.  This adapter keeps the 2,000 quota but
-   makes the per-problem budget an explicit constant
-   (:data:`MAX_PER_BASE_QUESTION`).
+8. **The pool is capped per base question, not read off a flat row quota.**  Doc
+   section 4.8 table B row 1 assigns GSM-IC **772** rows (D27 gave 428 of the
+   original 1,200 to FalseQA-answerable and TreeCut) and says nothing about the
+   100-distinct-base collapse (recon hazard 5) or the 9.5x-640x per-problem
+   replication.  This adapter builds **800** rows -- 100 problems x
+   :data:`MAX_PER_BASE_QUESTION` = 8 -- i.e. a flat per-problem budget and a
+   small buffer over the mix quota, instead of a lopsided draw over 58,052
+   near-duplicates.
 
 Where the design doc and the measurements *agree* (recorded so the agreement is
 auditable): file sizes and row counts 34,220 / 23,832 / 58,052; the ``out_topic``
@@ -137,9 +142,10 @@ disagreements.
 Not this adapter's job
 ----------------------
 
-* **D17 distractor synthesis** (replaying these templates onto SUM/UMWP/K&K) is
-  a separate deliverable; this file only emits native GSM-IC rows and exposes
-  the template inventory as a by-product of the funnel.
+* **D17 distractor synthesis** (replaying these templates onto UMWP-answerable
+  200 / K&K 100 / stage-1 main-pool 100, design doc section 4.7) is a separate
+  deliverable; this file only emits native GSM-IC rows and exposes the template
+  inventory as a by-product of the funnel.
 * **GSM8K-test contamination: measured, and absent.**  All 100 base questions
   join to GSM8K **train**; **0 of 100** occur in GSM8K **test**.  No base
   question is dropped for contamination, and GSM-IC contributes no leak into the
@@ -190,7 +196,7 @@ SOURCE_FILES = ("GSM-IC_2step.json", "GSM-IC_mstep.json")
 # purpose (report section 5) and their absence is a hard failure, not a warning.
 CROSS_CHECK_FILES = ("gsm8k_train.jsonl", "gsm8k_test.jsonl")
 
-# Contract placement (design doc sections 3, 4.5, 4.9.3): the distractor branch
+# Contract placement (design doc sections 3, 4.4, 4.8): the distractor branch
 # is solvable + numeric + option-less, so it lands on the numeric branch with
 # template B.
 BRANCH = schema.BRANCH_SOLVABLE_NUMERIC
@@ -198,10 +204,11 @@ TEMPLATE = schema.TEMPLATE_B
 PERTURBATION_TYPE = "distracting_condition"
 
 # At most this many rows per distinct ``original_question``.  100 base questions
-# x 20 lands exactly on the 2,000-row quota the design doc's D18 assigns to
-# GSM-IC, with a flat per-problem budget rather than a lopsided one.  See the
-# module docstring, "The per-base-question cap".
-MAX_PER_BASE_QUESTION = 20
+# x 8 lands on **800** rows: a flat per-problem budget and a small buffer over
+# the 772-row quota design doc section 4.8 table B row 1 assigns to GSM-IC after
+# D27 (the mix does the final trim).  See the module docstring, "The
+# per-base-question cap".
+MAX_PER_BASE_QUESTION = 8
 
 # ``<<expr=val>>`` calculator annotations in a GSM8K solution (the OpenAI
 # grade-school-math convention this source inherits).

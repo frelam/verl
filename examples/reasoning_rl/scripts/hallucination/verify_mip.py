@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Independent audit of the MiP adapter artifact (design doc section 4.9).
+"""Independent audit of the MiP adapter artifact (design doc sections 4.2 and 9).
 
 Usage::
 
@@ -20,39 +20,47 @@ Usage::
 Every check prints ``PASS``/``FAIL`` and the process exits non-zero if any
 check failed.  The audit reads **only** the artifact -- it never opens
 ``/home/charles/data/...`` and never imports the adapter -- so a bug in the
-adapter's own certificates cannot hide here.  Every gold is re-derived from the
-row's own bytes with a second implementation:
+adapter's own certificates cannot hide here.  Every certificate is re-derived
+from the row's own bytes with a second implementation:
 
 * the deleted span is recovered by diffing ``insufficient -> original``
   *backwards* (the adapter's admission diff runs forwards, so this is an
   independent witness, not the same computation read back);
-* the gsm8k gold is recomputed by evaluating the arithmetic the source wrote;
-* the math gold is re-extracted as the last ``\\boxed{}`` the solution reaches;
-* the surface-cue check is a from-scratch numpy multinomial Naive Bayes.
+* the necessity of the deleted value is re-proved against the derivation text
+  the adapter stored in ``extra_info.perturbed_entity_text``;
+* the surface-cue check is a from-scratch replay of the option leak that
+  motivated D12.
+
+The artifact is **single-sided by design**: D12/Q7 keep MiP's solvable side out
+of the pool, so every row is the unsolvable three-tier branch.  The two-sided
+checks of the earlier revision -- solvable-gold recomputation, pair
+reconstruction against a solvable twin, and the solvable-vs-unsolvable Naive
+Bayes -- therefore have no input here and are reported as not applicable rather
+than computed on one class.
 
 Checks
 ------
 
 ``schema``   :func:`schema.validate_row` over every row (the design's contract).
 ``contract`` D12 / template / branch / task_id / prompt-shape invariants.
-``L1``       per-row label certificate: re-derive the gold from the row alone.
+``L1``       per-row label certificate: re-derive the deleted span and re-prove
+             its necessity from the row alone.
 ``L2``       gold uniqueness: the deleted value is *really* gone from the
-             presented question, exactly one value was deleted, the pair's
-             shared premise still matches, and the solvable gold is the single
-             value of the derivation's final step.  "Really gone" is the
-             recon's membership convention (string-normalised: a deleted
-             ``$4.00`` counts as gone even if the question still says ``4``);
-             rows where the deleted value survives in *another spelling* are
-             listed for review rather than failed, since the surviving token is
-             usually a different quantity in a different role (a deleted
+             presented question and exactly one value was deleted.  "Really
+             gone" is the recon's membership convention (string-normalised: a
+             deleted ``$4.00`` counts as gone even if the question still says
+             ``4``); rows where the deleted value survives in *another spelling*
+             are listed for review rather than failed, since the surviving token
+             is usually a different quantity in a different role (a deleted
              ``$2.00`` coupon next to "buys 2 packs").
 ``L3a/b``    D12 invariant (no row carries an option block or a diagnosis
              label) plus a re-measurement of the option leak that motivated it.
-``L3c``      bag-of-words multinomial Naive Bayes, 5-fold out-of-fold balanced
-             accuracy between solvable and unsolvable, vocabulary restricted to
-             train support >= 5.  Raw number reported verbatim; the sign-flipped
-             reading and a length-only baseline are printed next to it because
-             the recon documents this estimator flipping sign out of fold.
+``L3c``      reported as not applicable: with the solvable side out of the pool
+             (D12/Q7) there is one class left, so a balanced-accuracy test is
+             undefined on this artifact.  The adapter's DEVIATIONS 4 records the
+             same change; the number the earlier two-sided revision printed here
+             cannot be reproduced from a single-sided artifact, and pretending
+             otherwise would be the dishonest option.
 """
 
 from __future__ import annotations
@@ -61,9 +69,7 @@ import argparse
 import collections
 import difflib
 import json
-import math
 import os
-import random
 import re
 import sys
 from decimal import Decimal, InvalidOperation
@@ -76,12 +82,7 @@ except ImportError:  # pragma: no cover - only when imported from elsewhere
 
 DEFAULT_ROWS = "/tmp/halluc_mip.parquet"
 MIN_L1_SAMPLE = 50
-NB_FOLDS = 5
-NB_MIN_SUPPORT = 5
-NB_ALPHA = 1.0
-NB_BA_LIMIT = 0.60
 
-SOLVABLE_BRANCH = schema.BRANCH_SOLVABLE_NUMERIC
 UNSOLVABLE_BRANCH = schema.BRANCH_UNSOLVABLE_BARE
 
 # ---------------------------------------------------------------------------
@@ -90,10 +91,6 @@ UNSOLVABLE_BRANCH = schema.BRANCH_UNSOLVABLE_BARE
 
 _WS_RE = re.compile(r"\s+")
 _NUM_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
-_ANN_RE = re.compile(r"<<([^>]*)>>")
-_BOXED_RE = re.compile(r"\\boxed\s*\{")
-_TRAILER_RE = re.compile(r"=\s*\$?\s*(-?\d[\d,]*(?:\.\d+)?)")
-_TOKEN_RE = re.compile(r"[a-z0-9']+")
 _SENT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -178,40 +175,6 @@ def forward_deleted(original: str, insufficient: str) -> tuple[str, str, int]:
         if tag in ("insert", "replace"):
             inserted.extend(b_words[j1:j2])
     return " ".join(deleted), " ".join(inserted), len(ops)
-
-
-def last_boxed(text: str) -> str | None:
-    result: str | None = None
-    for match in _BOXED_RE.finditer(text or ""):
-        start, depth, i = match.end(), 1, match.end()
-        while i < len(text) and depth:
-            if text[i] == "\\":
-                i += 2
-                continue
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-            i += 1
-        if depth == 0:
-            result = text[start : i - 1]
-    return result
-
-
-def eval_expression(expression: str) -> float | None:
-    cleaned = (expression or "").strip().replace("^", "**")
-    if not cleaned or not re.fullmatch(r"[0-9+\-*/(). ]+", cleaned):
-        return None
-    try:
-        return eval(cleaned, {"__builtins__": {}}, {})  # noqa: S307 - digits only
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def last_equals_value(text: str) -> str | None:
-    """The right-hand side of the *last* ``= <number>`` anywhere in ``text``."""
-    matches = _TRAILER_RE.findall(text or "")
-    return matches[-1] if matches else None
 
 
 def sentence_spans(text: str) -> list[tuple[int, int, str]]:
@@ -326,22 +289,17 @@ def check_contract(report: Report, rows: list[dict]) -> None:
                 problems.append(f"{task_id}: unsolvable branch with a mismatched task_id")
             if "\\boxed{UNSOLVABLE}" not in row["prompt"][0]["content"]:
                 problems.append(f"{task_id}: prompt does not ask for the UNSOLVABLE marker")
-        elif branch == SOLVABLE_BRANCH:
-            if not gt["solvable"] or not gt["answer"]:
-                problems.append(f"{task_id}: solvable row without an answer")
-            if not task_id.endswith("-solvable"):
-                problems.append(f"{task_id}: solvable branch with a mismatched task_id")
-            if not row["prompt"][0]["content"].startswith(info["paired_original_text"]):
-                problems.append(f"{task_id}: solvable prompt is not the source question")
         else:
-            problems.append(f"{task_id}: unexpected branch {branch!r}")
+            # D12/Q7: the solvable twin is out of the pool, so any other branch
+            # is a contract violation rather than a tolerated variant.
+            problems.append(f"{task_id}: unexpected branch {branch!r} (D12/Q7: unsolvable only)")
     # index must match the row's position (the mix stage relies on it)
     for position, row in enumerate(rows):
         if row["extra_info"]["index"] != position:
             problems.append(f"{row['extra_info']['task_id']}: index != position")
             break
     report.check(
-        "contract (D12 / template B / branch / prompt)",
+        "contract (D12 / template B / unsolvable-only branch / prompt)",
         not problems,
         f"{len(rows)} rows, {len(problems)} problems"
         + (f" | first: {problems[0]}" if problems else ""),
@@ -349,9 +307,8 @@ def check_contract(report: Report, rows: list[dict]) -> None:
 
 
 def check_l1(report: Report, rows: list[dict]) -> None:
-    """Re-derive every row's gold from its own bytes, with a second implementation."""
+    """Re-derive every row's certificate from its own bytes, with a second implementation."""
     unsolvable = [r for r in rows if r["extra_info"]["branch"] == UNSOLVABLE_BRANCH]
-    solvable = [r for r in rows if r["extra_info"]["branch"] == SOLVABLE_BRANCH]
 
     bad_unsolvable: list[str] = []
     for row in unsolvable:
@@ -421,52 +378,16 @@ def check_l1(report: Report, rows: list[dict]) -> None:
         if info["error_type"] != "missing_condition":
             bad_unsolvable.append(f"{task_id}: unexpected error_type {info['error_type']!r}")
 
-    bad_solvable: list[str] = []
-    tiers: collections.Counter[str] = collections.Counter()
-    for row in solvable:
-        info = row["extra_info"]
-        task_id = info["task_id"]
-        derivation = info["perturbed_entity_text"]
-        gold = json.loads(row["reward_model"]["ground_truth"])["answer"]
-        if task_id.split("-")[1] == "math":
-            boxed = last_boxed(derivation)
-            if boxed is None or norm_ws(boxed) != norm_ws(gold):
-                bad_solvable.append(f"{task_id}: last \\boxed{{{boxed}}} != gold {gold!r}")
-            else:
-                tiers["solution_boxed"] += 1
-            continue
-        recomputed, tier = _recompute_gsm8k(derivation)
-        # Numeric, not string, equality: the source may state the same value as
-        # "16.00" where the key says "16", and that is a spelling difference, not
-        # a different gold (the recon's necessity convention: Decimals, with only
-        # the percent fold -- which does not arise between two golds).
-        if recomputed is None or as_decimal(recomputed) != as_decimal(gold):
-            bad_solvable.append(f"{task_id}: recomputed {recomputed!r} != gold {gold!r}")
-        else:
-            tiers[tier] += 1
-
     report.info(
         "L1 sample",
-        f"{len(unsolvable) + len(solvable)} of {len(rows)} rows audited "
-        f"(floor {MIN_L1_SAMPLE}); unsolvable-by-reconstruction {len(unsolvable)}, "
-        f"solvable-by-recomputation {len(solvable)}",
-    )
-    report.info(
-        "L1 gsm8k recomputation tiers",
-        "recomputed from the source's own arithmetic: "
-        + ", ".join(f"{name}={count}" for name, count in sorted(tiers.items())),
+        f"{len(unsolvable)} of {len(rows)} rows audited (floor {MIN_L1_SAMPLE}); "
+        "every row is re-certified -- the artifact carries no solvable twin (D12/Q7)",
     )
     report.check(
         "L1 unsolvable: deleted span re-derived + necessity re-proved",
         not bad_unsolvable,
         f"{len(unsolvable)} rows, {len(bad_unsolvable)} uncertified"
         + (f" | first: {bad_unsolvable[0]}" if bad_unsolvable else ""),
-    )
-    report.check(
-        "L1 solvable: gold recomputed from the derivation",
-        not bad_solvable,
-        f"{len(solvable)} rows, {len(bad_solvable)} uncertified"
-        + (f" | first: {bad_solvable[0]}" if bad_solvable else ""),
     )
 
 
@@ -488,46 +409,13 @@ def _value_in_chain(value: str, chain: str) -> bool:
     return False
 
 
-def _recompute_gsm8k(derivation: str) -> tuple[str | None, str]:
-    """Recompute the gsm8k answer: the final stated step must equal the key.
-
-    Two independent recomputations, both from the source's own text:
-    ``annotation`` re-evaluates the last ``<<expr=val>>``; ``final_step`` reads
-    the value to the right of the last ``=`` in the whole text.  The check
-    passes when either agrees with the ``####`` key, which is exactly the
-    adapter's own admission rule re-derived rather than trusted.
-    """
-    key_match = re.search(r"####\s*(.+?)\s*$", (derivation or "").strip(), re.S)
-    if key_match is None:
-        return None, "no_key"
-    key = key_match.group(1).strip().replace(",", "").replace("$", "").rstrip(".")
-    pairs = [body.rsplit("=", 1) for body in _ANN_RE.findall(derivation or "") if "=" in body]
-    for expression, value in reversed(pairs):
-        evaluated = eval_expression(expression)
-        if evaluated is None:
-            continue
-        if as_decimal(value) == as_decimal(key) == as_decimal(str(evaluated)):
-            return value.strip(), "annotation"
-    trailer = last_equals_value(derivation)
-    if trailer is not None and as_decimal(trailer) == as_decimal(key):
-        return trailer, "final_step"
-    return None, "uncertified"
-
-
 def check_l2(report: Report, rows: list[dict]) -> None:
     """Gold uniqueness: the deleted value is really, unambiguously absent."""
     unsolvable = [r for r in rows if r["extra_info"]["branch"] == UNSOLVABLE_BRANCH]
-    solvable_by_base: dict[str, dict] = {}
-    for row in rows:
-        if row["extra_info"]["branch"] == SOLVABLE_BRANCH:
-            solvable_by_base[row["extra_info"]["task_id"][: -len("-solvable")]] = row
 
     still_readable: list[str] = []
     same_value_other_spelling: list[str] = []
     multi_value: list[str] = []
-    broken_pair: list[str] = []
-    conflicted_final: list[str] = []
-    checked_pairs = 0
 
     for row in unsolvable:
         info = row["extra_info"]
@@ -558,36 +446,13 @@ def check_l2(report: Report, rows: list[dict]) -> None:
                         f"{task_id}: deleted {values[0]!r}, question still spells {token!r}"
                     )
                     break
-        # the paired contrast: the same premise must be present on the other side
-        base = task_id[: -len("-unsolvable")]
-        twin = solvable_by_base.get(base)
-        if twin is not None:
-            checked_pairs += 1
-            if norm_ws(recovered) not in norm_ws(twin["extra_info"]["paired_original_text"]):
-                broken_pair.append(f"{task_id}: recovered span missing from the solvable twin")
-
-    for twin in solvable_by_base.values():
-        info = twin["extra_info"]
-        if info["task_id"].split("-")[1] != "gsm8k":
-            continue
-        gold = json.loads(twin["reward_model"]["ground_truth"])["answer"]
-        # "the only admissible option": the derivation's final stated value is
-        # the gold and nothing else is claimed as the answer.
-        final = last_equals_value(info["perturbed_entity_text"])
-        key = re.search(r"####\s*(.+?)\s*$", info["perturbed_entity_text"].strip(), re.S)
-        key_value = key.group(1).strip() if key else None
-        for candidate, label in ((final, "final step"), (key_value, "answer key")):
-            if candidate is not None and as_decimal(candidate) != as_decimal(gold):
-                conflicted_final.append(
-                    f"{info['task_id']}: {label} claims {candidate!r} but gold is {gold!r}"
-                )
-                break
 
     report.info(
         "L2 scope",
         "MiP rows carry no option block (D12), so uniqueness is audited as "
-        "\"the deleted value is really absent from the presented question\" "
-        f"plus the pair reconstruction; {checked_pairs} pairs checked",
+        "\"the deleted value is really absent from the presented question\"; "
+        "the solvable-twin reconstruction of the earlier revision is out of scope "
+        "because D12/Q7 keep that side out of the pool",
     )
     report.check(
         "L2 deleted value is really absent (recon spelling convention)",
@@ -604,18 +469,6 @@ def check_l2(report: Report, rows: list[dict]) -> None:
             "usually an unrelated quantity). Review rather than trust: "
             + "; ".join(same_value_other_spelling[:3]),
         )
-    report.check(
-        "L2 pair reconstruction (deleted span present in the solvable twin)",
-        not broken_pair,
-        f"{checked_pairs} pairs, {len(broken_pair)} broken"
-        + (f" | first: {broken_pair[0]}" if broken_pair else ""),
-    )
-    report.check(
-        "L2 solvable gold is the unique final value of its derivation",
-        not conflicted_final,
-        f"{len(solvable_by_base)} solvable rows, {len(conflicted_final)} with a rival gold"
-        + (f" | first: {conflicted_final[0]}" if conflicted_final else ""),
-    )
 
 
 def check_l3_ab(report: Report, rows: list[dict]) -> None:
@@ -672,165 +525,21 @@ def check_l3_ab(report: Report, rows: list[dict]) -> None:
             "L3 D12 justification",
             "any option set built from these deletions is guessable at "
             f"{any_absent / with_sentence:.1%} by \"pick the option that is missing from "
-            "the question\", so the adapter builds none (doc section 4.3 says 95.6%; the "
+            "the question\", so the adapter builds none (doc section 4.2 says 95.6%; the "
             "recon measured 100.0% and this re-measurement agrees)",
         )
 
-
-# ---------------------------------------------------------------------------
-# L3c: from-scratch multinomial Naive Bayes (sklearn is not installed)
-# ---------------------------------------------------------------------------
-
-
-def _bag(text: str) -> list[str]:
-    return [m.group(0) for m in _TOKEN_RE.finditer((text or "").lower())]
-
-
-def _balanced_accuracy(y_true: list[int], y_pred: list[int]) -> float:
-    recalls = []
-    for label in (0, 1):
-        idx = [i for i, y in enumerate(y_true) if y == label]
-        if not idx:
-            continue
-        recalls.append(sum(y_pred[i] == label for i in idx) / len(idx))
-    return sum(recalls) / len(recalls) if recalls else float("nan")
-
-
-def _naive_bayes_oof(
-    docs: list[list[str]],
-    labels: list[int],
-    *,
-    folds: int = NB_FOLDS,
-    seed: int = 0,
-    min_support: int = NB_MIN_SUPPORT,
-    alpha: float = NB_ALPHA,
-) -> tuple[float, list[float], int]:
-    """Out-of-fold balanced accuracy of a multinomial NB, plus diagnostics.
-
-    Vocabulary is restricted to tokens appearing in at least ``min_support``
-    *training* documents of the fold, per the audit contract.  The returned
-    ``scores`` are the model's own class-separation margins on the held-out
-    fold (mean log-odds for the positive class minus the negative class), which
-    is what exposes the sign-flip: a healthy classifier separates the training
-    fold the same way it separates the held-out fold.
-    """
-    rng = random.Random(seed)
-    order = list(range(len(docs)))
-    rng.shuffle(order)
-    fold_of = {index: position % folds for position, index in enumerate(order)}
-
-    predictions: list[int | None] = [None] * len(docs)
-    margins: list[float] = []
-    vocab_sizes: list[int] = []
-    for fold in range(folds):
-        test = [i for i in range(len(docs)) if fold_of[i] == fold]
-        train = [i for i in range(len(docs)) if fold_of[i] != fold]
-        support: collections.Counter[str] = collections.Counter()
-        for index in train:
-            support.update(set(docs[index]))
-        vocab = {token for token, count in support.items() if count >= min_support}
-        vocab_sizes.append(len(vocab))
-
-        counts = {0: collections.Counter(), 1: collections.Counter()}
-        totals = {0: 0, 1: 0}
-        n_docs = {0: 0, 1: 0}
-        for index in train:
-            label = labels[index]
-            n_docs[label] += 1
-            for token in docs[index]:
-                if token in vocab:
-                    counts[label][token] += 1
-                    totals[label] += 1
-        log_prior = {
-            label: math.log(max(n_docs[label], 1) / max(len(train), 1)) for label in (0, 1)
-        }
-        vocab_list = sorted(vocab)
-        for index in test:
-            scores = {}
-            for label in (0, 1):
-                score = log_prior[label]
-                denominator = totals[label] + alpha * max(len(vocab_list), 1)
-                for token in docs[index]:
-                    if token in vocab:
-                        score += math.log(
-                            (counts[label][token] + alpha) / denominator
-                        )
-                scores[label] = score
-            margins.append(scores[1] - scores[0])
-            predictions[index] = 1 if scores[1] > scores[0] else 0
-
-    balanced = _balanced_accuracy(labels, [p if p is not None else 0 for p in predictions])
-    return balanced, margins, max(vocab_sizes) if vocab_sizes else 0
-
-
-def check_l3c(report: Report, rows: list[dict]) -> None:
-    solvable = [r for r in rows if r["extra_info"]["branch"] == SOLVABLE_BRANCH]
-    unsolvable = [r for r in rows if r["extra_info"]["branch"] == UNSOLVABLE_BRANCH]
-    if not solvable or not unsolvable:
-        report.note(
-            "L3c skipped",
-            f"the artifact has one side only (solvable={len(solvable)}, "
-            f"unsolvable={len(unsolvable)}); a balanced-accuracy test is undefined, so "
-            "the option-presence/length cues above are the whole L3 evidence",
-        )
-        return
-
-    # The bag is the *question*, not the whole prompt: the template B tail is
-    # byte-identical on both sides, so including it would only dilute the signal
-    # with a constant.
-    docs, labels = [], []
-    for row in solvable:
-        docs.append(_bag(presented_question(row)))
-        labels.append(1)
-    for row in unsolvable:
-        docs.append(_bag(presented_question(row)))
-        labels.append(0)
-
-    balanced, margins, vocab_size = _naive_bayes_oof(docs, labels)
-    report.info(
-        "L3c setup",
-        f"n={len(docs)} (solvable {len(solvable)} / unsolvable {len(unsolvable)}), "
-        f"{NB_FOLDS}-fold out-of-fold, vocab = train tokens with support >= {NB_MIN_SUPPORT} "
-        f"(largest fold vocabulary {vocab_size} types), alpha={NB_ALPHA}, sklearn absent -> "
-        "own numpy/python implementation",
+    # The earlier revision also ran a 5-fold bag-of-words Naive Bayes between the
+    # solvable and unsolvable sides.  With the solvable side out of the pool
+    # (D12/Q7) there is no negative class left, so that reading is undefined --
+    # reported here rather than silently dropped.
+    report.note(
+        "L3c not applicable",
+        "the artifact is single-sided by design (D12/Q7 keep MiP's solvable side out of "
+        "the pool), so the solvable-vs-unsolvable balanced-accuracy test has one class "
+        "and cannot be computed; the option-leak re-measurement above is the L3 evidence "
+        "for this source",
     )
-    report.check(
-        f"L3c out-of-fold balanced accuracy <= {NB_BA_LIMIT:.2f}",
-        balanced <= NB_BA_LIMIT,
-        f"raw balanced accuracy = {balanced:.4f} (chance 0.5000, limit {NB_BA_LIMIT:.2f})",
-    )
-
-    inverted = 1.0 - balanced
-    lengths = {1: [len(d) for d, y in zip(docs, labels, strict=False) if y == 1],
-               0: [len(d) for d, y in zip(docs, labels, strict=False) if y == 0]}
-    print(
-        f"NOTE  L3c raw diagnostics  inverted reading = {inverted:.4f} "
-        f"(a multinomial NB whose sign flips out of fold scores below chance, so the "
-        f"raw {balanced:.4f} is not by itself evidence that the two sides are "
-        f"indistinguishable); mean token count solvable {sum(lengths[1]) / len(lengths[1]):.1f} "
-        f"vs unsolvable {sum(lengths[0]) / len(lengths[0]):.1f}"
-    )
-    # length-only baseline: the strongest single surface cue, measured not assumed
-    best = 0.0
-    best_threshold = 0
-    for threshold in sorted(set(lengths[1] + lengths[0])):
-        predicted = [1 if len(doc) >= threshold else 0 for doc in docs]
-        score = _balanced_accuracy(labels, predicted)
-        if score > best:
-            best, best_threshold = score, threshold
-    print(
-        f"NOTE  L3c length-only baseline  best balanced accuracy = {best:.4f} at "
-        f"token-count threshold {best_threshold} (a length cue is a surface cue, not an "
-        "option-selection shortcut: D12 leaves no option block to select)"
-    )
-    if inverted > NB_BA_LIMIT or best > NB_BA_LIMIT:
-        report.note(
-            "L3c caveat",
-            "the raw balanced accuracy passes, but the un-inverted reading "
-            f"({inverted:.4f}) and/or the length-only baseline ({best:.4f}) exceed "
-            f"{NB_BA_LIMIT:.2f}: this source's two sides are separable by length. Both "
-            "numbers are printed on every run rather than hidden behind the raw figure.",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -861,7 +570,6 @@ def main(argv: list[str] | None = None) -> int:
     check_l1(report, rows)
     check_l2(report, rows)
     check_l3_ab(report, rows)
-    check_l3c(report, rows)
 
     print(
         f"\n{len(report.passed)} check(s) passed, {len(report.failed)} failed"

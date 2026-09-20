@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Audit the GSM-IC branch parquet produced by ``gsmic_adapter.py``.
+"""Audit the GSM-IC branch parquet produced by ``gsm_ic_adapter.py``.
 
 Three layers, printed as ``PASS`` / ``FAIL`` per check; the process exits
 non-zero if any check fails.  Nothing here trusts the adapter: the gold is

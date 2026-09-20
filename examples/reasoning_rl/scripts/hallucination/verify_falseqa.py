@@ -21,7 +21,7 @@ Usage::
 Reads the artifact and re-derives every certificate **from the row's own two
 texts** (``prompt`` question + ``extra_info.paired_original_text``) plus the raw
 CSV; it never calls the adapter and never trusts the adapter's verdict.  Prints
-``PASS``/``FAIL`` per check, informational ``----`` lines for the measurements
+``PASS``/``FAIL`` per check, unlabelled informational lines for the measurements
 that are *not* gates, and exits non-zero if any check fails.
 
 Layers
@@ -32,53 +32,67 @@ positive ``--per-branch`` subsamples, which is a fast smoke mode and explicitly 
 a certificate -- a gold flipped on a row outside the sample is invisible to a
 sampled audit, so the default audits all rows).  The raw CSV is re-read and the
 source's blocked layout is explicitly undone: for a row recorded as
-``(split, side, k)``, the
-presented question must be row ``k`` of the source's ``label`` block for that
-side, and ``paired_original_text`` must be the *same* index ``k`` of the *other*
-block.  That is the "row k of label=1 is a rewrite of row k of label=0" claim,
-proved against the file rather than restated.
+``(split, side, k)``, the presented question must be row ``k`` of the source's
+``label`` block for that side, and ``paired_original_text`` must be the *same*
+index ``k`` of the *other* block.  That is the "row k of label=1 is a rewrite of
+row k of label=0" claim, proved against the file rather than restated.  The
+``(split, k)`` pair is read out of ``task_id`` rather than ``extra_info``, so the
+audit still anchors after ``mix_halluc`` has re-indexed the rows.
 
 The defect is then re-derived by diffing the two texts word-by-word
 (``autojunk=False``): there must be exactly one changed region visible on the fake
-side, the recorded gold must be that region's text, it must carry a content word,
-its first token must occur exactly once in the question, and the recorded
-deleted/inserted pair must replay one question into the other as a token multiset.
-The audit does not import the adapter's diff -- it re-runs it on the artifact.
+side and the recorded deleted/inserted pair must replay one question into the
+other as a token multiset.  The audit does not import the adapter's diff -- it
+re-runs it on the artifact.  On ``unsolvable_diag`` rows the region also has to be
+the recorded **gold replacement pair**: the gold option's left item equals the
+region's fake-side text and its right item the region's real-side text, with the
+left item verbatim in the question, carrying a content word, locatable by its
+first token, and the right item non-empty and absent from the question.
 
-**L2 -- gold uniqueness.**  ``unsolvable_diag``: every distractor must occur in the
-paired real question and the gold must not, so the gold is the only admissible
-option.  ``solvable_judge``: the row is a verdict row, so the check is that it
-carries no correct option (a correct option there would be an unearnable gold).
+**L2 -- the pair certificate.**  ``unsolvable_diag``: the gold pair is the
+*recorded replacement between the twins* -- the left item occurs in the presented
+question but not in the paired real question, and the right item occurs in the
+paired real question (it is the fragment that repairs the premise).
+``solvable_two_layer``: the row is a
+placeholder row, so the check is that it carries no correct option and no
+diagnosis label, while its gold is the source's own answer.
 
-**L3 -- option structure** (all rows, hard).  Every option must be a verbatim span
-of the row's own question; every option in a row must have the same word-token
-length (and, on diagnosis rows, the same length as the gold); both labels must
-offer the same number of options (D15/D14 -- a differing count would be a
-branch-identifying shortcut).
+**L3 -- replacement-pair structure** (all rows, hard).  Every option must be a
+``left -> right`` pair; all left items of a row must be identical and verbatim
+spans of the row's own question; the right items must be pairwise distinct, all
+of the same word count and the same surface type, and none of them may occur in
+the question (section 4.3: all three right items out-of-passage is what makes the
+"pick the right item not in the passage" heuristic undefined).  Both branches must
+offer the same option count (D15/D18).
 
 **L4 -- heuristic audit** (diagnosis rows, hard: each within the random baseline
-plus 10 points).  "Pick the option absent from the question" must be **0** -- the
-D13 rule makes it undefined, not merely weak -- and the longest-option,
-unique-capital and unique-digit rules must stay inside ``1/k + 0.10``.  The
-longest-option rule is measured on **character** length, three ways (as stated with
-a first-index tie-break, on the subset with a unique maximum, and in the degenerate
-token-count reading the doc's 30.9% comes from), because the source makes character
-length a real cue: the pointed-at fragment is a rewrite or an insertion and is often
-longer than the same-length windows around it.  Equal *token* length is what keeps
-the cue inside the budget, and the artifact passes on all three splits (0.391 /
-0.396 / 0.428 against 0.433) with just 0.6 points of headroom on ``test``.
+plus 10 points).  "Pick the pair whose right item is absent from the question"
+must be **0** -- the D21 rule makes it undefined, not merely weak -- and the
+longest-option, unique-capital and unique-digit rules must stay inside
+``1/k + 0.10``.  The longest-option rule is measured on the whole option text
+(whose only varying part is the right item).
 
-**L5 -- cross-question control.**  The same "in-question option" rule that finds
-nothing in this artifact is re-run on a *synthetic* block built the way D13 bans
-(one distractor borrowed from a different question): it then identifies the gold
-every time.  The control is the evidence that the same-question rule is
-load-bearing rather than decorative.
+**L5 -- mirror control.**  The same "out-of-passage right item" rule that finds
+nothing in this artifact is re-run on a *synthetic* block built the way D21 bans
+(both distractor right items taken from the presented question): it then
+identifies the gold every time.  The control is the evidence that the
+out-of-passage rule is load-bearing rather than decorative.
+
+**Pair atomicity.**  Every row's ``extra_info.pair_id`` must be
+``"{source split}:{index}"`` from its own ``task_id``, and no two rows sharing a
+``pair_id`` may land on opposite sides of the train/val boundary (D27).  The mixer
+enforces this through ``mix_halluc.enforce_pair_atomicity``; the audit re-derives
+it from the artifact.
 
 **Informational (not gates).**  The L1 corroboration flag (what share of the
-dataset's own rebuttals name the gold span -- the sample doc's human-review hook),
-the H6 bag-of-words Naive Bayes reading of the label task, the gold-position
-distribution the section 10 monitoring expects to be ~1/k, and the per-branch
-option character-length spread that the D14 isomorphism depends on.
+dataset's own rebuttals name the gold fragment -- the sample doc's human-review
+hook), the H6 bag-of-words Naive Bayes reading of the label task, the gold-position
+distribution the section 10 monitoring expects to be ~1/k, the per-branch option
+character-length spread the D18 isomorphism depends on, the distractor-quality
+spot-check sample (N=50, section 9 / Q9) and the corpus-frequency cue the
+distractor pool leaves behind (printed rather than hidden: it is a property of the
+source's vocabulary, not of the option block, and section 9's gate list does not
+include it).
 
 The H6 numbers are printed under **both** foldings, because the doc's two H6
 columns are not reproducible together: its AUC row (0.172 train) is an ungrouped
@@ -119,16 +133,24 @@ except ImportError:  # pragma: no cover - running as a plain script
 # measured off the artifact below, and the budget is derived from the measured k.
 K_OPTIONS = 3
 MAX_CHAR_RATIO = 2.0
-MARKER_SOLVABLE = "\\boxed{SOLVABLE}"
+#: The D21 replacement-pair arrow (``man -> women``).  Re-declared, for the same
+#: reason as ``K_OPTIONS``.
+PAIR_ARROW = " -> "
+#: The two verdicts template A offers (design doc section 5.2, the wording every
+#: option-block row shares).  The *marker* strings are what the reward parses, so
+#: the audit checks that the prompt offers both bullets instead of trusting the
+#: option block to imply them.  ``\boxed{SOLVABLE}`` is deliberately absent: the
+#: reward accepts it on the ``solvable_answer`` branch, but template A never asks
+#: for it, and a prompt that offered it would be a different scaffold.
+MARKER_ANSWER = "\\boxed{<答案>}"
 MARKER_UNSOLVABLE = "\\boxed{UNSOLVABLE"
+MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>}"
+MARKER_VERDICTS = (MARKER_ANSWER, MARKER_UNSOLVABLE_ID)
 #: The whole wording of template A that is *not* the row's own text: the verdict
 #: instruction between the question and the block, and the header that opens the
-#: block.  Re-declared here rather than imported from the adapter, for the same
-#: reason as ``K_OPTIONS`` -- a check that reads its expectations out of the code
-#: under test is not a check.
+#: block.
 OPTION_HEADER = "选项："
-MARKER_VERDICTS = (MARKER_SOLVABLE, MARKER_UNSOLVABLE)
-#: The D18 defect slot a diagnosis row fills and the section 4.4 perturbation class
+#: The D18 defect slot a diagnosis row fills and the section 4.3 perturbation class
 #: it must carry.  These are the keys the stage-2 balance table groups on, so a row
 #: whose metadata says otherwise is a bookkeeping corruption the artifact audit --
 #: not only the adapter's unit test -- has to catch.
@@ -138,10 +160,11 @@ LABEL_FALSE = "1"
 LABEL_TRUE = "0"
 
 BRANCH_DIAG = schema.BRANCH_UNSOLVABLE_DIAG
-BRANCH_JUDGE = schema.BRANCH_SOLVABLE_JUDGE
+BRANCH_ANSWERABLE = schema.BRANCH_SOLVABLE_TWO_LAYER
 
 L1_MIN_SAMPLE = 50
 L1_CORROBORATION_SAMPLE = 50  # the design doc's N=50 human-review sample
+DISTRACTOR_SAMPLE = 50  # section 9: "干扰右项也对" manual sample
 L3_MARGIN = 0.10
 H6_FOLDS = 5
 H6_MIN_SUPPORT = 5
@@ -149,10 +172,62 @@ H6_MIN_SUPPORT = 5
 #: a 1-document vocabulary memorises each test question's near-identical twin.
 H6_DOC_AUC_SUPPORT = 1
 
-#: The design doc's H6 reading (section 4.4 / section 9), all-words / function-only
+#: The design doc's H6 reading (section 4.3 / section 9), all-words / function-only
 #: / content-only, over the full split.  Printed next to the measurement; the
 #: interpretation baseline is not a gate.
 H6_DOC = {"all": 0.765, "function": 0.569, "content": 0.757}
+
+#: Suffix classes for the independent re-derivation of the adapter's surface
+#: "same type" rule (deviation 5 of the adapter).  Same table, separate copy.
+_SUFFIX_CLASSES = (
+    ("ing", 5),
+    ("ed", 4),
+    ("ly", 4),
+    ("tion", 6),
+    ("sion", 6),
+    ("ness", 6),
+    ("ity", 5),
+    ("ment", 6),
+    ("ance", 6),
+    ("ence", 6),
+    ("ous", 5),
+    ("ive", 5),
+    ("able", 6),
+    ("ible", 6),
+    ("ful", 5),
+    ("less", 6),
+    ("ist", 5),
+    ("ism", 5),
+    ("er", 5),
+    ("or", 5),
+    ("s", 4),
+)
+
+
+def _suffix_class(token: str) -> str:
+    folded = token.casefold()
+    for suffix, minimum in _SUFFIX_CLASSES:
+        if len(folded) >= minimum and folded.endswith(suffix):
+            return suffix
+    return "plain"
+
+
+def item_signature(text: str) -> tuple[int, bool, str, str]:
+    """The audit's own copy of the adapter's surface type signature."""
+    tokens = _tokens(text)
+    caps = [token[0].isupper() for token in tokens if token]
+    if not caps:
+        capitalisation = "lower"
+    elif all(caps):
+        capitalisation = "title"
+    else:
+        capitalisation = "mixed" if any(caps) else "lower"
+    return (
+        len(tokens),
+        any(ch.isdigit() for ch in text),
+        capitalisation,
+        _suffix_class(tokens[-1]) if tokens else "plain",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +262,7 @@ def _orient(row: dict) -> tuple[str, str]:
     """``(real question, fake question)`` for this row.
 
     The diff is always oriented ``real -> fake`` regardless of which side the row
-    presents: the judgment row presents the real question and points at the fake
+    presents: the answerable row presents the real question and points at the fake
     one through ``paired_original_text``, the diagnosis row the other way round.
     """
     question = question_of(row)
@@ -204,6 +279,22 @@ def _option_text(row: dict, option_id: str | None) -> str | None:
     return None
 
 
+def split_option(text: str) -> tuple[str, str] | None:
+    """``"men -> women"`` -> ``("men", "women")``, or ``None`` when malformed.
+
+    A replacement pair is exactly one arrow between two non-empty items.  An
+    option without an arrow, with two arrows, or with an empty side is a violation
+    of the D21 contract rather than a pair the audit should try to read.
+    """
+    if not isinstance(text, str) or text.count(PAIR_ARROW) != 1:
+        return None
+    left, _, right = text.partition(PAIR_ARROW)
+    left, right = left.strip(), right.strip()
+    if not left or not right:
+        return None
+    return left, right
+
+
 def _diag_rows(rows: list[dict]) -> list[dict]:
     """The diagnosis rows -- the only ones that carry a pointer gold."""
     return [
@@ -214,8 +305,12 @@ def _diag_rows(rows: list[dict]) -> list[dict]:
     ]
 
 
+def _answerable_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if row["extra_info"]["branch"] == BRANCH_ANSWERABLE]
+
+
 # ---------------------------------------------------------------------------
-# the diff, re-derived from the artifact
+# the diff and the pair identity, re-derived from the artifact
 # ---------------------------------------------------------------------------
 
 
@@ -228,7 +323,7 @@ def rederive_regions(real_q: str, fake_q: str) -> list[dict]:
 
     Word-level ``difflib`` with ``autojunk=False``; opcodes whose fake-side token
     range is empty are dropped *before* the merge, because a pure deletion is not
-    visible in the presented question and cannot be the option the model picks.
+    visible in the presented question and cannot be the item the model picks.
     Deliberately a standalone copy of the recipe: the audit must not be able to
     pass by calling the code it is auditing.
     """
@@ -259,6 +354,57 @@ def rederive_regions(real_q: str, fake_q: str) -> list[dict]:
     return regions
 
 
+def parse_task_id(task_id: str) -> tuple[str, str, int] | None:
+    """``falseqa-{side}-{split}-{index}`` -> ``(side, split, index)``, or ``None``.
+
+    The audit reads ``(split, index)`` out of the id rather than out of
+    ``extra_info``: ``mix_halluc`` re-indexes its rows and marks val rows with
+    ``split="val"``, so ``extra_info.index``/``split`` no longer name the source
+    row once the artifact has been mixed.
+    """
+    if not isinstance(task_id, str):
+        return None
+    parts = task_id.split("-")
+    if len(parts) != 4 or parts[0] != "falseqa" or parts[1] not in ("fake", "real"):
+        return None
+    try:
+        return parts[1], parts[2], int(parts[3])
+    except ValueError:
+        return None
+
+
+def source_split_of(row: dict) -> str:
+    """The source CSV this row came from, or the artifact's own ``split`` value."""
+    parsed = parse_task_id(row["extra_info"].get("task_id", ""))
+    return parsed[1] if parsed else str(row["extra_info"].get("split", ""))
+
+
+def source_index_of(row: dict) -> int | None:
+    """The pair index ``k`` this row was built from, or ``None``."""
+    parsed = parse_task_id(row["extra_info"].get("task_id", ""))
+    return parsed[2] if parsed else None
+
+
+def contains_token_window(text: str, item: str) -> bool:
+    """Whether ``item``'s token sequence occurs as a contiguous window of ``text``.
+
+    Token-level, not substring-level: the gold left item ``men`` must not count as
+    "occurring" in the paired real question ``... women ...`` just because the
+    characters are a substring of a longer word.  The *passage* test of L1/L3 stays
+    a substring test on purpose -- it re-derives the adapter's conservative gate
+    (the mirror heuristic a solver could run is a string match) -- while this
+    helper answers the semantic question "did this fragment survive the rewrite?".
+    """
+    haystack = [token.casefold() for token in _tokens(text)]
+    needle = [token.casefold() for token in _tokens(item)]
+    if not needle or len(needle) > len(haystack):
+        return False
+    return any(
+        haystack[start : start + len(needle)] == needle
+        for start in range(len(haystack) - len(needle) + 1)
+    )
+
+
 def _multiset_after_edit(real_q: str, fake_q: str, deleted: str, inserted: str) -> bool:
     """``tokens(fake)`` must equal ``tokens(real) - deleted + inserted`` as a multiset.
 
@@ -278,13 +424,15 @@ def _multiset_after_edit(real_q: str, fake_q: str, deleted: str, inserted: str) 
 # ---------------------------------------------------------------------------
 
 
-#: The source's three CSVs.  Checked rather than trusted because ``split`` is not
-#: only a CLI choice: it is read out of the artifact under audit
-#: (``row["extra_info"]["split"]``), and this file's whole purpose is to assume the
-#: artifact is hostile.  An unvalidated join would turn ``split`` into a path
-#: component, so a crafted artifact carrying ``"../../elsewhere/secret"`` would
-#: have the audit read an arbitrary file as CSV and report on it.
+#: The source's three CSVs.  Checked rather than trusted because the split is not
+#: only a CLI choice: it is read out of the artifact under audit, and this file's
+#: whole purpose is to assume the artifact is hostile.  An unvalidated join would
+#: turn it into a path component, so a crafted artifact carrying
+#: ``"../../elsewhere/secret"`` would have the audit read an arbitrary file as CSV.
 SPLITS = ("train", "valid", "test")
+#: ``extra_info.split`` values the artifact may carry: the source's own three
+#: splits (an adapter build) plus ``val`` (a mixed artifact).
+ARTIFACT_SPLITS = SPLITS + ("val",)
 
 
 def load_source_split(raw_dir: str, split: str) -> list[dict]:
@@ -297,7 +445,7 @@ def load_source_split(raw_dir: str, split: str) -> list[dict]:
 
 
 def source_blocks(raw_dir: str, split: str) -> dict[str, list[dict]]:
-    """``{"1": fake block, "0": real block}`` in file order, plus a block-size check."""
+    """``{"1": fake block, "0": real block}`` in file order."""
     rows = load_source_split(raw_dir, split)
     return {
         LABEL_FALSE: [r for r in rows if r.get("label") == LABEL_FALSE],
@@ -306,7 +454,11 @@ def source_blocks(raw_dir: str, split: str) -> dict[str, list[dict]]:
 
 
 def source_answer(row: dict) -> str:
-    """The source's own answer text, parsing ``test``'s list-repr form (doc 3.3)."""
+    """The source's own answer text, parsing ``test``'s list-repr form.
+
+    ``test``'s ``label=1`` answers are the repr of a 3-element Python list, so the
+    list form is parsed and the first element taken -- the sample doc requires it.
+    """
     text = (row.get("answer") or "").strip()
     if text.startswith("["):
         try:
@@ -318,24 +470,71 @@ def source_answer(row: dict) -> str:
     return text
 
 
-def check_split_vocabulary(rows: list[dict], reporter: Reporter) -> bool:
-    """Every row's ``split`` is one of the source's three CSVs.  Returns whether it is.
+def source_corpus(raw_dir: str, splits: list[str]) -> list[str]:
+    """Every question of the named source splits, whitespace-normalised."""
+    questions: list[str] = []
+    for split in splits:
+        for row in load_source_split(raw_dir, split):
+            question = _normalise(row.get("question", ""))
+            if question:
+                questions.append(question)
+    return questions
 
-    A gate rather than a note: ``split`` is read out of the artifact and is used
-    to build a file path, so a value the source cannot have is a boundary
-    violation, not a formatting quirk.
+
+def item_document_frequency(questions: list[str], max_tokens: int = 10) -> collections.Counter:
+    """How many *distinct* questions of the corpus contain each 1..n-token window.
+
+    Used for the informational distractor-frequency reading: a model's word prior
+    is a real cue on any option block built from a corpus, and this measures how
+    much of the gold's identity it alone would recover.
     """
-    seen = sorted({row["extra_info"].get("split") for row in rows}, key=str)
+    frequency: collections.Counter = collections.Counter()
+    for question in questions:
+        folded = question.casefold()
+        seen: set[str] = set()
+        for size in range(1, max_tokens + 1):
+            for start in range(len(_tokens(folded)) - size + 1):
+                window = " ".join(_tokens(folded)[start : start + size])
+                if window:
+                    seen.add(window)
+        frequency.update(seen)
+    return frequency
+
+
+def check_split_vocabulary(rows: list[dict], reporter: Reporter) -> bool:
+    """Every row's source split is one of the source's CSVs.  Returns whether it is.
+
+    A gate rather than a note: the source split is read out of the artifact and is
+    used to build a file path, so a value the source cannot have is a boundary
+    violation, not a formatting quirk.  The second half checks the *artifact*
+    split vocabulary (source splits plus the mixer's ``val``).
+    """
+    unparsable = [
+        row["extra_info"].get("task_id")
+        for row in rows
+        if parse_task_id(row["extra_info"].get("task_id", "")) is None
+    ]
+    seen = sorted({source_split_of(row) for row in rows}, key=str)
     unknown = [split for split in seen if split not in SPLITS]
-    return reporter.check(
-        f"contract: extra_info.split is one of {SPLITS}",
-        not unknown,
-        f"seen {seen}" if not unknown else f"unknown split(s) {unknown} in {len(rows)} rows",
+    ok = reporter.check(
+        f"contract: task_id encodes a source split in {SPLITS}",
+        not unknown and not unparsable,
+        f"seen {seen}, {len(unparsable)} unparsable task_id(s)"
+        if (unknown or unparsable)
+        else f"seen {seen} over {len(rows)} rows",
     )
+    artifact_seen = sorted({str(row["extra_info"].get("split")) for row in rows})
+    artifact_unknown = [split for split in artifact_seen if split not in ARTIFACT_SPLITS]
+    ok = reporter.check(
+        f"contract: extra_info.split is one of {ARTIFACT_SPLITS}",
+        not artifact_unknown,
+        f"seen {artifact_seen}" if artifact_seen else "no rows",
+    ) and ok
+    return ok
 
 
 def check_source_anchor(rows: list[dict], reporter: Reporter, raw_dir: str) -> None:
-    """Prove every row against the raw CSV: question, partner and audit answer.
+    """Prove every row against the raw CSV: question, partner and answer.
 
     A missing or unreadable raw directory is a FAIL, not a skip: without the file
     the index alignment is unprovable and the L1 corroboration flag has no input.
@@ -343,7 +542,7 @@ def check_source_anchor(rows: list[dict], reporter: Reporter, raw_dir: str) -> N
     cache: dict[str, dict[str, list[dict]]] = {}
     try:
         for row in rows:
-            split = row["extra_info"]["split"]
+            split = source_split_of(row)
             if split not in cache:
                 cache[split] = source_blocks(raw_dir, split)
     except ValueError as exc:  # a split the source does not have -- artifact-controlled
@@ -353,8 +552,7 @@ def check_source_anchor(rows: list[dict], reporter: Reporter, raw_dir: str) -> N
         reporter.check("source anchor: raw CSV readable", False, f"{raw_dir}: {exc}")
         return
     sizes = ", ".join(
-        f"{split}={len(blk[LABEL_FALSE])}+{len(blk[LABEL_TRUE])}"
-        for split, blk in sorted(cache.items())
+        f"{split}={len(blk[LABEL_FALSE])}+{len(blk[LABEL_TRUE])}" for split, blk in sorted(cache.items())
     )
     reporter.check("source anchor: raw CSV readable", True, "splits " + sizes)
 
@@ -363,11 +561,13 @@ def check_source_anchor(rows: list[dict], reporter: Reporter, raw_dir: str) -> N
     answer_failures: list[str] = []
     for row in rows:
         info = row["extra_info"]
-        blocks = cache[info["split"]]
-        index = info["index"]
+        task_id = info["task_id"]
+        blocks = cache[source_split_of(row)]
+        index = source_index_of(row)
+        if index is None:  # pragma: no cover - the vocabulary gate already failed
+            continue
         side_label = LABEL_TRUE if info.get("solvable") else LABEL_FALSE
         other_label = LABEL_FALSE if side_label == LABEL_TRUE else LABEL_TRUE
-        task_id = info["task_id"]
         if not 0 <= index < len(blocks[side_label]):
             question_failures.append(f"{task_id}: index {index} outside the {side_label}-block")
             continue
@@ -377,10 +577,14 @@ def check_source_anchor(rows: list[dict], reporter: Reporter, raw_dir: str) -> N
             pair_failures.append(f"{task_id}: index {index} outside the {other_label}-block")
         elif _normalise(blocks[other_label][index]["question"]) != info["paired_original_text"]:
             pair_failures.append(f"{task_id}: partner is not {other_label}-block row {index}")
-        if info.get("solvable") and source_answer(blocks[side_label][index]) != (
-            json.loads(row["reward_model"]["ground_truth"]).get("answer") or ""
-        ):
-            answer_failures.append(f"{task_id}: audit answer differs from the source's")
+        if not info.get("solvable"):
+            if json.loads(row["reward_model"]["ground_truth"]).get("answer") is not None:
+                answer_failures.append(f"{task_id}: unsolvable row carries an answer")
+        else:
+            expected = source_answer(blocks[side_label][index])
+            stored = json.loads(row["reward_model"]["ground_truth"]).get("answer") or ""
+            if expected != stored:
+                answer_failures.append(f"{task_id}: gold answer differs from the source's label=0 answer")
 
     reporter.check(
         "source anchor: presented question matches the raw CSV",
@@ -395,15 +599,54 @@ def check_source_anchor(rows: list[dict], reporter: Reporter, raw_dir: str) -> N
         + (f"; first: {pair_failures[:3]}" if pair_failures else ""),
     )
     reporter.check(
-        "source anchor: judgment audit answer matches the raw CSV",
+        "source anchor: gold answer matches the raw CSV",
         not answer_failures,
         f"{len(rows)} rows, {len(answer_failures)} mismatches"
         + (f"; first: {answer_failures[:3]}" if answer_failures else ""),
     )
 
 
+def check_pair_atomicity(rows: list[dict], reporter: Reporter) -> None:
+    """D27: the twins of one index-aligned pair share ``pair_id`` and one side.
+
+    ``mix_halluc.enforce_pair_atomicity`` returns a val row whose twin was not
+    carved into val back to the train pool, so a pair's two rows can never be on
+    opposite sides of the boundary.  The audit re-derives the property from the
+    artifact: the ``pair_id`` has to be the ``"{split}:{index}"`` of the row's own
+    ``task_id``, and no pair may appear on both sides.
+    """
+    wrong: list[str] = []
+    sides: dict[str, set[str]] = collections.defaultdict(set)
+    twins: collections.Counter = collections.Counter()
+    for row in rows:
+        info = row["extra_info"]
+        parsed = parse_task_id(info.get("task_id", ""))
+        pair_id = str(info.get("pair_id", "") or "")
+        if parsed is None or not pair_id:
+            wrong.append(f"{info.get('task_id')}: missing pair_id")
+            continue
+        expected = f"{parsed[1]}:{parsed[2]}"
+        if pair_id != expected:
+            wrong.append(f"{info['task_id']}: pair_id {pair_id!r} != {expected!r}")
+        twins[pair_id] += 1
+        sides[pair_id].add("val" if info.get("split") == "val" else "train")
+    straddling = sorted(pair_id for pair_id, found in sides.items() if len(found) > 1)
+    reporter.check(
+        "D27 pair identity: extra_info.pair_id is the task_id's source split:index",
+        not wrong,
+        f"{len(rows)} rows, {len(wrong)} violations" + (f"; first: {wrong[:3]}" if wrong else ""),
+    )
+    reporter.check(
+        "D27 pair atomicity: no pair is split across train/val",
+        not straddling,
+        f"{len(twins)} pairs, {len(straddling)} straddling sides"
+        + (f"; first: {straddling[:3]}" if straddling else "")
+        + f", {sum(1 for count in twins.values() if count == 2)} pair(s) with both twins present",
+    )
+
+
 # ---------------------------------------------------------------------------
-# L1 -- the defect and the pointer gold
+# L1 -- the defect and the gold replacement pair
 # ---------------------------------------------------------------------------
 
 
@@ -429,34 +672,39 @@ def check_l1(sample: dict[str, list[dict]], reporter: Reporter) -> None:
             if not _multiset_after_edit(real_q, fake_q, deleted, inserted):
                 replay_failures.append(f"{task_id}: recorded defect does not replay the pair")
 
-            gold = _option_text(row, info.get("correct_option_id")) if branch == BRANCH_DIAG else None
-            if branch == BRANCH_DIAG:
-                if gold is None:
-                    gold_failures.append(f"{task_id}: no gold option")
-                    continue
-                if gold != region["fake_text"].strip():
-                    gold_failures.append(f"{task_id}: gold {gold!r} is not the region {region['fake_text']!r}")
-                    continue
-                if gold not in fake_q:
-                    gold_failures.append(f"{task_id}: gold is not verbatim in the question")
-                    continue
-                tokens = _tokens(gold)
-                if not any(schema.is_content_word(token) for token in tokens):
-                    gold_failures.append(f"{task_id}: gold {gold!r} has no content word")
-                    continue
-                first = tokens[0].casefold()
-                if sum(1 for token in _tokens(fake_q) if token.casefold() == first) != 1:
-                    gold_failures.append(f"{task_id}: first token {first!r} is not unique in the question")
-            else:
-                # The verdict row has no pointer; its certificate is that the
-                # option block is pinned to the pair's own defect length, so the
-                # two labels cannot be told apart by their option shapes alone.
-                anchored = [o for o in info.get("options") or [] if len(_tokens(o.get("text", ""))) != region["n_fake"]]
-                if anchored:
-                    gold_failures.append(
-                        f"{task_id}: option(s) {[o['id'] for o in anchored]} not at the pair's "
-                        f"defect length {region['n_fake']}"
-                    )
+            if branch != BRANCH_DIAG:
+                # The answerable row is a placeholder row: it has no pointer gold,
+                # so its certificate is the pair itself (region + replay), and the
+                # block is audited by ``check_l3_options``/``check_answerable_side``.
+                continue
+            gold = _option_text(row, info.get("correct_option_id"))
+            if gold is None:
+                gold_failures.append(f"{task_id}: no gold option")
+                continue
+            pair = split_option(gold)
+            if pair is None:
+                gold_failures.append(f"{task_id}: gold option {gold!r} is not a replacement pair")
+                continue
+            left, right = pair
+            if left != region["fake_text"].strip():
+                gold_failures.append(f"{task_id}: gold left {left!r} is not the region {region['fake_text']!r}")
+                continue
+            if right != region["real_text"].strip():
+                gold_failures.append(f"{task_id}: gold right {right!r} is not the repair {region['real_text']!r}")
+                continue
+            if left not in fake_q:
+                gold_failures.append(f"{task_id}: gold left item is not verbatim in the question")
+                continue
+            tokens = _tokens(left)
+            if not any(schema.is_content_word(token) for token in tokens):
+                gold_failures.append(f"{task_id}: gold left item {left!r} has no content word")
+                continue
+            first = tokens[0].casefold()
+            if sum(1 for token in _tokens(fake_q) if token.casefold() == first) != 1:
+                gold_failures.append(f"{task_id}: first token {first!r} is not unique in the question")
+                continue
+            if right.casefold() in fake_q.casefold():
+                gold_failures.append(f"{task_id}: gold right item {right!r} already occurs in the question")
         detail = f"{len(picked)} rows"
         reporter.check(
             f"L1 {branch}: exactly one visible defect region",
@@ -470,7 +718,11 @@ def check_l1(sample: dict[str, list[dict]], reporter: Reporter) -> None:
             detail + f", {len(replay_failures)} failures"
             + (f"; first: {replay_failures[:3]}" if replay_failures else ""),
         )
-        label = "pointer gold certificate" if branch == BRANCH_DIAG else "verdict row anchored to the pair's defect"
+        label = (
+            "pointer gold is the region's replacement pair"
+            if branch == BRANCH_DIAG
+            else "placeholder row carries no pointer gold (region certificate only)"
+        )
         reporter.check(
             f"L1 {branch}: {label}",
             not gold_failures,
@@ -488,24 +740,34 @@ def check_l2(sample: dict[str, list[dict]], reporter: Reporter) -> None:
             real_q, _ = _orient(row)
             if branch == BRANCH_DIAG:
                 gold = _option_text(row, info.get("correct_option_id"))
-                if gold is None:
-                    failures.append(f"{task_id}: no gold option")
+                pair = split_option(gold or "")
+                if pair is None:
+                    failures.append(f"{task_id}: no gold replacement pair")
                     continue
-                if gold in real_q:
-                    failures.append(f"{task_id}: gold {gold!r} also occurs in the paired real question")
+                left, right = pair
+                if contains_token_window(real_q, left):
+                    # Text that survived the rewrite cannot be the fragment that
+                    # made the premise false; the pointer must be absent from the
+                    # repaired twin.
+                    failures.append(f"{task_id}: gold left {left!r} also occurs in the paired real question")
                     continue
-                for option in info.get("options") or []:
-                    text = option.get("text")
-                    if text != gold and text not in real_q:
-                        failures.append(f"{task_id}: second admissible option {text!r} (absent from the original)")
+                if not contains_token_window(real_q, right):
+                    # ... and the right item must be exactly what the twin says
+                    # there, i.e. the replacement that repairs the premise.
+                    failures.append(f"{task_id}: gold right {right!r} is not in the paired real question")
             else:
                 if info.get("correct_option_id") not in ("", None):
-                    failures.append(f"{task_id}: solvable row carries correct_option_id")
-                if json.loads(row["reward_model"]["ground_truth"]).get("correct_option_id") is not None:
-                    failures.append(f"{task_id}: judgment gold is not a verdict")
-        detail = f"{len(picked)} rows, {len(failures)} uniqueness failures"
-        if branch == BRANCH_JUDGE:
-            detail += " (the judgment gold is a verdict, so uniqueness means 'no option is the answer')"
+                    failures.append(f"{task_id}: solvable row carries an extra_info correct_option_id")
+                ground_truth = json.loads(row["reward_model"]["ground_truth"])
+                if ground_truth.get("correct_option_id") is not None:
+                    failures.append(f"{task_id}: placeholder block carries a correct option")
+                if not ground_truth.get("solvable_answer"):
+                    failures.append(f"{task_id}: answerable row is not on the solvable_answer branch")
+                if not ground_truth.get("answer"):
+                    failures.append(f"{task_id}: answerable row has an empty gold answer")
+        detail = f"{len(picked)} rows, {len(failures)} failures"
+        if branch == BRANCH_ANSWERABLE:
+            detail += " (a placeholder block must have no correct option)"
         reporter.check(
             f"L2 {branch}",
             not failures,
@@ -514,16 +776,18 @@ def check_l2(sample: dict[str, list[dict]], reporter: Reporter) -> None:
 
 
 # ---------------------------------------------------------------------------
-# L3 -- option structure (the D14/D15 isomorphism)
+# L3 -- the replacement-pair structure (D21/D27)
 # ---------------------------------------------------------------------------
 
 
 def _option_shape(rows: list[dict]) -> dict:
     """``{branch: {"count", "n", "median", "p90", "max"}}`` for the option blocks.
 
-    The spread is max/min *character* length inside one block.  Both labels must
-    show the same distribution, because a block whose lengths are wildly unequal is
-    a branch-identifying shortcut no matter how well the option *count* matches.
+    The spread is max/min *character* length inside one block.  Every option
+    starts with the same left item, so the spread is the right items' spread; both
+    branches must show the same distribution, because a block whose lengths are
+    wildly unequal is a branch-identifying shortcut no matter how well the option
+    *count* matches.
     """
     raw: dict[str, tuple[int, list[float]]] = {}
     for row in rows:
@@ -549,9 +813,9 @@ def _option_shape(rows: list[dict]) -> dict:
 
 
 def check_l3_options(rows: list[dict], reporter: Reporter) -> None:
-    missing: list[str] = []
-    unequal: list[str] = []
-    gold_unequal: list[str] = []
+    malformed: list[str] = []
+    left_failures: list[str] = []
+    right_failures: list[str] = []
     counts: collections.Counter = collections.Counter()
     for row in rows:
         info = row["extra_info"]
@@ -560,38 +824,110 @@ def check_l3_options(rows: list[dict], reporter: Reporter) -> None:
             continue
         counts[(info["branch"], len(options))] += 1
         question = question_of(row)
+        folded = question.casefold()
         task_id = info["task_id"]
+        pairs: list[tuple[str, str]] = []
         for option in options:
-            if option.get("text", "") not in question:
-                missing.append(f"{task_id}:{option.get('text')!r}")
-        lengths = {len(_tokens(option.get("text", ""))) for option in options}
-        if len(lengths) != 1:
-            unequal.append(f"{task_id}:{sorted(lengths)}")
-        if info["branch"] == BRANCH_DIAG:
-            gold = _option_text(row, info.get("correct_option_id"))
-            if gold is not None and len(_tokens(gold)) not in lengths:
-                gold_unequal.append(f"{task_id}: gold {len(_tokens(gold))} not in {sorted(lengths)}")
+            pair = split_option(option.get("text", ""))
+            if pair is None:
+                malformed.append(f"{task_id}:{option.get('text')!r}")
+            else:
+                pairs.append(pair)
+        if len(pairs) != len(options):
+            continue
+        lefts = {left for left, _ in pairs}
+        if len(lefts) != 1:
+            left_failures.append(f"{task_id}: {len(lefts)} distinct left items")
+            continue
+        left = pairs[0][0]
+        if left not in question:
+            left_failures.append(f"{task_id}: left item {left!r} is not verbatim in the question")
+            continue
+        if not any(schema.is_content_word(token) for token in _tokens(left)):
+            left_failures.append(f"{task_id}: left item {left!r} has no content word")
+        rights = [right for _, right in pairs]
+        if len({right.casefold() for right in rights}) != len(rights):
+            right_failures.append(f"{task_id}: right items are not pairwise distinct")
+            continue
+        signatures = {item_signature(right) for right in rights}
+        if len(signatures) != 1:
+            right_failures.append(f"{task_id}: right items have {len(signatures)} distinct types {sorted(signatures)}")
+            continue
+        present = [right for right in rights if right.casefold() in folded]
+        if present:
+            right_failures.append(f"{task_id}: right item(s) {present!r} occur in the question")
 
     reporter.check(
-        "L3a every option is a verbatim span of its own question",
-        not missing,
-        f"{len(rows)} rows, {len(missing)} options not found"
-        + (f"; first: {missing[:3]}" if missing else ""),
+        "L3a every option is a `left -> right` replacement pair",
+        not malformed,
+        f"{len(rows)} rows, {len(malformed)} malformed option(s)"
+        + (f"; first: {malformed[:3]}" if malformed else ""),
     )
     reporter.check(
-        "L3b every option has the gold's word-token length",
-        not unequal and not gold_unequal,
-        f"{len(rows)} rows, {len(unequal)} rows with unequal option lengths, "
-        f"{len(gold_unequal)} diag rows whose gold length differs"
-        + (f"; first: {(unequal + gold_unequal)[:3]}" if (unequal or gold_unequal) else ""),
+        "L3b every block has one identical in-passage left item with a content word",
+        not left_failures,
+        f"{len(rows)} rows, {len(left_failures)} failures"
+        + (f"; first: {left_failures[:3]}" if left_failures else ""),
+    )
+    reporter.check(
+        "L3c right items are pairwise distinct, same type/length, and out-of-passage",
+        not right_failures,
+        f"{len(rows)} rows, {len(right_failures)} failures"
+        + (f"; first: {right_failures[:3]}" if right_failures else ""),
     )
     per_branch = sorted({branch for branch, _ in counts})
     per_count = {len({count for branch, count in counts if branch == b}) for b in per_branch}
     reporter.check(
-        "L3c both labels offer the same option count (D15/D14)",
-        set(counts) and len(per_count) == 1 and per_count == {1},
+        "L3d both branches offer the same option count (D15/D18)",
+        set(counts) and len(per_count) == 1 and per_count == {1} and {count for _, count in counts} == {K_OPTIONS},
         "branch -> count: "
         + ", ".join(f"{branch}:{sorted({count for b, count in counts if b == branch})}" for branch in per_branch),
+    )
+
+
+def check_answerable_side(rows: list[dict], reporter: Reporter) -> None:
+    """The D27 contract of the answerable rows, re-derived from the artifact.
+
+    A ``solvable_two_layer`` row is gold-answerable, so it must carry the source's
+    answer verbatim, the ``solvable_answer`` flag, no correct option anywhere
+    (``extra_info`` or payload) and the *placeholder* block whose only job is the
+    D18 isomorphism.  ``check_l3_options`` audits the block's shape; this audits
+    the contract that makes it a placeholder.
+    """
+    answerable = _answerable_rows(rows)
+    failures: list[str] = []
+    for row in answerable:
+        info = row["extra_info"]
+        task_id = info["task_id"]
+        ground_truth = json.loads(row["reward_model"]["ground_truth"])
+        if not info.get("solvable") or not ground_truth.get("solvable"):
+            failures.append(f"{task_id}: not marked solvable")
+        if not ground_truth.get("solvable_answer"):
+            failures.append(f"{task_id}: missing the solvable_answer flag")
+        if ground_truth.get("two_layer") or ground_truth.get("pair_task") or ground_truth.get("judgment_only"):
+            failures.append(f"{task_id}: carries a second answer-contract flag")
+        if ground_truth.get("has_diagnosis_label") or info.get("has_diagnosis_label"):
+            failures.append(f"{task_id}: answerable row carries a diagnosis label")
+        if ground_truth.get("correct_option_id") is not None:
+            failures.append(f"{task_id}: payload correct_option_id is not null")
+        if info.get("correct_option_id") not in ("", None):
+            failures.append(f"{task_id}: extra_info correct_option_id is not empty")
+        if info.get("error_type") or info.get("perturbation_type"):
+            failures.append(f"{task_id}: answerable row carries defect metadata")
+        if info.get("template") != schema.TEMPLATE_A:
+            failures.append(f"{task_id}: answerable row is not on template A")
+        if len(info.get("options") or []) != K_OPTIONS:
+            failures.append(f"{task_id}: placeholder block is not k={K_OPTIONS}")
+        if not str(ground_truth.get("answer") or "").strip():
+            failures.append(f"{task_id}: gold answer is empty")
+        prompt = row["prompt"][0]["content"]
+        if MARKER_ANSWER not in prompt or MARKER_UNSOLVABLE_ID not in prompt:
+            failures.append(f"{task_id}: template A prompt does not offer both verdicts")
+    reporter.check(
+        "D27 answerable contract (solvable_answer / null option / placeholder block)",
+        not failures and bool(answerable),
+        f"{len(answerable)} answerable rows, {len(failures)} violations"
+        + (f"; first: {failures[:3]}" if failures else ""),
     )
 
 
@@ -600,8 +936,15 @@ def check_l3_options(rows: list[dict], reporter: Reporter) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _pick_absent(options: list[dict], question: str) -> str | None:
-    absent = [o for o in options if o.get("text", "") not in question]
+def _right_item(option: dict) -> str:
+    pair = split_option(option.get("text", ""))
+    return pair[1] if pair else option.get("text", "")
+
+
+def _pick_absent_right(options: list[dict], question: str) -> str | None:
+    """The mirror shortcut of section 4.3: the right item that is *not* in the passage."""
+    folded = question.casefold()
+    absent = [o for o in options if _right_item(o).casefold() not in folded]
     return absent[0]["id"] if len(absent) == 1 else None
 
 
@@ -610,26 +953,13 @@ def _pick_longest(options: list[dict], question: str) -> str | None:
     return options[lengths.index(max(lengths))]["id"]
 
 
-def _pick_longest_tokens(options: list[dict], question: str) -> str | None:
-    """The same rule measured in *word tokens* -- degenerate by construction.
-
-    Every option in a row has the same token count (L3b), so this reading is a
-    three-way tie everywhere and the first-index tie-break reduces it to ``1/k``.
-    It is reported because the design doc's 30.9% for "pick the longest option" is
-    what this reading produces: it does not measure the character-length cue, which
-    is the one a solver could actually use.
-    """
-    lengths = [len(_tokens(o.get("text", ""))) for o in options]
-    return options[lengths.index(max(lengths))]["id"]
-
-
 def _pick_unique_capital(options: list[dict], question: str) -> str | None:
-    hits = [o for o in options if any(ch.isupper() for ch in o.get("text", ""))]
+    hits = [o for o in options if any(ch.isupper() for ch in _right_item(o))]
     return hits[0]["id"] if len(hits) == 1 else None
 
 
 def _pick_unique_digit(options: list[dict], question: str) -> str | None:
-    hits = [o for o in options if any(ch.isdigit() for ch in o.get("text", ""))]
+    hits = [o for o in options if any(ch.isdigit() for ch in _right_item(o))]
     return hits[0]["id"] if len(hits) == 1 else None
 
 
@@ -648,33 +978,8 @@ def _heuristic_rate(rows: list[dict], pick) -> tuple[float, int, int]:
     return (hits / len(rows) if rows else 0.0), hits, defined
 
 
-def _tie_free_longest_hits(rows: list[dict]) -> tuple[int, int]:
-    """``(hits, rows)`` for "pick the longest option" counting unique maxima only.
-
-    The stated heuristic breaks a tie by first index, and equal-*token*-length
-    options are frequently equal-*character*-length too, so the tie-break wins about
-    half of the two-way ties for free.  This reading drops those rows instead of
-    scoring them, which is the assumption-free version of the same heuristic.
-    """
-    hits = rows_with_unique_max = 0
-    for row in rows:
-        info = row["extra_info"]
-        lengths = [len(o.get("text", "")) for o in info["options"]]
-        longest = max(lengths)
-        if lengths.count(longest) != 1:
-            continue
-        rows_with_unique_max += 1
-        gold = _option_text(row, info.get("correct_option_id"))
-        hits += gold is not None and len(gold) == longest
-    return hits, rows_with_unique_max
-
-
 def check_l4_heuristics(rows: list[dict], reporter: Reporter) -> None:
-    diag = [
-        row
-        for row in rows
-        if row["extra_info"]["branch"] == BRANCH_DIAG and row["extra_info"].get("correct_option_id")
-    ]
+    diag = _diag_rows(rows)
     if not diag:
         reporter.check("L4 heuristic budget", False, "no diagnosis rows with a gold in the artifact")
         return
@@ -682,29 +987,15 @@ def check_l4_heuristics(rows: list[dict], reporter: Reporter) -> None:
     baseline = 1 / k
     budget = baseline + L3_MARGIN
 
-    rate, hits, defined = _heuristic_rate(diag, _pick_absent)
+    rate, hits, defined = _heuristic_rate(diag, _pick_absent_right)
     reporter.check(
-        "L4a 'pick the option absent from the question' is undefined, not weak",
+        "L4a 'pick the pair whose right item is absent from the question' is undefined, not weak",
         hits == 0,
-        f"{rate:.4f} ({hits}/{len(diag)}), {defined} rows had a unique absent option; "
-        f"the D13 rule makes this cue empty",
+        f"{rate:.4f} ({hits}/{len(diag)}), {defined} rows had a unique absent right item; "
+        f"the D21 rule makes this cue empty",
     )
 
     rate, hits, _ = _heuristic_rate(diag, _pick_longest)
-    token_rate, _, _ = _heuristic_rate(diag, _pick_longest_tokens)
-    tie_free_hits, tie_free_rows = _tie_free_longest_hits(diag)
-    lengths = [len(_option_text(row, row["extra_info"]["correct_option_id"]) or "") for row in diag]
-    reporter.note(
-        f"L4b gold character length: min={min(lengths)} median={int(statistics.median(lengths))} max={max(lengths)}"
-    )
-    reporter.note(
-        "L4b tie-free reading (only rows with a unique longest option): "
-        f"{tie_free_hits / tie_free_rows:.4f} on {tie_free_rows} of {len(diag)} rows"
-    )
-    reporter.note(
-        f"L4b token-count reading (every option ties by construction): {token_rate:.4f} "
-        f"-- this degenerate reading is where the design doc's 30.9% comes from"
-    )
     reporter.check(
         f"L4b 'pick the longest option' <= {budget:.3f}",
         rate <= budget,
@@ -726,60 +1017,74 @@ def check_l4_heuristics(rows: list[dict], reporter: Reporter) -> None:
 
 
 def check_l5_cross_question_control(rows: list[dict], reporter: Reporter) -> None:
-    """Rebuild the block D13 bans and measure what the same-question rule buys.
+    """Rebuild the block D21 bans and measure what the out-of-passage rule buys.
 
-    For each diagnosis row the control looks for one same-length span *outside* this
-    question that does not occur in it, stands it in for a distractor, and re-runs
-    "the option absent from the question".  On the artifact's own blocks that rule
-    has no candidate at all (L4a: 0 of 700 rows); on the minimal violation it
-    identifies the borrowed option every time.  The gate is on the control being
-    *constructible* from the artifact's own text -- the leak rate then follows from
-    the construction -- and both numbers are printed so the contrast is explicit.
+    For each diagnosis row the control replaces *both* distractor right items with
+    same-word-count spans of the presented question -- the mirror shortcut section
+    4.3 warns about ("若干扰右项取自本题面，则 gold 右项是唯一的题外词") -- and re-runs
+    "the right item absent from the question".  On the artifact's own blocks that
+    rule has no candidate at all (L4a: 0 rows); on the minimal violation it
+    identifies the gold every time.  The gate is on the control being
+    *constructible* from the artifact's own text; both numbers are printed so the
+    contrast is explicit.
     """
-    diag = [
-        row
-        for row in rows
-        if row["extra_info"]["branch"] == BRANCH_DIAG and row["extra_info"].get("correct_option_id")
-    ]
+    diag = _diag_rows(rows)
     if not diag:
-        reporter.check("L5 cross-question control", False, "no diagnosis rows in the artifact")
+        reporter.check("L5 mirror control", False, "no diagnosis rows in the artifact")
         return
-    questions = [question_of(row) for row in diag]
     usable = 0
     leaked = 0
     skipped = 0
-    for index, row in enumerate(diag):
+    for row in diag:
         info = row["extra_info"]
+        question = question_of(row)
         gold = _option_text(row, info.get("correct_option_id"))
-        question = questions[index]
-        borrowed = None
-        for other_index, other in enumerate(questions):
-            if other == question or borrowed is not None:
-                break
-            for text in (o.get("text", "") for o in diag[other_index]["extra_info"]["options"]):
-                if text and text != gold and len(_tokens(text)) == len(_tokens(gold)) and text not in question:
-                    borrowed = text
-                    break
+        pair = split_option(gold or "")
+        if pair is None:
+            skipped += 1
+            continue
+        _, gold_right = pair
+        n_right = len(_tokens(gold_right))
+        borrowed = _in_passage_spans(question, n_right, 2)
         if borrowed is None:
             skipped += 1
             continue
         usable += 1
-        # Minimal D13 violation: one distractor is now text from another question.
-        kept = [o.get("text", "") for o in info["options"] if o.get("text") != gold][:1]
-        banned_block = [gold] + kept + [borrowed]
-        absent = [text for text in banned_block if text not in question]
-        leaked += len(absent) == 1 and absent[0] == borrowed
+        banned = [gold] + [f"{pair[0]}{PAIR_ARROW}{span}" for span in borrowed]
+        absent = [text for text in banned if _right_item({"text": text}).casefold() not in question.casefold()]
+        leaked += len(absent) == 1 and absent[0] == gold
     leak_rate = leaked / usable if usable else 0.0
     reporter.note(
-        f"L5 control: {usable} of {len(diag)} diagnosis rows can be rebuilt with a borrowed "
-        f"option, {skipped} skipped (no same-length foreign span), borrowed-option leak {leak_rate:.4f}"
+        f"L5 control: {usable} of {len(diag)} diagnosis rows can be rebuilt with in-passage "
+        f"distractor rights, {skipped} skipped (no same-length span); mirror-shortcut leak {leak_rate:.4f}"
     )
     reporter.check(
-        "L5 cross-question control: a borrowed option is identifiable by its absence",
+        "L5 mirror control: an in-passage distractor identifies the gold by its absence",
         usable >= L1_MIN_SAMPLE and leak_rate >= 0.99,
         f"{usable}/{len(diag)} rows constructible, {leaked}/{usable} leaks "
         f"(the artifact's own blocks offer 0 such candidates, L4a)",
     )
+
+
+def _in_passage_spans(question: str, n_tokens: int, k: int) -> list[str] | None:
+    """``k`` distinct ``n_tokens``-token spans of ``question``, or ``None``."""
+    if n_tokens <= 0:
+        return None
+    unique: dict[str, str] = {}
+    for match in _span_windows(question, n_tokens):
+        unique.setdefault(match.casefold(), match)
+    if len(unique) < k:
+        return None
+    return [unique[key] for key in sorted(unique)[:k]]
+
+
+def _span_windows(question: str, n_tokens: int) -> list[str]:
+    """Character slices of every ``n_tokens``-token window of ``question``."""
+    offsets = _offset_tokens(question)
+    return [
+        question[offsets[start][1] : offsets[start + n_tokens - 1][2]]
+        for start in range(len(offsets) - n_tokens + 1)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -788,12 +1093,12 @@ def check_l5_cross_question_control(rows: list[dict], reporter: Reporter) -> Non
 
 
 def check_l1_corroboration(rows: list[dict], reporter: Reporter, raw_dir: str, seed: int) -> None:
-    """What share of the dataset's own rebuttals name the gold span.
+    """What share of the dataset's own rebuttals name the gold fragment.
 
-    The design doc's L1 hook (56.8% train / 56.2% valid / 85.3% test): a *sampling*
-    flag for the N=50 human review, never a gate -- a rebuttal that paraphrases has
-    no obligation to repeat the span.  The rule here is the strictest available to
-    a script: every content word of the gold must appear in the rebuttal.
+    The design doc's L1 hook: a *sampling* flag for the N=50 human review, never a
+    gate -- a rebuttal that paraphrases has no obligation to repeat the fragment.
+    The rule here is the strictest available to a script: every content word of
+    the gold's left item must appear in the rebuttal.
     """
     diag = _diag_rows(rows)
     if not diag:
@@ -803,21 +1108,76 @@ def check_l1_corroboration(rows: list[dict], reporter: Reporter, raw_dir: str, s
     tally: dict[str, list[bool]] = collections.defaultdict(list)
     for row in picked:
         info = row["extra_info"]
+        index = source_index_of(row)
         try:
-            answer = source_answer(source_blocks(raw_dir, info["split"])[LABEL_FALSE][info["index"]])
-        except (OSError, IndexError):  # pragma: no cover - the anchor check already failed
+            answer = source_answer(source_blocks(raw_dir, source_split_of(row))[LABEL_FALSE][index])
+        except (OSError, IndexError, TypeError):  # pragma: no cover - the anchor check already failed
             continue
-        gold = _option_text(row, info.get("correct_option_id")) or ""
-        words = [t.casefold() for t in _tokens(gold) if schema.is_content_word(t)]
-        present = all(word in answer.casefold() for word in words)
-        tally[info["split"]].append(present)
+        pair = split_option(_option_text(row, info.get("correct_option_id")) or "")
+        if pair is None:
+            continue
+        left = pair[0]
+        words = [t.casefold() for t in _tokens(left) if schema.is_content_word(t)]
+        tally[source_split_of(row)].append(all(word in answer.casefold() for word in words))
     for split in sorted(tally):
         values = tally[split]
         reporter.note(
             f"L1 corroboration flag {split}: {sum(values)}/{len(values)} = {sum(values) / len(values):.3f} "
-            f"of the dataset's own rebuttals name every content word of the gold "
+            f"of the dataset's own rebuttals name every content word of the gold fragment "
             f"(sample, not a gate)"
         )
+
+
+def check_distractor_quality(rows: list[dict], reporter: Reporter, raw_dir: str, seed: int) -> None:
+    """The section 9 N=50 spot-check hook plus the corpus-frequency reading.
+
+    Two things are printed, neither of them a gate:
+
+    * a reproducible 50-row sample of ``question | gold pair | distractor pairs``
+      for the human judgement section 9 asks for ("干扰右项替换后前提是否也成立",
+      Q9).  ``--spot-check-out`` writes the same sample as JSONL.
+    * how much of the gold's identity the *corpus frequency* of the right item
+      alone recovers.  The distractor pool is drawn from a corpus, so a model's
+      word prior is a real cue on any block built this way; section 9's gate list
+      does not include it, so it is measured and printed rather than hidden.
+    """
+    diag = _diag_rows(rows)
+    if not diag:
+        reporter.note("distractor spot check: no diagnosis rows in the artifact")
+        return
+    picked = random.Random(seed).sample(diag, min(len(diag), DISTRACTOR_SAMPLE))
+    for row in sorted(picked, key=lambda r: r["extra_info"]["task_id"]):
+        gold = _option_text(row, row["extra_info"]["correct_option_id"]) or ""
+        others = [
+            option["text"]
+            for option in row["extra_info"]["options"]
+            if option["id"] != row["extra_info"]["correct_option_id"]
+        ]
+        reporter.note(f"spot-check {row['extra_info']['task_id']}: gold [{gold}] vs {others}")
+
+    try:
+        corpus = source_corpus(raw_dir, sorted({source_split_of(row) for row in rows}))
+    except (OSError, ValueError):  # pragma: no cover - the anchor check already failed
+        return
+    frequency = item_document_frequency(corpus)
+    hits = 0
+    defined = 0
+    for row in diag:
+        options = row["extra_info"]["options"]
+        gold_id = row["extra_info"]["correct_option_id"]
+        counts = [frequency.get(_right_item(option).casefold(), 0) for option in options]
+        best = options[max(range(len(counts)), key=lambda j: (counts[j], -j))]
+        defined += 1
+        hits += best["id"] == gold_id
+    reporter.note(
+        f"distractor frequency reading: 'pick the most frequent right item' scores {hits / defined:.4f} "
+        f"({len(corpus)} corpus questions, baseline {1 / len(diag[0]['extra_info']['options']):.4f}) "
+        f"-- a residual corpus-vocabulary cue, printed not gated (section 9 / Q9)"
+    )
+    reporter.note(
+        "distractor quality hook: use the spot-check sample above for the section 9 N=50 manual "
+        "judgement ('does a distractor right item also repair the premise?'); >10% failures pause the source"
+    )
 
 
 def _count_matrix(
@@ -1032,10 +1392,17 @@ def check_h6(rows: list[dict], reporter: Reporter, raw_dir: str, *, folds: int, 
     if len(set(artifact_labels)) < 2:
         reporter.note("H6: the artifact carries one label side only; skipping the interpretation baseline")
         return
-    artifact_groups = [(row["extra_info"]["split"], row["extra_info"]["index"]) for row in rows]
-    table = _h6_table(
-        artifact_texts, artifact_labels, artifact_groups, folds=folds, seed=seed, min_support=H6_MIN_SUPPORT
-    )
+    artifact_groups = [(source_split_of(row), source_index_of(row)) for row in rows]
+    # ``bow_nb_oof`` refuses an artifact every fold of which is too thin to build
+    # a vocabulary for; H6 is an interpretation baseline, so a small artifact is
+    # reported rather than crashed on.
+    try:
+        table = _h6_table(
+            artifact_texts, artifact_labels, artifact_groups, folds=folds, seed=seed, min_support=H6_MIN_SUPPORT
+        )
+    except ValueError as exc:
+        reporter.note(f"H6: the artifact is too small for a {folds}-fold reading ({exc}); skipped")
+        return
     agreement = all(abs(entry["local_argmax"] - entry["ungrouped_argmax"]) < 1e-9 for entry in table.values())
     reporter.check(
         "H6 local out-of-fold scorer reproduces verify_umwp.bow_nb_oof",
@@ -1050,16 +1417,15 @@ def check_h6(rows: list[dict], reporter: Reporter, raw_dir: str, *, folds: int, 
 
     try:
         raw_texts, raw_labels, raw_groups = _raw_h6_corpus(
-            raw_dir, sorted({row["extra_info"]["split"] for row in rows})
+            raw_dir, sorted({source_split_of(row) for row in rows})
         )
-    except (OSError, IndexError):  # pragma: no cover - the anchor check already failed
+        raw_table = _h6_table(
+            raw_texts, raw_labels, raw_groups, folds=folds, seed=seed, min_support=H6_MIN_SUPPORT
+        )
+    except (OSError, IndexError, ValueError):  # pragma: no cover - the anchor check already failed
         return
     reporter.note(f"H6 corpus raw split: n={len(raw_texts)} (the doc's own corpus), one group per pair")
-    _print_h6_table(
-        _h6_table(raw_texts, raw_labels, raw_groups, folds=folds, seed=seed, min_support=H6_MIN_SUPPORT),
-        reporter,
-        "raw",
-    )
+    _print_h6_table(raw_table, reporter, "raw")
     # The doc's AUC row (0.172 train) reproduces only at the richest vocabulary
     # under the ungrouped split, i.e. exactly in the regime where the fold leak
     # dominates.  Reported so the deviation note rests on a measurement.
@@ -1079,7 +1445,7 @@ def check_h6(rows: list[dict], reporter: Reporter, raw_dir: str, *, folds: int, 
 
 
 def check_monitoring(rows: list[dict], reporter: Reporter) -> None:
-    """Section 10's monitors: gold position, per-branch shapes, branch-solvability."""
+    """Section 10's monitors: gold position, per-branch shapes, branch balance."""
     diag = _diag_rows(rows)
     if diag:
         positions = collections.Counter(row["extra_info"]["correct_option_id"] for row in diag)
@@ -1088,22 +1454,23 @@ def check_monitoring(rows: list[dict], reporter: Reporter) -> None:
             f"monitor gold position: {dict(sorted(positions.items()))} (uniform expectation {len(diag) / k:.0f} per id)"
         )
         gold_lengths = collections.Counter(
-            len(_tokens(_option_text(row, row["extra_info"]["correct_option_id"]) or ""))
+            len(_tokens(split_option(_option_text(row, row["extra_info"]["correct_option_id"]) or "")[0]))
             for row in diag
+            if split_option(_option_text(row, row["extra_info"]["correct_option_id"]) or "")
         )
-        reporter.note(f"monitor gold token length: {dict(sorted(gold_lengths.items()))}")
+        reporter.note(f"monitor gold left-item token length: {dict(sorted(gold_lengths.items()))}")
     shape = _option_shape(rows)
     for branch, entry in sorted(shape.items()):
         reporter.note(
             f"monitor option spread {branch}: count={entry['count']} median={entry['median']:.2f} "
             f"p90={entry['p90']:.2f} max={entry['max']:.2f} over {entry['n']} rows "
-            f"(target <= {MAX_CHAR_RATIO ** 2:.1f}: the D14 isomorphism)"
+            f"(target <= {MAX_CHAR_RATIO ** 2:.1f}: the D18 isomorphism)"
         )
-    judge = sum(1 for row in rows if row["extra_info"]["branch"] == BRANCH_JUDGE)
+    answerable = len(_answerable_rows(rows))
     reporter.note(
-        f"monitor branch balance: diag={len(diag)} judge={judge} "
-        f"({judge / len(rows):.1%} of rows are the D14 judgment side, which "
-        f"mix_halluc.py has no quota cell for)"
+        f"monitor branch balance: diag={len(diag)} answerable={answerable} "
+        f"({answerable / len(rows):.1%} of rows are the D27 two-layer side; the two are twins and "
+        f"share pair_id)"
     )
 
 
@@ -1133,18 +1500,18 @@ def check_contract(rows: list[dict], reporter: Reporter) -> None:
         branch_of[branch] = info["template"]
         if not info.get("solvable") and ground_truth.get("answer") is not None:
             failures.append(f"{task_id}: unsolvable row carries an answer")
-        if branch == BRANCH_JUDGE:
-            if not ground_truth.get("judgment_only"):
-                failures.append(f"{task_id}: judgment row without judgment_only")
+        if branch == BRANCH_ANSWERABLE:
+            if not ground_truth.get("solvable_answer"):
+                failures.append(f"{task_id}: answerable row without the solvable_answer flag")
             if ground_truth.get("correct_option_id") is not None:
-                failures.append(f"{task_id}: judgment row carries a correct option")
+                failures.append(f"{task_id}: answerable row carries a correct option")
             if ground_truth.get("has_diagnosis_label"):
-                failures.append(f"{task_id}: judgment row carries a diagnosis label")
+                failures.append(f"{task_id}: answerable row carries a diagnosis label")
             if not info.get("options") or info["template"] != schema.TEMPLATE_A:
-                failures.append(f"{task_id}: judgment row must carry a template A option block (D14)")
+                failures.append(f"{task_id}: answerable row must carry a template A placeholder block (D18)")
             if info.get("error_type") or info.get("perturbation_type"):
                 failures.append(
-                    f"{task_id}: judgment row carries defect metadata "
+                    f"{task_id}: answerable row carries defect metadata "
                     f"(error_type={info.get('error_type')!r}, "
                     f"perturbation_type={info.get('perturbation_type')!r})"
                 )
@@ -1167,24 +1534,20 @@ def check_contract(rows: list[dict], reporter: Reporter) -> None:
                 )
             if not ground_truth.get("perturbation_type"):
                 failures.append(f"{task_id}: diag row without a perturbation_type")
-            # The model's expected marker is derived, not stored: the reward reads
-            # ground_truth.correct_option_id and requires option == that id, so the
-            # shape is checked here rather than by string-matching an answer field
-            # that an unsolvable row must not carry.
-            if MARKER_UNSOLVABLE not in row["prompt"][0]["content"]:
+            if MARKER_UNSOLVABLE_ID not in row["prompt"][0]["content"]:
                 failures.append(f"{task_id}: prompt does not ask for the UNSOLVABLE:<id> marker")
         # The reward reads the *status the model emits*, so the expected marker is
-        # a property of the prompt, not of a stored gold string: the verdict row
-        # must ask for both verdicts, the diagnosis row for the pointer gold.
+        # a property of the prompt, not of a stored gold string: every template A
+        # row must offer both verdicts, because the two sides share one wording.
         prompt = row["prompt"][0]["content"]
-        if branch == BRANCH_JUDGE and not (MARKER_SOLVABLE in prompt and MARKER_UNSOLVABLE in prompt):
-            failures.append(f"{task_id}: judgment prompt does not offer both verdict markers")
-        if branch == BRANCH_DIAG and MARKER_UNSOLVABLE not in prompt:
-            failures.append(f"{task_id}: diagnosis prompt does not ask for the pointer gold")
+        if info["template"] == schema.TEMPLATE_A and not all(
+            marker in prompt for marker in MARKER_VERDICTS
+        ):
+            failures.append(f"{task_id}: template A prompt does not offer both verdict markers")
         if not info.get("paired_original_text") or info["paired_original_text"] == question_of(row):
             failures.append(f"{task_id}: missing or identical paired original")
     reporter.check(
-        "branch invariants (template A / verdicts / options / pairing)",
+        "branch invariants (template A / verdicts / placeholder / pairing)",
         not failures,
         f"{len(rows)} rows, {len(failures)} violations" + (f"; first: {failures[:3]}" if failures else ""),
     )
@@ -1217,16 +1580,17 @@ def prompt_scaffold(prompt: str) -> tuple[str, str] | None:
 
 
 def check_template_isomorphism(rows: list[dict], reporter: Reporter) -> None:
-    """The D14 defence, asserted on the artifact: one scaffold for both labels.
+    """The D18 defence, asserted on the artifact: one scaffold for both sides.
 
-    Sections 5.2 and 9 make this the hard constraint of the source: the two labels
-    must differ *only* in their own question and option texts, because any other
-    difference is a branch-identifying shortcut that hands the model the verdict.
-    A differing option *count* is caught by :func:`check_l3_options` and the
-    verdict markers by :func:`check_contract`, but neither notices a scaffold whose
-    wording changed on one branch: a diagnosis prompt that dropped the
-    ``\\boxed{SOLVABLE}`` bullet, or renamed the option header, passes every other
-    check in this file.  This check exists to catch exactly those two mutations.
+    Sections 5.1/5.2 and 9 make this the hard constraint of the source: the two
+    sides must differ *only* in their own question and option texts, because any
+    other difference is a branch-identifying shortcut that hands the model the
+    verdict.  A differing option *count* is caught by :func:`check_l3_options` and
+    the verdict markers by :func:`check_contract`, but neither notices a scaffold
+    whose wording changed on one side: an answerable prompt that dropped the
+    ``\\boxed{UNSOLVABLE: <id>}`` bullet, or renamed the option header, passes every
+    other check in this file.  This check exists to catch exactly those two
+    mutations.
     """
     scaffolds: dict[str, set[tuple[str, str]]] = collections.defaultdict(set)
     unparsable: list[str] = []
@@ -1243,7 +1607,7 @@ def check_template_isomorphism(rows: list[dict], reporter: Reporter) -> None:
     distinct = {scaffold for branch in scaffolds.values() for scaffold in branch}
     per_branch = ", ".join(f"{branch}:{len(found)}" for branch, found in sorted(scaffolds.items()))
     reporter.check(
-        "D14 template isomorphism: one scaffold for every branch",
+        "D18 template isomorphism: one scaffold for both sides",
         bool(scaffolds) and len(distinct) == 1 and not unparsable and not unmarked,
         f"scaffolds per branch {{{per_branch}}}: {len(distinct)} distinct, "
         f"{len(unparsable)} prompt(s) without a template boundary/option header, "
@@ -1261,7 +1625,7 @@ def sample_by_branch(rows: list[dict], *, per_branch: int, seed: int) -> dict[st
     """``{branch: rows}`` for the L1/L2 certificate checks -- **all** rows by default.
 
     ``per_branch <= 0`` (the default) returns every row, because L1 and L2 re-derive
-    the pointer gold and the uniqueness proof row by row: a sampled audit cannot
+    the pointer gold and the pair certificate row by row: a sampled audit cannot
     certify an artifact, and a gold flipped on a row outside the sample passes it.
     A positive ``per_branch`` subsamples -- fast, but a smoke test rather than a
     certificate, which is why ``main`` labels that run explicitly.
@@ -1298,6 +1662,11 @@ def main() -> None:
         help="L1/L2 rows to audit per branch; 0 (default) audits every row, a positive "
         "value is a fast subsample that does not certify the artifact",
     )
+    parser.add_argument(
+        "--spot-check-out",
+        default=None,
+        help="write the section 9 N=50 distractor spot-check sample to this JSONL path",
+    )
     args = parser.parse_args()
 
     rows = schema.read_parquet_rows(args.rows)
@@ -1309,15 +1678,16 @@ def main() -> None:
 
     reporter = Reporter()
     if not check_split_vocabulary(rows, reporter):
-        # Every stage below reads ``extra_info.split`` -- as a cache key, as the
-        # name of a CSV, and as a path component.  An artifact naming a split the
-        # source does not have is not auditable; stop here rather than traceback
-        # inside a later check with a message that reads like a verifier bug.
+        # Every stage below reads the source split -- as a cache key, as the name
+        # of a CSV, and as a path component.  An artifact naming a split the source
+        # does not have is not auditable; stop here rather than traceback inside a
+        # later check with a message that reads like a verifier bug.
         print(f"RESULT: FAIL ({len(reporter.failed)}/{len(reporter.results)} checks failed: {reporter.failed})")
         raise SystemExit(1)
     check_contract(rows, reporter)
     check_template_isomorphism(rows, reporter)
     check_source_anchor(rows, reporter, args.raw_dir)
+    check_pair_atomicity(rows, reporter)
 
     sample = sample_by_branch(rows, per_branch=args.per_branch, seed=args.seed)
     mode = "every" if args.per_branch <= 0 else f"at most {args.per_branch} per"
@@ -1330,11 +1700,16 @@ def main() -> None:
     check_l2(sample, reporter)
 
     check_l3_options(rows, reporter)
+    check_answerable_side(rows, reporter)
     check_l4_heuristics(rows, reporter)
     check_l5_cross_question_control(rows, reporter)
 
     print()
     check_l1_corroboration(rows, reporter, args.raw_dir, args.seed)
+    check_distractor_quality(rows, reporter, args.raw_dir, args.seed)
+    if args.spot_check_out:
+        write_spot_check(rows, args.spot_check_out, args.seed)
+        reporter.note(f"spot-check sample written to {args.spot_check_out}")
     check_h6(rows, reporter, args.raw_dir, folds=args.folds, seed=args.seed)
     check_monitoring(rows, reporter)
 
@@ -1344,6 +1719,33 @@ def main() -> None:
         raise SystemExit(1)
     print(f"RESULT: PASS ({len(reporter.results)}/{len(reporter.results)} checks passed)")
     raise SystemExit(0)
+
+
+def write_spot_check(rows: list[dict], path: str, seed: int) -> None:
+    """Write the section 9 N=50 distractor spot-check sample as JSONL."""
+    diag = _diag_rows(rows)
+    picked = random.Random(seed).sample(diag, min(len(diag), DISTRACTOR_SAMPLE))
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        for row in sorted(picked, key=lambda r: r["extra_info"]["task_id"]):
+            gold_id = row["extra_info"]["correct_option_id"]
+            handle.write(
+                json.dumps(
+                    {
+                        "task_id": row["extra_info"]["task_id"],
+                        "split": source_split_of(row),
+                        "index": source_index_of(row),
+                        "question": question_of(row),
+                        "gold_pair": _option_text(row, gold_id),
+                        "distractor_pairs": [
+                            option["text"] for option in row["extra_info"]["options"] if option["id"] != gold_id
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 if __name__ == "__main__":

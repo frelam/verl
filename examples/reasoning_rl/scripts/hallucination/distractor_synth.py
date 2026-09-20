@@ -13,7 +13,7 @@
 # limitations under the License.
 """D17 distractor synthesis: *answerable, but with a red herring* rows.
 
-Design doc sections 4.9.4 (table C) and D17.  GSM-IC's ``sentence_template``
+Design doc section 4.7 (table B row 1) and D17.  GSM-IC's ``sentence_template``
 column is a rule-based distractor engine: each template is parameterised only by
 ``{role}`` and ``{number}``, so rendering it with any pair yields a well-formed
 extra sentence.  Attaching such a sentence to an *answerable* base problem leaves
@@ -21,8 +21,16 @@ the answer untouched -- the sentence states an irrelevant fact -- which is what
 makes the required contrast pair work:
 
     distractor (one irrelevant condition added, still answerable)
-        vs  SUM-del / TreeCut / UMWP-cat1 / MiP (one necessary premise removed,
-            unanswerable)
+        vs  UMWP-unanswerable / MiP (one necessary premise removed, unanswerable)
+
+The branch is exactly the 400 rows of table B row 1 (design doc section 4.7):
+**UMWP-answerable 200 / K&K 100 / stage-1 math pool 100**.  The 300 numeric rows
+keep their base pool's ``data_source`` (``halluc_math_umwp`` /
+``halluc_math_main``) and carry ``solvable_numeric``; the 100 K&K rows keep the
+D19 role-answer contract -- gold is a ``name -> surface role word`` mapping,
+``role_words`` rides the payload and the K&K instruction is appended to the
+prompt -- and therefore ride ``solvable_roles`` into the K&K mix cell, next to
+the unsynthesised K&K rows of D20.
 
 The recon measured the template inventory at **394** distinct templates over
 GSM-IC's 58,052 rows, not the 242 the design doc quotes (242 is the 2step-only
@@ -47,30 +55,30 @@ which this module refuses to do:
    exclusive.  Six of the eight label cells are therefore reachable, and the
    allocator reports which ones it could not fill instead of inventing rows.
 
-Row shape is the usual :mod:`schema` contract: template B (answer or refuse),
-gold = the base problem's original answer, so the reward path is the existing
-``_math_score`` and no new scoring logic is introduced (design doc section
-4.9.4: "答案与 reward 完全不变").
+Row shape is the usual :mod:`schema` contract: template B (answer or refuse), gold
+= the base problem's original answer, so the reward path is the existing
+``_math_score`` and no new scoring logic is introduced (design doc section 4.7:
+"答案与 reward 完全不变").
 
-Standing design-doc deviation, recorded here and surfaced in the build report:
-
-* Table B row 1 ("solvable numeric + distractor") is specified as
-  ``GSM-IC 2,000 + synthesised 2,400``, and section 4.9.4 splits those 2,400 as
-  SUM 1,000 / UMWP 600 / K&K 400 / main pool 400.  A K&K base answers with a
-  *role sequence*, not a number, so its 400 rows cannot carry the
-  ``solvable_numeric`` branch label.  They are emitted under
-  :data:`POOL_BRANCH` as ``solvable_roles`` instead; the row total is unchanged
-  and only the branch bookkeeping moves.
+Same-source pairing (design doc section 4.7's 成对性硬约束, D17): a distractor row
+is only a control for the missing-premise source it is paired with if both are
+built on the same base distribution -- otherwise "which base pool is this" is
+itself the shortcut.  :data:`POOL_CONTROL_SOURCE` names, per pool, the source
+split the base questions come from: UMWP-answerable pairs with UMWP-unanswerable
+(the same ``StandardDataset`` rows), K&K pairs with K&K's perturbed rows of D20
+(the same puzzle groups, same split), and the stage-1 math slice pairs with MiP
+(whose base questions are the same GSM8K/SVAMP/MATH distribution).  The pairing
+is an explicit assertion in :func:`verify_row`, not an implicit convention.
 
 Usage::
 
     /lhy/miniconda3/envs/lhy/bin/python distractor_synth.py --selftest
-    /lhy/miniconda3/envs/lhy/bin/python distractor_synth.py
+    /lhy/miniconda3/envs/lhy/bin/python distractor_synth.py --stage1-path <stage1.parquet>
 
 Rows land in :data:`DEFAULT_OUT`, next to every other adapter's output, because
 ``mix_halluc.py`` reads exactly one directory and the synthesised slice is one of
-the quota cells it must find there (table B row 1: ``(solvable_numeric, SUM)``
-and friends).
+the quota cells it must find there (table B row 1: ``(solvable_numeric, UMWP)``,
+``(solvable_numeric, MAIN)`` and ``(solvable_roles, KK)``).
 """
 
 from __future__ import annotations
@@ -92,7 +100,8 @@ import schema
 DEFAULT_RAW_DIR = os.path.expanduser("~/data/reasoning_rl/halluc/raw")
 #: Where the built rows and the build report go.  Same directory as the other
 #: adapters' ``DEFAULT_OUT`` -- ``mix_halluc.py`` reads one directory, and the
-#: synthesised slice *is* the ``(solvable_numeric, SUM/UMWP/KK/MAIN)`` cells.
+#: synthesised slice *is* the ``(solvable_numeric, UMWP/MAIN)`` and
+#: ``(solvable_roles, KK)`` cells.
 DEFAULT_OUT = os.path.expanduser("~/data/reasoning_rl/halluc/built/d17.parquet")
 GSMIC_FILES = ("GSM-IC_2step.json", "GSM-IC_mstep.json")
 
@@ -111,42 +120,67 @@ def report_path_for(out: str) -> str:
 # pools
 # ---------------------------------------------------------------------------
 
-POOL_SUM = "sum"
 POOL_UMWP = "umwp"
 POOL_KK = "kk"
 POOL_MAIN = "main"
-POOLS = (POOL_SUM, POOL_UMWP, POOL_KK, POOL_MAIN)
+POOLS = (POOL_UMWP, POOL_KK, POOL_MAIN)
 
-# Design doc section 4.9.4: SUM-answerable 1,000 / UMWP-answerable 600 / K&K 400
-# / main pool 400.
+# Design doc section 4.7: the synthesised distractor slice of table B row 1 is
+# UMWP-answerable 200 / K&K 100 / main pool 100 -- 400 rows in total.
 DEFAULT_POOL_QUOTA: dict[str, int] = {
-    POOL_SUM: 1000,
-    POOL_UMWP: 600,
-    POOL_KK: 400,
-    POOL_MAIN: 400,
+    POOL_UMWP: 200,
+    POOL_KK: 100,
+    POOL_MAIN: 100,
 }
 
 POOL_DATA_SOURCE: dict[str, str] = {
-    POOL_SUM: schema.SOURCE_SUM,
     POOL_UMWP: schema.SOURCE_UMWP,
     POOL_KK: schema.SOURCE_KK,
     POOL_MAIN: schema.SOURCE_MAIN,
 }
 
+POOL_OF_DATA_SOURCE: dict[str, str] = {
+    source: pool for pool, source in POOL_DATA_SOURCE.items()
+}
+
 POOL_BRANCH: dict[str, str] = {
-    POOL_SUM: schema.BRANCH_SOLVABLE_NUMERIC,
     POOL_UMWP: schema.BRANCH_SOLVABLE_NUMERIC,
-    # See the module docstring: a K&K base answers with role words, so these rows
-    # ride the roles branch rather than the numeric one.
+    # A K&K base answers with name -> role pairs (D19), not a number, so these
+    # rows ride the roles branch and land in the K&K mix cell.
     POOL_KK: schema.BRANCH_SOLVABLE_ROLES,
     POOL_MAIN: schema.BRANCH_SOLVABLE_NUMERIC,
 }
 
-POOL_RAW_PATH: dict[str, str] = {
-    POOL_SUM: "sum/train.parquet",
-    POOL_UMWP: "umwp/StandardDataset.jsonl",
-    POOL_KK: "kk",
+#: The pool-unique upstream key prefix every base from that pool carries.  The key
+#: is the only identifier allowed into a ``task_id`` and it names the raw file (and
+#: therefore the source split) the base question was read from, so the same-source
+#: assertion below can test it rather than trusting ``base.pool``.
+POOL_UID_PREFIX: dict[str, str] = {
+    POOL_UMWP: "umwp:",
+    POOL_KK: "kk:",
+    POOL_MAIN: "main:",
 }
+
+#: The missing-premise source each distractor pool is the *added-condition* control
+#: of (design doc section 4.7's 成对性硬约束, D17), as ``(control data_source, the
+#: split both sides' base questions come from)``.
+#:
+#: * UMWP-answerable <-> UMWP-unanswerable: the two halves of one
+#:   ``StandardDataset.jsonl`` row, so the pairs share a base distribution by
+#:   construction.
+#: * K&K <-> K&K (D20): K&K carries no unsolvable rows at all (D11), so its
+#:   control is the perturbed K&K cell the synthesised rows sit next to -- same
+#:   puzzle groups, same split.
+#: * main pool <-> MiP: MiP's base questions are the stage-1 math pool's own
+#:   GSM8K/SVAMP/MATH distribution (design doc section 4.2).
+POOL_CONTROL_SOURCE: dict[str, tuple[str, str]] = {
+    POOL_UMWP: (schema.SOURCE_UMWP, "train"),
+    POOL_KK: (schema.SOURCE_KK, "train"),
+    POOL_MAIN: (schema.SOURCE_MIP, "train"),
+}
+#: The total the three pools above must add up to (design doc section 4.7).  A
+#: module-level invariant, gated by ``verify_distractor.py`` and the test suite.
+DEFAULT_POOL_TOTAL = 400
 
 # The perturbation vocabulary entry these rows use (design doc section 3).
 DISTRACTOR_PERTURBATION = "distracting_condition"
@@ -158,7 +192,7 @@ DISTRACTOR_PERTURBATION = "distracting_condition"
 AXIS_TARGETS: dict[str, dict[str, float]] = {
     "role_label": {"overlapped": 0.50, "nonoverlapped": 0.50},
     "number_label": {"in_range": 0.50, "out_range": 0.50},
-    # Design doc table C: GSM-IC's own in/out split is 15,404 : 18,816 = 45:55.
+    # Design doc section 4.7: GSM-IC's own in/out split is 15,404 : 18,816 = 45:55.
     "sentence_label": {"in_topic": 0.45, "out_topic": 0.55},
 }
 AXES = ("role_label", "number_label", "sentence_label")
@@ -499,16 +533,21 @@ def load_safe_templates(
 
 @dataclass(frozen=True)
 class BaseQuestion:
-    """One answerable problem the distractor sentence gets attached to."""
+    """One answerable problem the distractor sentence gets attached to.
+
+    ``answer`` is a plain string for the numeric pools and a ``name -> surface
+    role word`` mapping for K&K (D19), i.e. exactly the value the reward's branch
+    expects on that pool's ``data_source``.
+    """
 
     question: str
-    answer: str
+    answer: str | dict[str, str]
     pool: str
     # A pool-unique, upstream-traceable key, and the only identifier allowed into a
     # ``task_id``.  ``index`` alone is not enough: K&K's five per-size parquet files
     # each number their rows 0..999, so indices repeat five times over within the
-    # pool (UMWP's ``id`` and SUM's row ordinal happen to be unique today, but that
-    # is upstream's business, not a property this module should assume).
+    # pool (UMWP's ``id`` and the stage-1 row ordinal happen to be unique today, but
+    # that is upstream's business, not a property this module should assume).
     uid: str = ""
     split: str = "train"
     index: int = -1
@@ -587,9 +626,9 @@ def base_names(text: str) -> list[str]:
 # discourse marker, and (d) be attested as an actor at least
 # ACTOR_MIN_POOL_SUPPORT times in UMWP or be one of K&K's inhabitants.
 #
-# The cost is supply, and it is measured rather than wished away: most MATH
-# problems have no actor at all, so the SUM pool can only fill the overlapped
-# half of its role quota on ~1 base in 10.  ``synthesise`` therefore plans the
+# The cost is supply, and it is measured rather than wished away: most stage-1
+# MATH problems have no actor at all, so the main pool can only fill a small part
+# of its overlapped role quota.  ``synthesise`` therefore plans the
 # role axis against a *global* budget it can actually meet and records the
 # shortfall against the design target in its report.
 
@@ -599,14 +638,15 @@ _NON_ACTOR_PROPER_LOWER = frozenset(name.casefold() for name in NON_ACTOR_PROPER
 # actor the sentence may reuse is Bill, and substituting the token as it stands
 # renders "Bill's baked 12 pieces of breads." -- or, into a template that carries
 # its own clitic, "John's's monthly rent is $10000."  Measured before the strip:
-# 87 of the SUM pool's 1,299 actor-bearing bases mined a possessive, of which 25
-# reached the shipped 2,000 rows.
+# 87 of the 1,299 actor-bearing bases in the recon's SUM slice mined a possessive
+# (SUM is not a D17 base pool any more -- the rule its measurement motivated is).
 _POSSESSIVE_RE = re.compile(r"['’]s?$")
 
 ACTOR_MIN_POOL_SUPPORT = 3
 # The pools whose questions are about people, and which therefore define the
-# person-name vocabulary.  SUM is deliberately not among them -- it is the pool
-# being filtered, and a vocabulary trained on it would inherit its noise.
+# person-name vocabulary.  The stage-1 main pool is deliberately not among them:
+# it names somebody on about one base in ten, and a vocabulary trained on that
+# noise would be worse than the bootstrap it is meant to provide.
 ACTOR_VOCABULARY_POOLS = (POOL_UMWP, POOL_KK)
 
 
@@ -718,34 +758,6 @@ def mine_actors(
     return report
 
 
-def load_sum_answerable(
-    raw_dir: str | os.PathLike = DEFAULT_RAW_DIR, *, split: str = "train"
-) -> list[BaseQuestion]:
-    """SUM's answerable side.  Same row as the unanswerable variant -> same distribution."""
-    import pyarrow.parquet as pq
-
-    path = Path(raw_dir) / "sum" / f"{split}.parquet"
-    table = pq.read_table(path, columns=["answerable_question", "ground_truth"])
-    questions = table.column("answerable_question").to_pylist()
-    answers = table.column("ground_truth").to_pylist()
-    bases: list[BaseQuestion] = []
-    for index, (question, answer) in enumerate(zip(questions, answers)):
-        question = (question or "").strip()
-        if not question:
-            continue
-        bases.append(
-            BaseQuestion(
-                question=question,
-                answer=(answer or "").strip(),
-                pool=POOL_SUM,
-                uid=f"sum:{split}:{index}",
-                split=split,
-                index=index,
-            )
-        )
-    return bases
-
-
 def load_umwp_answerable(
     raw_dir: str | os.PathLike = DEFAULT_RAW_DIR,
 ) -> list[BaseQuestion]:
@@ -806,16 +818,28 @@ def _render_number(value: Any) -> str:
     return str(value)
 
 
-def kk_answer(names: Sequence[str], solution: Sequence[bool], knight_knave: dict) -> str:
-    """K&K answer words in ``names`` order, using the row's own role words.
+def kk_answer_map(
+    names: Sequence[str], solution: Sequence[bool], knight_knave: dict
+) -> dict[str, str]:
+    """The D19 gold: a ``name -> surface role word`` mapping, one entry per person.
 
-    Must stay identical to whatever ``kk_adapter.py`` emits -- the reward maps the
-    model's answer through ``role_words`` and compares word by word, so a
-    divergence here silently mis-scores the 400 synthesised rows.
+    ``solution[i]`` is the *canonical* boolean (``True`` = truth-teller), so the
+    two surface words come from this row's own ``knight_knave`` pair and never
+    from a hard-coded knight/knave: the reward maps both sides back through
+    ``role_words`` before comparing (design doc section 5.1), so a bare
+    role-word sequence -- the superseded shape -- scores 0, and a mapping built
+    from the wrong word pair would score inverted.
+
+    Kept semantically identical to ``kk_adapter.answer_mapping``, its sibling for
+    the unsynthesised K&K rows: a divergence between the two would silently
+    mis-score whichever side drifted.
     """
     truth_word = knight_knave.get("knight") or "knight"
     lie_word = knight_knave.get("knave") or "knave"
-    return " ".join(truth_word if flag else lie_word for flag in solution)
+    return {
+        str(name): truth_word if flag else lie_word
+        for name, flag in zip(names, solution)
+    }
 
 
 def _literal(value: Any) -> Any:
@@ -837,7 +861,14 @@ def _literal(value: Any) -> Any:
 def load_kk_clean(
     raw_dir: str | os.PathLike = DEFAULT_RAW_DIR, *, min_inhabitants: int = 4
 ) -> list[BaseQuestion]:
-    """K&K clean puzzles with at least ``min_inhabitants`` people (design doc section 4.8)."""
+    """K&K clean puzzles with at least ``min_inhabitants`` people (design doc section 4.1).
+
+    The clean split is the *base* question here; the synthesised row answers with
+    this puzzle's own word pair and keeps D19's mapping gold.  The base split is
+    the same ``train`` split (and the same ``(len(names), index)`` groups) the
+    perturbed K&K rows of D20 come from -- that is the same-source pairing
+    :data:`POOL_CONTROL_SOURCE` asserts.
+    """
     import pyarrow.parquet as pq
 
     kk_dir = Path(raw_dir) / "kk"
@@ -862,7 +893,7 @@ def load_kk_clean(
             bases.append(
                 BaseQuestion(
                     question=question,
-                    answer=kk_answer(names, solution, knight_knave),
+                    answer=kk_answer_map(names, solution, knight_knave),
                     pool=POOL_KK,
                     # The file is part of the key: `index` restarts at 0 in each of
                     # the five per-size files, so it repeats five times over here.
@@ -882,11 +913,13 @@ def load_kk_clean(
 def load_main_pool(
     stage1_path: str | os.PathLike, *, limit: int | None = None
 ) -> list[BaseQuestion]:
-    """The stage-1 math pool, as the 4th synthesised slice (design doc section 4.9.4).
+    """The stage-1 math pool, as the third synthesised slice (design doc section 4.7).
 
     Stage-1 rows carry no separate question column: their ``prompt`` *is* the
     problem, and ``reward_model.ground_truth`` is the JSON payload the reward
-    reads.  Only rows the stage-1 pipeline marked solvable are eligible.
+    reads.  Only rows the stage-1 pipeline marked solvable are eligible.  Its
+    control source is MiP, whose base questions are this same GSM8K/SVAMP/MATH
+    distribution (design doc section 4.2).
     """
     import pyarrow.parquet as pq
 
@@ -966,7 +999,7 @@ def inject(question: str, sentence: str) -> str:
     the problem still ends on its question.  When the base does not end in a
     question, the sentence is appended.
 
-    Whitespace is collapsed per sentence.  A SUM/MATH question often spans lines
+    Whitespace is collapsed per sentence.  A main-pool MATH question often spans lines
     ("... degree 3n such that\\nP(0) = P(3) = ..."), and ``re.split`` only breaks
     where a ``.!?`` precedes the gap, so a bare newline would otherwise survive
     inside a part and make the base text no longer a substring of the rendered
@@ -1511,7 +1544,14 @@ def _all_cells(targets: dict[str, dict[str, float]]) -> set[tuple[str, str, str]
 
 
 def make_rows(selected: Sequence[Candidate]) -> list[dict]:
-    """Turn selected candidates into parquet rows (template B, gold unchanged)."""
+    """Turn selected candidates into parquet rows (template B, gold unchanged).
+
+    The gold is ``base.answer`` verbatim: a number for the UMWP / main-pool rows
+    and a ``name -> surface role word`` mapping for the K&K rows (D19), which is
+    also why ``role_words`` is passed to :func:`schema.make_row` -- that is what
+    appends the K&K answer-format instruction to the template-B prompt and what
+    the reward's ``kk_match`` normalises through.
+    """
     rows: list[dict] = []
     for candidate in selected:
         base = candidate.base
@@ -1523,6 +1563,7 @@ def make_rows(selected: Sequence[Candidate]) -> list[dict]:
             perturbation_type=DISTRACTOR_PERTURBATION,
             role_words=role_words or None,
         )
+        control_source, control_split = POOL_CONTROL_SOURCE[base.pool]
         extra_info: dict[str, Any] = {
             "split": base.split,
             "index": base.index,
@@ -1531,8 +1572,8 @@ def make_rows(selected: Sequence[Candidate]) -> list[dict]:
             "task_id": f"d17:{base.uid}",
             "solvable": True,
             # Mirrors the ground_truth payload.  The reward reads the payload, but
-            # D18's monitoring groups by this column, and an empty one silently
-            # hides these 2,400 rows from the perturbation breakdown.
+            # the section 4.8 composition's monitoring groups by this column, and
+            # an empty one silently hides these 400 rows from the breakdown.
             "perturbation_type": DISTRACTOR_PERTURBATION,
             "paired_original_text": base.question,
             "distractor_text": distractor.sentence,
@@ -1543,11 +1584,15 @@ def make_rows(selected: Sequence[Candidate]) -> list[dict]:
             },
             # The source template is deliberately *not* a row field: extra_info is
             # one Arrow struct shared with every other source, and the D17 promise
-            # that has to be auditable per row is the answer invariance and the
-            # three labels, not which of the 200-odd templates was drawn.  The
-            # report keeps the per-cell template usage instead.
+            # that has to be auditable per row is the answer invariance, the three
+            # labels and the same-source pairing, not which of the 200-odd
+            # templates was drawn.  The report keeps the per-cell template usage.
             "perturbation_family": "gsmic_template",
             "role_words": role_words,
+            # The D17 same-source pairing, carried in the row so the audit can
+            # re-derive it instead of taking the builder's word for it.
+            "control_source": control_source,
+            "control_split": control_split,
         }
         rows.append(
             schema.make_row(
@@ -1567,10 +1612,12 @@ def verify_row(base: BaseQuestion, row: dict) -> list[str]:
     """Audit one synthesised row against the base it came from.
 
     The D17 promise is narrow and checkable: the base problem is untouched, the
-    gold answer is byte-identical, and the added sentence is a red herring the
-    answer does not depend on.  This checks the first two exactly and the third
-    structurally (the sentence is present, and deleting it from the prompt gives
-    the base problem back).
+    gold answer is byte-identical, the added sentence is a red herring the answer
+    does not depend on, and the base question comes from the same source split as
+    the missing-premise source this row is the control for.  This checks the first
+    two exactly, the third structurally (the sentence is present, and deleting it
+    from the prompt gives the base problem back) and the fourth against
+    :data:`POOL_CONTROL_SOURCE` and the base's upstream key prefix.
     """
     problems: list[str] = []
     info = row["extra_info"]
@@ -1606,6 +1653,34 @@ def verify_row(base: BaseQuestion, row: dict) -> list[str]:
     for axis in AXES:
         if labels.get(axis) not in AXIS_TARGETS[axis]:
             problems.append(f"{axis} is {labels.get(axis)!r}")
+
+    # -- D17 same-source pairing (design doc section 4.7) --------------------
+    pool = POOL_OF_DATA_SOURCE.get(row.get("data_source"))
+    if pool is None:
+        problems.append(f"row carries an unknown data_source {row.get('data_source')!r}")
+    else:
+        if base.pool != pool:
+            problems.append(
+                f"base comes from pool {base.pool!r}, row is routed as {pool!r}"
+            )
+        control_source, control_split = POOL_CONTROL_SOURCE[pool]
+        if (info.get("control_source"), info.get("control_split")) != (
+            control_source,
+            control_split,
+        ):
+            problems.append(
+                "row does not declare its control source "
+                f"{control_source!r}/{control_split!r}"
+            )
+        if base.split != control_split or info.get("split") != control_split:
+            problems.append(
+                f"base question split {base.split!r} is not the control source's "
+                f"split {control_split!r}"
+            )
+        if not base.uid.startswith(POOL_UID_PREFIX[pool]):
+            problems.append(
+                f"base key {base.uid!r} is not from the {pool!r} upstream source"
+            )
     return problems
 
 
@@ -1622,7 +1697,6 @@ def load_pools(
     pools: dict[str, list[BaseQuestion]] = {}
     notes: dict[str, str] = {}
     for pool, loader in (
-        (POOL_SUM, load_sum_answerable),
         (POOL_UMWP, load_umwp_answerable),
         (POOL_KK, load_kk_clean),
     ):
@@ -1846,7 +1920,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--report", default=None, help="JSON report path (default: alongside --out)"
     )
-    parser.add_argument("--sum-quota", type=int, default=DEFAULT_POOL_QUOTA[POOL_SUM])
     parser.add_argument("--umwp-quota", type=int, default=DEFAULT_POOL_QUOTA[POOL_UMWP])
     parser.add_argument("--kk-quota", type=int, default=DEFAULT_POOL_QUOTA[POOL_KK])
     parser.add_argument("--main-quota", type=int, default=DEFAULT_POOL_QUOTA[POOL_MAIN])
@@ -1873,7 +1946,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"pool {pool:<5} bases={len(pools.get(pool) or []):>7}  {note}")
 
     quota = {
-        POOL_SUM: args.sum_quota,
         POOL_UMWP: args.umwp_quota,
         POOL_KK: args.kk_quota,
         POOL_MAIN: args.main_quota,
@@ -1947,7 +2019,7 @@ def _selftest() -> None:
     base = BaseQuestion(
         question="Jewel bought 10 magazines to be sold at $3.50 each. How much will she gain?",
         answer="5",
-        pool=POOL_SUM,
+        pool=POOL_UMWP,
     )
     template = Template(
         sentence_template="The height of {role} is {number} feet.",
@@ -1981,7 +2053,7 @@ def _selftest() -> None:
     overlap_base = BaseQuestion(
         question="Jewel bought 10 newspapers. How many did she buy in total?",
         answer="10",
-        pool=POOL_SUM,
+        pool=POOL_UMWP,
     )
     refused = 0
     for seed in range(40):

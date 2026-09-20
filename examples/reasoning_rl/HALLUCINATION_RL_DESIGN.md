@@ -115,6 +115,7 @@ SUM 配对任务（D23）把"识别可解"与"解出答案"绑定在同一行里
 | `perturbation_type` | `extra_info.perturbation_type` | `missing_condition / contradictory_condition / distracting_condition / null` |
 | `difficulty_tag` | `extra_info.difficulty` | 来源原生难度，供分桶监控 |
 | `metadata.paired_original_text` | `extra_info.paired_original_text` | 审计用（可裁掉以控体积） |
+| `pair_id` | `extra_info.pair_id` | ⚠️ **FalseQA 专用（D27）**：同一索引配对（label=1 / label=0）两条共用的稳定键；mix 用它保证同对不跨 train/val 两侧（两侧行落在不同 `(branch, source)` cell，按 cell 切分会裂开），reward 不读 |
 
 `reward_model` 通用示例：
 
@@ -235,6 +236,11 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
   RL 一定会找到这条路 → 放弃诊断（spec §1 自带 `has_diagnosis_label=false` 的降级路径）。
 - **入池（三档 bare）**：漏斗 984 → 634 有配对 → 626 题面真不同 → 325 单值前提被移除 →
   299 数值确实从题面消失 → 262 过必要性 + 14 占位词型 = **严口径 276**（默认）/ 宽口径 299。
+  > **实现口径（2026-09-20 复核）**：`mip_adapter.py` 实现的是 fail-closed 的严口径，实测漏斗为
+  > 984 → 634 → 626 → 325 → 299 → 299 → **270**（gsm8k 254 / math 16）：比文档的 276 少 6 条，
+  > 差额来自"证书链缺失 2 条 + 源从未使用的占位值 3 条 + 占位值仍在题面 1 条"。按 Q6 默认
+  > **不补**：mix 的 `(unsolvable_bare, MiP)` cell 仍写文档的 276，缺的 ~9 条（含 val 切分）
+  > 作为 cell shortfall 进 `mix_stats.json`，不静默凑数。
   不可解行 `has_diagnosis_label=false`、`perturbation_type=missing_condition`、
   **prompt 不附选项块**（模板 B，零泄漏）。
 - **可解侧不进池**：与 Big-Math 主池同源（GSM8K/MATH）、量小、去重成本高于收益（§12 Q7）。
@@ -293,6 +299,17 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 - 差异区域不唯一 / 无法构造合格干扰右项 → 该条丢弃，禁止兜底。
 - 交付前必须跑 `verify_falseqa.py`（§9）并留报告。
 
+> **实现口径（2026-09-20 复核）**：真实三 split 的产出为 train 1,757（**829 四档 + 928 两层**）、
+> valid 713（336 + 377）、test 1,011（476 + 535），审计各 PASS 31/31。四档侧比 §4.8 的 928 少 99：
+> 区域证书本身仍复现 928/377/535，缺的 99 条死在 D21 的**金标对**门槛上（33 条纯插入 ⇒ 没有"配对
+> 真前提片段"、30 条 gold 首词不唯一、24 条修复片段仍在题面内、11 条假前提片段只有停用词、1 条
+> 干扰右项不足 k−1）——即 D21 把一个"区域证书"任务收紧成"替换对证书"任务的必然代价，fail-closed
+> 不兜底。混样时该 cell 的 ~99 条缺口（+val 切分）作为 shortfall 报出。answerable 侧只需区域证书 +
+> 非空 answer，恰好 928。
+> 另：干扰右项取自"同 split 题面词表 + 表面类型签名 + 字符长度分层"，残余提示"选最高频右项"
+> 实测 train 0.46 / test 0.42（基线 1/3），`verify_falseqa.py` 打印但**不设门槛**（§9 未给该源设 L3
+> 硬门槛）；若将来要压，改用文档频率带会把提示移向"选最稀有"（0.48–0.56）并损失约 4% 产出。
+
 ### 4.4 GSM-IC（可解 + 干扰对照；常规处理）
 
 - 来源：原始 repo `github.com/google-research-datasets/GSM-IC` 的 `GSM-IC_2step.json` +
@@ -335,6 +352,14 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 **adapter（`sum_adapter.py`）**：断言两问均非空、`ground_truth` 可解析；A/B 打乱用行级 seed
 （可复现）；`verify_sum.py` 断言成品中 `answerable_id` 的 A/B 分布为 50:50 ±2pt。
 
+> **实现口径（2026-09-20 复核）**：36,480 行原始 → 36,342 可用（94 条 gold 冲突 + 44 条同 gold 重复）
+> → 选 6,000 条（`random.Random(f"{seed}:order")` 全库洗牌，非 first-N）；A/B 实测 3,032/2,968 =
+> 50.53% A（±2pt 内）。**L3 复核发现**：§4.5 报告的 BoW-NB 五折 balanced-acc 0.502/0.503 在本仓
+> 估计器（`bow_nb_oof`，min_support=5）下不可复现——4,000 条成员上 0.5565、12,000 条成员上 **0.5927**
+> （shuffled-label 对照 0.497/0.494），跨 min_support 协议读数区间 0.46–0.63。仍低于 Q8 默认门槛
+> （随机 + 10pt = 0.60），且 §9 未给 SUM 设 L3 硬门槛 → `verify_sum.py` 打印为 *L3b finding*，
+> 不新增文档没设的硬门槛。上线时按 §10 的判断层准确率（对照 50% 基线）盯这一点。
+
 ### 4.6 UMWP / TreeCut / CREPE（扩源；D16）
 
 | 源 | 取数方式 | license | 实测规模 | 配对 | 定档 |
@@ -352,6 +377,15 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
   **整体废弃**；不可解类别（Key Information Missing 32% / Ambiguous 49% / Unrealistic 11% /
   Unrelated Object 4% / Question Missing 5%）仅用于缺陷类型统计，不再决定契约分支。
   底题源自 GSM8K/SVAMP/MultiArith/ASDiv，与主池同源 → §7.2 去重为硬前置。
+  > **实现口径（2026-09-20 复核）**：全量 `StandardDataset.jsonl` 产出 **2,588 answerable / 2,588
+  > unanswerable**（5,200 → 5,176 配对行），审计 15/15 PASS。**"无类别补充 200"在本快照里观测不到**：
+  > 该文件给全部 2,600 条 unanswerable 都标了 cat1–5，实测 category-less = 0；适配器已去掉类别
+  > 守卫（无类别行会被接收、`perturbation_type` 记 None），配额 2,489 由有类别行填满。类别分布
+  > 实测 cat1 834 / cat2 1,259 / cat3 273 / cat4 103 / cat5 119（§4.8 的 840/1,040/226/85/98+200
+  > 是重勘的缩放估计，非本文件计数）。L3：长度启发式 0.5044、BoW-NB(support≥5) 0.3744，均 ≤0.55
+  > PASS；但同一估计器在 support≥50 读 0.5750（判别 token 是缺陷词表本身 some/several/less，
+  > 不是主题记忆）——落在 Q8 的 10pt 默认内、超出 5pt，`verify_umwp.py` 无条件打印该 sweep，
+  > 门槛按文档预注册的 support≥5 配置读。
 - **TreeCut**（D26 正负双侧入池）：`cut = ans_upstream[cutDepth-1]` → 剪掉的边必在根→答案
   路径上，**不可解性构造即证明**（`proof` 自带"N variables but M formulas"凭证）——这正是
   MiP 缺的东西；且**被剪的边已知** → 负样本可做四档诊断（gold 选项 = 被剪条件）。
@@ -371,6 +405,12 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 - **CREPE**：两个坑——① 标签串是 `'false presupposition'`（**空格**，README 写的下划线串会
   匹配到 0 行）；真值取 train 927 条。② `presuppositions` 仅 **1.1%** 是题面逐字 span（其余是
   转述）→ exact-match 指针 gold 不成立，**只能进判断型/三档**。
+  > **实现口径（2026-09-20 复核）**：去掉 KUQ（D25）后 CREPE-only 的 650 条构建上，BoW-NB 五折
+  > OOF balanced-acc = **0.6075**（+0.1075 over 随机），高于 §9 的 0.60 参考线。`verify_crepe.py`
+  > 把它作为 **FINDING**（打印并计入报告、不阻断）而不是静默放宽：§9 的硬门槛针对"选项集是唯一
+  > 信号"的源，CREPE 两侧都**不带选项块**，且随机标签对照 0.5002 仍是硬检查、7/7 通过。
+  > 原始数据目录随 D25 从 `raw/kuq_crepe` 更名为 `raw/crepe`（`fetch_raw.py`）；本机既有的重勘
+  > bundle 仍在旧名下，用 `--raw-dir` / `HALLUC_CREPE_RAW_DIR` 指向即可（或重跑 fetch_raw）。
 
 ### 4.7 干扰项合成（D17）
 
@@ -412,6 +452,13 @@ GSM-IC 的 242 个 `sentence_template` 全部只由 `{role}`（272 个取值）/
 
 **硬约束检查（D18）**：模板 A 含可解（行 3/5）与不可解（行 7）✅；模板 B 含可解（行 1/2/4）与
 不可解（行 8）✅；模板 C 自带两侧 ✅。
+
+> **实现口径（§4.8 行 1 的 400 条合成干扰行）**：D17 的三段施加对象（UMWP-answerable 200 / K&K 100 /
+> 主池数学题 100）全部保留，但 K&K 底题产出的行**答案契约是 D19 的「人名: 角色词」**，无法落在行 1
+> （行 1 的金标是 `\boxed{答案}` 走 `_math_score`）。因此按 `(branch, source)` 记账时：K&K 的 100 条
+> 计入行 2 的 `(solvable_roles, halluc_logic_kk)` cell（1,600 + 100 = **1,700**），行 1 的数值 cell 为
+> GSM-IC 772 + UMWP 200 + 主池 100 = 1,072。**两侧权重完全不变**（三条都是纯可解行，权重 1），
+> 所以 40/60 与 20,000 总量仍与表 B 逐行一致。
 
 按**缺陷类型**分布（不可解 12,000；SUM 配对按 3,000 计入"混合"）：
 
@@ -732,6 +779,7 @@ examples/reasoning_rl/
     ├── verify_treecut.py                          # TreeCut：proof 证书非空 + L3 硬门槛（修后 ≤ 随机+5pt）+ D26 选项断言（负样本选项全部题面外 + 泄题启发式 ≤ 随机+5pt；正样本占位选项无正确项）
     ├── verify_crepe.py                            # CREPE：标签按空格串匹配 927 条、span 比例 <10%
     ├── verify_distractor.py                       # 干扰项合成：答案不变硬断言 + 配平 + 底题同源
+    ├── verify_gsmic.py                            # GSM-IC：答案不变、无选项块、三组标注配平
     ├── kk_adapter.py
     ├── mip_adapter.py                             # 三档源（D12）：svamp 配对 + §4.2 漏斗
     ├── falseqa_adapter.py                         # 双侧源（D13/D21/D27）：label=1 配对 diff → 替换对 gold + 干扰对；label=0 占位替换对 + 按对 split
@@ -739,6 +787,9 @@ examples/reasoning_rl/
     ├── sum_adapter.py                             # 配对判断任务（D23）：A/B 行级随机
     ├── treecut_adapter.py                         # D26：负样本四档（生成器 cut 选项）+ 正样本占位选项块
     ├── umwp_adapter.py / crepe_adapter.py
+    ├── distractor_synth.py                        # D17：242 条 sentence_template 施加到 UMWP/K&K/主池底题（400 条）
+    ├── distractor_mining.py                       # 同题等长跨度挖掘（占位选项块与 FalseQA 干扰对的公共 helper）
+    ├── fetch_raw.py                               # 各源原始数据下载（离线构建用；KUQ 已随 D25 移除）
     ├── mix_halluc.py
     └── test_*.py                                  # 每个 adapter / mix / schema 的单元测试
 ```
@@ -779,6 +830,12 @@ examples/reasoning_rl/
 - **模板同构断言（D18 硬约束，做成单测不靠人眼）**：① 模板 A 子集与模板 B 子集里
   `solvable=true` 占比都必须 > 0；② `has_option_block` 与 `solvable` 的互信息 ≈ 0
   （|corr| < 0.1）；③ 模板 A 内各子集选项个数相同（=3，D15）。
+  > **实现口径（2026-09-20 复核）**：② 在 §4.8 的配额下**不可能成立**——模板 A 含 5,835 条四档
+  > 不可解行与 1,978 条可解行（UMWP/FalseQA-answerable + TreeCut 正样本），全库
+  > `corr(has_option_block, solvable)` 实测 **−0.478**，这不是实现缺陷而是配额的算术后果。
+  > 落地的断言改为**分模板两侧都存在且都不少于该模板的 10%**（模板 A 实测可解侧 25.3%），
+  > 与 §11 风险 10 的表述一致（"要防的是同模板内『选项块 ⟺ 不可解』的关联"）；模板 A 两侧
+  > **共用同一套文案**才是真正的防线。`B_judge` 作为 B 的"只判不答"变体并入 B 族计平衡。
 - **选项乱序不变性**：同一条数据、同一次输出，只打乱选项块顺序 + 同步改 `correct_option_id`，
   reward 必须不变。
 - **reward 与 adapter 字段契约**：`ground_truth` 必须是 JSON 字符串；四档源的

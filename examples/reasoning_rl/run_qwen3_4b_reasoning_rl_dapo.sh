@@ -14,6 +14,21 @@
 #       --if_ratio 0.10 --output_dir $DATA_DIR_IF
 # then resume pointing at the new mix (see TRAIN_FILES / VAL_FILES below).
 #
+# Mid-training hallucination-resistance stage (HALLUCINATION_RL_DESIGN.md):
+#   raw data lives under ~/data/reasoning_rl/halluc/raw (see scripts/hallucination/fetch_raw.py);
+#   build each source adapter, the synthesised distractors, then the stage-2 mix:
+#   for a in kk mip falseqa gsmic sum umwp treecut crepe; do
+#       python examples/reasoning_rl/scripts/hallucination/${a}_adapter.py ; done
+#   python examples/reasoning_rl/scripts/hallucination/distractor_synth.py
+#   python examples/reasoning_rl/scripts/hallucination/mix_halluc.py \
+#       --stage1_path $DATA_DIR/train.parquet
+# then resume from the stage-1 checkpoint with the new mix AND the new reward file
+# (see REWARD_PATH below):
+#   TRAIN_FILES="['$HOME/data/reasoning_rl/final_halluc/train.parquet']" \
+#   VAL_FILES="['$HOME/data/reasoning_rl/final_halluc/val.parquet']" \
+#   REWARD_PATH=$PWD/examples/reasoning_rl/reward/hallucination_compute_score.py \
+#   RESUME_MODE=resume_path RESUME_PATH=<ckpt_dir> bash run_qwen3_4b_reasoning_rl_dapo.sh
+#
 # DAPO switches (DESIGN.md section 8):
 #   - clip-higher (clip_ratio_high=0.4)              ON  (keeps low-prob exploration tokens)
 #   - dynamic sampling / filter_groups (metric=score) ON  (owned by the hard-replay sampler)
@@ -139,6 +154,13 @@ system_prompt=${REASONING_RL_SYSTEM_PROMPT:-}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# Reward-file hot-swap seam.  The default is the four-domain dispatcher, so a run
+# that does not set this behaves exactly as before; the hallucination-resistance
+# stage points it at its own dispatcher, which delegates every non-`halluc_*` row
+# back to that same file (HALLUCINATION_RL_DESIGN.md section 7.3 / Q3):
+#   REWARD_PATH=$REPO_ROOT/examples/reasoning_rl/reward/hallucination_compute_score.py
+REWARD_PATH=${REWARD_PATH:-"$REPO_ROOT/examples/reasoning_rl/reward/compute_score.py"}
+
 PROJECT_NAME=${PROJECT_NAME:-verl_reasoning_rl}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_reasoning_rl_dapo_$(date +%Y%m%d_%H%M)}
 ########################### end user-adjustable ###########################
@@ -231,7 +253,7 @@ ROLLOUT=(
 )
 
 REWARD=(
-    reward.custom_reward_function.path="$REPO_ROOT/examples/reasoning_rl/reward/compute_score.py"
+    reward.custom_reward_function.path="$REWARD_PATH"
     reward.custom_reward_function.name=compute_score
     reward.reward_manager.name=naive
 )

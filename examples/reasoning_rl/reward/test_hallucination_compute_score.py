@@ -17,27 +17,16 @@ Run from the repo root::
 
     pytest examples/reasoning_rl/reward/test_hallucination_compute_score.py -v
 
-The six-branch x three-case matrix of HALLUCINATION_RL_DESIGN.md section 9 is
-spread over the ``Test*`` classes below; each branch gets a correct-output cell
-(``+1``), a wrong-direction cell (``-1``) and an unparseable cell (``0``).
+The branch x case matrix of HALLUCINATION_RL_DESIGN.md section 9 is spread over
+the ``Test*`` classes below.  Every branch gets a correct-output cell, a
+wrong-direction cell and an unparseable cell, and the two cross-cutting rules are
+pinned down explicitly:
 
-DESIGN CONFLICTS
-----------------
-
-Three places in the design document contradict themselves; the module docstring
-of ``hallucination_compute_score.py`` records the resolution and the tests below
-pin that resolution down so it cannot drift silently:
-
-1. Misrefusal (``\\boxed{UNSOLVABLE}`` on a solvable row) is ``-1`` on **every**
-   solvable branch.  Section 6's pseudocode returns 0 on the numeric branch;
-   section 9's matrix lists it as the ``-1`` cell there and on the role-word
-   branch.  See ``TestSolvableNumeric.test_misrefusal_is_penalised``.
-2. ``halluc_math_gsmic`` gets no special case -- numeric solvable rows all route
-   through ``math_match``, so GSM-IC is scored like every other numeric pool.
-   See ``TestDelegation.test_halluc_math_gsmic_uses_the_math_branch``.
-3. ``\\boxed{UNSOLVABLE: B}`` on a three-tier row is ``+1`` (doc sections 5.1 and
-   6) rather than the 0 that section 9's matrix implies.
-   See ``TestUnsolvableThreeTier.test_spurious_option_id_still_scores``.
+* ``-1`` applies in exactly two places -- fabricating an answer on an unsolvable
+  row and refusing on a ``judgment_only`` row; every other solvable branch scores
+  a misrefusal 0 (section 6's pseudocode, section 9's matrix, D24/D26);
+* the bare ``\\boxed{UNSOLVABLE}`` string is branch-dependent: +1 on a three-tier
+  source, 0 on a four-tier one (section 5.1's "最容易写错的一处").
 """
 
 import json
@@ -57,6 +46,8 @@ from hallucination_compute_score import (
     extract_final,
     kk_match,
     math_match,
+    norm_match,
+    parse_pair,
     score_from_status,
 )
 
@@ -113,7 +104,8 @@ class TestExtractFinal:
         assert extract_final("\\boxed{  }") == (STATUS_NONE, None, None)
 
     def test_answer_that_contains_the_word_unsolvable(self):
-        # Only the whole boxed text decides; prose inside an answer stays an answer.
+        # Only the whole boxed text decides; prose inside an answer is a refusal
+        # shape, and the option id in it is unreadable.
         status, answer, _ = extract_final("\\boxed{the problem is unsolvable for small n}")
         assert status == STATUS_UNSOLVABLE_BARE
 
@@ -151,9 +143,12 @@ class TestExtractFinal:
     def test_option_on_its_own_line(self):
         assert extract_final("\\boxed{UNSOLVABLE:\nB\n}") == (STATUS_UNSOLVABLE_OPTION, None, "B")
 
+    def test_pair_answer_is_an_answer(self):
+        assert extract_final("\\boxed{B: 42}") == (STATUS_ANSWER, "B: 42", None)
+
 
 # ---------------------------------------------------------------------------
-# branch 1/2: solvable, numeric (GSM-IC, SUM-answerable, distractor-synthesised)
+# branch 1: solvable, numeric (GSM-IC, synthesised distractors, TreeCut positives)
 # ---------------------------------------------------------------------------
 
 
@@ -167,16 +162,17 @@ class TestSolvableNumeric:
     def test_wrong_answer_scores_zero(self):
         assert score(self.SOURCE, "\\boxed{71}", self.GT) == 0.0
 
-    def test_misrefusal_is_penalised(self):
-        # DESIGN CONFLICT 1: doc section 9 lists this as the -1 cell.
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == -1.0
+    def test_misrefusal_scores_zero(self):
+        # Section 6's pseudocode and section 9's matrix: only a judgment_only row
+        # penalises a refusal, so a numeric row does not (D24/D26 restate it as
+        # "误拒 → 0（与普通可解行一致）").
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 0.0
 
-    def test_misrefusal_with_option_is_penalised(self):
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", self.GT) == -1.0
+    def test_misrefusal_with_option_scores_zero(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", self.GT) == 0.0
 
     def test_misrefusal_with_solvable_marker_is_zero(self):
-        # \boxed{SOLVABLE} on a plain numeric row is not a verdict the row asked
-        # for, and it is not an answer either: neither +1 nor -1.
+        # \boxed{SOLVABLE} on a plain numeric row is not an answer: no credit.
         assert score(self.SOURCE, "\\boxed{SOLVABLE}", self.GT) == 0.0
 
     def test_no_boxed_scores_zero(self):
@@ -191,71 +187,215 @@ class TestSolvableNumeric:
         gt = gt_json(solvable=True, answer="\\frac{1}{2}", has_diagnosis_label=False)
         assert score(self.SOURCE, "\\boxed{0.5}", gt) == 1.0
 
+    def test_placeholder_option_block_does_not_change_the_branch(self):
+        """TreeCut positives (D26) carry a placeholder block the reward ignores."""
+        gt = gt_json(
+            solvable=True,
+            answer="72",
+            correct_option_id=None,
+            has_diagnosis_label=False,
+            perturbation_type=None,
+        )
+        assert score("halluc_math_treecut", "\\boxed{72}", gt) == 1.0
+        assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE: A}", gt) == 0.0
+
 
 # ---------------------------------------------------------------------------
-# branch 3: solvable, role-word sequence (K&K) -- the reward-inversion defence
+# branch 2: solvable, name -> role pairs (K&K, D19) -- the reward-inversion defence
 # ---------------------------------------------------------------------------
 
 
-class TestSolvableRoleWords:
+class TestSolvableNameRolePairs:
     SOURCE = "halluc_logic_kk"
 
-    def test_canonical_words(self):
-        gt = gt_json(solvable=True, answer="knight knave", role_words=["knight", "knave"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{knight knave}", gt) == 1.0
-        assert score(self.SOURCE, "\\boxed{knave knight}", gt) == 0.0
+    @staticmethod
+    def gt(answer, role_words):
+        return gt_json(solvable=True, answer=answer, role_words=role_words, has_diagnosis_label=False)
+
+    def test_mapping_match(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Oliver: knight, Ethan: knave}", gt) == 1.0
+
+    def test_name_order_is_irrelevant(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Ethan: knave, Oliver: knight}", gt) == 1.0
+
+    def test_case_and_separators_are_irrelevant(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{oliver: KNIGHT; ethan: a knave}", gt) == 1.0
+        assert score(self.SOURCE, "\\boxed{**Oliver**: knight\nEthan: knave}", gt) == 1.0
 
     def test_flip_role_inversion_defence(self):
         """flip_role rows write "knaves always tell the truth": the *surface* words
         are swapped, so a hard-coded K = knight would score truth as falsehood."""
-        gt = gt_json(solvable=True, answer="knave knave", role_words=["knave", "knight"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{knave knave}", gt) == 1.0
+        gt = self.gt({"Oliver": "knave", "Ethan": "knave"}, ["knave", "knight"])
+        assert score(self.SOURCE, "\\boxed{Oliver: knave, Ethan: knave}", gt) == 1.0
         # The canonical words are the *wrong* answer on this row.
-        assert score(self.SOURCE, "\\boxed{knight knight}", gt) == 0.0
+        assert score(self.SOURCE, "\\boxed{Oliver: knight, Ethan: knight}", gt) == 0.0
 
     def test_random_pair_inversion_defence(self):
-        gt = gt_json(solvable=True, answer="angel devil devil", role_words=["angel", "devil"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{angel devil devil}", gt) == 1.0
-        assert score(self.SOURCE, "\\boxed{devil angel angel}", gt) == 0.0
+        gt = self.gt({"Quinn": "angel", "Ava": "devil", "Jack": "devil"}, ["angel", "devil"])
+        assert score(self.SOURCE, "\\boxed{Quinn: angel, Ava: devil, Jack: devil}", gt) == 1.0
+        assert score(self.SOURCE, "\\boxed{Quinn: devil, Ava: angel, Jack: angel}", gt) == 0.0
 
-    def test_plurals_and_articles(self):
-        gt = gt_json(solvable=True, answer="knight knave", role_words=["knight", "knave"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{a knight, a knave}", gt) == 1.0
-        assert score(self.SOURCE, "\\boxed{knights knaves}", gt) == 1.0
+    def test_old_role_sequence_scores_zero(self):
+        """The superseded D11 shape carries no name to check the answer against."""
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{knight knave}", gt) == 0.0
+        assert score(self.SOURCE, "\\boxed{knave knight}", gt) == 0.0
 
-    def test_k_n_literals_rejected(self):
-        # Design doc section 12 Q17: the canonical K/N shorthand is not the contract.
-        gt = gt_json(solvable=True, answer="knight knave", role_words=["knight", "knave"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{K N}", gt) == 0.0
+    def test_wrong_role_scores_zero(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Oliver: knave, Ethan: knave}", gt) == 0.0
 
-    def test_wrong_length_rejected(self):
-        gt = gt_json(solvable=True, answer="knight knave", role_words=["knight", "knave"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{knight}", gt) == 0.0
-        assert score(self.SOURCE, "\\boxed{knight knave knave}", gt) == 0.0
+    def test_missing_name_scores_zero(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Oliver: knight}", gt) == 0.0
 
-    def test_prose_answer_rejected(self):
-        # Names are out-of-vocabulary tokens: the format is part of the contract.
-        gt = gt_json(solvable=True, answer="knight knave", role_words=["knight", "knave"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{Ethan is a knight and Abigail is a knave}", gt) == 0.0
+    def test_extra_name_scores_zero(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Oliver: knight, Ethan: knave, Zoe: knave}", gt) == 0.0
 
-    def test_misrefusal_is_penalised(self):
-        gt = gt_json(solvable=True, answer="knight knave", role_words=["knight", "knave"], has_diagnosis_label=False)
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", gt) == -1.0
+    def test_duplicate_name_scores_zero(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Oliver: knight, Oliver: knave, Ethan: knave}", gt) == 0.0
+
+    def test_out_of_vocabulary_role_scores_zero(self):
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{Oliver: sage, Ethan: knave}", gt) == 0.0
+
+    def test_misrefusal_scores_zero(self):
+        # Section 9: \boxed{UNSOLVABLE} on a K&K row is 0, not -1.
+        gt = self.gt({"Oliver": "knight", "Ethan": "knave"}, ["knight", "knave"])
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", gt) == 0.0
 
     def test_missing_role_words_fails_closed(self):
         # An adapter that forgot role_words must not silently score with an
-        # assumed knight/knave mapping (design doc section 11 risk 9).
-        gt = gt_json(solvable=True, answer="knave knave", has_diagnosis_label=False)
-        assert kk_match("knave knave", None, "knave knave") is False
+        # assumed knight/knave mapping (design doc section 11 risk 5).
+        gt = self.gt({"Oliver": "knave"}, None)
+        assert score(self.SOURCE, "\\boxed{Oliver: knave}", gt) == 0.0
+        assert kk_match("Oliver: knave", None, {"Oliver": "knave"}) is False
 
 
 # ---------------------------------------------------------------------------
-# branch 4: solvable, judgment-only (FalseQA-real D14, CREPE-normal, KUQ-known)
+# branch 3: solvable, judgement + answer (two-layer: UMWP D24, FalseQA D27)
+# ---------------------------------------------------------------------------
+
+
+class TestSolvableTwoLayerNumeric:
+    """UMWP-answerable: giving an answer *is* the judgement (D24)."""
+
+    SOURCE = "halluc_math_umwp"
+    GT = gt_json(solvable=True, answer="42", two_layer=True, has_diagnosis_label=False)
+
+    def test_answer_scores_full(self):
+        assert score(self.SOURCE, "\\boxed{42}", self.GT) == 1.0
+
+    def test_judged_but_wrong_scores_half(self):
+        assert score(self.SOURCE, "\\boxed{43}", self.GT) == 0.5
+
+    def test_refusal_fails_the_judgement_layer(self):
+        for refusal in ("\\boxed{UNSOLVABLE}", "\\boxed{UNSOLVABLE: B}", "\\boxed{SOLVABLE}"):
+            assert score(self.SOURCE, refusal, self.GT) == 0.0, refusal
+
+    def test_no_boxed_scores_zero(self):
+        assert score(self.SOURCE, "42", self.GT) == 0.0
+
+
+class TestSolvableTwoLayerFreeText:
+    """FalseQA-answerable: same two layers over a free-text answer (D27)."""
+
+    SOURCE = "halluc_commonsense_falseqa"
+    GT = gt_json(
+        solvable=True, answer="a teacher", solvable_answer=True, correct_option_id=None, has_diagnosis_label=False
+    )
+
+    def test_normalised_match_scores_full(self):
+        assert score(self.SOURCE, "\\boxed{a teacher}", self.GT) == 1.0
+
+    def test_case_punctuation_and_articles_are_normalised(self):
+        for answer in ("\\boxed{Teacher!}", "\\boxed{the teacher.}", "\\boxed{  TEACHER  }"):
+            assert score(self.SOURCE, answer, self.GT) == 1.0, answer
+
+    def test_judged_but_wrong_scores_half(self):
+        assert score(self.SOURCE, "\\boxed{a student}", self.GT) == 0.5
+
+    def test_solvable_marker_takes_the_judgement_layer_only(self):
+        assert score(self.SOURCE, "\\boxed{SOLVABLE}", self.GT) == 0.5
+
+    def test_misrefusal_scores_zero(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 0.0
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", self.GT) == 0.0
+
+    def test_no_boxed_scores_zero(self):
+        assert score(self.SOURCE, "a teacher", self.GT) == 0.0
+
+    def test_norm_match_directly(self):
+        assert norm_match("The Teacher!", "a teacher") is True
+        assert norm_match("teacher", "teachers") is False
+        assert norm_match(None, "teacher") is False
+
+
+# ---------------------------------------------------------------------------
+# branch 4: SUM's paired judge-then-solve task (D23)
+# ---------------------------------------------------------------------------
+
+
+class TestSumPairTask:
+    SOURCE = "halluc_math_sumpair"
+    GT = gt_json(
+        solvable=True,
+        pair_task=True,
+        answerable_id="B",
+        answer=42,
+        has_diagnosis_label=False,
+        perturbation_type=None,
+    )
+
+    def test_judged_and_solved_scores_full(self):
+        assert score(self.SOURCE, "\\boxed{B: 42}", self.GT) == 1.0
+
+    def test_lowercase_and_full_width_colon_parse(self):
+        assert score(self.SOURCE, "\\boxed{b：42}", self.GT) == 1.0
+        assert score(self.SOURCE, "\\boxed{B : 42}", self.GT) == 1.0
+
+    def test_judged_but_wrong_scores_half(self):
+        assert score(self.SOURCE, "\\boxed{B: 43}", self.GT) == 0.5
+
+    def test_wrong_judgement_scores_zero_even_with_the_right_answer(self):
+        assert score(self.SOURCE, "\\boxed{A: 42}", self.GT) == 0.0
+
+    def test_unparseable_shapes_score_zero(self):
+        for response in ("\\boxed{42}", "\\boxed{UNSOLVABLE}", "\\boxed{A}", "42"):
+            assert score(self.SOURCE, response, self.GT) == 0.0, response
+
+    def test_ab_swap_invariance(self):
+        """Swapping the two questions and answerable_id must not change the score."""
+        swapped = gt_json(
+            solvable=True,
+            pair_task=True,
+            answerable_id="A",
+            answer=42,
+            has_diagnosis_label=False,
+            perturbation_type=None,
+        )
+        assert score(self.SOURCE, "\\boxed{A: 42}", swapped) == 1.0
+        assert score(self.SOURCE, "\\boxed{B: 42}", swapped) == 0.0
+
+    def test_parse_pair_directly(self):
+        assert parse_pair("A: 42") == ("A", "42")
+        assert parse_pair("b：7") == ("B", "7")
+        assert parse_pair("42") == (None, None)
+        assert parse_pair(None) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# branch 5: solvable, judgement only (CREPE-normal)
 # ---------------------------------------------------------------------------
 
 
 class TestSolvableJudgmentOnly:
-    SOURCE = "halluc_commonsense_falseqa"
+    SOURCE = "halluc_commonsense_crepe"
     GT = gt_json(solvable=True, answer=None, judgment_only=True, has_diagnosis_label=False, correct_option_id=None)
 
     def test_solvable_marker_scores(self):
@@ -282,8 +422,7 @@ class TestSolvableJudgmentOnly:
 
 
 # ---------------------------------------------------------------------------
-# branch 5: unsolvable, three-tier bare (MiP, SUM-deletion, TreeCut, UMWP cat1,
-#           CREPE-false-presupposition, KUQ-unknown)
+# branch 6: unsolvable, three-tier bare (MiP, UMWP-unanswerable, CREPE-FP)
 # ---------------------------------------------------------------------------
 
 
@@ -295,7 +434,8 @@ class TestUnsolvableThreeTier:
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 1.0
 
     def test_spurious_option_id_still_scores(self):
-        # DESIGN CONFLICT 3: doc 5.1/6 say +1, doc 9's matrix implies 0.
+        # Doc sections 5.1/6: the prompt carries no option block, so an option id
+        # is meaningless and the verdict earns full credit.
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: A}", self.GT) == 1.0
 
     def test_fabrication_is_penalised(self):
@@ -313,19 +453,15 @@ class TestUnsolvableThreeTier:
         """Every three-tier source shares one behaviour (design doc section 9)."""
         for source in (
             "halluc_math_mip",
-            "halluc_math_sum",
-            "halluc_math_treecut",
             "halluc_math_umwp",
             "halluc_commonsense_crepe",
-            "halluc_commonsense_kuq",
         ):
             assert score(source, "\\boxed{UNSOLVABLE}", self.GT) == 1.0, source
             assert score(source, "\\boxed{42}", self.GT) == -1.0, source
 
 
 # ---------------------------------------------------------------------------
-# branch 6: unsolvable, four-tier diagnostic (FalseQA-fake, SUM-visible,
-#           UMWP-visible)
+# branch 7: unsolvable, four-tier diagnostic (FalseQA-fake, TreeCut negatives D26)
 # ---------------------------------------------------------------------------
 
 
@@ -337,6 +473,11 @@ class TestUnsolvableFourTier:
         correct_option_id="B",
         has_diagnosis_label=True,
         perturbation_type="contradictory_condition",
+        options=[
+            {"id": "A", "text": "man -> child"},
+            {"id": "B", "text": "man -> women"},
+            {"id": "C", "text": "man -> teacher"},
+        ],
     )
 
     def test_correct_option_scores(self):
@@ -376,10 +517,25 @@ class TestUnsolvableFourTier:
             answer=None,
             correct_option_id="C",
             has_diagnosis_label=True,
-            options=[{"id": "A", "text": "space"}, {"id": "B", "text": "gases"}, {"id": "C", "text": "Confucius"}],
+            options=[
+                {"id": "A", "text": "man -> women"},
+                {"id": "B", "text": "man -> teacher"},
+                {"id": "C", "text": "man -> child"},
+            ],
         )
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: C}", shuffled) == 1.0
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", shuffled) == 0.0
+
+    def test_treecut_negative_uses_the_same_branch(self):
+        gt = gt_json(
+            solvable=False,
+            answer=None,
+            correct_option_id="A",
+            has_diagnosis_label=True,
+            perturbation_type="missing_condition",
+        )
+        assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE: A}", gt) == 1.0
+        assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE}", gt) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -391,8 +547,12 @@ class TestBareMarkerBranchCorrelation:
     def test_same_string_two_scores(self):
         three_tier = gt_json(solvable=False, has_diagnosis_label=False)
         four_tier = gt_json(solvable=False, has_diagnosis_label=True, correct_option_id="B")
-        assert score("halluc_math_sum", "\\boxed{UNSOLVABLE}", three_tier) == 1.0
-        assert score("halluc_math_sum", "\\boxed{UNSOLVABLE}", four_tier) == 0.0
+        assert score("halluc_math_umwp", "\\boxed{UNSOLVABLE}", three_tier) == 1.0
+        assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE}", four_tier) == 0.0
+
+    def test_the_message_names_the_source(self):
+        four_tier = gt_json(solvable=False, has_diagnosis_label=True, correct_option_id="B")
+        assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE}", four_tier) == 0.0, "halluc_math_treecut"
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +586,8 @@ class TestFormatGateAndMalformedInputs:
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", gt_json(answer="42")) == 0.0
 
     def test_ground_truth_as_a_dict_is_accepted(self):
-        assert score_from_status({"solvable": False, "has_diagnosis_label": False}, STATUS_UNSOLVABLE_BARE, None, None) == 1.0
+        bare = {"solvable": False, "has_diagnosis_label": False}
+        assert score_from_status(bare, STATUS_UNSOLVABLE_BARE, None, None) == 1.0
 
     def test_pathological_response_does_not_raise(self):
         weird = "<think>x</think>\n\n\\boxed{{{{{{" + "[" * 500
@@ -438,15 +599,39 @@ class TestFormatGateAndMalformedInputs:
 # ---------------------------------------------------------------------------
 
 
+#: Ground truths shared by the decision table (module level: the parametrize
+#: decorator is evaluated while the class body is still being built).
+FREE_TEXT_GT = {"solvable": True, "solvable_answer": True, "answer": "a teacher"}
+PAIR_GT = {"solvable": True, "pair_task": True, "answerable_id": "B", "answer": 42}
+FOUR_TIER_GT = {"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}
+
+
 class TestDecisionTable:
     @pytest.mark.parametrize(
         ("ground_truth", "status", "answer", "option", "expected"),
         [
-            # solvable numeric
+            # solvable numeric (misrefusal is 0, not -1)
             ({"solvable": True, "answer": "72"}, STATUS_ANSWER, "72", None, 1.0),
             ({"solvable": True, "answer": "72"}, STATUS_ANSWER, "7", None, 0.0),
-            ({"solvable": True, "answer": "72"}, STATUS_UNSOLVABLE_BARE, None, None, -1.0),
+            ({"solvable": True, "answer": "72"}, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
+            ({"solvable": True, "answer": "72"}, STATUS_UNSOLVABLE_OPTION, None, "B", 0.0),
             ({"solvable": True, "answer": "72"}, STATUS_NONE, None, None, 0.0),
+            # solvable two-layer numeric (D24)
+            ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_ANSWER, "42", None, 1.0),
+            ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_ANSWER, "43", None, 0.5),
+            ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
+            ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_SOLVABLE_MARKER, None, None, 0.0),
+            # solvable two-layer free text (D27)
+            (FREE_TEXT_GT, STATUS_ANSWER, "Teacher!", None, 1.0),
+            (FREE_TEXT_GT, STATUS_ANSWER, "a student", None, 0.5),
+            (FREE_TEXT_GT, STATUS_SOLVABLE_MARKER, None, None, 0.5),
+            (FREE_TEXT_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
+            # SUM pair task (D23)
+            (PAIR_GT, STATUS_ANSWER, "B: 42", None, 1.0),
+            (PAIR_GT, STATUS_ANSWER, "B: 43", None, 0.5),
+            (PAIR_GT, STATUS_ANSWER, "A: 42", None, 0.0),
+            (PAIR_GT, STATUS_ANSWER, "42", None, 0.0),
+            (PAIR_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
             # solvable judgment-only
             ({"solvable": True, "judgment_only": True}, STATUS_SOLVABLE_MARKER, None, None, 1.0),
             ({"solvable": True, "judgment_only": True}, STATUS_UNSOLVABLE_BARE, None, None, -1.0),
@@ -460,11 +645,11 @@ class TestDecisionTable:
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_NONE, None, None, 0.0),
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_SOLVABLE_MARKER, None, None, 0.0),
             # unsolvable four-tier
-            ({"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}, STATUS_UNSOLVABLE_OPTION, None, "B", 1.0),
-            ({"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}, STATUS_UNSOLVABLE_OPTION, None, "A", 0.0),
-            ({"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
-            ({"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}, STATUS_ANSWER, "1", None, -1.0),
-            ({"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}, STATUS_NONE, None, None, 0.0),
+            (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, None, "B", 1.0),
+            (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, None, "A", 0.0),
+            (FOUR_TIER_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
+            (FOUR_TIER_GT, STATUS_ANSWER, "1", None, -1.0),
+            (FOUR_TIER_GT, STATUS_NONE, None, None, 0.0),
         ],
     )
     def test_cell(self, ground_truth, status, answer, option, expected):
@@ -504,11 +689,11 @@ class TestDelegation:
             )
 
     def test_halluc_math_gsmic_uses_the_math_branch(self):
-        # DESIGN CONFLICT 2: no special case; solvable numeric rows are all scored
-        # by math_match, so the misrefusal penalty applies here too.
+        """GSM-IC rows are plain numeric solvable rows: same matcher, same cells."""
         gt = gt_json(solvable=True, answer="72", has_diagnosis_label=False)
         assert score("halluc_math_gsmic", "\\boxed{72}", gt) == 1.0
-        assert score("halluc_math_gsmic", "\\boxed{UNSOLVABLE}", gt) == -1.0
+        assert score("halluc_math_gsmic", "\\boxed{71}", gt) == 0.0
+        assert score("halluc_math_gsmic", "\\boxed{UNSOLVABLE}", gt) == 0.0
 
     def test_unknown_halluc_source_still_scores(self):
         """Routing is ground-truth driven, so a new source needs no code change."""

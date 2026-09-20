@@ -13,13 +13,13 @@
 # limitations under the License.
 """Tests for ``crepe_adapter.py`` (and the L3 harness in ``verify_crepe.py``).
 
-Every fixture is inline and tiny, and the CREPE / KUQ records are copied verbatim
-out of the raw bundle (``crepe_{train,validation,test}.parquet`` and
-``knowns_unknowns.jsonl``) -- ids, questions, labels, presuppositions, answers and
-categories are the source's own bytes.  Rows built on top of them exist only to
-drive one filter branch each and are marked ``# synthetic``.  **Nothing here reads
-``/home/charles/data/reasoning_rl/halluc/raw``**: the bundles are written into
-``tmp_path`` with pyarrow.
+Every fixture is inline and tiny, and the CREPE records are copied verbatim out
+of the raw bundle (``crepe_{train,validation,test}.parquet``) -- ids, questions,
+labels and presuppositions are the source's own bytes.  Rows built on top of them
+exist only to drive one filter branch each and are marked ``# synthetic``.
+**Nothing here reads ``/home/charles/data/reasoning_rl/halluc/raw``**: the
+bundles are written into ``tmp_path`` with pyarrow.  (The one real-bundle test is
+skipped unless that directory exists or ``HALLUC_CREPE_RAW_DIR`` points at it.)
 
 The main bundle is laid out so every funnel stage drops at least as many rows as
 it owns and every drop reason has exactly one owner:
@@ -30,18 +30,16 @@ idx   record                                        outcome
 0     CREPE train 2018-09504 ['normal']             kept, branch solvable_judge
 1     CREPE train 2018-03713 ['false presupp.']      kept, branch unsolvable_bare
       (its presupposition shares the question's opening span but is not
-       verbatim -- a 10-row fixture cannot reproduce the real 14/1295 rate)
+       verbatim -- a 6-row fixture cannot reproduce the real 14/1295 rate)
 2     CREPE train 2018-00818 ['false presupp.']      kept (paraphrase presupposition)
 3     CREPE train 2018-24401 ['fp','normal']         dropped: label_uniqueness (dual)
 4     CREPE validation 2019_a-01077 ['normal']       kept
 5     CREPE test 2019_b-11155 ['false presupp.']     kept
-6     KUQ line 0 known, hotpotqa                     kept, branch solvable_judge
-7     KUQ line 1 known, triviaqa (4 answers)         kept
-8     KUQ line 2 unknown, false assumption           kept, branch unsolvable_bare
-9     KUQ line 3 unknown, counterfactual             kept
-10    KUQ line 4 unknown, controversial              dropped: category filter
-11    KUQ line 5 known, trailing space in question   kept (whitespace stripped)
 ====  ==========================================  ==================================
+
+The adapter is single-source by design: D25 removed the other judgment-only
+source from the pool entirely, so this file has no fixture, loader or wiring for
+it, and ``TestSourceSelection`` asserts that absence directly.
 """
 
 from __future__ import annotations
@@ -58,9 +56,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# The reward dispatcher lives in a sibling directory; the reward's own test file
+# does the same, and the module resolves its own `compute_score` import either
+# way.  Importing it here is what lets the two contract cells of design doc
+# section 9 (the three-tier vs four-tier bare-UNSOLVABLE cell) be asserted on the
+# *scoring* side instead of only on the schema side.
+sys.path.insert(0, str(Path(_HERE).resolve().parents[1] / "reward"))
 
 import crepe_adapter as ca  # noqa: E402
+import hallucination_compute_score as reward  # noqa: E402
 import schema  # noqa: E402
 import verify_crepe as vc  # noqa: E402
 
@@ -109,88 +115,33 @@ CREPE_TEST = {
     "presuppositions": ["Files are removed from HDD/SSD drives when deleted."],
 }
 
-KUQ_KNOWN = {
-    "question": "What wrestling promotion was formed by the current NEVER Openweight Champion?",
-    "answer": ["Pro Wrestling Fujiwara Group"],
-    "unknown": False,
-    "source": "hotpotqa",
-}
-KUQ_KNOWN_MULTI = {
-    "question": "In which decade of the 20th century was the FBI set up?",
-    "answer": ["1900 s", "nineteen hundreds", "1900s", "1900s disambiguation"],
-    "unknown": False,
-    "source": "triviaqa",
-}
-KUQ_UNKNOWN_FA = {
-    "question": "Can AI make the best rum brand?",
-    "answer": ["AI is incapable of creating Rum let alone rum brands."],
-    "unknown": True,
-    "source": "turk",
-    "category": "false assumption",
-}
-KUQ_UNKNOWN_CF = {
-    "question": "Can a person be double-jointed in their mind?",
-    "answer": ["A person can have two minds at the same time."],
-    "unknown": True,
-    "source": "turk",
-    "category": "counterfactual",
-}
-KUQ_UNKNOWN_OTHER = {
-    "question": "Are Moms better than Dads?",
-    "answer": ["This is a subjective question."],
-    "unknown": True,
-    "source": "turk",
-    "category": "controversial",
-}
-KUQ_WHITESPACE = {
-    "question": "VfL Wolfsburg's attacking midfielder is what nationality? ",
-    "answer": ["Bosnian"],
-    "unknown": False,
-    "source": "hotpotqa",
-}
-
-# The six KUQ lines, in file order: the line index *is* the KUQ source identity.
-KUQ_FIXTURE = [
-    KUQ_KNOWN,
-    KUQ_KNOWN_MULTI,
-    KUQ_UNKNOWN_FA,
-    KUQ_UNKNOWN_CF,
-    KUQ_UNKNOWN_OTHER,
-    KUQ_WHITESPACE,
-]
-
 CREPE_DEFAULT = {
     "train": [CREPE_NORMAL, CREPE_FP_OVERLAP, CREPE_FP_PARAPHRASE, CREPE_DUAL],
     "validation": [CREPE_VALIDATION],
     "test": [CREPE_TEST],
 }
 
-# 12 raw records -> 10 rows: one dual-label drop, one out-of-scope-category drop.
+# 6 raw records -> 5 rows: one dual-label drop.
 EXPECTED_FUNNEL = {
-    "raw_rows": 12,
-    "after_question_text": 12,
-    "after_label_uniqueness": 11,
-    "after_certificate": 11,
-    "after_kuq_category_filter": 10,
-    "after_cross_label_conflict": 10,
-    "after_dedup": 10,
-    "after_quota": 10,
-    "after_limit": 10,
+    "raw_rows": 6,
+    "after_question_text": 6,
+    "after_label_uniqueness": 5,
+    "after_certificate": 5,
+    "after_cross_label_conflict": 5,
+    "after_dedup": 5,
+    "after_quota": 5,
+    "after_limit": 5,
 }
 
-# Interleaved one row per quota group per round (GROUP_ORDER), each group first
-# round-robin over its native split -- so the order itself is under test.
+# Interleaved one row per quota group per round (GROUP_ORDER: solvable_judge
+# first, then unsolvable_bare), each group first round-robin over its native
+# split -- so the order itself is under test.
 EXPECTED_TASK_IDS = [
-    "crepe:train:2018-09504",
-    "crepe:test:2019_b-11155",
-    "kuq:00000",
-    "kuq:00002",
-    "crepe:validation:2019_a-01077",
-    "crepe:train:2018-00818",
-    "kuq:00001",
-    "kuq:00003",
-    "crepe:train:2018-03713",
-    "kuq:00005",
+    "crepe:train:2018-09504",  # solvable_judge, round 0
+    "crepe:test:2019_b-11155",  # unsolvable_bare, round 0
+    "crepe:validation:2019_a-01077",  # solvable_judge, round 1
+    "crepe:train:2018-00818",  # unsolvable_bare, round 1
+    "crepe:train:2018-03713",  # unsolvable_bare, round 2
 ]
 
 CREPE_PARQUET_SCHEMA = pa.schema(
@@ -201,6 +152,19 @@ CREPE_PARQUET_SCHEMA = pa.schema(
         ("presuppositions", pa.list_(pa.string())),
     ]
 )
+
+# The quota allocation design doc section 4.8 table B rows 4 and 8 fix for this
+# source; the fixture is far too small for the quotas to bind, so the numbers are
+# asserted directly.
+EXPECTED_QUOTAS = {
+    (schema.SOURCE_CREPE, schema.BRANCH_SOLVABLE_JUDGE): 250,
+    (schema.SOURCE_CREPE, schema.BRANCH_UNSOLVABLE_BARE): 400,
+}
+
+# The real bundle, for the one end-to-end audit test (skipped when absent).  The
+# env override exists because the recon bundle was downloaded into a shared
+# directory whose name predates D25; a fresh `fetch_raw.py` uses `raw/crepe`.
+REAL_RAW_DIR = os.environ.get("HALLUC_CREPE_RAW_DIR", ca.RAW_DIR_DEFAULT)
 
 
 # ---------------------------------------------------------------------------
@@ -230,31 +194,22 @@ def write_crepe_split(raw_dir: Path, split: str, records: list[dict], columns=No
     return path
 
 
-def write_bundle(
-    raw_dir: Path,
-    crepe: dict[str, list[dict]] | None = None,
-    kuq: list[dict] | None = None,
-) -> Path:
+def write_bundle(raw_dir: Path, crepe: dict[str, list[dict]] | None = None) -> Path:
     """Write a miniature raw bundle.
 
-    ``crepe`` maps split -> records (an omitted split becomes an empty parquet so
-    ``load_crepe`` never trips over a missing file).  ``kuq=None`` writes no
-    ``knowns_unknowns.jsonl`` at all; ``kuq=[]`` writes an empty one.
+    ``crepe`` maps split -> records; an omitted split becomes an empty parquet so
+    ``load_crepe`` never trips over a missing file.
     """
     crepe = CREPE_DEFAULT if crepe is None else crepe
     raw_dir.mkdir(parents=True, exist_ok=True)
     for split in ca.CREPE_SPLITS:
         write_crepe_split(raw_dir, split, crepe.get(split) or [])
-    if kuq is not None:
-        (raw_dir / ca.KUQ_FILE).write_text(
-            "".join(json.dumps(record) + "\n" for record in kuq), encoding="utf-8"
-        )
     return raw_dir
 
 
 @pytest.fixture()
 def bundle(tmp_path: Path) -> Path:
-    return write_bundle(tmp_path, kuq=KUQ_FIXTURE)
+    return write_bundle(tmp_path)
 
 
 def build(raw_dir: Path, **kwargs):
@@ -270,12 +225,12 @@ class TestMainBundle:
     def test_funnel_stages_and_counts(self, bundle: Path):
         rows, funnel = build(bundle)
         assert list(funnel.items()) == list(EXPECTED_FUNNEL.items())
-        assert len(rows) == 10
+        assert len(rows) == 5
 
     def test_funnel_starts_at_raw_and_never_grows(self, bundle: Path):
         _, funnel = build(bundle)
         assert next(iter(funnel)) == "raw_rows"
-        assert funnel["raw_rows"] == 12  # 6 CREPE + 6 KUQ lines
+        assert funnel["raw_rows"] == 6
         values = list(funnel.values())
         assert all(later <= earlier for earlier, later in zip(values, values[1:], strict=False))
 
@@ -286,7 +241,6 @@ class TestMainBundle:
             "after_question_text",
             "after_label_uniqueness",
             "after_certificate",
-            "after_kuq_category_filter",
             "after_cross_label_conflict",
             "after_dedup",
             "after_quota",
@@ -301,15 +255,14 @@ class TestMainBundle:
         rows, _ = build(bundle)
         by_id = {row["extra_info"]["task_id"]: row for row in rows}
         assert "crepe:validation:2019_a-01077" in by_id
-        assert "kuq:00002" in by_id  # KUQ line index, zero-padded
         assert len(by_id) == len(rows)
         # No uuid / random component: a rebuild reproduces every key exactly.
         again, _ = build(bundle)
         assert [row["extra_info"]["task_id"] for row in again] == list(by_id)
 
     def test_build_is_deterministic_and_byte_identical(self, bundle: Path, tmp_path: Path):
-        first, funnel_a = build(bundle, limit=7)
-        second, funnel_b = build(bundle, limit=7)
+        first, funnel_a = build(bundle, limit=3)
+        second, funnel_b = build(bundle, limit=3)
         assert funnel_a == funnel_b
         assert first == second
         schema.normalise_extra_info(first)
@@ -322,14 +275,11 @@ class TestMainBundle:
     def test_breakdown_is_two_fifths_solvable(self, bundle: Path):
         rows, _ = build(bundle)
         assert Counter(row["extra_info"]["branch"] for row in rows) == {
-            schema.BRANCH_SOLVABLE_JUDGE: 5,
-            schema.BRANCH_UNSOLVABLE_BARE: 5,
+            schema.BRANCH_SOLVABLE_JUDGE: 2,
+            schema.BRANCH_UNSOLVABLE_BARE: 3,
         }
-        assert Counter(row["extra_info"]["template"] for row in rows) == {ca.TEMPLATE: 10}
-        assert Counter(row["data_source"] for row in rows) == {
-            schema.SOURCE_CREPE: 5,
-            schema.SOURCE_KUQ: 5,
-        }
+        assert Counter(row["extra_info"]["template"] for row in rows) == {ca.TEMPLATE: 5}
+        assert Counter(row["data_source"] for row in rows) == {schema.SOURCE_CREPE: 5}
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +291,7 @@ class TestBranchPayloads:
     def test_solvable_rows_are_judgment_only(self, bundle: Path):
         rows, _ = build(bundle)
         judges = [r for r in rows if r["extra_info"]["solvable"]]
-        assert len(judges) == 5
+        assert len(judges) == 2  # CREPE-normal only
         for row in judges:
             payload = json.loads(row["reward_model"]["ground_truth"])
             assert payload["solvable"] is True
@@ -353,13 +303,13 @@ class TestBranchPayloads:
             assert row["extra_info"]["judgment_only"] is True
             assert row["extra_info"]["perturbation_type"] == ""
             assert row["extra_info"]["error_type"] == ""
-            # the gold marker the reward scores +1 against (D14)
+            # the gold marker the reward scores +1 against (design doc section 5.2)
             assert "\\boxed{SOLVABLE}" in row["prompt"][0]["content"]
 
     def test_unsolvable_rows_carry_no_answer_and_no_diagnosis_label(self, bundle: Path):
         rows, _ = build(bundle)
         bares = [r for r in rows if not r["extra_info"]["solvable"]]
-        assert len(bares) == 5
+        assert len(bares) == 3  # CREPE false-presupposition only
         for row in bares:
             payload = json.loads(row["reward_model"]["ground_truth"])
             assert payload["solvable"] is False
@@ -368,8 +318,19 @@ class TestBranchPayloads:
             assert payload["has_diagnosis_label"] is False
             assert row["extra_info"]["branch"] == schema.BRANCH_UNSOLVABLE_BARE
             assert row["extra_info"]["has_diagnosis_label"] is False
+            assert row["extra_info"]["judgment_only"] is False
             assert row["extra_info"]["perturbation_type"] == ca.UNSOLVABLE_PERTURBATION
             assert row["extra_info"]["error_type"] == ca.ERROR_TYPE
+
+    def test_judgment_only_is_set_on_the_normal_side_only(self, bundle: Path):
+        """The flag is the branch switch: it must never leak to the bare side."""
+        rows, _ = build(bundle)
+        by_label = {
+            True: [json.loads(r["reward_model"]["ground_truth"]) for r in rows if r["extra_info"]["solvable"]],
+            False: [json.loads(r["reward_model"]["ground_truth"]) for r in rows if not r["extra_info"]["solvable"]],
+        }
+        assert all(payload.get("judgment_only") is True for payload in by_label[True])
+        assert all("judgment_only" not in payload for payload in by_label[False])
 
     def test_perturbation_type_is_absent_to_the_reward_on_solvable_rows(self, bundle: Path):
         rows, _ = build(bundle)
@@ -387,9 +348,6 @@ class TestBranchPayloads:
         assert question.startswith(CREPE_NORMAL["question"])
         assert "\\boxed{SOLVABLE}" in question
         assert "UNSOLVABLE" in question
-        trailing = by_id["kuq:00005"]["prompt"][0]["content"]
-        assert trailing.startswith(KUQ_WHITESPACE["question"].strip())
-        assert not trailing.startswith(" ")
         assert ca.TEMPLATE == schema.TEMPLATE_B_JUDGE
 
     def test_every_row_passes_validate_row_and_round_trips(self, bundle: Path, tmp_path: Path):
@@ -412,20 +370,104 @@ class TestBranchPayloads:
             assert info["index"] == index
             assert info["seed"] == 7
             assert isinstance(info["difficulty"], str) and info["difficulty"]
-            assert info["split"] in ca.CREPE_SPLITS  # KUQ's native split is "train"
+            assert info["split"] in ca.CREPE_SPLITS
         by_id = {row["extra_info"]["task_id"]: row["extra_info"] for row in rows}
         assert by_id["crepe:train:2018-09504"]["difficulty"] == "normal"
         assert by_id["crepe:train:2018-03713"]["difficulty"] == "false_presupposition"
-        assert by_id["kuq:00000"]["difficulty"] == "known"
-        assert by_id["kuq:00002"]["difficulty"] == "false_assumption"
-        assert by_id["kuq:00003"]["difficulty"] == "counterfactual"
         assert by_id["crepe:test:2019_b-11155"]["split"] == "test"
-        assert by_id["kuq:00002"]["split"] == "train"
 
     def test_no_row_carries_an_options_block_or_role_words(self, bundle: Path):
+        """Neither side gets options: the bare side is option-less by D12/D24."""
         rows, _ = build(bundle)
         assert all(not row["extra_info"]["options"] for row in rows)
         assert all(not row["extra_info"]["role_words"] for row in rows)
+        assert all("选项" not in row["prompt"][0]["content"] for row in rows)
+
+
+# ---------------------------------------------------------------------------
+# reward contract cells (design doc sections 6 and 9)
+# ---------------------------------------------------------------------------
+
+
+def _solution(boxed: str | None) -> str:
+    """A format-valid rollout whose final box is ``boxed`` (or has no box)."""
+    body = f"reasoning about the premise.\n\n{boxed}" if boxed else "reasoning, no final box."
+    return f"<think>\n{body}\n</think>\n\nfinal answer: {boxed or 'none'}"
+
+
+def _score(data_source: str, boxed: str | None, payload: dict) -> float:
+    return reward.score_halluc_row(
+        data_source, _solution(boxed), json.dumps(payload, ensure_ascii=False)
+    )
+
+
+class TestRewardCells:
+    """CREPE's two reward branches, cell by cell (design doc section 9)."""
+
+    def test_normal_row_scores_the_solvable_marker_plus_one(self):
+        payload = {"solvable": True, "judgment_only": True, "answer": None,
+                   "has_diagnosis_label": False, "correct_option_id": None,
+                   "perturbation_type": None}
+        assert _score(schema.SOURCE_CREPE, "\\boxed{SOLVABLE}", payload) == 1.0
+
+    def test_normal_row_misrefusal_is_minus_one(self):
+        payload = {"solvable": True, "judgment_only": True, "answer": None,
+                   "has_diagnosis_label": False, "correct_option_id": None,
+                   "perturbation_type": None}
+        for boxed in ("\\boxed{UNSOLVABLE}", "\\boxed{UNSOLVABLE: B}"):
+            assert _score(schema.SOURCE_CREPE, boxed, payload) == -1.0, boxed
+
+    def test_normal_row_non_verdict_scores_zero(self):
+        payload = {"solvable": True, "judgment_only": True, "answer": None,
+                   "has_diagnosis_label": False, "correct_option_id": None,
+                   "perturbation_type": None}
+        assert _score(schema.SOURCE_CREPE, "\\boxed{clouds}", payload) == 0.0
+        assert _score(schema.SOURCE_CREPE, None, payload) == 0.0
+
+    def test_false_presupposition_row_bare_refusal_is_plus_one(self):
+        payload = {"solvable": False, "judgment_only": False, "answer": None,
+                   "has_diagnosis_label": False, "correct_option_id": None,
+                   "perturbation_type": "contradictory_condition"}
+        assert _score(schema.SOURCE_CREPE, "\\boxed{UNSOLVABLE}", payload) == 1.0
+        # an option id is meaningless on a three-tier source, so it still scores
+        assert _score(schema.SOURCE_CREPE, "\\boxed{UNSOLVABLE: B}", payload) == 1.0
+
+    def test_false_presupposition_row_fabrication_is_minus_one(self):
+        payload = {"solvable": False, "judgment_only": False, "answer": None,
+                   "has_diagnosis_label": False, "correct_option_id": None,
+                   "perturbation_type": "contradictory_condition"}
+        assert _score(schema.SOURCE_CREPE, "\\boxed{42}", payload) == -1.0
+        assert _score(schema.SOURCE_CREPE, None, payload) == 0.0
+
+    def test_bare_unsolvable_is_branch_dependent(self):
+        """Section 5.1/9: +1 on a three-tier source, 0 on a four-tier one.
+
+        The two directions are asserted with the ``data_source`` in the message,
+        because the string alone is not enough to know the score.
+        """
+        three_tier = {"solvable": False, "answer": None, "correct_option_id": None,
+                      "has_diagnosis_label": False, "perturbation_type": "contradictory_condition"}
+        four_tier = {"solvable": False, "answer": None, "correct_option_id": "B",
+                     "has_diagnosis_label": True, "perturbation_type": "contradictory_condition"}
+        assert _score(schema.SOURCE_CREPE, "\\boxed{UNSOLVABLE}", three_tier) == 1.0, (
+            f"{schema.SOURCE_CREPE}: bare UNSOLVABLE must be +1 on a three-tier source"
+        )
+        assert _score(schema.SOURCE_FALSEQA, "\\boxed{UNSOLVABLE}", four_tier) == 0.0, (
+            f"{schema.SOURCE_FALSEQA}: bare UNSOLVABLE must be 0 on a four-tier source"
+        )
+
+    def test_the_cells_hold_on_the_adapter_s_own_rows(self, bundle: Path):
+        """Same cells, but scored against the ground truth the adapter wrote."""
+        rows, _ = build(bundle)
+        normal = next(r for r in rows if r["extra_info"]["solvable"])
+        false_premise = next(r for r in rows if not r["extra_info"]["solvable"])
+        normal_gt = normal["reward_model"]["ground_truth"]
+        bare_gt = false_premise["reward_model"]["ground_truth"]
+
+        assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{SOLVABLE}"), normal_gt) == 1.0
+        assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{UNSOLVABLE}"), normal_gt) == -1.0
+        assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{UNSOLVABLE}"), bare_gt) == 1.0
+        assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{42}"), bare_gt) == -1.0
 
 
 # ---------------------------------------------------------------------------
@@ -448,73 +490,43 @@ class TestLabelUniquenessDrops:
             {"id": "x-3", "question": "q?", "labels": None, "presuppositions": []},
         ],
     )
-    def test_crepe_rows_without_exactly_one_known_label_are_dropped(
-        self, tmp_path: Path, record: dict
-    ):
-        bundle = write_bundle(tmp_path, crepe={"train": [record]}, kuq=[])
+    def test_rows_without_exactly_one_known_label_are_dropped(self, tmp_path: Path, record: dict):
+        bundle = write_bundle(tmp_path, crepe={"train": [record]})
         rows, funnel = build(bundle)
         assert rows == []
         assert funnel["raw_rows"] == 1
         assert funnel["after_label_uniqueness"] == 0
 
-    def test_crepe_row_without_an_id_is_dropped_even_with_a_good_label(self, tmp_path: Path):
+    def test_row_without_an_id_is_dropped_even_with_a_good_label(self, tmp_path: Path):
         record = dict(CREPE_NORMAL, id="")
-        bundle = write_bundle(tmp_path, crepe={"train": [record]}, kuq=[])
+        bundle = write_bundle(tmp_path, crepe={"train": [record]})
         rows, _ = build(bundle)
         assert rows == []
 
+    def test_the_underscore_label_form_matches_nothing(self, tmp_path: Path):
+        """Design doc section 4.6 pitfall 1: the README's spelling is wrong."""
+        record = dict(CREPE_NORMAL, id="u-1", labels=["false_presupposition"],
+                      presuppositions=["x"])
+        bundle = write_bundle(tmp_path, crepe={"train": [record]})
+        rows, funnel = build(bundle)
+        assert rows == []
+        assert funnel["after_label_uniqueness"] == 0
+
 
 class TestCertificateDrops:
-    def test_solvable_crepe_row_with_a_presupposition_is_dropped(self, tmp_path: Path):
+    def test_solvable_row_with_a_presupposition_is_dropped(self, tmp_path: Path):
         # synthetic: the source never records normal+presuppositions (0 rows)
         record = dict(CREPE_NORMAL, id="s-1", presuppositions=["Something is assumed."])
-        bundle = write_bundle(tmp_path, crepe={"train": [record]}, kuq=[])
+        bundle = write_bundle(tmp_path, crepe={"train": [record]})
         rows, funnel = build(bundle)
         assert rows == []
         assert funnel["after_label_uniqueness"] == 1
         assert funnel["after_certificate"] == 0
 
-    def test_unsolvable_crepe_row_without_a_presupposition_is_dropped(self, tmp_path: Path):
+    def test_unsolvable_row_without_a_presupposition_is_dropped(self, tmp_path: Path):
         # synthetic: every real FP row carries at least one presupposition
         record = dict(CREPE_FP_PARAPHRASE, id="s-2", presuppositions=[])
-        bundle = write_bundle(tmp_path, crepe={"train": [record]}, kuq=[])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_certificate"] == 0
-
-    def test_kuq_unknown_row_from_a_non_crowd_source_is_dropped(self, tmp_path: Path):
-        # synthetic: every real unknown row has source == "turk"
-        record = dict(KUQ_UNKNOWN_FA, source="hotpotqa")
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[record])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_label_uniqueness"] == 1
-        assert funnel["after_certificate"] == 0
-
-    def test_kuq_unknown_row_without_a_category_is_dropped(self, tmp_path: Path):
-        # synthetic: unknown=True with the category key absent
-        record = {k: v for k, v in KUQ_UNKNOWN_FA.items() if k != "category"}
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[record])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_certificate"] == 0
-
-    def test_kuq_known_row_carrying_a_category_is_dropped(self, tmp_path: Path):
-        # synthetic: category is an absent key on every real known row
-        record = dict(KUQ_KNOWN, category="false assumption")
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[record])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_certificate"] == 0
-
-    @pytest.mark.parametrize(
-        "answer",
-        [[], [""], ["  "], [None], "not a list", "abc", 7],
-    )
-    def test_kuq_known_row_without_a_usable_answer_is_dropped(self, tmp_path: Path, answer):
-        # synthetic: every real known row has a non-empty string answer list
-        record = dict(KUQ_KNOWN, answer=answer)
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[record])
+        bundle = write_bundle(tmp_path, crepe={"train": [record]})
         rows, funnel = build(bundle)
         assert rows == []
         assert funnel["after_certificate"] == 0
@@ -522,86 +534,32 @@ class TestCertificateDrops:
 
 class TestQuestionTextDrops:
     @pytest.mark.parametrize("question", ["", "   ", "\n\t", None])
-    def test_crepe_rows_without_question_text_are_dropped(self, tmp_path: Path, question):
+    def test_rows_without_question_text_are_dropped(self, tmp_path: Path, question):
         record = dict(CREPE_NORMAL, id="e-1", question=question)
-        bundle = write_bundle(tmp_path, crepe={"train": [record]}, kuq=[])
+        bundle = write_bundle(tmp_path, crepe={"train": [record]})
         rows, funnel = build(bundle)
         assert rows == []
         assert funnel["raw_rows"] == 1
         assert funnel["after_question_text"] == 0
 
-    def test_kuq_rows_without_question_text_are_dropped(self, tmp_path: Path):
-        record = dict(KUQ_KNOWN, question="   ")
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN, record])
-        rows, funnel = build(bundle)
-        assert len(rows) == 1
-        assert funnel["after_question_text"] == 1
-
-
-class TestKuqLabelAndCategoryDrops:
-    @pytest.mark.parametrize("unknown", ["true", "false", 1, 0, None])
-    def test_kuq_rows_with_a_non_bool_unknown_flag_are_dropped(
-        self, tmp_path: Path, unknown
-    ):
-        record = dict(KUQ_KNOWN, unknown=unknown)
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[record])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_label_uniqueness"] == 0
-
-    @pytest.mark.parametrize(
-        "category", ["controversial", "ambiguous", "future unknown", "unsolved problem"]
-    )
-    def test_out_of_scope_unknown_categories_are_dropped(
-        self, tmp_path: Path, category: str
-    ):
-        record = dict(KUQ_UNKNOWN_OTHER, category=category)
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[record])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_label_uniqueness"] == 1
-        assert funnel["after_certificate"] == 1
-        assert funnel["after_kuq_category_filter"] == 0
-
-    def test_the_two_in_scope_categories_are_admitted(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_UNKNOWN_FA, KUQ_UNKNOWN_CF])
-        rows, funnel = build(bundle)
-        assert len(rows) == 2
-        assert funnel["after_kuq_category_filter"] == 2
-        assert {json.loads(r["reward_model"]["ground_truth"])["solvable"] for r in rows} == {False}
-
-    def test_crepe_rows_are_untouched_by_the_category_filter(self, tmp_path: Path):
-        # CREPE candidates carry category=None, which the filter admits.
-        bundle = write_bundle(
-            tmp_path, crepe={"train": [CREPE_NORMAL, CREPE_FP_PARAPHRASE]}, kuq=[]
-        )
-        rows, funnel = build(bundle)
-        assert len(rows) == 2
-        assert funnel["after_kuq_category_filter"] == 2
-
 
 class TestCrossLabelConflicts:
     def test_a_question_under_both_labels_loses_every_row(self, tmp_path: Path):
-        question = "What is the population of the city?"
-        known = dict(KUQ_KNOWN, question=question)
-        unknown = dict(KUQ_UNKNOWN_FA, question=question)
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[known, unknown])
+        question = "Is this premise true?"
+        normal = dict(CREPE_NORMAL, id="c-1", question=question)
+        false_premise = dict(CREPE_FP_PARAPHRASE, id="c-2", question=question)
+        bundle = write_bundle(tmp_path, crepe={"train": [normal, false_premise]})
         rows, funnel = build(bundle)
         assert rows == []
         assert funnel["after_certificate"] == 2
         assert funnel["after_cross_label_conflict"] == 0
 
-    def test_a_cross_source_conflict_also_removes_both_rows(self, tmp_path: Path):
-        question = "Is this premise true?"
-        crepe = dict(CREPE_NORMAL, id="c-1", question=question)
-        kuq = dict(KUQ_UNKNOWN_FA, question=question)
-        bundle = write_bundle(tmp_path, crepe={"train": [crepe]}, kuq=[kuq])
-        rows, funnel = build(bundle)
-        assert rows == []
-        assert funnel["after_cross_label_conflict"] == 0
-
     def test_a_question_under_one_label_survives(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN, dict(KUQ_KNOWN, answer=["x"])])
+        bundle = write_bundle(
+            tmp_path,
+            crepe={"train": [dict(CREPE_NORMAL, id="c-1", question="Q?"),
+                             dict(CREPE_NORMAL, id="c-2", question="q?")]},
+        )
         rows, funnel = build(bundle)
         assert len(rows) == 1  # same question, same label -> dedup, not conflict
         assert funnel["after_cross_label_conflict"] == 2
@@ -609,33 +567,30 @@ class TestCrossLabelConflicts:
 
 class TestDedup:
     def test_a_repeated_question_keeps_the_first_by_order_key(self, tmp_path: Path):
-        first = dict(KUQ_KNOWN, answer=["first"])
-        second = dict(KUQ_KNOWN, answer=["second"])
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[first, second])
+        first = dict(CREPE_NORMAL, id="a")
+        second = dict(CREPE_NORMAL, id="b")
+        bundle = write_bundle(tmp_path, crepe={"train": [first, second]})
         rows, funnel = build(bundle)
         assert funnel["after_cross_label_conflict"] == 2
         assert funnel["after_dedup"] == 1
         assert len(rows) == 1
-        assert rows[0]["extra_info"]["task_id"] == "kuq:00000"
+        assert rows[0]["extra_info"]["task_id"] == "crepe:train:a"
 
     def test_dedup_ignores_case_and_whitespace(self, tmp_path: Path):
-        first = dict(KUQ_KNOWN, answer=["a"])
-        second = dict(KUQ_KNOWN, question="  " + first["question"].upper() + " ", answer=["b"])
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[first, second])
+        first = dict(CREPE_NORMAL, id="a")
+        second = dict(CREPE_NORMAL, id="b", question="  " + first["question"].upper() + " ")
+        bundle = write_bundle(tmp_path, crepe={"train": [first, second]})
         rows, funnel = build(bundle)
         assert funnel["after_dedup"] == 1
         assert len(rows) == 1
         # The surviving row keeps the question verbatim (no normalisation applied).
         assert rows[0]["prompt"][0]["content"].startswith(first["question"])
 
-    def test_a_surrounding_space_alone_does_not_change_the_prompt(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_WHITESPACE])
-        rows, _ = build(bundle)
-        assert len(rows) == 1
-        assert rows[0]["prompt"][0]["content"].startswith(KUQ_WHITESPACE["question"].strip())
-
     def test_distinct_questions_are_all_kept(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN, KUQ_KNOWN_MULTI])
+        bundle = write_bundle(
+            tmp_path,
+            crepe={"train": [CREPE_NORMAL, dict(CREPE_NORMAL, id="other", question="Other?")]},
+        )
         rows, funnel = build(bundle)
         assert funnel["after_dedup"] == 2
         assert len(rows) == 2
@@ -667,19 +622,19 @@ class TestLimit:
         rows, funnel = build(bundle, limit=3)
         assert [row["extra_info"]["task_id"] for row in rows] == EXPECTED_TASK_IDS[:3]
         assert funnel["after_limit"] == 3
-        # Both labels and both sources survive even a tiny limit.
+        # Both labels survive even a tiny limit.
         assert {row["extra_info"]["solvable"] for row in rows} == {True, False}
 
     def test_limit_zero_emits_nothing_but_keeps_the_funnel(self, bundle: Path):
         rows, funnel = build(bundle, limit=0)
         assert rows == []
-        assert funnel["after_quota"] == 10
+        assert funnel["after_quota"] == 5
         assert funnel["after_limit"] == 0
 
     def test_a_limit_above_the_pool_is_harmless(self, bundle: Path):
         rows, funnel = build(bundle, limit=999)
-        assert len(rows) == 10
-        assert funnel["after_limit"] == 10
+        assert len(rows) == 5
+        assert funnel["after_limit"] == 5
 
     def test_a_negative_limit_is_rejected(self, bundle: Path):
         with pytest.raises(ValueError, match="non-negative"):
@@ -692,6 +647,13 @@ class TestLimit:
 
 
 class TestQuotaMechanics:
+    def test_the_quota_table_is_the_doc_allocation(self):
+        assert ca.QUOTAS == EXPECTED_QUOTAS
+
+    def test_the_group_order_covers_every_quota(self):
+        assert set(ca.GROUP_ORDER) == set(ca.QUOTAS)
+        assert len(ca.GROUP_ORDER) == len(ca.QUOTAS)
+
     def test_sampling_is_seeded_by_the_group_index(self, bundle: Path, monkeypatch):
         monkeypatch.setitem(ca.QUOTAS, (schema.SOURCE_CREPE, schema.BRANCH_SOLVABLE_JUDGE), 1)
         rows, _ = build(bundle, seed=3)
@@ -721,12 +683,6 @@ class TestQuotaMechanics:
         assert [r["extra_info"]["task_id"] for r in first] == [
             r["extra_info"]["task_id"] for r in second
         ]
-
-    def test_a_source_without_members_is_skipped(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN])
-        rows, funnel = build(bundle)
-        assert len(rows) == 1
-        assert rows[0]["extra_info"]["branch"] == schema.BRANCH_SOLVABLE_JUDGE
 
     def test_a_group_missing_from_the_quota_table_raises(self, bundle: Path, monkeypatch):
         monkeypatch.setattr(ca, "QUOTAS", {})
@@ -760,16 +716,21 @@ class TestQuotaMechanics:
 
 
 class TestSourceSelection:
-    def test_crepe_only(self, bundle: Path):
-        rows, funnel = build(bundle, sources=(schema.SOURCE_CREPE,))
+    def test_the_declared_source_is_crepe_only(self):
+        assert ca.SOURCE_NAMES == (schema.SOURCE_CREPE,)
+        assert ca.SOURCE_CHOICES == ("crepe",)
+
+    def test_no_trace_of_the_removed_source_remains(self):
+        """D25 removed the other judgment-only source from the pool entirely."""
+        assert not hasattr(schema, "SOURCE_KUQ")
+        assert not any("kuq" in name.casefold() for name in dir(ca))
+        assert not any("kuq" in name.casefold() for name in dir(vc))
+        assert not any("kuq" in path.name.casefold() for path in Path(_HERE).glob("*.py"))
+
+    def test_building_the_declared_source_works(self, bundle: Path):
+        rows, funnel = build(bundle, sources=ca.SOURCE_NAMES)
         assert {row["data_source"] for row in rows} == {schema.SOURCE_CREPE}
         assert funnel["raw_rows"] == 6
-
-    def test_kuq_only_needs_no_crepe_files(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN, KUQ_UNKNOWN_CF])
-        rows, funnel = build(bundle, sources=(schema.SOURCE_KUQ,))
-        assert {row["data_source"] for row in rows} == {schema.SOURCE_KUQ}
-        assert funnel["raw_rows"] == 2
 
     def test_an_unknown_source_is_rejected(self, bundle: Path):
         with pytest.raises(ValueError, match="unknown source"):
@@ -787,19 +748,8 @@ class TestRawLoading:
         with pytest.raises(FileNotFoundError, match="validation"):
             build(bundle)
 
-    def test_a_missing_kuq_file_raises(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe=CREPE_DEFAULT, kuq=None)
-        with pytest.raises(FileNotFoundError, match="knowns_unknowns"):
-            build(bundle)
-
-    def test_an_empty_kuq_file_yields_only_crepe_rows(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe=CREPE_DEFAULT, kuq=[])
-        rows, funnel = build(bundle)
-        assert funnel["raw_rows"] == 6
-        assert {row["data_source"] for row in rows} == {schema.SOURCE_CREPE}
-
     def test_a_missing_required_column_raises(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN])
+        bundle = write_bundle(tmp_path, crepe={})
         write_crepe_split(
             bundle,
             "train",
@@ -809,20 +759,11 @@ class TestRawLoading:
         with pytest.raises(ValueError, match="presuppositions"):
             build(bundle)
 
-    def test_a_bad_kuq_json_line_raises(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN])
-        with open(bundle / ca.KUQ_FILE, "a", encoding="utf-8") as handle:
-            handle.write("{not json}\n")
-        with pytest.raises(json.JSONDecodeError):
-            build(bundle)
-
-    def test_blank_jsonl_lines_are_skipped(self, tmp_path: Path):
-        bundle = write_bundle(tmp_path, crepe={}, kuq=[KUQ_KNOWN])
-        with open(bundle / ca.KUQ_FILE, "a", encoding="utf-8") as handle:
-            handle.write("\n")
+    def test_an_empty_bundle_yields_no_rows(self, tmp_path: Path):
+        bundle = write_bundle(tmp_path, crepe={})
         rows, funnel = build(bundle)
-        assert funnel["raw_rows"] == 1
-        assert len(rows) == 1
+        assert rows == []
+        assert set(funnel.values()) == {0}
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +772,7 @@ class TestRawLoading:
 
 
 class TestCandidate:
-    def test_crepe_candidate_fields(self):
+    def test_candidate_fields(self):
         candidate = ca._crepe_candidate("test", CREPE_FP_PARAPHRASE)
         assert candidate.source == schema.SOURCE_CREPE
         assert candidate.split == "test"
@@ -841,10 +782,9 @@ class TestCandidate:
         assert candidate.perturbation_type == ca.UNSOLVABLE_PERTURBATION
         assert candidate.error_type == ca.ERROR_TYPE
         assert candidate.difficulty == "false_presupposition"
-        assert candidate.category is None
         assert candidate.label_ok and candidate.certificate_ok
 
-    def test_crepe_solvable_candidate_has_no_perturbation(self):
+    def test_solvable_candidate_has_no_perturbation(self):
         candidate = ca._crepe_candidate("train", CREPE_NORMAL)
         assert candidate.solvable is True
         assert candidate.branch == schema.BRANCH_SOLVABLE_JUDGE
@@ -852,31 +792,15 @@ class TestCandidate:
         assert candidate.error_type == ""
         assert candidate.difficulty == "normal"
 
-    def test_kuq_candidate_index_becomes_the_task_id(self):
-        candidate = ca._kuq_candidate(41, KUQ_UNKNOWN_CF)
-        assert candidate.task_id == "kuq:00041"
-        assert candidate.split == "train"
-        assert candidate.solvable is False
-        assert candidate.category == "counterfactual"
-        assert candidate.difficulty == "counterfactual"
-
-    def test_kuq_known_candidate(self):
-        candidate = ca._kuq_candidate(0, KUQ_KNOWN)
-        assert candidate.solvable is True
-        assert candidate.branch == schema.BRANCH_SOLVABLE_JUDGE
-        assert candidate.difficulty == "known"
-        assert candidate.category is None
-
     def test_order_key_sorts_by_source_split_then_key(self):
         keys = sorted(
             [
                 ca._crepe_candidate("test", dict(CREPE_NORMAL, id="b")),
-                ca._kuq_candidate(3, KUQ_KNOWN),
                 ca._crepe_candidate("train", dict(CREPE_NORMAL, id="a")),
             ],
             key=ca.Candidate.order_key,
         )
-        assert [c.task_id for c in keys] == ["crepe:test:b", "crepe:train:a", "kuq:00003"]
+        assert [c.task_id for c in keys] == ["crepe:test:b", "crepe:train:a"]
 
 
 # ---------------------------------------------------------------------------
@@ -899,18 +823,17 @@ class TestMain:
         assert "funnel (rows remaining after each stage)" in printed
         for stage in EXPECTED_FUNNEL:
             assert stage in printed
-        assert "rows by branch: solvable_judge=5, unsolvable_bare=5" in printed
-        assert "rows by template: B_judge=10" in printed
+        assert "rows by branch: solvable_judge=2, unsolvable_bare=3" in printed
+        assert "rows by template: B_judge=5" in printed
         assert "rows with an options block: 0; with a diagnosis label: 0" in printed
+        assert f"D18 table B quotas: {schema.SOURCE_CREPE}/{schema.BRANCH_SOLVABLE_JUDGE}=250" in printed
         assert out.exists()
         rows = schema.read_parquet_rows(str(out))
-        assert len(rows) == 10
+        assert len(rows) == 5
         for row in rows:
             assert schema.validate_row(row) == []
 
-    def test_main_respects_limit_and_sources(
-        self, bundle: Path, tmp_path: Path, monkeypatch, capsys
-    ):
+    def test_main_respects_limit(self, bundle: Path, tmp_path: Path, monkeypatch, capsys):
         out = tmp_path / "limited.parquet"
         monkeypatch.setattr(
             sys,
@@ -922,51 +845,25 @@ class TestMain:
                 "--out",
                 str(out),
                 "--limit",
-                "4",
+                "2",
                 "--sources",
                 "crepe",
             ],
         )
         ca.main()
         printed = capsys.readouterr().out
-        assert "limit: 4" in printed
-        assert "sources       : halluc_commonsense_crepe" in printed
+        assert "limit: 2" in printed
+        assert f"sources       : {schema.SOURCE_CREPE}" in printed
         rows = schema.read_parquet_rows(str(out))
-        assert len(rows) == 4
+        assert len(rows) == 2
         assert {row["data_source"] for row in rows} == {schema.SOURCE_CREPE}
-
-    def test_main_with_kuq_only(self, bundle: Path, tmp_path: Path, monkeypatch, capsys):
-        out = tmp_path / "kuq.parquet"
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "crepe_adapter.py",
-                "--raw-dir",
-                str(bundle),
-                "--out",
-                str(out),
-                "--sources",
-                "kuq",
-            ],
-        )
-        ca.main()
-        printed = capsys.readouterr().out
-        assert "sources       : halluc_commonsense_kuq" in printed
-        rows = schema.read_parquet_rows(str(out))
-        assert {row["data_source"] for row in rows} == {schema.SOURCE_KUQ}
-        assert len(rows) == 5
 
     def test_print_breakdown_handles_an_empty_list(self, capsys):
         ca._print_breakdown([])
         assert "no rows emitted" in capsys.readouterr().out
 
     def test_main_refuses_to_write_an_empty_parquet(self, tmp_path: Path, monkeypatch):
-        bundle = write_bundle(
-            tmp_path,
-            crepe={"train": [CREPE_DUAL]},
-            kuq=[{k: v for k, v in KUQ_UNKNOWN_OTHER.items()}],
-        )
+        bundle = write_bundle(tmp_path, crepe={"train": [CREPE_DUAL]})
         out = tmp_path / "empty.parquet"
         monkeypatch.setattr(
             sys, "argv", ["crepe_adapter.py", "--raw-dir", str(bundle), "--out", str(out)]
@@ -1020,17 +917,10 @@ class TestVerifyHarness:
         balanced, _, _ = vc.nb_out_of_fold(texts, np.array(labels), min_support=1, seed=0)
         assert balanced > 0.90
 
-    @pytest.mark.parametrize(
-        "task_id,expected",
-        [
-            ("crepe:train:2018-09504", ("crepe", "train:2018-09504")),
-            ("kuq:00041", ("kuq", "00041")),
-        ],
-    )
-    def test_decode_task_id(self, task_id: str, expected):
-        assert vc.decode_task_id(task_id) == expected
+    def test_decode_task_id(self):
+        assert vc.decode_task_id("crepe:train:2018-09504") == ("crepe", "train:2018-09504")
 
-    @pytest.mark.parametrize("task_id", ["nope:1", "crepe:train", "kuq:1:2"])
+    @pytest.mark.parametrize("task_id", ["nope:1", "crepe:train", "kuq:1", "kuq:00041"])
     def test_decode_task_id_rejects_other_shapes(self, task_id: str):
         with pytest.raises(ValueError, match="unrecognised task_id"):
             vc.decode_task_id(task_id)
@@ -1049,12 +939,8 @@ class TestVerifyHarness:
 
     def test_stratified_sample_covers_every_group(self, bundle: Path):
         rows, _ = build(bundle)
-        sample = vc.stratified_sample(rows, 6, random.Random(0))
-        assert len(sample) == 6
-        assert {row["data_source"] for row in sample} == {
-            schema.SOURCE_CREPE,
-            schema.SOURCE_KUQ,
-        }
+        sample = vc.stratified_sample(rows, 4, random.Random(0))
+        assert len(sample) == 4
         assert {row["extra_info"]["solvable"] for row in sample} == {True, False}
 
     def test_stratified_sample_stops_at_the_pool_size(self, bundle: Path):
@@ -1067,8 +953,8 @@ class TestVerifyHarness:
         audit.record("X2", False, "broken")
         audit.record("X3", True, "also fine", ["detail line"])
         printed = capsys.readouterr().out
-        assert "PASS  X1   fine" in printed
-        assert "FAIL  X2   broken" in printed
+        assert "PASS  X1" in printed
+        assert "FAIL  X2" in printed
         assert "detail line" in printed
         assert audit.checks == 3
         assert audit.failures == 1
@@ -1079,24 +965,75 @@ class TestVerifyHarness:
         audit.record("X1", True, "fine")
         assert audit.exit_code == 0
 
+    def test_a_finding_is_visible_but_does_not_flip_the_exit_code(self, capsys):
+        """The L3c reading must stay visible without becoming a gate here.
+
+        Design doc section 9's hard L3 threshold is scoped to sources whose
+        enabled option set is the only signal; CREPE carries no option block, so
+        the number is a reported finding and the run stays green for it.
+        """
+        audit = vc.Audit()
+        audit.finding("L3c", "balanced accuracy above the reference gate")
+        printed = capsys.readouterr().out
+        assert "FINDING  L3c" in printed
+        assert audit.findings == 1
+        assert audit.checks == 0
+        assert audit.failures == 0
+        assert audit.exit_code == 0
+
     def test_full_audit_runs_every_check_on_a_built_artifact(self, bundle: Path, capsys):
         """End-to-end run of ``run_checks`` against a real adapter build.
 
-        ``L2b`` is the one check that must fail here, and for a reason that has
-        nothing to do with the adapter: it asserts the real bundle's per-split
-        label-string hit counts (927 / 544 / 751), which a 10-row fixture cannot
-        reproduce.  ``L3c`` is left unasserted because with 5 rows per class any
-        out-of-fold reading it produces is meaningless.  Pinning the rest is the
-        point: it shows the harness certifies a genuine adapter artifact without
-        crashing and without being weakened.
+        ``L2b`` is the one hard check that must fail here, and for a reason that
+        has nothing to do with the adapter: it asserts the real bundle's
+        per-split label-string hit counts (927 / 544 / 751), which a 6-row
+        fixture cannot reproduce.  ``L3c`` is asserted as a *finding*, not a
+        failure: with 5 rows it still runs and prints a number, and the harness
+        must not let it decide admission.
         """
         rows, _ = build(bundle)
         audit = vc.run_checks(rows, str(bundle), sample_size=8, seed=0)
         printed = capsys.readouterr().out
         assert audit.checks == 7
+        assert audit.failures == 1
+        assert audit.findings == 1
         assert audit.exit_code == 1
         assert "FAIL  L2b" in printed
-        for code in ("L0", "L1 ", "L1b", "L2 ", "L3a"):
+        assert "FINDING  L3c" in printed
+        for code in ("L0", "L1", "L1b", "L2", "L3a", "L3c-ctrl"):
             assert f"PASS  {code}" in printed
-        assert "label certificate re-derived from raw for 8 rows" in printed
-        assert "0 sampled false presuppositions are verbatim spans" in printed
+        assert "label certificate re-derived from raw for 5 rows" in printed
+
+
+# ---------------------------------------------------------------------------
+# the audit on the real bundle (skipped when it is not downloaded)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(REAL_RAW_DIR),
+    reason="raw CREPE bundle not downloaded; set HALLUC_CREPE_RAW_DIR to audit it",
+)
+class TestRealBundle:
+    def test_the_build_is_the_documented_650_rows(self):
+        rows, funnel = build(Path(REAL_RAW_DIR))
+        assert funnel["after_quota"] == 650
+        assert len(rows) == 650
+        assert Counter(row["extra_info"]["branch"] for row in rows) == {
+            schema.BRANCH_SOLVABLE_JUDGE: 250,
+            schema.BRANCH_UNSOLVABLE_BARE: 400,
+        }
+        for row in rows:
+            assert schema.validate_row(row) == []
+
+    def test_the_full_audit_reports_the_l3c_finding_and_exits_zero(self, capsys):
+        """The hard checks pass; the NB number is reported, never hidden."""
+        rows, _ = build(Path(REAL_RAW_DIR))
+        audit = vc.run_checks(rows, REAL_RAW_DIR, sample_size=50, seed=0)
+        printed = capsys.readouterr().out
+        assert audit.checks == 7
+        assert audit.failures == 0
+        assert audit.findings == 1
+        assert audit.exit_code == 0
+        assert "FINDING  L3c" in printed
+        assert "balanced accuracy" in printed

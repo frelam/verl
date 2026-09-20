@@ -36,14 +36,15 @@ The tests are grouped the way the module is:
   imperative mined as a name (``"Create ate 4 pounds of chocolate."``) and an
   unfillable placeholder interpolated as a number (``"... fed n/a monkeys."``).
   Both have a test that fails without the rule that prevents them.
-* the four loaders, including the dual-form handling that would otherwise drop a
-  whole source silently.
+* the three loaders, including the dual-form handling that would otherwise drop a
+  whole source silently, and the D19 mapping gold the K&K pool now carries.
 * rendering one distractor: the three axes are *recomputed from the text that was
   built*, so every labelled request either lands in the requested cell or returns
   ``None`` -- never a differently-labelled row.
 * planning and allocation, including the axis that the data refuses to balance at
   the design's 50/50 (see :func:`ds.allocate_role_budget`).
-* row emission and the per-row self-check.
+* row emission, the per-row self-check, and the D17 same-source pairing the row
+  declares and :func:`ds.verify_row` re-checks (design doc section 4.7).
 * ``synthesise`` end to end -- on a hand-built pool where the module's own
   reporting is what is under test, and on a slice of the real pools where the
   three axes have to come out balanced at the design's targets.
@@ -230,8 +231,8 @@ def raw_dir(tmp_path):
 JEWEL = ds.BaseQuestion(
     question="Jewel bought 10 magazines to be sold at $3.50 each. How much will she gain?",
     answer="5",
-    pool=ds.POOL_SUM,
-    uid="sum:train:0",
+    pool=ds.POOL_UMWP,
+    uid="umwp:0",
     meta={"names": ["Jewel"]},
 )
 
@@ -248,8 +249,8 @@ BRYAN = ds.BaseQuestion(
 EQUATION = ds.BaseQuestion(
     question="Determine the value of the constant k such that the equation has one root.",
     answer="5",
-    pool=ds.POOL_SUM,
-    uid="sum:train:1",
+    pool=ds.POOL_UMWP,
+    uid="umwp:2",
     meta={},
 )
 
@@ -258,11 +259,22 @@ KK = ds.BaseQuestion(
         "There are 4 inhabitants on the island, each of whom is either a knight or "
         "a knave. Ava says that Ben is a knave."
     ),
-    answer="knight knave knight knave",
+    # D19: the gold is a name -> surface role word mapping, never a sequence.
+    answer={"Ava": "knight", "Ben": "knave", "Cara": "knight", "Dan": "knave"},
     pool=ds.POOL_KK,
     uid="kk:clean__train__4ppl:0",
     role_words=("knight", "knave"),
     meta={"names": ["Ava", "Ben", "Cara", "Dan"]},
+)
+
+# The stage-1 math slice's base: a numeric problem whose control source is MiP
+# (design doc section 4.7).
+STAGE1 = ds.BaseQuestion(
+    question="How many panes of glass does the window need?",
+    answer="42",
+    pool=ds.POOL_MAIN,
+    uid="main:0",
+    meta={"names": []},
 )
 
 
@@ -279,7 +291,7 @@ def _copy(base: ds.BaseQuestion) -> ds.BaseQuestion:
 def _candidate(cell: tuple[str, str, str], order: float, base=None) -> ds.Candidate:
     role_label, number_label, sentence_label = cell
     base = base or ds.BaseQuestion(
-        question="q", answer="a", pool=ds.POOL_SUM, uid=f"sum:train:{int(order)}"
+        question="q", answer="a", pool=ds.POOL_UMWP, uid=f"umwp:{int(order)}"
     )
     return ds.Candidate(
         base=base,
@@ -564,8 +576,8 @@ def test_actor_candidates_rejects_a_latex_macro():
 def test_actor_candidates_strips_the_possessive_clitic():
     """The defect: a possessive substituted as an actor renders "Bill's baked ...".
 
-    Measured on the real SUM pool before the strip: 87 of 1,299 actor-bearing bases
-    mined a possessive, 25 of which reached the shipped rows.
+    Measured on the recon's SUM slice before the strip: 87 of 1,299 actor-bearing
+    bases mined a possessive (SUM is not a D17 base pool any more).
     """
     assert ds.actor_candidates("Bill's brother has 5 apples.", set()) == ["Bill"]
     assert ds.actor_candidates("James bought 4 apples.", set()) == ["James"]
@@ -579,7 +591,6 @@ def test_actor_candidates_rejects_an_opener_at_any_position():
 
 def test_mine_actors_requires_pool_support():
     pools = {
-        ds.POOL_SUM: [],
         ds.POOL_UMWP: [
             _umwp("Ava has 2 apples.", "umwp:1"),
             _umwp("Ava has 3 apples.", "umwp:2"),
@@ -603,7 +614,7 @@ def test_mine_actors_requires_pool_support():
 
 def test_mine_actors_seeds_the_vocabulary_from_the_kk_inhabitants():
     """K&K's puzzle lists its people, so they need no support in UMWP."""
-    pools = {ds.POOL_SUM: [], ds.POOL_UMWP: [], ds.POOL_KK: [KK, KK]}
+    pools = {ds.POOL_UMWP: [], ds.POOL_KK: [KK, KK]}
     report = ds.mine_actors(pools, min_support=3)
     assert report["pools"][ds.POOL_KK]["bases_with_actor"] == 2
     assert set(report["pools"][ds.POOL_KK]["top_actors"]) == {"Ava", "Ben", "Cara", "Dan"}
@@ -612,17 +623,17 @@ def test_mine_actors_seeds_the_vocabulary_from_the_kk_inhabitants():
 def test_mine_actors_leaves_a_base_without_names_empty():
     """Fail-closed: a base with no mined actor simply has no overlapped cell."""
     equation, jewel = _copy(EQUATION), _copy(JEWEL)
-    pools = {ds.POOL_SUM: [equation, jewel], ds.POOL_UMWP: [], ds.POOL_KK: []}
+    pools = {ds.POOL_UMWP: [equation, jewel], ds.POOL_KK: []}
     ds.mine_actors(pools)
     assert ds.base_names_of(equation) == []
     assert ds.base_names_of(jewel) == []
 
 
 def test_mine_actors_reports_the_supply_it_measured():
-    pools = {ds.POOL_SUM: [_copy(JEWEL)], ds.POOL_UMWP: [], ds.POOL_KK: []}
+    pools = {ds.POOL_UMWP: [_copy(JEWEL)], ds.POOL_KK: []}
     report = ds.mine_actors(pools)
     assert report["min_pool_support"] == ds.ACTOR_MIN_POOL_SUPPORT
-    assert report["pools"][ds.POOL_SUM]["coverage"] == 0.0
+    assert report["pools"][ds.POOL_UMWP]["coverage"] == 0.0
     assert report["lowercase_vocabulary"] > 0
 
 
@@ -659,47 +670,24 @@ def test_render_number_drops_a_float_integral_point():
     assert ds._render_number(460.5) == "460.5"
 
 
-def test_kk_answer_uses_the_rows_own_word_pair():
-    assert (
-        ds.kk_answer(["A", "B"], [True, False], {"knight": "truth-teller", "knave": "liar"})
-        == "truth-teller liar"
+def test_kk_answer_map_is_a_name_to_surface_role_mapping():
+    """D19: the gold is per person and uses the row's own two words."""
+    assert ds.kk_answer_map(
+        ["A", "B"], [True, False], {"knight": "truth-teller", "knave": "liar"}
+    ) == {"A": "truth-teller", "B": "liar"}
+    # A missing word pair falls back to the canonical one, never to a sequence.
+    assert ds.kk_answer_map(["A"], [True], {}) == {"A": "knight"}
+
+
+def test_kk_answer_map_pairs_each_name_with_its_own_role():
+    """The mapping must not be a sequence: the names are the keys the reward checks."""
+    gold = ds.kk_answer_map(
+        ["Oliver", "Ethan", "Mia"],
+        [False, True, True],
+        {"knight": "angel", "knave": "devil"},
     )
-    assert ds.kk_answer(["A"], [True], {}) == "knight"
-
-
-def _write_sum(path, rows) -> None:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(
-        pa.table(
-            {
-                "answerable_question": [row[0] for row in rows],
-                "ground_truth": [row[1] for row in rows],
-            }
-        ),
-        path,
-    )
-
-
-def test_load_sum_answerable_keys_by_row_ordinal(tmp_path):
-    _write_sum(
-        tmp_path / "sum" / "train.parquet",
-        [("A problem.", "5"), ("", "3"), ("Another.", "7")],
-    )
-    bases = ds.load_sum_answerable(tmp_path)
-    # The blank row is dropped but the ordinal is not renumbered: the key has to
-    # stay addressable in the raw file.
-    assert [(b.uid, b.answer) for b in bases] == [
-        ("sum:train:0", "5"),
-        ("sum:train:2", "7"),
-    ]
-
-
-def test_load_sum_answerable_raises_on_a_missing_file(tmp_path):
-    with pytest.raises(FileNotFoundError):
-        ds.load_sum_answerable(tmp_path)
+    assert gold == {"Oliver": "devil", "Ethan": "angel", "Mia": "angel"}
+    assert set(gold) == {"Oliver", "Ethan", "Mia"}
 
 
 def _write_umwp(path, rows) -> None:
@@ -778,8 +766,12 @@ def test_load_kk_clean_keys_by_file_and_index(tmp_path):
         "kk:clean__train__5ppl:0",
     ]
     assert len({b.uid for b in bases}) == 2
-    assert bases[0].answer == "knight knight knight knight"
-    assert bases[1].answer == "knave knave knave knave knave"
+    # D19: a name -> surface role word mapping, never a role-word sequence.
+    assert bases[0].answer == {"A": "knight", "B": "knight", "C": "knight", "D": "knight"}
+    assert bases[1].answer == {
+        "A": "knave", "B": "knave", "C": "knave", "D": "knave", "E": "knave",
+    }
+    assert bases[0].role_words == ("knight", "knave")
 
 
 def test_load_kk_clean_applies_the_inhabitant_floor(tmp_path):
@@ -816,7 +808,33 @@ def test_load_kk_clean_reads_reprs_as_well_as_typed_columns(tmp_path):
             )
         ],
     )
-    assert ds.load_kk_clean(tmp_path)[0].answer == "knight knave knight knave"
+    assert ds.load_kk_clean(tmp_path)[0].answer == {
+        "A": "knight", "B": "knave", "C": "knight", "D": "knave",
+    }
+
+
+def test_load_kk_clean_uses_the_rows_own_word_pair_in_the_mapping(tmp_path):
+    """``flip_role`` / ``random_pair`` rows really do swap the words (D19/§4.1).
+
+    A mapping built from a hard-coded knight/knave would score these rows
+    inverted, so the gold has to come from the raw row's own pair.
+    """
+    _write_kk(
+        tmp_path / "kk",
+        "4ppl",
+        [
+            (
+                "Swapped words.",
+                ["A", "B", "C", "D"],
+                {"knight": "angel", "knave": "devil"},
+                [True, False, True, False],
+                0,
+            )
+        ],
+    )
+    base = ds.load_kk_clean(tmp_path)[0]
+    assert base.role_words == ("angel", "devil")
+    assert base.answer == {"A": "angel", "B": "devil", "C": "angel", "D": "devil"}
 
 
 def _write_main(path, rows) -> None:
@@ -867,8 +885,8 @@ def test_load_pools_notes_an_absent_stage1_slice(tmp_path):
 
 def test_load_pools_notes_a_missing_raw_file(tmp_path):
     pools, notes = ds.load_pools(tmp_path, None)
-    assert pools[ds.POOL_SUM] == []
-    assert "raw file missing" in notes[ds.POOL_SUM]
+    assert pools[ds.POOL_UMWP] == []
+    assert "raw file missing" in notes[ds.POOL_UMWP]
 
 
 # ---------------------------------------------------------------------------
@@ -986,7 +1004,7 @@ def test_choose_distractor_refuses_an_overlap_that_restates_a_property():
         ds.BaseQuestion(
             question="Jewel bought 10 newspapers. How many did she buy?",
             answer="10",
-            pool=ds.POOL_SUM,
+            pool=ds.POOL_UMWP,
             meta={"names": ["Jewel"]},
         ),
         random.Random(0),
@@ -1014,7 +1032,7 @@ def test_choose_distractor_refuses_a_sentence_already_in_the_base():
     base = ds.BaseQuestion(
         question="Tom is 11. How old is Tom?",
         answer="11",
-        pool=ds.POOL_SUM,
+        pool=ds.POOL_UMWP,
         meta={"names": ["Tom"]},
     )
     template = ds.Template(
@@ -1046,7 +1064,7 @@ def test_choose_distractor_in_range_falls_back_to_a_whole_number_inside_the_span
     base = ds.BaseQuestion(
         question="Jewel has 3.5 apples and buys 4.25 more.",
         answer="7.75",
-        pool=ds.POOL_SUM,
+        pool=ds.POOL_UMWP,
         meta={"names": ["Jewel"]},
     )
     for seed in range(20):
@@ -1119,7 +1137,7 @@ def test_impossible_cells_is_overlapped_and_in_topic():
     }
 
 
-@pytest.mark.parametrize("quota", [8, 100, 2400])
+@pytest.mark.parametrize("quota", [8, 100, 400])
 def test_plan_cells_hits_the_marginals_exactly(quota):
     cells = ds.plan_cells(quota, impossible=ds.impossible_cells())
     assert sum(cells.values()) == quota
@@ -1224,8 +1242,8 @@ def test_allocate_keeps_the_axes_it_can_when_one_cell_runs_dry():
     to 0.45 by inventing rows would not be.
 
     This fixture is what a thin cell looks like from the allocator's side.  On the
-    real pools at these quotas (SUM 2,000 rows, all 2,600 UMWP, 200 K&K) none of
-    the six cells is dry and the third pass selects nothing at all.
+    real pools at these quotas (all 2,600 UMWP rows, 200 K&K) none of the six
+    cells is dry and the third pass selects nothing at all.
     """
     quota = 200
     thin = ("nonoverlapped", "in_range", "in_topic")
@@ -1267,68 +1285,68 @@ def test_allocate_is_order_stable():
 
 
 def test_allocate_role_budget_is_proportional_to_what_each_pool_can_build():
-    supply = {"sum": 10_000, "umwp": 1_000, "kk": 5_000}
-    buildable = {"sum": 1000, "umwp": 600, "kk": 400}
+    supply = {"umwp": 10_000, "kk": 5_000, "main": 10_000}
+    buildable = {"umwp": 200, "kk": 100, "main": 100}
     budget = ds.allocate_role_budget(supply, buildable, 0.50)
-    assert budget == {"sum": 500, "umwp": 300, "kk": 200}
-    assert sum(budget.values()) == 1000
+    assert budget == {"umwp": 100, "kk": 50, "main": 50}
+    assert sum(budget.values()) == 200
 
 
 def test_allocate_role_budget_gives_a_starved_pool_what_it_has():
     """An earlier rule gave one pool nothing whenever a bigger one had room.
 
-    ``kk`` can only name an actor on 40 of its 400 buildable rows, so the global
-    budget shrinks to the total room (920, not 1,000) and the split is by room:
-    ``kk`` contributes its 40 -- a share of 0.10 against the design's 0.50, which
+    ``kk`` can only name an actor on 20 of its 100 buildable rows, so the global
+    budget shrinks to the total room (185, not 200) and the split is by room:
+    ``kk`` contributes its 20 -- a share of 0.20 against the design's 0.50, which
     is exactly the shortfall the report has to state rather than hide -- and the
-    two pools that *can* reach the target still reach it (550/1,000 = 0.55, the
-    out_topic cap).  Zeroing the small pool instead would have left 720 rows of
-    room unused and dragged the global share to 0.10.
+    two pools that *can* reach the target still reach it (110/200 = 0.55, the
+    out_topic cap).  Zeroing the small pool instead would have left 20 rows of
+    room unused and dragged the global share down with it.
     """
-    supply = {"sum": 10_000, "umwp": 10_000, "kk": 40}
-    buildable = {"sum": 1000, "umwp": 600, "kk": 400}
+    supply = {"umwp": 10_000, "kk": 20, "main": 10_000}
+    buildable = {"umwp": 200, "kk": 100, "main": 100}
     budget = ds.allocate_role_budget(supply, buildable, 0.50)
-    assert budget == {"sum": 550, "umwp": 330, "kk": 40}
+    assert budget == {"umwp": 110, "kk": 20, "main": 55}
     assert all(value > 0 for value in budget.values())
     assert sum(budget.values()) < round(0.50 * sum(buildable.values()))
 
 
 def test_allocate_role_budget_hands_out_its_own_total_not_the_room_total():
     """With the budget under the total room, every pool lands on the same share."""
-    supply = {"sum": 10_000, "umwp": 10_000}
-    buildable = {"sum": 1000, "umwp": 600}
+    supply = {"umwp": 10_000, "kk": 10_000}
+    buildable = {"umwp": 200, "kk": 100}
     budget = ds.allocate_role_budget(supply, buildable, 0.20)
-    assert budget == {"sum": 200, "umwp": 120}
+    assert budget == {"umwp": 40, "kk": 20}
     for pool, rows in budget.items():
         assert rows / buildable[pool] == pytest.approx(0.20)
 
 
 def test_allocate_role_budget_is_capped_by_the_out_topic_room():
     """Overlapped implies out_topic, so a pool cannot exceed its out_topic budget."""
-    supply = {"sum": 10_000}
-    buildable = {"sum": 1000}
+    supply = {"umwp": 10_000}
+    buildable = {"umwp": 200}
     budget = ds.allocate_role_budget(supply, buildable, 0.50)
-    assert budget == {"sum": 500}
+    assert budget == {"umwp": 100}
     # Raise the request past the 55% out_topic cap and the cap binds.
-    assert ds.allocate_role_budget(supply, buildable, 0.90) == {"sum": 550}
+    assert ds.allocate_role_budget(supply, buildable, 0.90) == {"umwp": 110}
 
 
 def test_allocate_role_budget_is_capped_by_actor_supply():
-    supply = {"sum": 30}
-    buildable = {"sum": 1000}
-    assert ds.allocate_role_budget(supply, buildable, 0.50) == {"sum": 30}
+    supply = {"umwp": 30}
+    buildable = {"umwp": 200}
+    assert ds.allocate_role_budget(supply, buildable, 0.50) == {"umwp": 30}
 
 
 def test_allocate_role_budget_uses_buildable_not_the_requested_quota():
     """The regression: keying the fraction to the *requested* total pinned every
     pool to the out_topic cap (0.55) whenever one pool had no source, because the
     budget then asked for 50% of rows that would never be built."""
-    supply = {"sum": 10_000, "umwp": 10_000, "kk": 5_000, "main": 0}
-    buildable = {"sum": 1000, "umwp": 600, "kk": 400, "main": 0}
+    supply = {"umwp": 10_000, "kk": 5_000, "main": 0}
+    buildable = {"umwp": 200, "kk": 100, "main": 0}
     budget = ds.allocate_role_budget(supply, buildable, 0.50)
-    assert sum(budget.values()) == 1000  # 50% of the 2,000 buildable, not of 2,400
+    assert sum(budget.values()) == 150  # 50% of the 300 buildable, not of the 400 asked
     assert budget["main"] == 0
-    for pool, share in (("sum", 1000), ("umwp", 600), ("kk", 400)):
+    for pool, share in (("umwp", 200), ("kk", 100)):
         assert budget[pool] == share // 2
 
 
@@ -1389,8 +1407,8 @@ def test_make_rows_records_the_three_labels():
 
 def test_make_rows_routes_each_pool_to_its_own_data_source_and_branch():
     for base, data_source, branch in (
-        (JEWEL, schema.SOURCE_SUM, schema.BRANCH_SOLVABLE_NUMERIC),
-        (BRYAN, schema.SOURCE_UMWP, schema.BRANCH_SOLVABLE_NUMERIC),
+        (JEWEL, schema.SOURCE_UMWP, schema.BRANCH_SOLVABLE_NUMERIC),
+        (STAGE1, schema.SOURCE_MAIN, schema.BRANCH_SOLVABLE_NUMERIC),
         (KK, schema.SOURCE_KK, schema.BRANCH_SOLVABLE_ROLES),
     ):
         distractor = ds.choose_distractor(
@@ -1411,8 +1429,68 @@ def test_make_rows_routes_each_pool_to_its_own_data_source_and_branch():
         assert row["extra_info"]["branch"] == branch
 
 
+def test_make_rows_uses_the_mapping_gold_and_the_role_words_for_kk():
+    """D19 end to end: mapping gold, role_words payload, K&K prompt instruction."""
+    distractor = ds.choose_distractor(
+        HEIGHT, KK, random.Random(3), names=["Zoe"], numbers=["8"]
+    )
+    assert distractor is not None
+    row = ds.make_rows(
+        [
+            ds.Candidate(
+                base=KK,
+                distractor=distractor,
+                question=ds.inject(KK.question, distractor.sentence),
+                order=0.0,
+            )
+        ]
+    )[0]
+    payload = json.loads(row["reward_model"]["ground_truth"])
+    assert payload["answer"] == KK.answer
+    assert isinstance(payload["answer"], dict)
+    assert payload["role_words"] == ["knight", "knave"]
+    assert row["extra_info"]["role_words"] == ["knight", "knave"]
+    # The instruction is what tells the model to answer per person; a bare
+    # sequence cannot satisfy the reward's kk_match (D19).
+    assert schema._KK_ROLE_INSTRUCTION.strip() in row["prompt"][0]["content"]
+    assert schema.validate_row(row) == []
+
+
+def test_make_rows_carries_the_same_source_pairing_of_its_pool():
+    """The D17 pairing is an audit field, not a convention of the loader."""
+    for base, control_source, control_split in (
+        (JEWEL, schema.SOURCE_UMWP, "train"),
+        (STAGE1, schema.SOURCE_MIP, "train"),
+        (KK, schema.SOURCE_KK, "train"),
+    ):
+        distractor = ds.choose_distractor(
+            HEIGHT, base, random.Random(4), names=["Zoe"], numbers=["8"]
+        )
+        row = ds.make_rows(
+            [
+                ds.Candidate(
+                    base=base,
+                    distractor=distractor,
+                    question=ds.inject(base.question, distractor.sentence),
+                    order=0.0,
+                )
+            ]
+        )[0]
+        assert row["extra_info"]["control_source"] == control_source
+        assert row["extra_info"]["control_split"] == control_split
+
+
+def test_default_pool_quota_is_the_three_named_pools_and_400():
+    """Design doc section 4.7: UMWP 200 / K&K 100 / main 100, exactly 400."""
+    assert ds.POOLS == (ds.POOL_UMWP, ds.POOL_KK, ds.POOL_MAIN)
+    assert ds.DEFAULT_POOL_QUOTA == {ds.POOL_UMWP: 200, ds.POOL_KK: 100, ds.POOL_MAIN: 100}
+    assert sum(ds.DEFAULT_POOL_QUOTA.values()) == ds.DEFAULT_POOL_TOTAL == 400
+    for pool in ds.POOLS:
+        assert pool in ds.POOL_DATA_SOURCE and pool in ds.POOL_BRANCH
+
+
 def test_make_rows_satisfies_the_schema_contract():
-    for base in (JEWEL, KK):
+    for base in (JEWEL, STAGE1, KK):
         distractor = ds.choose_distractor(
             HEIGHT, base, random.Random(2), names=["Zoe"], numbers=["8"]
         )
@@ -1465,8 +1543,8 @@ def test_verify_row_catches_a_base_that_is_no_longer_recoverable():
     """The base is deliberately *not* a span of the prompt: inject splits it.
 
     The check is removability, not containment -- an earlier revision asserted the
-    base was a contiguous span and failed 1,395 of 2,000 rows for a reason that
-    was never a defect.  The edit below has to leave the distractor sentence alone
+    base was a contiguous span and failed 1,395 of that revision's rows for a
+    reason that was never a defect.  The edit below has to leave the distractor sentence alone
     (it replaces a word only the base carries), or the earlier check fails first
     and the removability branch is never reached -- which is how this test passed
     for the wrong reason once already.
@@ -1498,6 +1576,56 @@ def test_verify_row_catches_a_label_outside_the_axis_vocabulary():
     assert "role_label is 'sideways'" in ds.verify_row(base, row)
 
 
+# ---------------------------------------------------------------------------
+# the same-source base pairing (design doc section 4.7)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_row_catches_a_base_split_that_is_not_the_controls():
+    """A base from another split is not the control the pairing claims.
+
+    The pairing is only meaningful when both sides' base questions come from the
+    same source split (D17's 成对性硬约束), so this has to be an assertion and not
+    a convention of which loader happened to fill the pool.
+    """
+    base, row = _emit_one()
+    other = dataclasses.replace(base, split="test")
+    assert any(
+        "not the control source's split" in problem for problem in ds.verify_row(other, row)
+    )
+    # The row's own recorded split is part of the same claim.
+    row["extra_info"]["split"] = "test"
+    assert any(
+        "not the control source's split" in problem for problem in ds.verify_row(base, row)
+    )
+
+
+def test_verify_row_catches_a_base_from_another_pools_upstream_source():
+    base, row = _emit_one()
+    other = dataclasses.replace(base, uid="kk:clean__train__4ppl:0")
+    assert any("upstream source" in problem for problem in ds.verify_row(other, row))
+
+
+def test_verify_row_catches_a_row_that_declares_the_wrong_control_source():
+    base, row = _emit_one()
+    row["extra_info"]["control_source"] = schema.SOURCE_MIP
+    assert any(
+        "does not declare its control source" in problem for problem in ds.verify_row(base, row)
+    )
+    row["extra_info"]["control_source"] = schema.SOURCE_UMWP
+    row["extra_info"]["control_split"] = "test"
+    assert any(
+        "does not declare its control source" in problem for problem in ds.verify_row(base, row)
+    )
+
+
+def test_verify_row_catches_a_row_routed_to_the_wrong_pool():
+    base, row = _emit_one()
+    row["data_source"] = schema.SOURCE_KK
+    problems = ds.verify_row(base, row)
+    assert any("row is routed as" in problem for problem in problems)
+
+
 def test_verify_row_accepts_a_prompt_with_extra_text_appended():
     """K&K role rows append the answer-format instruction after the puzzle."""
     base, row = _emit_one()
@@ -1519,16 +1647,16 @@ def _pools() -> dict[str, list[ds.BaseQuestion]]:
     after it -- which is precisely how two of these tests came to fail.
     """
     return {
-        ds.POOL_SUM: [_copy(JEWEL), _copy(EQUATION)],
-        ds.POOL_UMWP: [_copy(BRYAN)],
+        ds.POOL_UMWP: [_copy(JEWEL), _copy(EQUATION), _copy(BRYAN)],
         ds.POOL_KK: [_copy(KK)],
         ds.POOL_MAIN: [],
     }
 
 
 # Quotas for the real-pool fixture: enough rows for all three axes to be
-# meaningful, few enough that the whole file still runs in seconds.
-SMALL_QUOTA = {ds.POOL_SUM: 40, ds.POOL_UMWP: 20, ds.POOL_KK: 10, ds.POOL_MAIN: 0}
+# meaningful, few enough that the whole file still runs in seconds.  The main
+# pool has no stage-1 source here, so its slice is 0 and the run is 70 rows.
+SMALL_QUOTA = {ds.POOL_UMWP: 40, ds.POOL_KK: 30, ds.POOL_MAIN: 0}
 
 
 @functools.lru_cache(maxsize=None)
@@ -1548,11 +1676,11 @@ def real_pools() -> dict[str, list[ds.BaseQuestion]]:
 
     The slice keeps the file fast.  It does not change the axes: all 2,600 UMWP
     rows and 200 of the 5,000 K&K puzzles are here, and those are the two pools
-    that feed the actor vocabulary, so the mining behaves as it does in a build.
+    that feed the actor vocabulary (the stage-1 main pool is absent on this box),
+    so the mining behaves as it does in a build.
     """
     pools, _notes = _loaded_pools()
     return {
-        ds.POOL_SUM: [_copy(base) for base in pools[ds.POOL_SUM][:2000]],
         ds.POOL_UMWP: [_copy(base) for base in pools[ds.POOL_UMWP]],
         ds.POOL_KK: [_copy(base) for base in pools[ds.POOL_KK][:200]],
         ds.POOL_MAIN: [],
@@ -1576,6 +1704,25 @@ def test_synthesise_balances_all_three_axes_on_real_pools(real_pools):
     for axis in ds.AXES:
         for label, fraction in ds.AXIS_TARGETS[axis].items():
             assert abs(report["achieved_overall"][axis][label] - fraction) <= ds.AXIS_TOLERANCE
+
+
+def test_synthesise_fills_the_d17_total_except_the_missing_stage1_slice(real_pools):
+    """The design's 400 rows at the full quota: 200 + 100 + 100.
+
+    The stage-1 main pool has no source on this box, so its 100 rows are reported
+    as a shortfall rather than replaced from the other pools (design doc section
+    4.7).  This is the quota check on real supply: the two pools that *do* have
+    data fill their cells exactly.
+    """
+    rows, report = ds.synthesise(real_pools, templates=_safe_templates(), seed=0)
+    assert report["quota"] == ds.DEFAULT_POOL_QUOTA
+    assert report["requested_total"] == 400
+    assert report["pools"][ds.POOL_UMWP]["selected"] == 200
+    assert report["pools"][ds.POOL_KK]["selected"] == 100
+    assert report["pools"][ds.POOL_MAIN]["selected"] == 0
+    assert report["pools"][ds.POOL_MAIN]["shortfall"] == ds.DEFAULT_POOL_QUOTA[ds.POOL_MAIN]
+    assert report["built_total"] == 300 == len(rows)
+    assert all(report["balanced_overall"].values()), report["achieved_overall"]
 
 
 def test_synthesise_emits_rows_the_schema_and_the_self_check_accept(real_pools):
@@ -1617,12 +1764,12 @@ def test_synthesise_reports_an_empty_pool_rather_than_skipping_it():
 def test_synthesise_reports_the_role_supply_it_could_not_meet():
     """The design's per-pool 50/50 cannot be built: most MATH problems name nobody."""
     templates, _report = ds.load_safe_templates()
-    pools = {ds.POOL_SUM: [EQUATION], ds.POOL_UMWP: [], ds.POOL_KK: [], ds.POOL_MAIN: []}
+    pools = {ds.POOL_UMWP: [EQUATION], ds.POOL_KK: [], ds.POOL_MAIN: []}
     _rows, report = ds.synthesise(
-        pools, templates=templates, quota={ds.POOL_SUM: 4}, seed=1, mine=False
+        pools, templates=templates, quota={ds.POOL_UMWP: 4}, seed=1, mine=False
     )
-    assert report["effective_targets"][ds.POOL_SUM]["overlapped_supply"] == 0
-    assert report["effective_targets"][ds.POOL_SUM]["overlapped_budget"] == 0
+    assert report["effective_targets"][ds.POOL_UMWP]["overlapped_supply"] == 0
+    assert report["effective_targets"][ds.POOL_UMWP]["overlapped_budget"] == 0
     assert report["role_supply_note"].startswith("overlapped role supply 0 of 1 buildable")
 
 
@@ -1633,19 +1780,19 @@ def test_synthesise_reports_the_actor_mining_it_ran(real_pools):
     )
     assert rows
     mining = report["actor_mining"]["pools"]
-    # K&K's inhabitants are given, so that pool has to come out complete; the two
-    # mined pools do not, and the shortfall is the role axis' design refusal.
+    # K&K's inhabitants are given, so that pool has to come out complete; the
+    # mined UMWP pool does not, and the stage-1 pool has no source here at all.
     assert mining[ds.POOL_KK]["bases_with_actor"] == len(real_pools[ds.POOL_KK])
     assert 0.0 < mining[ds.POOL_UMWP]["coverage"] < 1.0
-    assert 0.0 < mining[ds.POOL_SUM]["coverage"] < mining[ds.POOL_UMWP]["coverage"]
-    for pool in (ds.POOL_SUM, ds.POOL_UMWP, ds.POOL_KK):
+    assert mining[ds.POOL_MAIN]["bases"] == 0
+    for pool in (ds.POOL_UMWP, ds.POOL_KK):
         assert (
             report["effective_targets"][pool]["overlapped_supply"]
             == mining[pool]["bases_with_actor"]
         )
     # Supply counts bases, the budget counts rows: with ample supply each pool's
     # share is the design's half of what it can build.
-    for pool in (ds.POOL_SUM, ds.POOL_UMWP, ds.POOL_KK):
+    for pool in (ds.POOL_UMWP, ds.POOL_KK):
         effective = report["effective_targets"][pool]
         assert effective["overlapped_budget"] == pytest.approx(effective["buildable"] * 0.50)
     assert "overlapped role supply" in report["role_supply_note"]
@@ -1657,13 +1804,12 @@ def test_synthesise_can_skip_mining_and_then_has_no_overlapped_supply(real_pools
         real_pools, templates=_safe_templates(), quota=SMALL_QUOTA, seed=1, mine=False
     )
     assert report["actor_mining"] is None
-    # SUM and UMWP carry no names until mining fills them in, so they lose their
-    # overlapped cells rather than falling back to a capitalised verb.
-    assert report["effective_targets"][ds.POOL_SUM]["overlapped_supply"] == 0
+    # The stage-1/UMWP bases carry no names until mining fills them in, so UMWP
+    # loses its overlapped cells rather than falling back to a capitalised verb.
     assert report["effective_targets"][ds.POOL_UMWP]["overlapped_supply"] == 0
     # K&K is the exception in both directions: its names come from the puzzle.
     assert report["effective_targets"][ds.POOL_KK]["overlapped_supply"] > 0
-    assert report["pools"][ds.POOL_SUM]["requested"] == SMALL_QUOTA[ds.POOL_SUM]
+    assert report["pools"][ds.POOL_UMWP]["requested"] == SMALL_QUOTA[ds.POOL_UMWP]
 
 
 def test_synthesise_records_the_design_and_the_effective_targets_separately(real_pools):
@@ -1672,14 +1818,19 @@ def test_synthesise_records_the_design_and_the_effective_targets_separately(real
         real_pools, templates=_safe_templates(), quota=SMALL_QUOTA, seed=1, mine=False
     )
     assert report["design_targets"]["role_label"] == ds.AXIS_TARGETS["role_label"]
-    # Unmined SUM can name nobody, so its *effective* role target is the one the
+    # Unmined UMWP can name nobody, so its *effective* role target is the one the
     # data allows -- and it is not the design's.
-    effective = report["effective_targets"][ds.POOL_SUM]["targets"]["role_label"]
+    effective = report["effective_targets"][ds.POOL_UMWP]["targets"]["role_label"]
     assert effective == {"overlapped": 0.0, "nonoverlapped": 1.0}
     assert effective != report["design_targets"]["role_label"]
-    # K&K can meet it, so its effective target is the design's.
+    # K&K can name every inhabitant, so its effective overlapped target is the
+    # largest share the *global* budget allows: with UMWP starved the budget is
+    # capped by K&K's own out_topic room (an overlapped fill is necessarily
+    # out_topic), so it lands just above the design's 0.50 rather than exactly on
+    # it -- which is precisely what the effective target exists to state.
     kk_role = report["effective_targets"][ds.POOL_KK]["targets"]["role_label"]
-    assert kk_role == pytest.approx(ds.AXIS_TARGETS["role_label"])
+    assert kk_role["overlapped"] > ds.AXIS_TARGETS["role_label"]["overlapped"]
+    assert kk_role["overlapped"] <= ds.AXIS_TARGETS["sentence_label"]["out_topic"]
     assert sum(kk_role.values()) == pytest.approx(1.0)
     for pool in ds.POOLS:
         for axis in ds.AXES:
@@ -1691,7 +1842,7 @@ def test_synthesise_records_the_design_and_the_effective_targets_separately(real
 def test_synthesise_reports_the_templates_it_drew_from():
     templates, _report = ds.load_safe_templates()
     _rows, report = ds.synthesise(
-        _pools(), templates=templates, quota={ds.POOL_SUM: 4}, seed=1, mine=False
+        _pools(), templates=templates, quota={ds.POOL_UMWP: 4}, seed=1, mine=False
     )
     assert report["requested_total"] == 4
     assert report["seed"] == 1
@@ -1702,9 +1853,9 @@ def test_synthesise_drops_non_numeric_fills_and_records_them():
     bad = _template("The {role} of the machine is {number} units.", number="n/a")
     safe, _report = ds.load_safe_templates()
     rows, report = ds.synthesise(
-        {ds.POOL_SUM: [JEWEL], ds.POOL_UMWP: [], ds.POOL_KK: [], ds.POOL_MAIN: []},
+        {ds.POOL_UMWP: [JEWEL], ds.POOL_KK: [], ds.POOL_MAIN: []},
         templates=[bad, *safe],
-        quota={ds.POOL_SUM: 2},
+        quota={ds.POOL_UMWP: 2},
         seed=1,
         mine=False,
     )

@@ -20,14 +20,21 @@ here reads ``/home/charles/data/reasoning_rl/halluc/raw``: each test writes its
 own ``{gsm8k,svamp,math,formula}.json`` fixture files into ``tmp_path``, so the
 suite runs with no raw data present at all and cannot drift with the download.
 
-Coverage: one test per funnel stage, per emitted branch, per drop reason, both
-gold certificates (gsm8k tiers T1/T2 and math ``\\boxed{}``), the placeholder
-family, the limit/pair rule, determinism, and the D12 no-options invariant.
+The adapter emits **only** the unsolvable three-tier branch (design doc section
+4.2 / D12 / Q7 keep MiP's solvable side out of the pool), so there is no
+solvable-twin expectation anywhere below: the artifact's row count *is* the
+strict funnel's ``necessary_value_certified`` count.
+
+Coverage: one test per funnel stage, the emitted row shape, the drop reasons,
+the placeholder family, the limit rule, determinism, the D12 no-options
+invariant, and -- when the raw bundle happens to be present -- the measured
+strict pool size (270).
 """
 
 from __future__ import annotations
 
 import json
+import os
 
 import mip_adapter as adapter
 import pytest
@@ -38,8 +45,7 @@ import schema
 # ---------------------------------------------------------------------------
 
 # recon section 3 "gsm8k.json[0]": one deleted clause ("He runs 60 meters each
-# sprint."), one value (60), used by the source's own chain (9*60=540), and a
-# gold the last annotation recomputes -> admitted on both branches.
+# sprint."), one value (60), used by the source's own chain (9*60=540).
 GSM8K_PAIR = {
     "question": "James decides to run 3 sprints 3 times a week.  He runs 60 meters each "
     "sprint.  How many total meters does he run a week?",
@@ -61,7 +67,7 @@ GSM8K_PLACEHOLDER = {
 # The recon's T2 shape: the last step is done in prose after the last
 # annotation, e.g. "he has 25-2 = 23 jewels. #### 23".  The deleted premise
 # ("5 more") is a value the annotation chain uses, which is what makes it a
-# necessity-passing row whose *gold* is only certifiable from the prose.
+# necessity-passing row.
 GSM8K_T2 = {
     "question": "Aaron has 20 jewels and buys 5 more. Siobhan has 2 fewer jewels than "
     "Aaron. How many jewels does Siobhan have?",
@@ -71,10 +77,9 @@ GSM8K_T2 = {
     "jewels than Aaron. How many jewels does Siobhan have?",
 }
 
-# An admitted math row (a single deleted numeric premise, a gold the solution's
-# own last \boxed{} reaches).  Note the blank lines: the question itself embeds
-# "\n\n", which is why the prompt must be split at the template marker and not
-# at the first blank line.
+# An admitted math row (a single deleted numeric premise).  Note the blank
+# lines: the question itself embeds "\n\n", which is why the prompt must be
+# split at the template marker and not at the first blank line.
 MATH_PAIR = {
     "solution": "The area of a circle is $\\pi r^2$ with $r = 7$, so it is $49\\pi$.\n"
     "\\boxed{49\\pi}",
@@ -144,18 +149,17 @@ def gsm8k_row(question, insufficient_question, answer=None):
 
 
 # ---------------------------------------------------------------------------
-# the happy path: both branches, funnel, contract
+# the happy path: the single emitted branch, funnel, contract
 # ---------------------------------------------------------------------------
 
 
 class TestEmittedRows:
-    def test_pair_emits_both_branches(self, tmp_path):
+    def test_build_emits_only_the_unsolvable_branch(self, tmp_path):
+        """D12/Q7: the solvable twin is out of the pool, so one pair is one row."""
         raw = write_raw(tmp_path, gsm8k=[GSM8K_PAIR])
         rows, funnel = adapter.build_rows(raw)
-        assert [row["extra_info"]["branch"] for row in rows] == [
-            adapter.UNSOLVABLE_BRANCH,
-            adapter.SOLVABLE_BRANCH,
-        ]
+        assert [row["extra_info"]["branch"] for row in rows] == [adapter.UNSOLVABLE_BRANCH]
+        assert not hasattr(adapter, "SOLVABLE_BRANCH")
         assert funnel["raw_rows"] == 1
         assert funnel[adapter.LIMIT_STAGE] == 1
 
@@ -172,6 +176,7 @@ class TestEmittedRows:
         assert gt["has_diagnosis_label"] is False
         assert gt["perturbation_type"] == "missing_condition"
         assert "judgment_only" not in gt  # this is not a judgment row
+        assert "two_layer" not in gt and "solvable_answer" not in gt and "pair_task" not in gt
         assert info["template"] == schema.TEMPLATE_B
         assert info["branch"] == adapter.UNSOLVABLE_BRANCH
         assert info["solvable"] is False
@@ -188,43 +193,33 @@ class TestEmittedRows:
         assert "\\boxed{UNSOLVABLE}" in unsolvable["prompt"][0]["content"]
         assert "选项" not in unsolvable["prompt"][0]["content"]
 
-    def test_solvable_row_contract(self, tmp_path):
-        raw = write_raw(tmp_path, gsm8k=[GSM8K_PAIR])
+    def test_no_solvable_row_is_emitted_even_though_the_gold_is_recoverable(self, tmp_path):
+        """The source's own answer is well-formed; the twin is still not emitted."""
+        raw = write_raw(tmp_path, gsm8k=[GSM8K_PAIR, GSM8K_T2])
         rows, _ = adapter.build_rows(raw)
-        solvable = rows[1]
-        gt = json.loads(solvable["reward_model"]["ground_truth"])
-        info = solvable["extra_info"]
-
-        assert gt["solvable"] is True
-        assert gt["answer"] == "540"  # the source's own `####` value
-        assert gt["correct_option_id"] is None
-        assert info["template"] == schema.TEMPLATE_B
-        assert info["branch"] == adapter.SOLVABLE_BRANCH
-        assert info["error_type"] == ""  # a well-posed problem is not a defect row
-        assert info["task_id"].endswith("-solvable")
-        assert info["paired_original_text"] == GSM8K_PAIR["question"]
-        assert solvable["prompt"][0]["content"].startswith(GSM8K_PAIR["question"])
+        payloads = [json.loads(row["reward_model"]["ground_truth"]) for row in rows]
+        assert [payload["solvable"] for payload in payloads] == [False, False]
+        assert all(payload["answer"] is None for payload in payloads)
 
     def test_every_row_passes_schema_validation(self, tmp_path):
         raw = write_raw(
             tmp_path, gsm8k=[GSM8K_PAIR, GSM8K_PLACEHOLDER, GSM8K_T2], math=[MATH_PAIR]
         )
         rows, _ = adapter.build_rows(raw)
-        assert len(rows) == 8
+        assert len(rows) == 4  # one row per certified deletion, no pairing
         for row in rows:
             assert schema.validate_row(row) == []
         schema.normalise_extra_info(rows)
         schema.validate_rows(rows)  # raises on any violation
 
-    def test_math_row_uses_unique_id_level_and_solution_gold(self, tmp_path):
+    def test_math_row_uses_unique_id_and_level(self, tmp_path):
         raw = write_raw(tmp_path, math=[MATH_PAIR])
         rows, _ = adapter.build_rows(raw)
-        assert len(rows) == 2
+        assert len(rows) == 1
         info = rows[0]["extra_info"]
         assert info["task_id"] == "mip-math-test_geometry_123_json-unsolvable"
         assert info["difficulty"] == "level-2"
         assert rows[0]["prompt"][0]["content"].startswith(MATH_PAIR["insufficient_question"])
-        assert json.loads(rows[1]["reward_model"]["ground_truth"])["answer"] == "49\\pi"
 
     def test_math_row_with_two_deleted_values_is_dropped(self, tmp_path):
         """One changed region, two numeric premises -> not the single-value bucket."""
@@ -237,7 +232,7 @@ class TestEmittedRows:
     def test_placeholder_row_is_admitted_with_its_own_family(self, tmp_path):
         raw = write_raw(tmp_path, gsm8k=[GSM8K_PLACEHOLDER])
         rows, _ = adapter.build_rows(raw)
-        assert len(rows) == 2
+        assert len(rows) == 1
         assert rows[0]["extra_info"]["perturbation_family"] == "placeholder"
         assert rows[0]["extra_info"]["deleted_condition_text"] == "220"
 
@@ -273,6 +268,12 @@ class TestFunnelStages:
         assert funnel["raw_rows"] == 3  # 1 gsm8k + 1 svamp + 1 formula
         assert funnel["paired_original_present"] == 1  # svamp and formula cannot pair
         assert funnel[adapter.LIMIT_STAGE] == 1
+
+    def test_row_count_equals_the_strict_funnel_output(self, tmp_path):
+        """No pair halving: every certified deletion becomes exactly one row."""
+        raw = write_raw(tmp_path, gsm8k=[GSM8K_PAIR, GSM8K_T2], math=[MATH_PAIR])
+        rows, funnel = adapter.build_rows(raw)
+        assert len(rows) == funnel["necessary_value_certified"] == funnel[adapter.LIMIT_STAGE] == 3
 
     def test_unpairable_sources_are_dropped_before_the_diff(self, tmp_path):
         raw = write_raw(tmp_path, svamp=[SVAMP_ROW], formula=[FORMULA_ROW])
@@ -393,8 +394,13 @@ class TestFunnelStages:
         assert rows == []
         assert funnel["necessary_value_certified"] == 0
 
-    def test_uncertifiable_gold_keeps_the_unsolvable_row_only(self, tmp_path):
-        """The answer key contradicts the source's own arithmetic: no twin."""
+    def test_an_inconsistent_source_answer_key_does_not_drop_the_unsolvable_row(self, tmp_path):
+        """The answer key is only the chain the necessity check reads.
+
+        With the solvable twin gone (D12/Q7) there is no gold certificate left to
+        fail: the unsolvable row is admitted exactly when its deleted value is
+        necessary, which this row's ``<<6+0=6>>`` chain satisfies.
+        """
         row = gsm8k_row(
             "Tom has 6 apples and 40 oranges. How many fruits does he have?",
             "Tom has some apples and 40 oranges. How many fruits does he have?",
@@ -410,8 +416,8 @@ class TestFunnelStages:
         raw = write_raw(tmp_path, gsm8k=[GSM8K_T2])
         rows, funnel = adapter.build_rows(raw)
         assert funnel["necessary_value_certified"] == 1
-        assert len(rows) == 2
-        assert json.loads(rows[1]["reward_model"]["ground_truth"])["answer"] == "23"
+        assert len(rows) == 1
+        assert json.loads(rows[0]["reward_model"]["ground_truth"])["solvable"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -420,25 +426,6 @@ class TestFunnelStages:
 
 
 class TestCertificates:
-    def test_gsm8k_annotation_tier(self):
-        gold, tier = adapter._certify_gsm8k(GSM8K_PAIR["answer"])
-        assert (gold, tier) == ("540", "T1")
-
-    def test_gsm8k_final_step_tier(self):
-        gold, tier = adapter._certify_gsm8k(GSM8K_T2["answer"])
-        assert (gold, tier) == ("23", "T2")
-
-    def test_gsm8k_conflicting_key_is_uncertified(self):
-        answer = "Tom has 6+0=<<6+0=6>>6 fruits\nSo he has 24/240 = 0.10 baskets\n#### 10"
-        assert adapter._certify_gsm8k(answer) == (None, None)
-
-    def test_gsm8k_without_a_key_is_uncertified(self):
-        assert adapter._certify_gsm8k("no key here") == (None, None)
-
-    def test_math_gold_is_the_last_boxed_value(self):
-        gold, tier = adapter._certify_math(MATH_PAIR)
-        assert (gold, tier) == ("49\\pi", "solution_boxed")
-
     def test_necessary_folds_percentages(self):
         """Convention: necessity compares Decimals and folds 10 <-> 0.1."""
         assert adapter._necessary("10", "the rate is 0.1 of the price") is True
@@ -446,34 +433,6 @@ class TestCertificates:
         assert adapter._necessary("5", "we counted 500 items") is True
         assert adapter._necessary("7", "we counted 3 and 4 items") is False
         assert adapter._necessary("7", "") is None  # nothing to check against
-
-    def test_math_gold_without_a_matching_box_is_uncertified(self):
-        row = dict(MATH_PAIR, solution="The answer follows from the diagram.")
-        assert adapter._certify_math(row) == (None, None)
-
-    def test_last_boxed_survives_nested_braces(self):
-        text = "$x=\\boxed{\\frac{1}{2}}$ and finally $\\boxed{3}$"
-        assert adapter._last_boxed(text) == "3"
-
-    def test_safe_arithmetic_refuses_non_arithmetic(self):
-        assert adapter._safe_arithmetic("__import__('os')") is None
-        assert adapter._safe_arithmetic("6/0") is None
-        assert adapter._safe_arithmetic("3*3") == 9
-
-    def test_certifiers_refuse_empty_input(self):
-        assert adapter._certify_gsm8k("") == (None, None)
-        assert adapter._certify_gsm8k("no key here") == (None, None)
-        assert adapter._certify_gsm8k("a non-numeric key\n#### abc") == (None, None)
-        assert adapter._certify_math({}) == (None, None)
-        assert adapter._certify_math({"answer": "", "solution": "\\boxed{1}"}) == (None, None)
-
-    def test_unevaluable_annotation_falls_through_to_the_final_step(self):
-        """An annotation whose expression is not arithmetic is skipped, not fatal."""
-        answer = (
-            "The total is unknown=<<unknown=5>>5 so far.\n"
-            "Adding the rest, we get 5+2 = 7 items\n#### 7"
-        )
-        assert adapter._certify_gsm8k(answer) == ("7", "T2")
 
     def test_decimal_rejects_non_numeric_tokens(self):
         assert adapter._decimal("abc") is None
@@ -498,6 +457,11 @@ class TestCertificates:
         assert adapter._normalise_number("4.0") == "4"
         assert adapter._normalise_number("1,200") == "1200"
         assert adapter._numeric_values("costs $4.00 today") == {"4.00"}
+
+    def test_the_solvable_side_certificates_are_gone(self):
+        """The twin's gold certificates left with the twin (D12/Q7)."""
+        for name in ("_certify_gsm8k", "_certify_math", "_last_boxed", "_safe_arithmetic"):
+            assert not hasattr(adapter, name)
 
 
 class TestClassify:
@@ -548,25 +512,22 @@ class TestLimitAndDeterminism:
             )
         return write_raw(tmp_path, gsm8k=rows)
 
-    def test_limit_keeps_pairs_whole(self, tmp_path):
+    def test_limit_caps_rows_without_pairing(self, tmp_path):
         raw = self._raw(tmp_path)
         rows, funnel = adapter.build_rows(raw, limit=4)
         assert len(rows) == 4
-        assert funnel[adapter.LIMIT_STAGE] == 2
-        branches = [row["extra_info"]["branch"] for row in rows]
-        assert branches.count(adapter.UNSOLVABLE_BRANCH) == 2
-        assert branches.count(adapter.SOLVABLE_BRANCH) == 2
+        assert funnel[adapter.LIMIT_STAGE] == 4
 
-    def test_odd_limit_rounds_down_to_a_whole_pair_count(self, tmp_path):
+    def test_odd_limit_keeps_exactly_that_many_rows(self, tmp_path):
         raw = self._raw(tmp_path)
         rows, funnel = adapter.build_rows(raw, limit=3)
-        assert len(rows) == 2
-        assert funnel[adapter.LIMIT_STAGE] == 1
+        assert len(rows) == 3
+        assert funnel[adapter.LIMIT_STAGE] == 3
 
-    def test_limit_below_one_pair_is_rejected(self, tmp_path):
+    def test_limit_below_one_is_rejected(self, tmp_path):
         raw = self._raw(tmp_path)
         with pytest.raises(ValueError):
-            adapter.build_rows(raw, limit=1)
+            adapter.build_rows(raw, limit=0)
 
     def test_same_seed_is_byte_identical(self, tmp_path):
         raw = self._raw(tmp_path)
@@ -589,10 +550,7 @@ class TestLimitAndDeterminism:
         ids = [row["extra_info"]["task_id"] for row in rows]
         assert len(ids) == len(set(ids))
         assert all(identifier.startswith("mip-gsm8k-") for identifier in ids)
-        assert {identifier.rsplit("-", 1)[1] for identifier in ids} == {
-            "solvable",
-            "unsolvable",
-        }
+        assert {identifier.rsplit("-", 1)[1] for identifier in ids} == {"unsolvable"}
 
     def test_index_follows_the_written_order(self, tmp_path):
         raw = self._raw(tmp_path)
@@ -611,6 +569,31 @@ class TestLimitAndDeterminism:
 
 
 # ---------------------------------------------------------------------------
+# the documented pool size (only when the real raw bundle is present)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not os.path.isdir(adapter.DEFAULT_RAW_DIR),
+    reason="raw MiP bundle not downloaded; the measured pool size cannot be rebuilt",
+)
+def test_strict_pool_is_the_documented_270_rows():
+    """The code implements the strict口径 (fail-closed), which yields 270.
+
+    Design doc section 4.2 quotes 严口径 276 / 宽口径 299; the adapter drops the
+    2 chainless rows and the placeholders whose value the source never used (see
+    the adapter's DEVIATIONS 1), so the delivered pool is 270 -- a previous
+    measurement said the same.  Q6 keeps the 23 unflagged rows out, so 276 is an
+    upper bound this adapter deliberately does not reach.
+    """
+    rows, funnel = adapter.build_rows(adapter.DEFAULT_RAW_DIR)
+    assert funnel["necessary_value_certified"] == 270
+    assert len(rows) == 270
+    assert funnel[adapter.LIMIT_STAGE] == len(rows)
+    assert {row["extra_info"]["branch"] for row in rows} == {adapter.UNSOLVABLE_BRANCH}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -624,6 +607,7 @@ class TestMain:
         printed = capsys.readouterr().out
         assert "funnel" in printed
         assert "by_branch" in printed
+        assert "no solvable twin" in printed
         assert "by_template" in printed
         assert "by_solvable" in printed
 
@@ -631,7 +615,16 @@ class TestMain:
         assert len(rows) > 0
         for row in rows:
             assert schema.validate_row(row) == []
-        assert all("options" in row["extra_info"] for row in rows)
+            assert row["extra_info"]["options"] == []
+        assert {row["extra_info"]["branch"] for row in rows} == {adapter.UNSOLVABLE_BRANCH}
+
+    def test_main_honours_limit(self, tmp_path, capsys):
+        raw = write_raw(tmp_path, gsm8k=[GSM8K_PAIR, GSM8K_T2], math=[MATH_PAIR])
+        out = tmp_path / "limited.parquet"
+        code = adapter.main(["--raw-dir", raw, "--out", str(out), "--limit", "2"])
+        assert code == 0
+        assert len(schema.read_parquet_rows(str(out))) == 2
+        assert "after_limit                  2" in capsys.readouterr().out
 
     def test_main_fails_closed_when_nothing_survives(self, tmp_path):
         raw = write_raw(tmp_path, svamp=[SVAMP_ROW])

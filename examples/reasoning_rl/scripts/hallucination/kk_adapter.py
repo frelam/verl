@@ -11,32 +11,40 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""K&K adapter -- knights-and-knaves rows whose gold is a role-word sequence.
+"""K&K adapter -- solvable knights-and-knaves rows whose gold is a name -> role map.
 
 Source: the ``K-and-K/knights-and-knaves`` (clean) and
 ``K-and-K/perturbed-knights-and-knaves`` (perturbed) HF datasets, downloaded as 26
-parquet files, 48,076 rows (CC-BY-NC-SA-4.0).  Design doc section 4.1 records the
-verification of this source and section 4.2 specifies this adapter.
+parquet files, 48,076 rows raw = clean 6,900 + perturbed 41,176 (CC-BY-NC-SA-4.0).
+Design doc section 4.1 records the source facts and locks the decisions this
+adapter implements, D11 / D19 / D20; D20 sends **only the perturbed** side into the
+pool (the clean files are still read for certification and for the audit-only
+``paired_original_text``).  Section 4.8 table B row 2 is the mix quota this pool
+feeds.
 
 Every row is a *solvable* logical puzzle: a constraint system over N inhabitants,
-each of whom is a truth-teller or a liar.  Sections 4.1/4.2 are unambiguous that
-K&K supplies **no** unanswerable / refusal / diagnosis data (measured: 0 rows with
-0 or >= 2 solutions over all 48,076), so this adapter fills exactly one contract
-cell (design doc section 4.9.3 table B row 2):
+each of whom is a truth-teller or a liar.  Section 4.1 is unambiguous that K&K
+supplies **no** unanswerable / refusal / diagnosis data (measured: 0 rows with 0 or
+>= 2 solutions over all 48,076), so this adapter fills exactly one contract cell
+(design doc section 4.8 table B row 2):
 
 ========================  ========  ===============================================
 branch                    template  gold
 ========================  ========  ===============================================
-``solvable_roles``        B         the **surface** role words, one per inhabitant,
-                                    in ``names`` order (``angel devil devil``)
+``solvable_roles``        B         ``{name: surface role word}``, one entry per
+                                    inhabitant (D19); the prompt asks for
+                                    ``\\boxed{人名: 角色词, …}``, order free
 ========================  ========  ===============================================
 
-The gold is the *surface* sequence, never the canonical ``knight``/``knave``
-words: 13,800 rows (28.70%) -- the ``flip_role`` and ``random_pair`` families --
-spell the two roles differently, and ``role_words`` carries the row's own pair so
-the reward can map both sides into canonical space.  Skipping that read is design
-risk 9 and makes the reward run *backwards* on those rows (design doc sections 5.1
-and 12 Q17; the sample document's ``"KNAK"`` payload is an instance of the bug).
+The gold is a **mapping**, never a bare role-word sequence: section 5.1 (D19)
+fixes the contract as per-inhabitant ``name: role`` pairs and the reward requires
+the model's name set to equal the gold's exactly, so a sequence carries no name to
+check against.  The *surface* words are the row's own ``knight_knave`` pair, never
+the canonical ``knight``/``knave``: 13,800 rows (28.70%) -- the ``flip_role`` and
+``random_pair`` families -- spell the two roles differently, and ``role_words``
+carries the row's own pair so the reward can map both sides into canonical space.
+Skipping that read is design risk 5 and makes the reward run *backwards* on those
+rows (design doc sections 5.1 and 11).
 
 Certificates (fail closed; each is re-derived by ``verify_kk.py``)
 -----------------------------------------------------------------
@@ -52,9 +60,10 @@ Certificates (fail closed; each is re-derived by ``verify_kk.py``)
   read from the row itself, and the two words must be distinct.  A row whose
   ``knight_knave`` is missing, blank or degenerate is dropped.
 * **Group** -- ``(len(names), index)`` identifies one abstract problem and its
-  (up to 7) wording variants; at most one variant enters the pool, so no group can
-  straddle a train/val boundary (design doc section 4.2; the split is by group,
-  and with one member per group the rule holds by construction).
+  (up to 7) wording variants; at most one **perturbed** variant enters the pool
+  (D20 keeps the clean member out of it), so no group can straddle a train/val
+  boundary (design doc section 4.1; the split is by group, and with one member per
+  group the rule holds by construction).
 * **Shape** -- names are distinct, ``len(solution) == len(names)``, every entry a
   bool, ``index`` an int (fail closed on anything else).
 
@@ -72,18 +81,18 @@ Every number below is measured by this adapter; ``main()`` prints the funnel tha
 shows where each row is lost.
 
 1. **Output size: the adapter ships the full 5,000-row group-deduplicated pool,
-   not the 2,000 of table B row 2.**  The 2,000 is the *mix* quota, not the
-   adapter's: ``mix_halluc.DEFAULT_QUOTA[(solvable_roles, halluc_logic_kk)]`` is
-   2,400 = these 2,000 plus the 400 synthesised-distractor rows of
-   ``distractor_synth.py``, and ``mix_halluc`` carves its val split out of the
-   cell *before* filling that quota.  The house convention is explicit
-   (``kuq_adapter.py``: "It is not the balance mechanism -- the two arms ... are
-   drawn per branch by ``mix_halluc.py`` from the full pool"), and
-   ``umwp_adapter`` ships 1,945 solvable-judge rows against a 550 quota.
-   ``--limit 2000`` reproduces the doc's number exactly (1,000 clean + 1,000
-   perturbed); the default ships all 5,000.
+   not the 1,600 of table B row 2.**  The 1,600 is the *mix* quota (design doc
+   section 4.8), not the adapter's cap: ``mix_halluc.DEFAULT_QUOTA
+   [(solvable_roles, halluc_logic_kk)]`` is 1,700 = these 1,600 plus the 100
+   synthesised-distractor rows of ``distractor_synth.py``, and ``mix_halluc``
+   carves its val split out of the cell *before* filling that quota.  The house
+   convention is explicit ("It is not the balance mechanism ... the two arms ...
+   are drawn per branch by ``mix_halluc.py`` from the full pool"), and
+   ``umwp_adapter`` ships its full pool against a smaller quota.
+   D11/D20 put the pool at "≈5,000 groups"; this adapter ships exactly that, and
+   has no default ``--limit``.
 
-2. **``difficulty`` is the string ``"4ppl"``, not the int 4.**  Section 4.2 says
+2. **``difficulty`` is the string ``"4ppl"``, not the int 4.**  Section 4.1 says
    ``difficulty_tag = len(names)``, but ``schema.py``'s ``validate_row`` rejects a
    non-string ``difficulty`` ("stage 1 stores a string").  The only precedent in
    the repo is the sample document's ``"difficulty": "4ppl"``, which is also how
@@ -105,20 +114,22 @@ shows where each row is lost.
    48,076/48,076, 0 unmatched") is exactly true and is the one this adapter
    relies on; the two sentences contradict each other one line apart.
 
-5. **The pool is train-only.**  Sections 4.1/4.8 measure the corpus as "about
-   6,900 abstract problems x 7 variants" and put the pool unit at "5,000 groups",
-   which is the ``train`` side after ``N >= 4``.  The source ``test`` split
-   (500 eligible groups / 3,492 rows) is held out and reported in the funnel as
-   ``after_source_test_drop``.  Never mixing the two source splits is also what
-   makes the section 4.2 group-leak rule automatic: measured, **0 of 6,900
-   groups** straddle the source boundary.
+5. **The pool is train-only.**  Design doc section 4.1 measures the corpus as
+   "about 6,900 abstract problems x 7 variants" and puts the pool unit at
+   "≈5,000 groups", which is the ``train`` side after ``N >= 4``.  The source
+   ``test`` split (500 eligible groups / 3,492 rows) is held out and reported in
+   the funnel as ``after_source_test_drop``.  Never mixing the two source splits is
+   also what makes the section 4.1 group-leak rule automatic: measured, **0 of
+   6,900 groups** straddle the source boundary.
 
 6. **The doc defines no L3 for K&K** (there is no binary label and no options
-   block, so the BoW-NB yardstick used for SUM/UMWP/TreeCut/CREPE/KUQ does not
-   exist here).  ``verify_kk.py`` substitutes the analogous anti-cheat floor for a
-   *sequence* answer: the per-position-majority baseline and the single-word
-   heuristics must stay near the ``2**-L`` chance floor.  Measured maxima are
-   printed, and the hard threshold (<= 0.25) is set well above them.
+   block, so the BoW-NB yardstick used for SUM/UMWP/TreeCut/CREPE does not exist
+   here).  ``verify_kk.py`` substitutes the analogous anti-cheat floor for a
+   per-inhabitant answer (design doc section 9): the constant "everyone is a
+   truth-teller / everyone is a liar" assignments and the per-position-majority
+   assignment are scored **per person** against the gold mapping and must stay near
+   the ``2**-L`` chance floor.  Measured numbers are printed pass or fail, and the
+   hard thresholds are set above them.
 
 Departures from ``halluc_samples.md`` 5.1/5.2 (the user's own sample file)
 --------------------------------------------------------------------------
@@ -127,22 +138,24 @@ The sample document's K&K payloads contradict the design doc, the schema and the
 reward on four points; this adapter follows the design doc.  Recorded here because
 the sample document is an input to the design, not because it is authoritative.
 
-* ``answer`` is the **surface** sequence (``angel devil``), not a canonical
-  ``KNAK``/``NKKN`` code.  Section 4.2, section 3's row example and section 12 Q17
-  all say surface words; ``schema.py``'s ``_KK_ROLE_INSTRUCTION`` tells the model
-  to answer in the prompt's own words; and the reward maps the answer through
-  ``_role_map``, so ``K``/``N`` are out of vocabulary and a coded gold would score
-  **0 forever** (``reward/hallucination_compute_score.py``).
+* ``answer`` is the **name -> surface role word mapping** (``{"Oliver": "angel"}``),
+  neither a canonical ``KNAK``/``NKKN`` code nor a bare role sequence.  Section 5.1
+  (D19) fixes the per-inhabitant ``name: role`` contract; ``schema.py``'s
+  ``_KK_ROLE_INSTRUCTION`` tells the model to answer in the prompt's own words; and
+  the reward maps both sides through ``_role_map``, so ``K``/``N`` are out of
+  vocabulary and a coded gold scores **0 forever**
+  (``reward/hallucination_compute_score.py``).  A bare sequence is rejected by that
+  same parser -- it carries no name to check the answer against.
 * ``ground_truth.role_words`` is present on every row.  Both sample payloads omit
   it; without it the reward logs "K&K row without a usable role_words list; scoring
-  0" -- the sample document is itself an instance of design risk 9.
+  0" -- the sample document is itself an instance of design risk 5.
 * ``answer`` is not derived by stripping the English ``solution_text``; it is built
-  from ``solution`` and ``knight_knave`` directly.
+  from ``names`` + ``solution`` + ``knight_knave`` directly.
 * ``perturbation_type`` stays ``None``.  The sample payload sets
   ``"perturbed_statement"``, which is not in ``schema.PERTURBATION_TYPES`` and is
   rejected by ``validate_row``; the family belongs in
-  ``extra_info.perturbation_family``, where it is a monitoring bucket and never a
-  reward term.
+  ``extra_info.perturbation_family``, where it is a monitoring bucket (design doc
+  section 10 plots K&K accuracy per perturbation family) and never a reward term.
 """
 
 from __future__ import annotations
@@ -183,8 +196,10 @@ def report_path_for(out: str) -> str:
 BRANCH_ROLES = schema.BRANCH_SOLVABLE_ROLES
 TEMPLATE = schema.TEMPLATE_B
 
-#: The seven wording families design doc section 4.2 names.  Six are the source's
-#: own perturbation files; ``clean`` is the unperturbed member of a group.
+#: The seven wording families design doc section 4.1 names.  Six are the source's
+#: own perturbation files; ``clean`` is the unperturbed member of a group, read for
+#: certification and for the audit-only ``paired_original_text`` but never emitted
+#: (D20).
 FAMILY_CLEAN = "clean"
 FAMILIES = (
     "clean",
@@ -353,21 +368,23 @@ def normalise_text(text: str) -> str:
     return " ".join((text or "").split())
 
 
-def canonical_gold(names: list[str], solution: list[bool]) -> str:
-    """The canonical knight/knave rendering -- an *audit* string, never the gold."""
-    return " ".join(CANONICAL_ROLE_WORDS[0] if flag else CANONICAL_ROLE_WORDS[1] for flag in solution)
+def answer_mapping(names: list[str], solution: list[bool], role_words: list[str]) -> dict[str, str]:
+    """The gold: ``{name: surface role word}``, one entry per inhabitant (D19).
 
+    Index ``i`` pairs ``names[i]`` with ``role_words[0]`` (the row's truth-teller
+    word) when ``solution[i]`` is True and ``role_words[1]`` (its liar word)
+    otherwise.  The canonical boolean list is *not* the gold: it stays in
+    ``extra_info.canonical_solution`` for the audit, and the reward maps both this
+    mapping and the model's answer back into that space through the row's own
+    ``role_words`` (design doc section 5.1).
 
-def surface_gold(solution: list[bool], role_words: list[str]) -> str:
-    """The gold: the row's own two words, one per inhabitant, in ``names`` order.
-
-    Kept byte-identical to ``distractor_synth.kk_answer`` (whose docstring says it
-    "must stay identical to whatever ``kk_adapter.py`` emits") -- the reward maps
-    both this and the model's answer through ``role_words``, so a divergence
-    silently mis-scores the 400 synthesised rows that share this branch.
+    The mapping is what makes the answer checkable per person: a bare sequence
+    (``angel devil devil``) carries no name, so the reward's parser rejects it and
+    scores 0 (design doc section 9).  The reward also accepts the mapping keys only
+    as a set equality, so a missing, extra or unknown inhabitant scores 0.
     """
     truth_word, lie_word = role_words
-    return " ".join(truth_word if flag else lie_word for flag in solution)
+    return {name: (truth_word if flag else lie_word) for name, flag in zip(names, solution, strict=False)}
 
 
 # ---------------------------------------------------------------------------
@@ -479,7 +496,7 @@ def role_words_of(row: dict) -> tuple[str, str] | None:
 
 
 def certify_row(row: dict) -> dict | None:
-    """The row's gold and canonical witness, or ``None`` when it cannot be proved.
+    """The row's gold mapping and canonical witness, or ``None`` when unprovable.
 
     Three things must hold: the row passes :func:`is_well_formed`, the enumerator
     yields exactly one solution, that solution is the row's own ``solution`` field,
@@ -507,8 +524,7 @@ def certify_row(row: dict) -> dict | None:
         "names": names,
         "solution": solution,
         "role_words": [truth_word, lie_word],
-        "gold": surface_gold(solution, [truth_word, lie_word]),
-        "canonical_gold": canonical_gold(names, solution),
+        "answer": answer_mapping(names, solution, [truth_word, lie_word]),
     }
 
 
@@ -542,7 +558,7 @@ def solution_text_format_of(row: dict, witness: list[bool]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# group selection (design doc section 4.2)
+# group selection (design doc section 4.1)
 # ---------------------------------------------------------------------------
 
 
@@ -609,9 +625,10 @@ def _pick_perturbed(present: dict[str, dict], offset: int) -> dict | None:
     """The group's perturbed member at ``offset`` in a rotating family order.
 
     The rotation is what keeps the six perturbation families roughly even: a
-    group that lacks the family the rotation lands on (measured: ``perturbed_leaf``
-    is absent from 218 clean problems and ``perturbed_statement`` from 6) shifts to
-    the next one rather than collapsing the balance onto one family.
+    group that lacks the family the rotation lands on (measured over the eligible
+    pool: ``perturbed_leaf`` is absent from 66 groups and ``perturbed_statement``
+    from 3) shifts to the next one rather than collapsing the balance onto one
+    family.
     """
     total = len(PERTURBATION_FAMILIES)
     for step in range(total):
@@ -623,31 +640,29 @@ def _pick_perturbed(present: dict[str, dict], offset: int) -> dict | None:
 
 
 def select_group_members(groups: dict[tuple[int, int], list[dict]]) -> tuple[list[dict], dict]:
-    """Pick at most one member per group, aiming for clean : perturbed = 1:1.
+    """Pick one **perturbed** member per group (D20: clean rows never enter).
 
-    Groups are visited in ``(len(names), index)`` order and alternate clean /
-    perturbed, which is exact rather than approximate: measured, **2,500 clean +
-    2,500 perturbed**, 500/500 inside every size tier.  The alternative -- a per
-    group coin flip -- would leave the ratio to chance for no benefit, and the
-    design doc only asks for "roughly 1:1".
+    Groups are visited in ``(len(names), index)`` order and the six perturbation
+    families rotate with them, so a group that lacks the family the rotation lands
+    on (measured over the eligible pool: ``perturbed_leaf`` is absent from 66 of the
+    5,000 groups and ``perturbed_statement`` from 3) shifts to the next present one
+    rather than collapsing the balance onto one family.  Measured on the real
+    corpus: 5,000 of 5,000 eligible groups have a perturbed member, and the shipped
+    pool holds 828-839 rows per family.
+
+    The clean member is still read (``_clean_sibling``) -- it is the group's audit
+    text -- but it is never selected: D20 fixes the pool on the perturbed side.
     """
     chosen: list[dict] = []
     stats = collections.Counter()
     perturbed_rank = 0
-    for rank, key in enumerate(sorted(groups)):
+    for key in sorted(groups):
         present = _families_present(groups[key])
-        member = None
-        if rank % 2 == 0:
-            member = present.get(FAMILY_CLEAN)
-            if member is None:  # unreachable on this corpus; fail open to perturbed
-                stats["group_without_clean"] += 1
+        member = _pick_perturbed(present, perturbed_rank)
         if member is None:
-            member = _pick_perturbed(present, perturbed_rank)
-            if member is not None:
-                perturbed_rank += 1
-        if member is None:
-            stats["group_without_member"] += 1
+            stats["group_without_perturbed"] += 1
             continue
+        perturbed_rank += 1
         chosen.append(member)
     return chosen, dict(stats)
 
@@ -693,10 +708,10 @@ def _build_row(member: dict, clean_sibling: dict | None, seed: int) -> dict:
     certificate = certify_row(member)
     if certificate is None:  # pragma: no cover - selection only admits certified rows
         raise ValueError(f"uncertified row reached the builder: {member.get('_file')}")
+    if family == FAMILY_CLEAN:  # pragma: no cover - D20 keeps clean rows out
+        raise ValueError(f"a clean row reached the builder: {member.get('_file')}")
     role_words = certificate["role_words"]
-    paired = ""
-    if family != FAMILY_CLEAN and clean_sibling is not None:
-        paired = normalise_text(clean_sibling["quiz"])
+    paired = normalise_text(clean_sibling["quiz"]) if clean_sibling is not None else ""
     extra_info = {
         "split": "train",
         "index": index,
@@ -711,7 +726,7 @@ def _build_row(member: dict, clean_sibling: dict | None, seed: int) -> dict:
     }
     ground_truth = schema.build_ground_truth(
         solvable=True,
-        answer=certificate["gold"],
+        answer=certificate["answer"],
         correct_option_id=None,
         has_diagnosis_label=False,
         perturbation_type=None,
@@ -735,8 +750,10 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[l
     :func:`schema.normalise_extra_info` / :func:`schema.validate_rows` /
     :func:`schema.write_rows_parquet`, and ``report`` carries the ordered drop
     chain under ``"funnel"`` plus the measured group / family / enumerator
-    counters.  Selection is deterministic -- ``seed`` is recorded but never
-    chooses a row -- so the same ``raw_dir`` and ``limit`` always produce
+    counters.  The funnel's ``after_clean_exclusion_drop`` stage is D20: the pool
+    holds perturbed rows only, and ``report["pool"]`` records how many clean rows
+    were read and excluded.  Selection is deterministic -- ``seed`` is recorded but
+    never chooses a row -- so the same ``raw_dir`` and ``limit`` always produce
     byte-identical rows.
     """
     raw = load_source(raw_dir)
@@ -786,7 +803,13 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[l
     train = [row for row in big_enough if row["_split"] == "train"]
     funnel["after_source_test_drop"] = len(train)
 
-    # 6. one variant per abstract problem.
+    # 6. D20: only the perturbed variants enter the pool.  The clean members stay
+    #    in ``groups`` -- they are the group's certification and audit text
+    #    (``paired_original_text``) -- but a clean row is never selected.
+    perturbed = [row for row in train if row["_family"] != FAMILY_CLEAN]
+    funnel["after_clean_exclusion_drop"] = len(perturbed)
+
+    # 7. one variant per abstract problem.
     groups: dict[tuple[int, int], list[dict]] = collections.defaultdict(list)
     for row in train:
         groups[group_key(row)].append(row)
@@ -807,6 +830,16 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[l
         "seed": seed,
         "limit": limit,
         "funnel": dict(funnel),
+        "pool": {
+            # D20's measurement: how much of the eligible train side was clean and
+            # therefore excluded.  ``selected.clean`` stays in the report as a
+            # zero-valued invariant rather than disappearing, so a regression that
+            # re-admits clean rows is visible in the artifact's own report.
+            "eligible_train_rows": len(train),
+            "clean_excluded": len(train) - len(perturbed),
+            "perturbed_rows": len(perturbed),
+            "per_family": _breakdown(train, lambda row: row["_family"]),
+        },
         "groups": {
             "total": len(groups),
             "size_histogram": _histogram(len(members) for members in groups.values()),
@@ -907,6 +940,11 @@ def main() -> None:
         previous = count
     print("\ngroups (before in-group dedup):")
     print(f"  total {report['groups']['total']}, sizes {report['groups']['size_histogram']}")
+    print(
+        f"\npool: {report['pool']['eligible_train_rows']} eligible train rows; "
+        f"{report['pool']['clean_excluded']} clean excluded (D20); "
+        f"{report['pool']['perturbed_rows']} perturbed"
+    )
     print("\nper perturbation_family:")
     for family, count in report["selected"]["per_family"].items():
         print(f"  {family:22s} {count}")

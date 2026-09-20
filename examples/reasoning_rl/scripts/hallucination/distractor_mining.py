@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Same-question, equal-length option mining (design doc D13/D15, section 4.6).
+"""Same-question, equal-length option mining (design doc D13/D15, sections 4.3 and 5.1).
 
-The judgment branches ask the model to pick *which option makes the premise false*.
-That option set is only a real test if the answer cannot be found by surface
-heuristics, and the recon audits measured two heuristics that win outright:
+The judgment branches ask the model to pick *which option makes the premise false*
+(FalseQA-fake's replacement pair, D21) or which condition is missing (TreeCut
+negatives, D26).  That option set is only a real test if the answer cannot be
+found by surface heuristics, and the recon audits measured two heuristics that win
+outright:
 
 * **Cross-question text.**  When distractors are borrowed from a different
   problem, "the option that does not occur in the question" scores 88.5-100%
@@ -176,8 +178,12 @@ def mine_option_spans(
 def spans_are_same_question(question: str, spans: list[str]) -> bool:
     """Whether every span occurs verbatim in ``question`` (the L3 guard).
 
-    Audit helper: the four-tier option block must satisfy this for **every** row,
-    and :mod:`verify_distractor` asserts it in bulk.
+    Audit helper, used by every adapter that renders an option block: the
+    **placeholder** blocks of the solvable rows (UMWP-answerable D24 /
+    FalseQA-answerable D27 / TreeCut positives D26) and the four-tier option
+    blocks of the diagnosis sources (FalseQA-fake D21 / TreeCut negatives D26).
+    Keeping every option a span of this question is the same-question rule above;
+    a cross-question option is guessable by its absence from the question text.
     """
     return all(span in question for span in spans)
 
