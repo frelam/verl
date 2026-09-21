@@ -1174,6 +1174,149 @@ def test_desc_replace_tags_self_computable_tool():
 
 
 # ============================================================================
+# missing_info augmentation — unknowable slots become ask-negatives
+# ============================================================================
+#
+# The synthetic generators write the query *after* the call, so label
+# argument values like ``name='John'`` need never appear in the user's
+# words.  Such samples are converted to negatives: the label becomes
+# ``[]`` (no call should be made; the desired behaviour is asking the
+# user for the missing value), while values the model CAN derive — from
+# the query, the history, the schema defaults/enums, or a relative date —
+# must stay positive.
+
+
+def _task_with_arg(value, query="Book a table at the bistro for me."):
+    from examples.tool_rl.prepare_data import _format_gt, _normalize_tools
+
+    tool = {
+        "name": "reserve_table",
+        "description": "Reserve a table.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "name"}},
+            "required": ["name"],
+        },
+    }
+    gt = [{"name": "reserve_table", "arguments": {"name": value}}]
+    return {
+        "label": _format_gt(gt),
+        "tools": [_normalize_tools([tool])[0]],
+        "messages": [{"role": "user", "content": query}],
+        "metadata": {
+            "tools": [_normalize_tools([tool])[0]],
+            "ground_truth": gt,
+            "task_id": "t",
+        },
+    }
+
+
+def test_missing_info_converts_unknowable_slot():
+    import random
+
+    from examples.tool_rl.prepare_data import _augment_missing_info
+
+    task = _task_with_arg("John")
+    assert _augment_missing_info(task, random.Random(0)) == "missing_info"
+    assert task["metadata"]["ground_truth"] == [] and task["label"] == ""
+    assert task["metadata"]["augmented"] == "missing_info"
+    assert task["metadata"]["augment_detail"]["param"] == "name"
+    # Tools stay declared: the reward should punish the call as spurious,
+    # and ask-the-user scores REQUEST_INFO = full marks.
+    assert len(task["tools"]) == 1
+
+
+def test_missing_info_skips_derivable_values():
+    import random
+
+    from examples.tool_rl.prepare_data import _augment_missing_info
+
+    # In the query, in a tool_response turn, from a schema default, or a
+    # relative date — all derivable, none may be converted.
+    in_query = _task_with_arg("Smith", query="Book a table for Smith.")
+    assert _augment_missing_info(in_query, random.Random(0)) is None
+
+    in_history = _task_with_arg("Smith")
+    in_history["messages"].append({"role": "user", "content": "<tool_response>\nname: Smith\n</tool_response>"})
+    in_history["messages"].append({"role": "user", "content": "Book the table please."})
+    assert _augment_missing_info(in_history, random.Random(0)) is None
+
+    in_schema = _task_with_arg("Smith")
+    for t in (*in_schema["tools"], *in_schema["metadata"]["tools"]):
+        t["parameters"]["properties"]["name"]["default"] = "Smith"
+    assert _augment_missing_info(in_schema, random.Random(0)) is None
+
+    derivable_date = _task_with_arg("2024-05-20")
+    assert _augment_missing_info(derivable_date, random.Random(0)) is None
+
+
+def test_missing_info_partial_token_is_still_missing():
+    import random
+
+    from examples.tool_rl.prepare_data import _augment_missing_info
+
+    # Matching is exact-token: "Smith" is NOT found inside "Smithsonian",
+    # so the value counts as missing and the sample converts.
+    partial = _task_with_arg("Smith", query="Ask Smithsonian about the table.")
+    assert _augment_missing_info(partial, random.Random(0)) == "missing_info"
+
+
+def test_augment_missing_info_tasks_targeted_ratio():
+    import random
+
+    from examples.tool_rl.prepare_data import augment_missing_info_tasks
+
+    bad = _task_with_arg("John")
+    good = _task_with_arg("Smith", query="Book a table for Smith.")
+    n = augment_missing_info_tasks([bad, good], ratio=0.5, rng=random.Random(0))
+    assert n == 1
+    assert bad["metadata"]["ground_truth"] == []
+    assert good["metadata"]["ground_truth"], "derivable sample must stay positive"
+
+    # Already-augmented samples are not re-converted.
+    bad["metadata"]["augmented"] = "desc_replace"
+    assert augment_missing_info_tasks([bad], ratio=1.0, rng=random.Random(0)) == 0
+
+
+def test_reward_missing_info_negative_shaping(keyword_mode):
+    """End-to-end: a converted sample must reward asking, punish the call."""
+    res = compute_score(
+        "tool_rl",
+        _think_text("May I have your name for the reservation?"),
+        "",
+        _extra_info(),  # converted label: no calls needed
+    )
+    assert res["abstention_class"] == int(AbstentionClass.REQUEST_INFO)
+    assert res["tool_correctness"] == 1.0
+    assert res["score"] == pytest.approx(1.0)
+
+    # The old positive behaviour — calling with the fabricated value — is
+    # now a spurious call. The call names an UNDECLARED tool (the fixture's
+    # declared tool is get_weather): spurious-call Dim 1 = -undeclared
+    # penalty = -0.1, Dim 3 = 0.
+    res = compute_score(
+        "tool_rl",
+        _think_call("reserve_table", {"name": "John"}),
+        "",
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.SPURIOUS_CALL)
+    assert res["tool_correctness"] == pytest.approx(-0.1)
+    assert res["tool_call_format"] == 0.0
+
+    # Calling the *declared* tool with a fabricated value is still fully
+    # spurious on Dim 1 without the undeclared penalty.
+    res = compute_score(
+        "tool_rl",
+        _think_call("get_weather", {"city": "Paris"}),
+        "",
+        _extra_info(),
+    )
+    assert res["abstention_class"] == int(AbstentionClass.SPURIOUS_CALL)
+    assert res["tool_correctness"] == 0.0
+
+
+# ============================================================================
 # Regression: conversation groups must not straddle train/val
 # ============================================================================
 

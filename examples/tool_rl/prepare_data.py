@@ -1127,6 +1127,17 @@ def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
 #   3.  default_shuffle — randomise ``default`` values in the tool schema.
 #                         Teaches: don't copy schema defaults into calls.
 #
+#   4.  missing_info    — *select* positive samples whose label argument
+#                         values cannot be derived from the prompt (the
+#                         generator-invented slots, e.g. ``name='John'``
+#                         for a query that never mentions a name); empty
+#                         the label so the desired behaviour becomes
+#                         asking the user for the missing value.  These
+#                         are the BFCL miss_func/miss_param-style
+#                         negatives: calling the (still declared, still
+#                         fitting) tool is now spurious, and a fabricated
+#                         direct answer keeps the guess penalty.
+#
 # Each augmented sample gets ``metadata["augmented"] = <strategy>``.
 
 # Unrelated tool names used for renames — clearly off-topic for typical
@@ -1187,6 +1198,101 @@ _GENERIC_PARAM_NAMES = [
     "user_option",
     "item_reference",
 ]
+
+
+# ============================================================================
+# missing_info — argument-value provenance analysis
+# ============================================================================
+#
+# A label argument value that the model cannot derive from the prompt turns
+# "call the tool" into "guess the value".  The synthetic generators (APIGen /
+# ToolACE / Seal-Tools) produce these by construction: the query is written
+# *after* the call, so slots like ``name='John'`` need never surface in the
+# user's words.  ``_missing_arg_value`` finds them and
+# ``_augment_missing_info`` converts such samples into ask-the-user negatives.
+
+
+def _norm_tokens(text: Any) -> set[str]:
+    """Lowercase alphanumeric word tokens of ``text`` (for provenance tests)."""
+    return set(re.findall(r"[a-z0-9]+", str(text).lower()))
+
+
+# YYYY-MM-DD — a value the model may legitimately *derive* when the query
+# gives a relative date ("May 20th" with a known context year), so it does
+# not count as missing information.  It is deliberately impossible to know
+# whether the query's context pins the year, so treat derivable-shaped
+# values as present rather than teach abstention on a resolvable ask.
+_DATE_VALUE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _missing_arg_value(task: dict) -> tuple[str, str, Any] | None:
+    """First label argument value that is absent from the entire prompt.
+
+    "Absent" = no token of the value appears in the query, the non-user
+    history (assistant / tool_response turns), the tool schemas (defaults,
+    enums, examples), or as a partial token overlap with the query — the
+    places a policy could legitimately read the value from.  Date-shaped
+    values are exempt (derivable from a relative date, see
+    ``_DATE_VALUE_RE``).
+
+    Returns ``(tool_name, param_name, value)`` or ``None``.
+    """
+    query_tokens: set[str] = set()
+    other_tokens: set[str] = set()
+    for m in task.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        if m.get("role") == "user":
+            query_tokens |= _norm_tokens(content)
+        else:
+            other_tokens |= _norm_tokens(content)
+    schema_tokens: set[str] = set()
+    for tool_list in (task.get("tools"), task.get("metadata", {}).get("tools")):
+        for t in tool_list or []:
+            if isinstance(t, dict):
+                schema_tokens |= _norm_tokens(json.dumps(t, ensure_ascii=False))
+
+    gt = task.get("metadata", {}).get("ground_truth")
+    if not isinstance(gt, list):
+        return None
+    for call in gt:
+        if not isinstance(call, dict):
+            continue
+        for pname, value in (call.get("arguments") or {}).items():
+            tokens = _norm_tokens(value)
+            if not tokens or tokens & query_tokens:
+                continue
+            if tokens <= other_tokens or tokens <= schema_tokens:
+                continue
+            if _DATE_VALUE_RE.fullmatch(str(value).strip()):
+                continue
+            return (str(call.get("name", "")), str(pname), value)
+    return None
+
+
+def _augment_missing_info(task: dict, rng: random.Random) -> str | None:
+    """Strategy 4: convert a missing-slot positive into an ask-the-user negative.
+
+    The declared tools still fit the query — only a required value is
+    unknowable — so the schema is left untouched and the label becomes
+    ``[]``: the desired behaviour is asking the user for the missing
+    value (``REQUEST_INFO``), while calling the tool with a fabricated
+    value or guessing a direct answer keep their penalties.
+    """
+    missing = _missing_arg_value(task)
+    if missing is None:
+        return None
+    tool_name, pname, value = missing
+
+    task["label"] = ""
+    task["metadata"]["ground_truth"] = []
+    task["metadata"]["has_ground_truth"] = False
+    task["metadata"]["augmented"] = "missing_info"
+    task["metadata"]["augment_detail"] = {"tool": tool_name, "param": pname, "value": value}
+    return "missing_info"
 
 
 def _augment_tool_copies(task: dict, name: str):
@@ -1413,6 +1519,7 @@ _AUGMENT_STRATEGIES = (
     _augment_desc_replace,
     _augment_param_rename,
     _augment_default_shuffle,
+    _augment_missing_info,
 )
 
 
@@ -1446,6 +1553,36 @@ def augment_tasks(
                 augmented += 1
                 break
     return augmented
+
+
+def augment_missing_info_tasks(tasks: list[dict], ratio: float, rng: random.Random) -> int:
+    """Convert a ``ratio`` fraction of eligible positives to ask-negatives.
+
+    Eligible = positive, not already augmented, and carrying at least one
+    label argument value that is absent from the prompt (see
+    :func:`_missing_arg_value`).  Unlike the random strategy roulette in
+    :func:`augment_tasks` this pass is targeted: only samples that actually
+    contain an unknowable slot are converted, so ``ratio`` translates
+    directly into the number of BFCL miss_param-style training negatives.
+    """
+    if ratio <= 0 or not tasks:
+        return 0
+    eligible = [
+        i
+        for i, t in enumerate(tasks)
+        if isinstance(t.get("metadata", {}).get("ground_truth"), list)
+        and t["metadata"]["ground_truth"]
+        and not t.get("metadata", {}).get("augmented")
+        and _missing_arg_value(t) is not None
+    ]
+    rng.shuffle(eligible)
+    target = min(len(eligible), max(1, round(len(tasks) * ratio)))
+
+    converted = 0
+    for i in eligible[:target]:
+        if _augment_missing_info(tasks[i], rng) is not None:
+            converted += 1
+    return converted
 
 
 # ============================================================================
@@ -1642,6 +1779,14 @@ def to_verl_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     ),
                     "augmented": meta.get("augmented", ""),
                     "answerable_direct": bool(meta.get("answerable_direct")),
+                    # JSON blob of ``augment_detail`` — which slot was
+                    # declared unknowable (tool/param/value) — for offline
+                    # analysis of the missing_info negatives.
+                    "augment_detail": (
+                        json.dumps(meta["augment_detail"], ensure_ascii=False)
+                        if meta.get("augment_detail") is not None
+                        else None
+                    ),
                 },
             }
         )
@@ -1650,13 +1795,74 @@ def to_verl_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
     import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        # Keep the schema so an empty val split is still loadable.
-        df = df.reindex(columns=["data_source", "prompt", "tools", "reward_model", "extra_info"])
-    df.to_parquet(path, index=False)
-    logger.info("Wrote %d rows → %s", len(df), path)
+    # Explicit Arrow schema instead of pandas inference: the ``tools`` column
+    # legitimately mixes fully-populated tool dicts with ``[]`` (no_tools
+    # negatives), which newer pyarrow refuses to unify ("cannot mix list and
+    # non-list").  Declaring list<struct> accepts both and keeps the on-disk
+    # format readable by RLHFDataset.  ``extra_info`` stays a plain JSON
+    # object column via the map<string, string> type — every value it carries
+    # is a str / bool / None after ``to_verl_rows``.
+    schema = pa.schema(
+        [
+            ("data_source", pa.string()),
+            ("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))),
+            (
+                "tools",
+                pa.list_(
+                    pa.struct(
+                        [
+                            ("description", pa.string()),
+                            ("name", pa.string()),
+                            ("parameters", pa.string()),  # JSON blob
+                        ]
+                    )
+                ),
+            ),
+            ("reward_model", pa.struct([("ground_truth", pa.string()), ("style", pa.string())])),
+            ("extra_info", pa.map_(pa.string(), pa.string())),
+        ]
+    )
+
+    def _cell(value: Any) -> Any:
+        return json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+
+    pyrows = []
+    for r in rows:
+        tools = r.get("tools") or []
+        extra = r.get("extra_info") or {}
+        pyrows.append(
+            {
+                "data_source": r["data_source"],
+                "prompt": [
+                    {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+                    for m in (r["prompt"] or [])
+                    if isinstance(m, dict)
+                ],
+                "tools": [
+                    {
+                        "name": str(t.get("name", "")),
+                        "description": str(t.get("description", "")),
+                        "parameters": _cell(t.get("parameters", {})),
+                    }
+                    for t in tools
+                    if isinstance(t, dict)
+                ],
+                "reward_model": {
+                    "style": str((r.get("reward_model") or {}).get("style", "rule")),
+                    "ground_truth": str((r.get("reward_model") or {}).get("ground_truth") or ""),
+                },
+                # JSON-encode non-string leaves (bools) so the map stays
+                # uniform; the reward reads them through json.loads.
+                "extra_info": [
+                    (str(k), _cell(v)) for k, v in extra.items()
+                ],
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(pyrows, schema=schema), path)
+    logger.info("Wrote %d rows → %s", len(pyrows), path)
 
 
 # ============================================================================
@@ -1744,6 +1950,15 @@ def main():
         help="Fraction of original negatives stripped of tool declarations "
         "('no tools declared' negative type). 0 disables.",
     )
+    parser.add_argument(
+        "--missing-info-ratio",
+        type=float,
+        default=0.05,
+        help="Fraction of ALL samples to convert into ask-the-user negatives "
+        "by targeting positives whose label argument values cannot be derived "
+        "from the prompt (BFCL miss_param-style). Runs after per-dataset "
+        "augmentation, before --neg-ratio trimming; 0 disables.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -1797,6 +2012,20 @@ def main():
     if not all_tasks:
         logger.error("No labeled samples left after filtering.")
         sys.exit(1)
+
+    # Ask-the-user negatives: convert positives with unknowable argument
+    # slots (generator-invented values) before the negative-share trim so
+    # the converted samples count towards the target ratio.
+    if args.missing_info_ratio > 0:
+        n_missing = augment_missing_info_tasks(
+            all_tasks,
+            args.missing_info_ratio,
+            random.Random(args.seed),
+        )
+        logger.info(
+            "Converted %d positives to ask-negatives (missing_info)",
+            n_missing,
+        )
 
     # Negative-sample shaping: first strip tool declarations from a small
     # fraction of negatives ("no tools declared" type), then trim the
