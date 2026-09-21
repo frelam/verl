@@ -24,7 +24,26 @@ Routing (data_source prefix -> verifier):
 
 ===================  =====================================================
 ``math_*``           math_verify (``pip install math-verify``); falls back
-                     to verl's math_dapo when the package is missing
+                     to verl's math_dapo when the package is missing; last
+                     resorts for ground-truth format noise: a k-digit rounded
+                     decimal gt (DAPO keeps e.g. 0.333 for 1/3) accepts any
+                     prediction inside its rounding bucket; a percent or
+                     labelled-list decimal gt (``6.535%``; ``...Stock:
+                     0.3114, ...``) accepts any boxed value inside its
+                     round-or-truncate interval, recovering truncated
+                     textbook decimals and coarser-precision predictions
+                     (``6.54%``); a normalised
+                     literal comparison recovers plain-text variable names
+                     (Big-Math keeps e.g. ``y2 < y1 < y3``) that the symbolic
+                     parser mangles; a canonical-polarity comparison recovers
+                     yes/no ground truths stored in the problem's original
+                     language (``Выполнимо`` vs ``Yes``); a bounded symbol-
+                     identification search
+                     recovers predictions that substitute a prompt condition
+                     the gt left general (``max(C,T)``/``C+T`` vs ``T``/``2T``
+                     when the prompt said C equals T); and fixed-point numeric
+                     equivalence recovers predictions that evaluate a formula
+                     the gt left unevaluated (``a(1 - 10\%)^2`` vs ``0.81a``)
 ``code_*``           sandbox_fusion when ``sandbox_fusion_url`` is set,
                      else prime_code local execution (smoke runs only)
 ``logic_*``          rule verifier: extract the final answer
@@ -78,15 +97,28 @@ Before routing, every response must follow the Qwen3-4B thinking-template
 shape — one non-empty ``<think>...</think>`` block followed by a non-empty
 final response (``format_ok``). Non-compliant generations score 0 regardless
 of answer correctness, and never reach the code sandbox.
+
+Repetition penalty
+------------------
+
+After routing, every score is repetition-adjusted (``_repetition_adjusted``):
+a single word 4-gram occurring more than 15 times marks a degenerate
+repetition loop; each occurrence past the threshold costs 0.1, penalties
+from several looped n-grams add up, and the total is floored at -1, so
+degenerate repetition loops cannot collect full credit when their last copy
+happens to be right.
 """
 
 from __future__ import annotations
 
 import ast
+import itertools
 import json
 import logging
 import math
 import re
+from collections import Counter
+from decimal import Decimal
 
 logger = logging.getLogger(__name__)
 
@@ -167,12 +199,42 @@ def _math_score(solution_str: str, ground_truth: str) -> float:
     ``math_*`` **and** ``stem_*`` reward of every later sample.  Falling back to
     math_dapo (in-process, no shared state) keeps those samples scoreable
     instead of silently rewarding nothing.
+
+    Last resort: when every strict verifier scores 0, five credit-adding
+    checks for known ground-truth format noise get their say
+    (``_math_last_resort``): a ground truth stored as a k-digit rounded
+    decimal is matched within its rounding bucket, and percent/labelled-list
+    decimal ground truths against their round-or-truncate uncertainty
+    interval (``_rounded_decimal_match``/``_labeled_decimal_match`` -- a DAPO
+    ground truth of 0.333 no longer zeroes the exact answer 1/3, ``6.535%``
+    no longer zeroes the coarser-rounded ``6.54%``, and a truncated textbook
+    value like ``...Stock: 0.3114`` no longer zeroes the correctly rounded
+    0.3115); a whitespace/subscript/brace-normalised literal comparison
+    recovers plain-text variable names the symbolic parser mangles
+    (``_normalized_text_match`` -- a Big-Math ground truth of ``y2 < y1 <
+    y3`` no longer zeroes ``y_2 < y_1 < y_3``); a canonical-polarity
+    comparison recovers yes/no ground truths stored in the problem's original
+    language (``_yes_no_match`` -- a Russian ``Выполнимо`` no longer zeroes
+    an English ``Yes``, while a genuinely wrong ``No`` still scores 0); a
+    bounded symbol-
+    identification search recovers answers that substitute a prompt condition
+    the ground truth left general (``_conditional_match`` -- a ground truth of
+    ``max(C,T)``/``C+T`` no longer zeroes ``T``/``2T`` when the prompt said
+    C equals T); and numeric equivalence at fixed sample points recovers
+    answers that correctly evaluate a formula the ground truth left
+    unevaluated (``_evaluated_gt_match`` -- ``a(1 - 10\%)^2`` no longer
+    zeroes ``0.81a``).
     """
     ground_truth = str(ground_truth)
     try:
         from verl.utils.reward_score import math_verify
 
-        return float(math_verify.compute_score(solution_str, ground_truth))
+        score = float(math_verify.compute_score(solution_str, ground_truth))
+        if score:
+            return score
+        # Strict verifier said no -- the ground-truth-noise last resorts get
+        # their say before the miss is final.
+        return 1.0 if _math_last_resort(solution_str, ground_truth) else 0.0
     except ImportError:
         pass
     except Exception as e:  # never let one bad sample kill the reward pass
@@ -188,7 +250,514 @@ def _math_score(solution_str: str, ground_truth: str) -> float:
         acc = float(res["acc"]) if isinstance(res, dict) else float(res)
         if acc:
             return acc
-    return 0.0
+    return 1.0 if _math_last_resort(solution_str, ground_truth) else 0.0
+
+
+# A ground truth stored as a plain decimal with a fraction part, e.g. "0.333";
+# the capture group is the fraction digits (the gt's written precision).
+_DECIMAL_GT_RE = re.compile(r"^[+-]?\d+\.(\d+)$")
+
+
+def _math_pred_values(solution_str: str) -> list[float]:
+    """Numeric values math_verify's parser extracts from the solution's boxed answer.
+
+    Best-effort: returns [] when math-verify is not installed (math_dapo-only
+    smoke environments), when the solution carries no boxed answer, or when
+    nothing parses to a finite real number.
+    """
+    boxed = _extract_boxed(solution_str)
+    if boxed is None or len(boxed) > 500:  # bound the parse on crafted input
+        return []
+    try:
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
+    except ImportError:
+        return []
+    try:
+        # parsing_timeout=None: the default signal-based timeout only works in
+        # the main thread, but rewards run in a worker-thread pool; the boxed
+        # input is length-bounded above, so no timeout is needed here.
+        try:
+            extracted = parse(
+                f"${boxed}$", (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None
+            )
+        except TypeError:  # older math_verify without parsing_timeout
+            extracted = parse(f"${boxed}$", (ExprExtractionConfig(), LatexExtractionConfig()))
+    except Exception:
+        return []
+    values = []
+    for expr in extracted:
+        if isinstance(expr, tuple):  # some math_verify versions return (expr, str)
+            expr = expr[0]
+        try:
+            value = float(expr)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+    return values
+
+
+def _rounded_decimal_match(solution_str: str, ground_truth: str) -> bool:
+    """Last-resort match for ground truths stored as a k-digit rounded decimal.
+
+    DAPO-Math-17k stores some answers rounded to a few decimal places ("0.333"
+    for 1/3); math_verify's ~1e-6 numeric tolerance then rejects the exact
+    answer -- a false negative no strict verifier can bridge.  When the gt
+    literal is a plain decimal with k>=1 fraction digits, accept any extracted
+    prediction within half a unit of the gt's last digit (the rounding bucket
+    the gt author themselves specified).  An integer ground truth is treated as
+    exact and never enters this path.  Additive-only: it runs after the strict
+    verifiers failed, so it can turn a 0 into a 1 but never a 1 into a 0.
+
+    Ground truths that are NOT one bare decimal -- a percent figure
+    (``6.535%``) or a labelled list (``Adobe Systems Stock: 0.3114, ...``) --
+    fall through to ``_labeled_decimal_match``.
+    """
+    candidate = _extract_boxed(ground_truth) or ground_truth.strip()
+    candidate = candidate.strip().strip("$").strip()
+    m = _DECIMAL_GT_RE.match(candidate)
+    if m:  # bare single decimal: strict rounding-bucket semantics
+        gt_value = float(candidate)  # the regex guarantees a plain decimal
+        tol = 0.5 * 10 ** -len(m.group(1))
+        return any(abs(pred - gt_value) <= tol for pred in _math_pred_values(solution_str))
+    return _labeled_decimal_match(solution_str, candidate)
+
+
+# Numeral with an optional (LaTeX-escaped) percent sign; group 1 is the number,
+# group 2 the percent marker ("6.54", "6.54%", "6.54\%").
+_NUMERAL_RE = re.compile(r"([+-]?(?:\d+\.\d+|\.\d+|\d+))\s*(\\?%)?")
+# "30,500" is one number, but "0.3115, 0.3443" (and "0.3115,0.3443") are two:
+# only a comma followed by exactly three digits is a thousands separator.
+_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}(?:\D|$))")
+# Characters allowed around the numerals: prose labels in the ground truth,
+# only punctuation/LaTeX escapes in a boxed prediction.  Any maths operator
+# (``= < > ( ) [ ] { } ^ * / _ | ~`` or a stray ``+``/``-``) means the string
+# is not decimal-answer-shaped and stays with the symbolic verifiers.
+_GT_FILLER_RE = re.compile(r"^[A-Za-z\s.,:;%$]*$")
+_PRED_FILLER_RE = re.compile(r"^[\s.,:;%$\\]*$")
+_DEC_MAX_VALUES = 8
+
+
+def _numeral_value(token: str, pct: str | None) -> tuple[Decimal, int]:
+    """Exact value and written precision (fraction digits) of a numeral token."""
+    v = Decimal(token)
+    k = len(token.partition(".")[2])
+    if pct:  # "6.535%" == 0.06535 written at 5 fraction digits
+        v /= 100
+        k += 2
+    return v, k
+
+
+def _gt_decimal_bucket(token: str, pct: str | None) -> tuple[Decimal, Decimal, bool]:
+    """Uncertainty interval ``(lo, hi, is_point)`` of a ground-truth numeral.
+
+    Textbook ground truths are frequently *truncated* rather than rounded
+    (Big-Math stores ``0.3114`` for 9500/30500 = 0.311475..., while the model's
+    correctly rounded 0.3115 then scores 0), so the bucket extends a full unit
+    of the last written digit upwards but only half a unit downwards:
+    ``[v - 0.5*10^-k, v + 10^-k)``.  An integer numeral is an exact point.
+    """
+    v, k = _numeral_value(token, pct)
+    if k == 0:
+        return (v, v, True)
+    return (v - Decimal(5).scaleb(-(k + 1)), v + Decimal(1).scaleb(-k), False)
+
+
+def _pred_decimal_bucket(token: str, pct: str | None) -> tuple[Decimal, Decimal, bool]:
+    """Rounding bucket ``(lo, hi, False)`` of a predicted numeral: the values
+    whose correct rounding at the written precision is the numeral,
+    ``[v - 0.5*10^-k, v + 0.5*10^-k)`` (an integer prediction uses k = 0)."""
+    v, k = _numeral_value(token, pct)
+    half = Decimal(5).scaleb(-(k + 1))
+    return (v - half, v + half, False)
+
+
+def _decimal_overlap(gt, pred) -> bool:
+    """Non-empty intersection of two ``(lo, hi, is_point)`` buckets: some true
+    value could be written as the gt numeral AND as the predicted numeral."""
+    g_lo, g_hi, g_pt = gt
+    p_lo, p_hi, p_pt = pred
+    if g_pt and p_pt:
+        return g_lo == p_lo
+    if g_pt:
+        return p_lo <= g_lo < p_hi
+    if p_pt:
+        return g_lo <= p_lo < g_hi
+    return g_lo < p_hi and p_lo < g_hi
+
+
+def _gt_decimal_buckets(candidate: str) -> list | None:
+    """Decimal buckets for a (possibly labelled) decimal-list ground truth.
+
+    Returns None when the candidate is not decimal-answer-shaped: numerals
+    embedded in prose labels are fine, but any mathematical operator sends the
+    ground truth back to the symbolic last resorts.
+    """
+    if len(candidate) > 500:
+        return None
+    cleaned = _THOUSANDS_RE.sub("", candidate)
+    matches = list(_NUMERAL_RE.finditer(cleaned))
+    if not matches or len(matches) > _DEC_MAX_VALUES:
+        return None
+    if not _GT_FILLER_RE.match(_NUMERAL_RE.sub("", cleaned)):
+        return None
+    return [_gt_decimal_bucket(m.group(1), m.group(2)) for m in matches]
+
+
+def _point_decimal_buckets(boxed: str) -> list:
+    """Exact point values math_verify extracts from a non-plain boxed answer."""
+    try:
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
+    except ImportError:
+        return []
+    try:
+        # parsing_timeout=None: rewards run in a worker-thread pool where the
+        # default signal-based timeout does not work; input is length-bounded.
+        try:
+            extracted = parse(f"${boxed}$", (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None)
+        except TypeError:  # older math_verify without parsing_timeout
+            extracted = parse(f"${boxed}$", (ExprExtractionConfig(), LatexExtractionConfig()))
+    except Exception:
+        return []
+    points = []
+    for expr in extracted:
+        if isinstance(expr, tuple):  # some math_verify versions return (expr, str)
+            expr = expr[0]
+        try:
+            value = float(expr)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            points.append((Decimal(str(value)),) * 2 + (True,))
+    return points
+
+
+def _pred_decimal_buckets(solution_str: str) -> list:
+    """Decimal/point buckets for every \\boxed{...} in the final response.
+
+    A boxed answer containing only numerals contributes its written values
+    with their precision; anything else (``\\dfrac{1}{3}``) goes through
+    math_verify as exact point values.  Capped at ``_DEC_MAX_VALUES``.
+    """
+    response = _extract_final_response(solution_str)
+    buckets = []
+    for content in _extract_all_boxed(response):
+        if len(buckets) >= _DEC_MAX_VALUES:
+            break
+        content = content.strip()
+        if not content or len(content) > 500:
+            continue
+        cleaned = _THOUSANDS_RE.sub("", content)
+        matches = list(_NUMERAL_RE.finditer(cleaned))
+        if matches and _PRED_FILLER_RE.match(_NUMERAL_RE.sub("", cleaned)):
+            buckets.extend(_pred_decimal_bucket(m.group(1), m.group(2)) for m in matches)
+        else:
+            buckets.extend(_point_decimal_buckets(content))
+    return buckets[: _DEC_MAX_VALUES]
+
+
+def _labeled_decimal_match(solution_str: str, gt_candidate: str) -> bool:
+    """Last-resort match for decimal ground truths that are not a bare decimal.
+
+    Big-Math keeps textbook-style answers the bare-decimal regex cannot hold:
+    percent figures (``6.535%``) and labelled value lists (``Adobe Systems
+    Stock: 0.3114, Dow Chemical Stock: 0.3442, ...``).  On top of rounding,
+    those strings show two extra noise classes: the written value may be
+    *truncated* instead of rounded (9500/30500 = 0.311475... stored as 0.3114,
+    so the correctly rounded 0.3115 scores 0), and the model may write the same
+    value at a coarser precision (``6.54%`` for ``6.535%``).  Every gt numeral
+    therefore gets its round-or-truncate uncertainty interval and every boxed
+    prediction numeral its correct-rounding bucket; a single-value ground truth
+    matches when ANY boxed value overlaps (the bare-decimal path's ``any``
+    semantics, so a restated final answer cannot fail a count check), a
+    multi-value ground truth requires an equal count and an in-order pairwise
+    overlap.  The bare-decimal path above deliberately keeps its strict
+    half-unit bucket, so this trunc-aware interval only ever applies to ground
+    truths that previously scored 0 unconditionally.  Additive-only: it runs
+    after the strict verifiers failed, so it can turn a 0 into a 1 but never a
+    1 into a 0.
+    """
+    gt_buckets = _gt_decimal_buckets(gt_candidate)
+    if not gt_buckets:
+        return False
+    pred_buckets = _pred_decimal_buckets(solution_str)
+    if not pred_buckets:
+        return False
+    if len(gt_buckets) == 1:
+        return any(_decimal_overlap(gt_buckets[0], p) for p in pred_buckets)
+    if len(gt_buckets) != len(pred_buckets):
+        return False
+    return all(_decimal_overlap(g, p) for g, p in zip(gt_buckets, pred_buckets))
+
+
+# Relation commands -> ASCII, longest first; short ones use a letter lookahead
+# so ``\le`` never mangles ``\left``.
+_REL_SUBS = [
+    (re.compile(r"\\leqslant|\\leq|\\le(?![a-zA-Z])"), "<="),
+    (re.compile(r"\\geqslant|\\geq|\\ge(?![a-zA-Z])"), ">="),
+    (re.compile(r"\\neq|\\ne(?![a-zA-Z])"), "!="),
+    (re.compile(r"\\lt(?![a-zA-Z])"), "<"),
+    (re.compile(r"\\gt(?![a-zA-Z])"), ">"),
+]
+# Non-semantic LaTeX decoration dropped entirely: subscript braces/marker
+# (``y_{2}``/``y_2`` -> ``y2``), grouping braces, inline spacing, dollars.
+# ``^`` is KEPT: ``x^2`` (x squared) must not collapse into ``x2``.
+_TEXT_STRIP_RE = re.compile(r"\\left|\\right|\\!|\\,|\\;|\\:|\\ |[{}_$~]")
+_WS_RE = re.compile(r"\s+")
+
+
+def _normalize_math_text(s: str) -> str:
+    for pattern, repl in _REL_SUBS:
+        s = pattern.sub(repl, s)
+    s = _TEXT_STRIP_RE.sub("", s)
+    return _WS_RE.sub("", s)
+
+
+def _normalized_text_match(solution_str: str, ground_truth: str) -> bool:
+    """Last-resort literal comparison after normalising LaTeX surface syntax.
+
+    Big-Math ground truths store variable names in plain text (``y2 < y1 <
+    y3``); math_verify parses ``y2`` as ``y*2`` while the model's natural
+    ``y_2`` parses as a subscripted symbol, so a correct answer can never
+    match symbolically.  Comparing whitespace/subscript/brace-normalised text
+    recovers exactly this formatting-variance class.  ``^`` is preserved so
+    powers cannot collapse into variable names.  Additive-only: it runs after
+    the strict verifiers failed, so it can turn a 0 into a 1 but never a 1
+    into a 0.
+    """
+    pred = _extract_boxed(solution_str)
+    if pred is None:
+        return False
+    gt = _extract_boxed(ground_truth) or ground_truth
+    pred_norm, gt_norm = _normalize_math_text(pred), _normalize_math_text(gt)
+    return bool(pred_norm) and pred_norm == gt_norm
+
+
+# Yes/no answers across the languages Big-Math mixes in.  The ground truth is
+# stored in the problem's original language (Russian olympiad answers like
+# ``Выполнимо.``), while the model answers in the prompt's language (English),
+# so a correct ``Yes`` can never literally match.  Both sides are reduced to a
+# canonical polarity and compared; the tables are deliberately small and
+# unambiguous so nothing else can enter this path.
+_YES_TOKENS = {
+    "yes", "yeah", "true", "possible", "feasible", "doable",
+    "да", "верно", "выполнимо", "возможно",
+    "是", "对", "正确", "能", "可以",
+}
+_NO_TOKENS = {
+    "no", "false", "impossible", "infeasible", "not possible",
+    "нет", "неверно", "невыполнимо", "невозможно",
+    "否", "错", "错误", "不能", "不可以", "不可能",
+}
+# LaTeX commands/decoration stripped before the polarity lookup.
+_YESNO_STRIP_RE = re.compile(r"\\[a-zA-Z]+|[{}$*_~]|[.,!;:`'\"()<>]")
+
+
+def _canon_yes_no(text: str):
+    """Canonical ``True``/``False`` polarity of a short yes/no-style answer,
+    or None when the text is not an unambiguous polarity token."""
+    cleaned = _YESNO_STRIP_RE.sub(" ", text.lower())
+    cleaned = " ".join(cleaned.split())
+    if cleaned in _YES_TOKENS:
+        return True
+    if cleaned in _NO_TOKENS:
+        return False
+    return None
+
+
+def _yes_no_match(solution_str: str, ground_truth: str) -> bool:
+    """Last-resort match for yes/no ground truths stored in another language.
+
+    Only fires when BOTH sides normalise to a polarity token, so a wrong
+    answer (``No`` vs ``Выполнимо``) still scores 0 and non-yes/no strings
+    never enter this path.  Additive-only: it runs after the strict verifiers
+    failed, so it can turn a 0 into a 1 but never a 1 into a 0.
+    """
+    pred = _extract_boxed(solution_str)
+    if pred is None:
+        return False
+    gt = _extract_boxed(ground_truth) or ground_truth
+    pred_pol, gt_pol = _canon_yes_no(pred), _canon_yes_no(gt)
+    return pred_pol is not None and pred_pol == gt_pol
+
+
+# Bounds for _conditional_match: it runs only on the already-failed path, and
+# bails (no credit) whenever the problem is bigger than these caps.
+_COND_MAX_GT_EXPRS = 4
+_COND_MAX_PRED_EXPRS = 8
+_COND_MAX_GT_SYMBOLS = 3
+_COND_MAX_SYMBOLS = 4
+
+
+def _sympy_exprs(parsed) -> list:
+    exprs = []
+    for e in parsed:
+        if isinstance(e, tuple):  # some math_verify versions return (expr, str)
+            e = e[0]
+        if hasattr(e, "free_symbols"):
+            exprs.append(e)
+    return exprs
+
+
+def _strip_unevaluated(exprs) -> list:
+    """Unwrap UnevaluatedExpr literals (math_verify wraps e.g. the 1/100 from
+    ``10\%`` in one); they defeat subs/evalf and structural equality.  Once
+    unwrapped, held arithmetic such as ``a*(1 - 10\%)^2`` auto-evaluates."""
+
+    import sympy as sp  # lazy; callers already guard the ImportError
+
+    def _strip(e):
+        try:
+            return e.replace(lambda x: isinstance(x, sp.UnevaluatedExpr), lambda x: x.args[0])
+        except Exception:
+            return e
+
+    return [_strip(e) for e in exprs]
+
+
+def _conditional_match(solution_str: str, ground_truth: str) -> bool:
+    """Last resort for ground truths left as unevaluated general formulas.
+
+    Some prompts attach a condition ("if C exactly equals T ..."); the model
+    then answers with the condition substituted (``T``, ``2T``) while the
+    dataset keeps the general formula (``max(C,T)``, ``C+T``), and a strict
+    comparison can never equate the two.  Credit the response when EVERY
+    ground-truth expression equals some predicted expression under one
+    consistent symbol identification (e.g. ``C->T``).  The reward never sees
+    the prompt, so only identifications the prediction itself exhibits are
+    considered, the identity map is excluded (that is the strict verifiers'
+    territory), and all sizes are bounded by the ``_COND_MAX_*`` caps -- a
+    narrow, cheap, additive-only fallback on the failed path.
+    """
+    try:
+        import sympy as sp
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
+    except ImportError:
+        return False
+    response = _extract_final_response(solution_str)
+    if not response:
+        return False
+    try:
+        # parsing_timeout=None: signal-based timeouts only work in the main
+        # thread, but rewards run in a worker-thread pool.
+        gt_exprs = _sympy_exprs(parse(ground_truth, (LatexExtractionConfig(),), parsing_timeout=None))
+        if not gt_exprs:  # datasets often keep bare LaTeX without $...$
+            gt_exprs = _sympy_exprs(parse(f"${ground_truth}$", (LatexExtractionConfig(),), parsing_timeout=None))
+        pred_exprs = _sympy_exprs(
+            parse(response, (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None)
+        )
+    except Exception:
+        return False
+
+    def _flatten(exprs):
+        # A parsed answer set {a, b} offers each element as a candidate.
+        out = []
+        for e in exprs:
+            out.extend(e.args if isinstance(e, sp.FiniteSet) else (e,))
+        return out
+
+    gt_exprs = _strip_unevaluated(_flatten(gt_exprs))
+    pred_exprs = list(dict.fromkeys(_strip_unevaluated(_flatten(pred_exprs))))  # dedupe, keep order
+    if not (0 < len(gt_exprs) <= _COND_MAX_GT_EXPRS) or not (0 < len(pred_exprs) <= _COND_MAX_PRED_EXPRS):
+        return False
+    gt_symbols = sorted(set().union(*(e.free_symbols for e in gt_exprs)), key=str)
+    universe = sorted(set(gt_symbols) | set().union(*(e.free_symbols for e in pred_exprs)), key=str)
+    if not (0 < len(gt_symbols) <= _COND_MAX_GT_SYMBOLS) or len(universe) > _COND_MAX_SYMBOLS:
+        return False
+    for mapping in itertools.product(universe, repeat=len(gt_symbols)):
+        sigma = dict(zip(gt_symbols, mapping))
+        if all(sigma[s] == s for s in gt_symbols):
+            continue  # identity: the strict verifiers already had their say
+        if all(any(g.subs(sigma) == p for p in pred_exprs) for g in gt_exprs):
+            return True
+    return False
+
+
+# Fixed non-integer sample points for _evaluated_gt_match: deterministic
+# (rewards must be reproducible), off integers/zeros to dodge trivial roots,
+# and each round assigns distinct values to the sorted free symbols.
+_EVAL_ROUNDS = ((1.7, 2.9, 3.3), (4.1, 5.7, 6.3), (7.9, 8.3, 9.1))
+_EVAL_RTOL = 1e-6
+_EVAL_ATOL = 1e-9
+
+
+def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
+    """Last resort for ground truths stored as unevaluated formulas.
+
+    Big-Math keeps answers like ``a(1 - 10\\%)^2``: parsing preserves the
+    unevaluated tree, the rational/Float epsilon (81/100 vs 0.81) defeats
+    symbolic equality, and the free symbol ``a`` defeats math_verify's
+    numeric comparison -- so the correctly evaluated answer ``0.81a`` scores
+    0.  Numeric equivalence at fixed sample points (Schwartz-Zippel style)
+    recovers exactly this class: every ground-truth expression must equal
+    some predicted expression at >=2 of 3 deterministic non-integer points.
+    Bounded by the ``_COND_MAX_*`` caps, additive-only on the failed path.
+    """
+    try:
+        import sympy as sp
+        from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
+    except ImportError:
+        return False
+    response = _extract_final_response(solution_str)
+    if not response:
+        return False
+    try:
+        # parsing_timeout=None: signal-based timeouts only work in the main
+        # thread, but rewards run in a worker-thread pool.
+        gt_exprs = _sympy_exprs(parse(ground_truth, (LatexExtractionConfig(),), parsing_timeout=None))
+        if not gt_exprs:  # datasets often keep bare LaTeX without $...$
+            gt_exprs = _sympy_exprs(parse(f"${ground_truth}$", (LatexExtractionConfig(),), parsing_timeout=None))
+        pred_exprs = _sympy_exprs(
+            parse(response, (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None)
+        )
+    except Exception:
+        return False
+    # No Boolean filtering: relations fail float()/evalf below and self-exclude.
+    gt_exprs = _strip_unevaluated(x for e in gt_exprs for x in (e.args if isinstance(e, sp.FiniteSet) else (e,)))
+    pred_exprs = list(
+        dict.fromkeys(_strip_unevaluated(x for e in pred_exprs for x in (e.args if isinstance(e, sp.FiniteSet) else (e,))))
+    )
+    if not (0 < len(gt_exprs) <= _COND_MAX_GT_EXPRS) or not (0 < len(pred_exprs) <= _COND_MAX_PRED_EXPRS):
+        return False
+    if len(set().union(*(e.free_symbols for e in gt_exprs + pred_exprs))) > _COND_MAX_SYMBOLS:
+        return False
+
+    def _equiv(g, p) -> bool:
+        if g == p:
+            return True
+        syms = sorted(g.free_symbols | p.free_symbols, key=str)
+        if not syms:
+            try:
+                return math.isclose(float(g.evalf()), float(p.evalf()), rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL)
+            except Exception:
+                return False
+        hits = 0
+        for point in _EVAL_ROUNDS:
+            subs = dict(zip(syms, point[: len(syms)]))
+            try:
+                gv = float(g.subs(subs).evalf())
+                pv = float(p.subs(subs).evalf())
+            except Exception:
+                continue  # singular point / non-numeric (e.g. relation); next round
+            if not (math.isfinite(gv) and math.isfinite(pv)):
+                continue
+            if not math.isclose(gv, pv, rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL):
+                return False  # provably different at a real point
+            hits += 1
+        return hits >= 2
+
+    return all(any(_equiv(g, p) for p in pred_exprs) for g in gt_exprs)
+
+
+def _math_last_resort(solution_str: str, ground_truth: str) -> bool:
+    """Credit-adding fallbacks for known ground-truth format noise."""
+    return (
+        _rounded_decimal_match(solution_str, ground_truth)
+        or _normalized_text_match(solution_str, ground_truth)
+        or _yes_no_match(solution_str, ground_truth)
+        or _conditional_match(solution_str, ground_truth)
+        or _evaluated_gt_match(solution_str, ground_truth)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +878,23 @@ def _extract_boxed(text: str) -> str | None:
             if depth == 0:
                 return text[i:j]
     return None
+
+
+def _extract_all_boxed(text: str) -> list[str]:
+    """Contents of every \\boxed{...} with balanced braces, in order."""
+    contents = []
+    for m in _BOXED_RE.finditer(text):
+        i = m.end()
+        depth = 1
+        for j in range(i, len(text)):
+            if text[j] == "{":
+                depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    contents.append(text[i:j])
+                    break
+    return contents
 
 
 def _strip_fences(s: str) -> str:
@@ -711,6 +1297,40 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# repetition penalty
+# ---------------------------------------------------------------------------
+
+# Degenerate loops (the same block pasted over and over) can still carry the
+# right answer -- e.g. a repeated <answer> fence whose last copy is correct --
+# and would otherwise collect full credit.  A single word n-gram occurring
+# more than ``_REP_THRESHOLD`` times marks the trajectory as a death loop;
+# every occurrence past the threshold costs ``_REP_STEP``, penalties from
+# several looped n-grams add up, and ``_repetition_adjusted`` floors the
+# final score at ``_REP_FLOOR``.  Applied to every returned score, including
+# format-gate and verifier-crash zeros: a degenerate sample deserves the
+# penalty regardless of correctness.
+_REP_NGRAM = 4
+_REP_THRESHOLD = 15
+_REP_STEP = 0.1
+_REP_FLOOR = -1.0
+
+
+def _repetition_penalty(text: str) -> float:
+    """Death-loop penalty in points: per word n-gram, each occurrence past
+    ``_REP_THRESHOLD`` costs ``_REP_STEP``; multiple looped n-grams stack."""
+    words = text.split()
+    if len(words) < _REP_NGRAM + _REP_THRESHOLD:  # too short to loop past the threshold
+        return 0.0
+    counts = Counter(zip(*(words[i:] for i in range(_REP_NGRAM))))
+    excess = sum(count - _REP_THRESHOLD for count in counts.values() if count > _REP_THRESHOLD)
+    return _REP_STEP * excess
+
+
+def _repetition_adjusted(solution_str: str, score: float) -> float:
+    return max(score - _repetition_penalty(solution_str), _REP_FLOOR)
+
+
+# ---------------------------------------------------------------------------
 # dispatcher
 # ---------------------------------------------------------------------------
 
@@ -737,9 +1357,14 @@ def compute_score(
     rollout's thread pool, where any escaping exception aborts the whole rollout
     (the ``OverflowError`` from a ``1e999`` grid was one example). A pathological
     row or a crafted answer fails closed with a logged 0 instead.
+
+    Every returned score is repetition-adjusted (``_repetition_adjusted``): a
+    degenerate, heavily self-repeating generation loses 0.1 per redundant
+    n-gram past a loose allowance, floored at -1 -- repetition loops can no
+    longer collect full credit just because the last copy is right.
     """
     if not format_ok(solution_str):
-        return {"score": 0.0}
+        return {"score": _repetition_adjusted(solution_str, 0.0)}
     if not data_source.startswith(("math", "code", "logic", "stem", "if")):
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
     try:
@@ -755,5 +1380,5 @@ def compute_score(
             score = _if_score(solution_str, ground_truth)
     except Exception:
         logger.exception("[reasoning_rl] verifier crashed for %s; scoring 0", data_source)
-        return {"score": 0.0}
-    return {"score": float(score)}
+        return {"score": _repetition_adjusted(solution_str, 0.0)}
+    return {"score": _repetition_adjusted(solution_str, float(score))}

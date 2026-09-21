@@ -25,6 +25,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compute_score import (
     _align_callable_name,
+    _conditional_match,
+    _evaluated_gt_match,
+    _normalized_text_match,
+    _repetition_penalty,
+    _yes_no_match,
     compute_score,
     extract_logic_answer,
     format_ok,
@@ -334,6 +339,295 @@ class TestComputeScore:
         monkeypatch.setattr(math_verify, "compute_score", boom)
         res = compute_score("stem_drsci", think_wrap("The final answer is: $\\boxed{105}$"), "105")
         assert res["score"] == 1.0
+
+    def test_math_rounded_decimal_ground_truth(self):
+        # DAPO-Math-17k stores some answers as k-digit rounded decimals ("0.333"
+        # for 1/3); the exact answer must not be scored 0.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score(
+            "math_dapo",
+            think_wrap("The final answer is: $\\boxed{\\dfrac{1}{3}}$"),
+            "Therefore, the final answer is: $\\boxed{0.333}$.",
+        )
+        assert res["score"] == 1.0
+
+    def test_math_rounded_decimal_gt_rejects_out_of_bucket(self):
+        # The rounding bucket is half a unit of the gt's last digit: 0.334 is
+        # not "0.333 rounded to 3 places".
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score("math_dapo", think_wrap("The answer is $\\boxed{0.334}$"), "0.333")
+        assert res["score"] == 0.0
+
+    def test_math_integer_ground_truth_not_loosened(self):
+        # An integer gt is exact, not "rounded to units": 3.4 must not match 3.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score("math_bigmath", think_wrap("The answer is $\\boxed{3.4}$"), "3")
+        assert res["score"] == 0.0
+
+    def test_math_inequality_chain_plain_text_gt(self):
+        # Big-Math stores plain-text names ("y2 < y1 < y3"); math_verify parses
+        # "y2" as y*2, so the subscripted correct answer could never match.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score(
+            "math_bigmath", think_wrap("The answer is $\\boxed{y_2 < y_1 < y_3}$."), "y2 < y1 < y3"
+        )
+        assert res["score"] == 1.0
+
+    def test_math_general_formula_gt_with_substituted_condition(self):
+        # Prompt said C equals T; the gt keeps the general formulas.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score(
+            "math_dapo",
+            think_wrap("With buffering $\\boxed{T}$, without $\\boxed{2T}$. The final answer is: $\\boxed{T}$ and $\\boxed{2T}$."),
+            "With buffering: $\\max(C, T)$ Without buffering: $C + T$",
+        )
+        assert res["score"] == 1.0
+
+    def test_math_unevaluated_percent_gt(self):
+        # The gt keeps the unevaluated formula; the model evaluated it.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score(
+            "math_bigmath", think_wrap("The final price is $\\boxed{0.81a}$ yuan."), "a(1 - 10\\%)^2"
+        )
+        assert res["score"] == 1.0
+
+    def test_math_percent_gt_coarser_prediction(self):
+        # The true rate is 6.5353%; the gt keeps 3 places, the model wrote the
+        # same value correctly rounded to 2 places (and restated the box).
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score(
+            "math_bigmath",
+            think_wrap(
+                "Thus $r \\approx 6.5368\\%$. Rounded: $\\boxed{6.54\\%}$\n"
+                "**Final Answer:** $$\\boxed{6.54\\%}$$"
+            ),
+            "6.535%",
+        )
+        assert res["score"] == 1.0
+
+    def test_math_percent_gt_rejects_outside_bucket(self):
+        # 6.52% is not 6.535% at any common precision.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        res = compute_score("math_bigmath", think_wrap("The answer is $\\boxed{6.52\\%}$"), "6.535%")
+        assert res["score"] == 0.0
+
+    def test_math_labeled_list_truncated_gt(self):
+        # Textbook gt stores TRUNCATED decimals (9500/30500 = 0.311475... is
+        # stored as 0.3114); the model's values are the correct roundings.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        gt = "Adobe Systems Stock: 0.3114, Dow Chemical Stock: 0.3442, Office Depot Stock: 0.3442"
+        res = compute_score(
+            "math_bigmath",
+            think_wrap(
+                "Adobe: $\\boxed{0.3115}$, Dow: $\\boxed{0.3443}$, Office Depot: $\\boxed{0.3443}$"
+            ),
+            gt,
+        )
+        assert res["score"] == 1.0
+
+    def test_math_labeled_list_rejects_wrong_value(self):
+        # 0.3440 differs from the gt's 0.3442 by more than rounding/truncation.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        gt = "Adobe Systems Stock: 0.3114, Dow Chemical Stock: 0.3442, Office Depot Stock: 0.3442"
+        res = compute_score(
+            "math_bigmath",
+            think_wrap("$\\boxed{0.3115}$, $\\boxed{0.3443}$, $\\boxed{0.3440}$"),
+            gt,
+        )
+        assert res["score"] == 0.0
+
+    def test_math_labeled_list_rejects_count_mismatch(self):
+        # A multi-value gt needs every value, in order.
+        pytest.importorskip("verl.utils.reward_score.math_verify")
+        gt = "Adobe Systems Stock: 0.3114, Dow Chemical Stock: 0.3442, Office Depot Stock: 0.3442"
+        res = compute_score("math_bigmath", think_wrap("$\\boxed{0.3115}$"), gt)
+        assert res["score"] == 0.0
+
+
+class TestNormalizedTextMatch:
+    """Helper-level checks for the literal last resort (no math_verify needed)."""
+
+    def test_inequality_chain_subscript_vs_plain(self):
+        assert _normalized_text_match(think_wrap("\\boxed{y_2 < y_1 < y_3}"), "y2 < y1 < y3")
+        assert _normalized_text_match(think_wrap("\\boxed{y_{2} < y_{1} < y_{3}}"), "y2 < y1 < y3")
+
+    def test_wrong_order_still_rejected(self):
+        assert not _normalized_text_match(think_wrap("\\boxed{y_1 < y_2 < y_3}"), "y2 < y1 < y3")
+
+    def test_powers_not_collapsed_into_names(self):
+        # "^" survives normalisation: x^2 must not collapse into the name x2.
+        assert not _normalized_text_match(think_wrap("\\boxed{x^2}"), "x2")
+
+    def test_le_not_mangled_by_left(self):
+        assert _normalized_text_match(think_wrap("\\boxed{x \\le 3}"), "x <= 3")
+        assert _normalized_text_match(think_wrap("\\boxed{\\left(x + 1\\right)}"), "(x+1)")
+
+    def test_no_boxed_no_match(self):
+        assert not _normalized_text_match(think_wrap("the answer is y2 < y1 < y3"), "y2 < y1 < y3")
+
+
+class TestConditionalMatch:
+    """Helper-level checks for the symbol-identification last resort."""
+
+    GT = "With buffering: $\\max(C, T)$ Without buffering: $C + T$"
+
+    def test_substituted_condition_matches_general_formula(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap(
+            "With buffering $\\boxed{T}$, without $\\boxed{2T}$. "
+            "The final answer is: $\\boxed{T}$ and $\\boxed{2T}$."
+        )
+        assert _conditional_match(resp, self.GT)
+
+    def test_wrong_substituted_values_rejected(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The final answer is: $\\boxed{T}$ and $\\boxed{3T}$.")
+        assert not _conditional_match(resp, self.GT)
+
+    def test_identity_map_not_used(self):
+        # Identical formulas are the strict verifiers' territory, not ours.
+        pytest.importorskip("math_verify")
+        assert not _conditional_match(think_wrap("The final answer is: $\\boxed{C + T}$."), "$C + T$")
+
+    def test_no_free_symbols_no_match(self):
+        pytest.importorskip("math_verify")
+        assert not _conditional_match(think_wrap("The final answer is: $\\boxed{42}$."), "42")
+
+    def test_prose_ground_truth_no_match(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The final answer is: $\\boxed{T}$ and $\\boxed{2T}$.")
+        assert not _conditional_match(resp, "yes, it is possible")
+
+
+class TestEvaluatedGtMatch:
+    """Helper-level checks for the sample-point numeric equivalence last resort."""
+
+    GT = "a(1 - 10\\%)^2"
+
+    def test_evaluated_form_matches_unevaluated_gt(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The final price is $\\boxed{0.81a}$.")
+        assert _evaluated_gt_match(resp, self.GT)
+
+    def test_wrong_value_rejected(self):
+        pytest.importorskip("math_verify")
+        assert not _evaluated_gt_match(think_wrap("The answer is $\\boxed{0.82a}$."), self.GT)
+
+    def test_wrong_structure_rejected(self):
+        pytest.importorskip("math_verify")
+        # One discount instead of two: 0.9a differs from 0.81a at every point.
+        assert not _evaluated_gt_match(think_wrap("The answer is $\\boxed{0.9a}$."), self.GT)
+
+    def test_symbol_free_numeric_pair(self):
+        pytest.importorskip("math_verify")
+        assert _evaluated_gt_match(think_wrap("The answer is $\\boxed{0.75}$."), "\\frac{3}{4}")
+
+    def test_inequality_chain_not_in_scope(self):
+        pytest.importorskip("math_verify")
+        # Relations are excluded here; they belong to _normalized_text_match.
+        assert not _evaluated_gt_match(think_wrap("\\boxed{y_2 < y_1 < y_3}"), "y2 < y1 < y3")
+
+
+def _loop(k: int) -> str:
+    # k copies of an 8-word block separated by a unique token, so exactly the
+    # block's 5 internal word 4-grams repeat (each k times); k > 15 is a death
+    # loop with k - 15 excess occurrences per gram.
+    return " ".join(f"a b c d e f g h s{i}" for i in range(k))
+
+
+class TestRepetitionPenalty:
+    def test_threshold_is_free(self):
+        # 15 occurrences of one n-gram is NOT over the threshold.
+        assert _repetition_penalty(_loop(15)) == 0.0
+
+    def test_step_per_excess_occurrence(self):
+        # A single looped n-gram: n words of "x" give one 4-gram seen n-3
+        # times, so the excess over 15 is n-18.
+        assert _repetition_penalty(" ".join(["x"] * 19)) == pytest.approx(0.1)
+        assert _repetition_penalty(" ".join(["x"] * 20)) == pytest.approx(0.2)
+        assert _repetition_penalty(" ".join(["x"] * 33)) == pytest.approx(1.5)
+
+    def test_multiple_looped_ngrams_stack(self):
+        # _loop(16) loops 5 distinct 4-grams once each past the threshold.
+        assert _repetition_penalty(_loop(16)) == pytest.approx(0.5)
+        assert _repetition_penalty(_loop(17)) == pytest.approx(1.0)
+
+    def test_short_or_clean_text_free(self):
+        assert _repetition_penalty("too short") == 0.0
+        assert _repetition_penalty(" ".join(f"tok{i}" for i in range(500))) == 0.0
+
+    def test_correct_but_degenerate_scores_below_one(self):
+        # Space-padded so the think tags don't merge into the edge grams.
+        gt = json.dumps({"answer": "6", "task": "maze"})
+        res = compute_score("logic_reasoning_gym", think_wrap("6", think=f" {_loop(16)} "), gt)
+        assert res["score"] == pytest.approx(0.5)
+
+    def test_heavy_repetition_hits_floor(self):
+        gt = json.dumps({"answer": "6", "task": "maze"})
+        res = compute_score("logic_reasoning_gym", think_wrap("6", think=f" {_loop(30)} "), gt)
+        assert res["score"] == -1.0
+
+    def test_wrong_and_degenerate_also_floored(self):
+        # The penalty is correctness-agnostic: a degenerate miss goes below 0.
+        gt = json.dumps({"answer": "6", "task": "maze"})
+        res = compute_score("logic_reasoning_gym", think_wrap("7", think=f" {_loop(30)} "), gt)
+        assert res["score"] == -1.0
+
+    def test_repeated_answer_block_like_reported_case(self):
+        # The reported dump: a correct <answer> fence pasted ~20 times.
+        seq = "7 2 2 6 7 4 4 3 7 5 5 8 9 2 6 0 0 2 6 6 7 4 4 9 7 5 7 3 0 4"
+        gt = json.dumps({"answer": seq, "task": "maze"})
+        response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 20)
+        res = compute_score("logic_reasoning_gym", think_wrap(response), gt)
+        assert res["score"] == -1.0
+
+    def test_fifteen_copies_still_free(self):
+        # 15 copies loop every block-internal 4-gram exactly 15 times: the
+        # threshold is only crossed by the 16th occurrence.  (The seq uses
+        # distinct tokens so no 4-gram already repeats inside one copy.)
+        seq = " ".join(str(i) for i in range(30))
+        gt = json.dumps({"answer": seq, "task": "maze"})
+        response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 15)
+        res = compute_score("logic_reasoning_gym", think_wrap(response), gt)
+        assert res["score"] == 1.0
+
+    def test_gram_repeating_inside_each_copy_counts_too(self):
+        # The reported case's seq repeats "6 7 4 4" twice per copy, so already
+        # at 15 copies that 4-gram is seen 30 times -> 15 excess -> -1.5.
+        seq = "7 2 2 6 7 4 4 3 7 5 5 8 9 2 6 0 0 2 6 6 7 4 4 9 7 5 7 3 0 4"
+        gt = json.dumps({"answer": seq, "task": "maze"})
+        response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 15)
+        res = compute_score("logic_reasoning_gym", think_wrap(response), gt)
+        assert res["score"] == pytest.approx(-0.5)
+
+    def test_clean_correct_answer_unaffected(self):
+        gt = json.dumps({"answer": "6", "task": "maze"})
+        assert compute_score("logic_reasoning_gym", think_wrap("6"), gt)["score"] == 1.0
+
+
+class TestYesNoMatch:
+    """Helper-level checks for the cross-language yes/no last resort."""
+
+    def test_russian_feasible_vs_english_yes(self):
+        assert _yes_no_match(think_wrap("\\boxed{Yes}"), "Выполнимо.")
+        assert _yes_no_match(think_wrap("\\boxed{\\text{Yes}}"), "Выполнимо.")
+
+    def test_opposite_polarity_still_rejected(self):
+        # The reported sample: the model said No while the gt says "feasible".
+        assert not _yes_no_match(think_wrap("\\boxed{No}"), "Выполнимо.")
+
+    def test_russian_yes_no(self):
+        assert _yes_no_match(think_wrap("\\boxed{\\text{Да}}"), "да")
+        assert not _yes_no_match(think_wrap("\\boxed{\\text{Нет}}"), "да")
+
+    def test_chinese_polarity(self):
+        assert _yes_no_match(think_wrap("\\boxed{能}"), "可以")
+        assert not _yes_no_match(think_wrap("\\boxed{不能}"), "可以")
+
+    def test_non_polarity_strings_never_match(self):
+        assert not _yes_no_match(think_wrap("\\boxed{42}"), "42")
+        assert not _yes_no_match(think_wrap("\\boxed{yes}"), "4")
+        assert not _yes_no_match(think_wrap("\\boxed{y_2 < y_1}"), "y2 < y1")
 
 
 # ---------------------------------------------------------------------------
