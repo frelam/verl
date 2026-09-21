@@ -24,6 +24,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compute_score import (
+    _REP_MIN_COUNT,
     _align_callable_name,
     _conditional_match,
     _evaluated_gt_match,
@@ -537,12 +538,14 @@ def _loop(k: int) -> str:
 
 class TestRepetitionPenalty:
     def test_threshold_is_free(self):
-        # 15 occurrences of one n-gram is NOT over the threshold.
+        # 15 occurrences of one n-gram is NOT over the threshold (short text,
+        # so the length-scaled term is inactive and the floor of 15 applies).
         assert _repetition_penalty(_loop(15)) == 0.0
 
     def test_step_per_excess_occurrence(self):
         # A single looped n-gram: n words of "x" give one 4-gram seen n-3
-        # times, so the excess over 15 is n-18.
+        # times, so the excess over 15 is n-18.  All below the ratio term
+        # kicks in (total ngrams < 750), so the floor of 15 governs.
         assert _repetition_penalty(" ".join(["x"] * 19)) == pytest.approx(0.1)
         assert _repetition_penalty(" ".join(["x"] * 20)) == pytest.approx(0.2)
         assert _repetition_penalty(" ".join(["x"] * 33)) == pytest.approx(1.5)
@@ -555,6 +558,33 @@ class TestRepetitionPenalty:
     def test_short_or_clean_text_free(self):
         assert _repetition_penalty("too short") == 0.0
         assert _repetition_penalty(" ".join(f"tok{i}" for i in range(500))) == 0.0
+
+    def test_long_legitimate_discourse_free(self):
+        # The mis-scored class this penalty used to produce: a 16k-token CoT
+        # (~11k words) where connective reasoning phrases recur 20-40 times.
+        # The flat threshold of 15 charged every occurrence past 15; the
+        # length-scaled threshold (11000ish // 50 = 220ish) must not.
+        filler = " ".join(f"w{i}" for i in range(11_000))
+        for phrase in ("if the first person is telling the truth then", "let me check what the next step should be"):
+            words = filler.split()
+            for pos in range(0, len(words) - 8, 275):  # ~40 non-overlapping insertions
+                words[pos : pos + 8] = phrase.split()
+            assert _repetition_penalty(" ".join(words)) == 0.0
+
+    def test_long_death_loop_still_penalised(self):
+        # A real death loop dominates the text -- exactly what the ratio term
+        # encodes.  300 copies of an 8-word block appended to 10k filler words
+        # (12,700 words total -> 12,697 ngrams -> threshold 253): each of the
+        # block's 5 internal 4-grams is seen 300 times, past the threshold,
+        # so the penalty fires at a length where the old flat threshold of 15
+        # would have charged 285 phantom excesses per gram.
+        filler = " ".join(f"f{i}" for i in range(10_000))
+        loop = " ".join(f"a b c d e f g h s{i}" for i in range(300))
+        text = filler + " " + loop
+        total = len(text.split()) - 3
+        threshold = max(_REP_MIN_COUNT, total // 50)
+        assert threshold == 253
+        assert _repetition_penalty(text) == pytest.approx(0.1 * 5 * (300 - threshold))
 
     def test_correct_but_degenerate_scores_below_one(self):
         # Space-padded so the think tags don't merge into the edge grams.

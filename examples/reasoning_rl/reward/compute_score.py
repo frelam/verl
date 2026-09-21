@@ -102,11 +102,15 @@ Repetition penalty
 ------------------
 
 After routing, every score is repetition-adjusted (``_repetition_adjusted``):
-a single word 4-gram occurring more than 15 times marks a degenerate
-repetition loop; each occurrence past the threshold costs 0.1, penalties
-from several looped n-grams add up, and the total is floored at -1, so
-degenerate repetition loops cannot collect full credit when their last copy
-happens to be right.
+a single word 4-gram occurring more than the length-scaled threshold
+``max(15, total_ngrams // 50)`` marks a degenerate repetition loop; each
+occurrence past the threshold costs 0.1, penalties from several looped
+n-grams add up, and the total is floored at -1, so degenerate repetition
+loops cannot collect full credit when their last copy happens to be right.
+The absolute floor of 15 keeps short texts calibrated (15 occurrences there
+is a death loop); the ratio term scales the threshold with response length
+so connective reasoning phrases that legitimately recur across a 16k-24k
+token CoT are not charged as loops.
 """
 
 from __future__ import annotations
@@ -1303,26 +1307,42 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
 # Degenerate loops (the same block pasted over and over) can still carry the
 # right answer -- e.g. a repeated <answer> fence whose last copy is correct --
 # and would otherwise collect full credit.  A single word n-gram occurring
-# more than ``_REP_THRESHOLD`` times marks the trajectory as a death loop;
+# more than ``_rep_threshold(len)`` times marks the trajectory as a death loop;
 # every occurrence past the threshold costs ``_REP_STEP``, penalties from
 # several looped n-grams add up, and ``_repetition_adjusted`` floors the
 # final score at ``_REP_FLOOR``.  Applied to every returned score, including
 # format-gate and verifier-crash zeros: a degenerate sample deserves the
 # penalty regardless of correctness.
+#
+# The threshold is length-scaled: a fixed count cannot separate a death loop
+# from normal discourse once the response-length curriculum reaches 16k-24k
+# tokens -- connective reasoning phrases ("if the first person is", "the
+# answer is") naturally occur 20-40 times across ~10k words, so a flat 15
+# mis-scored verbose-but-legitimate responses negative.  The threshold is
+# therefore ``max(_REP_MIN_COUNT, total // _REP_RATIO)``: short texts keep
+# the original absolute floor (calibrated on death loops, not prose), long
+# texts only get charged when one n-gram occupies >1/_REP_RATIO of all
+# n-gram positions -- the signature of a loop, not of verbose reasoning.
 _REP_NGRAM = 4
-_REP_THRESHOLD = 15
+_REP_MIN_COUNT = 15
+_REP_RATIO = 50
 _REP_STEP = 0.1
 _REP_FLOOR = -1.0
 
 
+def _rep_threshold(total_ngrams: int) -> int:
+    return max(_REP_MIN_COUNT, total_ngrams // _REP_RATIO)
+
+
 def _repetition_penalty(text: str) -> float:
     """Death-loop penalty in points: per word n-gram, each occurrence past
-    ``_REP_THRESHOLD`` costs ``_REP_STEP``; multiple looped n-grams stack."""
+    ``_rep_threshold`` costs ``_REP_STEP``; multiple looped n-grams stack."""
     words = text.split()
-    if len(words) < _REP_NGRAM + _REP_THRESHOLD:  # too short to loop past the threshold
+    if len(words) < _REP_NGRAM + _REP_MIN_COUNT:  # too short to loop past the threshold
         return 0.0
     counts = Counter(zip(*(words[i:] for i in range(_REP_NGRAM))))
-    excess = sum(count - _REP_THRESHOLD for count in counts.values() if count > _REP_THRESHOLD)
+    threshold = _rep_threshold(len(words) - _REP_NGRAM + 1)
+    excess = sum(count - threshold for count in counts.values() if count > threshold)
     return _REP_STEP * excess
 
 
@@ -1360,8 +1380,8 @@ def compute_score(
 
     Every returned score is repetition-adjusted (``_repetition_adjusted``): a
     degenerate, heavily self-repeating generation loses 0.1 per redundant
-    n-gram past a loose allowance, floored at -1 -- repetition loops can no
-    longer collect full credit just because the last copy is right.
+    n-gram past a length-scaled allowance, floored at -1 -- repetition loops
+    can no longer collect full credit just because the last copy is right.
     """
     if not format_ok(solution_str):
         return {"score": _repetition_adjusted(solution_str, 0.0)}
