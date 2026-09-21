@@ -1,0 +1,2120 @@
+#!/usr/bin/env python3
+"""V2 data preparation for tool_rl — adds missing_info ask-negatives.
+
+Variant of ``prepare_data.py`` that additionally converts positive samples
+whose label argument values cannot be derived from the prompt (the
+generator-invented slots, BFCL miss_param-style) into "ask-the-user"
+negatives, and retargets the mix: ``--neg-ratio`` 0.30,
+``--missing-info-ratio`` 0.40 (share of the negative pool).  The parquet
+writer here also emits an explicit Arrow schema so the mixed
+``tools``/``extra_info`` column types survive the round trip.
+
+Use this script INSTEAD of ``prepare_data.py`` to regenerate the training
+data; the original stays untouched for the legacy mix.
+
+Download and prepare tool-use datasets for Qwen3-4B GRPO training in verl
+(ported from slime ``examples/tool_rl/data/download_data.py``). Downloads
+APIGen, ToolACE, Hammer, API-Bank and Seal-Tools and converts them to
+verl's parquet schema used by ``verl.utils.dataset.RLHFDataset``.
+
+BFCL is excluded from the default dataset mix: its samples overlap with
+the BFCL benchmark, so training on them risks evaluation data leakage.
+The loader remains available via ``--datasets bfcl``.
+
+Since the LLM-judge (RM) reward mode is not migrated, samples **without**
+structured ground-truth tool calls are dropped by default
+(``--keep-unlabeled`` disables the filter).
+
+Output parquet columns
+----------------------
+- ``data_source``   : ``"tool_rl"``
+- ``prompt``        : ``[{"role": ..., "content": ...}, ...]`` chat messages
+                      (consumed via ``data.prompt_key=prompt``)
+- ``tools``         : per-sample tool schemas
+                      (consumed by the ``tool_rl_agent`` agent loop)
+- ``reward_model``  : ``{"style": "rule", "ground_truth": <label str>}``
+- ``extra_info``    : ``{"index", "task_id", "source", "tools",
+                      "ground_truth_calls", ...}`` — ``tools`` and
+                      ``ground_truth_calls`` are read by the reward function;
+                      ``ground_truth_calls == []`` means "no tools needed".
+
+Usage
+-----
+.. code-block:: bash
+
+    python examples/tool_rl/prepare_data.py -o ./data/tool_rl
+    python examples/tool_rl/prepare_data.py -o ./data/tool_rl --max-samples 5000
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import copy
+import json
+import logging
+import random
+import re
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+# The shared reward parser lives under ``reward/`` and is imported here so the
+# dataset's ground truth and the reward agree on what a tool call is.  Running
+# this file directly puts the *script* directory on sys.path (not the repo
+# root), so make the repo root importable first.
+_REPO_ROOT = str(Path(__file__).resolve().parents[2])
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from examples.tool_rl.reward.verifier import parse_toolace_tool_calls  # noqa: E402
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX = 5000
+_SEED = 42
+_DATA_SOURCE = "tool_rl"
+# BFCL is intentionally absent (evaluation-leakage risk, see module docstring).
+_DEFAULT_DATASETS = ["apigen", "toolace", "hammer", "apibank", "sealtools"]
+
+# Distractor tools added to API-Bank / Seal-Tools samples so the task stays
+# a tool-*selection* problem (their raw format only names the correct API).
+_N_DISTRACTORS = 5
+
+# Local download cache (GitHub raw files); avoids re-downloading on reruns.
+_CACHE_DIR = Path.home() / ".cache" / "tool_rl"
+
+# Generic system prompt used for all samples. Tool schemas are NOT embedded
+# here — they travel in the sample's ``tools`` field and are rendered by the
+# chat template at rollout time (avoids double declaration).
+_GENERIC_TOOL_SYSTEM = (
+    "You are a helpful assistant with access to tools. Use them when needed to answer user queries accurately."
+)
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+
+def _normalize_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize tool definitions to standard format.
+
+    Returns **independent copies**.  The Seal-Tools / API-Bank loaders pass
+    the same schema dict into many samples (one shared ``schemas`` pool), and
+    the augmentation strategies mutate tools in place.  Without the copy, a
+    parameter renamed for one sample rewrites every other sample's declared
+    schema while leaving *their* labels untouched — those rows can then never
+    be matched by a schema-conformant call (see ``_augment_param_rename``).
+    """
+    result = []
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("name", "")
+        if not name:
+            continue
+        params = t.get("parameters", {})
+        # Qwen chat template expects JSON Schema properties
+        if isinstance(params, dict) and "properties" not in params:
+            params = {"type": "object", "properties": params}
+        result.append(
+            copy.deepcopy(
+                {
+                    "name": name,
+                    "description": t.get("description", ""),
+                    "parameters": params,
+                }
+            )
+        )
+    return result
+
+
+def _format_gt(answers: list[dict[str, Any]]) -> str:
+    """Format ground truth as readable string."""
+    if not answers:
+        return ""
+    lines = []
+    for a in answers:
+        name = a.get("name", "")
+        args = a.get("arguments", {}) or {}
+        if isinstance(args, dict):
+            args_str = json.dumps(args, ensure_ascii=False)
+        else:
+            args_str = str(args)
+        lines.append(f"  {name}({args_str})")
+    return "Ground truth:\n" + "\n".join(lines)
+
+
+def _make_meta(source: str, task_id: str, tools: list, gt: Any, **extra) -> dict:
+    return {
+        "benchmark": "tool_rl",
+        "source": source,
+        "task_id": task_id,
+        "ground_truth": gt,  # None=no label, []=no tools needed, [{...}]=tool calls
+        "has_ground_truth": bool(gt),
+        "tools": _normalize_tools(tools),
+        "max_turns": 1,
+        **extra,
+    }
+
+
+# ============================================================================
+# APIGen loader
+# ============================================================================
+
+
+def load_apigen(max_samples: int) -> list[dict[str, Any]]:
+    """Load APIGen — single JSON file via hf_hub_download."""
+    logger.info("Loading APIGen (Salesforce/xlam-function-calling-60k)...")
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        logger.error("pip install huggingface_hub")
+        return []
+
+    try:
+        path = hf_hub_download(
+            "Salesforce/xlam-function-calling-60k",
+            "xlam_function_calling_60k.json",
+            repo_type="dataset",
+        )
+    except Exception as e:
+        logger.warning("APIGen download failed: %s", e)
+        return []
+
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    tasks = []
+    for sample in data:
+        if len(tasks) >= max_samples:
+            break
+        query = sample.get("query", "")
+        if not query:
+            continue
+
+        tools_raw = sample.get("tools", "[]")
+        answers_raw = sample.get("answers", "[]")
+        try:
+            tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
+        except json.JSONDecodeError:
+            tools = []
+        try:
+            answers = json.loads(answers_raw) if isinstance(answers_raw, str) else answers_raw
+        except json.JSONDecodeError:
+            answers = []
+
+        messages = [
+            {"role": "system", "content": _GENERIC_TOOL_SYSTEM},
+            {"role": "user", "content": query},
+        ]
+
+        tasks.append(
+            {
+                "messages": messages,
+                "tools": _normalize_tools(tools),
+                "label": _format_gt(answers),
+                "metadata": _make_meta("apigen", f"apigen-{sample.get('id', '?')}", tools, answers),
+            }
+        )
+
+    logger.info("APIGen: %d samples", len(tasks))
+    return tasks
+
+
+# ============================================================================
+# ToolACE loader (multi-turn → split into single-turn)
+# ============================================================================
+
+
+def load_toolace(max_samples: int) -> list[dict[str, Any]]:
+    """Load ToolACE — split multi-turn conversations into single-turn samples."""
+    logger.info("Loading ToolACE (Team-ACE/ToolACE)...")
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        logger.error("pip install datasets")
+        return []
+
+    try:
+        ds = load_dataset("Team-ACE/ToolACE", split="train")
+    except Exception as e:
+        logger.warning("ToolACE: %s", e)
+        return []
+
+    tasks = []
+    # Guard rail against silently emptying ToolACE labels: every assistant
+    # turn that is shaped like ToolACE's ``[func(k=v)]`` call list must parse
+    # into a ground-truth call.  See the ratio check at the end.
+    n_call_shaped = 0
+    n_unparsed = 0
+    for i, sample in enumerate(ds):
+        if len(tasks) >= max_samples:
+            break
+        system = sample.get("system", "")
+        conversations = sample.get("conversations", [])
+        if not conversations:
+            continue
+
+        tools = _extract_tools_from_text(system)
+        history: list[dict] = []
+
+        for ti, turn in enumerate(conversations):
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("from", "")
+            value = str(turn.get("value", ""))
+
+            if role == "user":
+                # Do NOT keep ToolACE's original system text: it embeds the
+                # tool schemas as JSON, which the chat template would render
+                # a second time from the sample's ``tools`` field.
+                messages = [{"role": "system", "content": _GENERIC_TOOL_SYSTEM}]
+                for h in history[-8:]:
+                    messages.append(dict(h))
+                messages.append({"role": "user", "content": value})
+
+                assistant_resp = _find_next_assistant(conversations, ti)
+                # ToolACE writes assistant calls as ``[func(k=v, ...)]``,
+                # which neither the Qwen XML nor the bare-JSON parser can
+                # read.  Try the ToolACE parser first and keep the generic
+                # one only as a fallback for rows in another format.
+                gt_calls = parse_toolace_tool_calls(assistant_resp)
+                if not gt_calls:
+                    gt_calls = _parse_qwen_tool_calls(assistant_resp)
+                if _looks_like_toolace_call(assistant_resp):
+                    n_call_shaped += 1
+                    if not gt_calls:
+                        n_unparsed += 1
+
+                tasks.append(
+                    {
+                        "messages": messages,
+                        "tools": _normalize_tools(tools),
+                        "label": _format_gt(gt_calls)
+                        + (f"\nReference:\n{assistant_resp[:1000]}" if assistant_resp else ""),
+                        "metadata": _make_meta(
+                            "toolace",
+                            f"toolace-{i}-t{ti}",
+                            tools,
+                            gt_calls,
+                            conversation_turn=ti,
+                        ),
+                    }
+                )
+                history.append({"role": "user", "content": value})
+
+            elif role == "assistant":
+                history.append({"role": "assistant", "content": value[:800]})
+            elif role == "tool":
+                # Qwen chat templates carry tool results inside a user turn
+                # wrapped in <tool_response>; a raw "tool" role may be
+                # silently dropped when the template is applied.
+                history.append(
+                    {
+                        "role": "user",
+                        "content": f"<tool_response>\n{value[:500]}\n</tool_response>",
+                    }
+                )
+
+            if len(tasks) >= max_samples:
+                break
+
+    if n_call_shaped and n_unparsed:
+        logger.warning(
+            "ToolACE: %d/%d call-shaped assistant turns were not parsed into ground-truth tool calls",
+            n_unparsed,
+            n_call_shaped,
+        )
+    if n_call_shaped and n_unparsed / n_call_shaped > 0.05:
+        raise RuntimeError(
+            f"ToolACE: {n_unparsed}/{n_call_shaped} call-shaped assistant turns "
+            "could not be parsed into ground-truth tool calls. Emitting them "
+            "as 'no tools needed' would mislabel them as negatives and reward "
+            "abstention over the correct call, so refusing to continue. Fix "
+            "parse_toolace_tool_calls() or check whether the dataset format "
+            "changed."
+        )
+
+    logger.info("ToolACE: %d single-turn samples", len(tasks))
+    return tasks
+
+
+def _looks_like_toolace_call(text: str) -> bool:
+    """Cheap shape check for ToolACE's ``[func(...)]`` assistant call list."""
+    text = text.strip()
+    return text.startswith("[") and "(" in text
+
+
+def _find_next_assistant(conversations: list, idx: int) -> str:
+    for j in range(idx + 1, len(conversations)):
+        t = conversations[j]
+        if isinstance(t, dict) and t.get("from") == "assistant":
+            return str(t.get("value", ""))
+    return ""
+
+
+# ============================================================================
+# Hammer loader
+# ============================================================================
+
+
+def load_hammer(max_samples: int) -> list[dict[str, Any]]:
+    """Load Hammer irrelevance data."""
+    logger.info("Loading Hammer (MadeAgents/xlam-irrelevance-7.5k)...")
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        logger.error("pip install datasets")
+        return []
+
+    try:
+        ds = load_dataset("MadeAgents/xlam-irrelevance-7.5k", split="train")
+    except Exception as e:
+        logger.warning("Hammer: %s", e)
+        return []
+
+    tasks = []
+    for i, sample in enumerate(ds):
+        if len(tasks) >= max_samples:
+            break
+        query = sample.get("query", "")
+        if not query:
+            continue
+        tools_raw = sample.get("tools", "[]")
+        answers_raw = sample.get("answers", "[]")
+        try:
+            tools = json.loads(tools_raw) if isinstance(tools_raw, str) else tools_raw
+        except json.JSONDecodeError:
+            tools = []
+        try:
+            answers = json.loads(answers_raw) if isinstance(answers_raw, str) else answers_raw
+        except json.JSONDecodeError:
+            answers = []
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant. Determine if tools are needed for the user's request.",
+            },
+            {"role": "user", "content": query},
+        ]
+
+        tasks.append(
+            {
+                "messages": messages,
+                "tools": _normalize_tools(tools),
+                "label": _format_gt(answers),
+                "metadata": _make_meta("hammer", f"hammer-{i}", tools, answers, is_irrelevant=not bool(answers)),
+            }
+        )
+
+    logger.info("Hammer: %d samples", len(tasks))
+    return tasks
+
+
+# ============================================================================
+# BFCL loader
+# ============================================================================
+
+
+def load_bfcl(max_samples: int) -> list[dict[str, Any]]:
+    """Load BFCL — split multi-turn, keep single-turn."""
+    logger.info("Loading BFCL (gorilla-llm/Berkeley-Function-Calling-Leaderboard)...")
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError:
+        logger.error("pip install huggingface_hub")
+        return []
+
+    try:
+        files = list_repo_files(
+            "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+            repo_type="dataset",
+        )
+    except Exception as e:
+        logger.warning("BFCL: %s", e)
+        return []
+
+    json_files = [f for f in files if f.endswith(".json")]
+    priority = ["simple", "multiple", "parallel", "multi_turn"]
+    json_files.sort(key=lambda f: (not any(p in f.lower() for p in priority), f))
+
+    tasks = []
+    for jf in json_files:
+        if len(tasks) >= max_samples:
+            break
+        try:
+            path = hf_hub_download(
+                "gorilla-llm/Berkeley-Function-Calling-Leaderboard",
+                jf,
+                repo_type="dataset",
+            )
+        except Exception:
+            continue
+        category = jf.replace(".json", "").replace("BFCL_v3_", "")
+        with open(path) as f:
+            for line in f:
+                if len(tasks) >= max_samples:
+                    break
+                try:
+                    raw = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    continue
+                tasks.extend(_parse_bfcl(raw, category))
+
+    logger.info("BFCL: %d samples", len(tasks))
+    return tasks
+
+
+def _extract_bfcl_turns(question: Any) -> list[list[dict]] | None:
+    """Extract turns from BFCL v3 question field.
+
+    BFCL v3 format: ``[[{"role": "user", "content": "..."}], ...]``
+    Each outer element is a turn with one or more messages.
+    Returns list of messages per turn (list of lists of dicts).
+    """
+    if isinstance(question, list) and len(question) > 0:
+        # BFCL v3: list of turns, each turn is a list of messages
+        if isinstance(question[0], list):
+            return question
+        # Some files have list of dicts (single turn)
+        if isinstance(question[0], dict) and "role" in question[0]:
+            return [question]
+    return None
+
+
+def _extract_text_from_bfcl_messages(messages: list) -> str:
+    """Extract user text from BFCL message list."""
+    parts = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                parts.append(content)
+    return "\n".join(parts) if parts else ""
+
+
+def _parse_bfcl(raw: dict, category: str) -> list[dict]:
+    """Parse BFCL sample → single-turn samples."""
+    funcs = raw.get("function") or raw.get("functions") or []
+    if isinstance(funcs, dict):
+        funcs = [funcs]
+    tools = _normalize_tools(funcs)
+    tid = raw.get("id", f"bfcl-{category}")
+
+    # Skip auxiliary files
+    if category.startswith("possible_answer/") or category.startswith("multi_turn_func_doc/"):
+        return []
+
+    turns_data = _extract_bfcl_turns(raw.get("question"))
+    if turns_data is None:
+        return []
+
+    results = []
+    history: list[dict] = []
+
+    for ti, turn_msgs in enumerate(turns_data):
+        if not isinstance(turn_msgs, list):
+            continue
+        query_text = _extract_text_from_bfcl_messages(turn_msgs)
+        if not query_text:
+            continue
+
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant with access to tools."},
+        ]
+        for h in history[-8:]:
+            msgs.append(dict(h))
+        msgs.append({"role": "user", "content": query_text})
+
+        # Parse ground truth for this turn
+        gt_raw = raw.get("ground_truth") or raw.get("answers") or raw.get("answer") or ""
+        if isinstance(gt_raw, list):
+            gt_str = "\n".join(json.dumps(g, ensure_ascii=False) for g in gt_raw if g) if gt_raw else ""
+        elif isinstance(gt_raw, str):
+            gt_str = gt_raw
+        else:
+            gt_str = str(gt_raw) if gt_raw else ""
+        if gt_str.strip():
+            gt = _parse_qwen_tool_calls(gt_str)
+        else:
+            gt = None  # BFCL has no ground truth — needs RM mode (not migrated)
+
+        results.append(
+            {
+                "messages": msgs,
+                "tools": tools,
+                "label": _format_gt(gt) + (f"\nReference:\n{gt_str[:800]}" if gt_str.strip() else ""),
+                "metadata": _make_meta(
+                    f"bfcl/{category}",
+                    f"{tid}-t{ti}",
+                    tools,
+                    gt,
+                    bfcl_category=category,
+                ),
+            }
+        )
+
+        # Add to history for multi-turn context
+        history.append({"role": "user", "content": query_text})
+        # Look for assistant response in the same turn
+        for msg in turn_msgs:
+            if isinstance(msg, dict) and msg.get("role") == "assistant":
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    history.append({"role": "assistant", "content": content[:500]})
+
+    return results
+
+
+# ============================================================================
+# GitHub raw download helpers (API-Bank / Seal-Tools)
+# ============================================================================
+
+
+def _download(url: str, dest: Path, timeout: int = 120, retries: int = 3) -> Path | None:
+    """Download ``url`` to ``dest`` (skipped if already cached)."""
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                data = resp.read()
+            dest.write_bytes(data)
+            return dest
+        except Exception as e:
+            if attempt == retries - 1:
+                logger.warning("Download failed %s: %s", url, e)
+                return None
+    return None
+
+
+def _github_tree(repo: str, branch: str = "main") -> list[str]:
+    """List all blob paths of a GitHub repo (cached in ``_CACHE_DIR``)."""
+    cache = _CACHE_DIR / f"tree-{repo.replace('/', '-')}.json"
+    url = f"https://api.github.com/repos/{repo}/git/trees/{branch}?recursive=1"
+    path = _download(url, cache, timeout=180)
+    if path is None:
+        return []
+    try:
+        tree = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    return [t["path"] for t in tree.get("tree", []) if t.get("type") == "blob"]
+
+
+def _fetch_raw(repo: str, relpath: str, branch: str = "main", timeout: int = 120) -> str | None:
+    """Fetch one raw file from GitHub (cached in ``_CACHE_DIR``)."""
+    cache = _CACHE_DIR / "raw" / repo / relpath
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{relpath}"
+    path = _download(url, cache, timeout=timeout)
+    if path is None:
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _fetch_raw_many(repo: str, relpaths: list[str], branch: str = "main", workers: int = 12) -> dict[str, str]:
+    """Fetch many small raw files concurrently; skips failures."""
+    out: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = pool.map(lambda p: (p, _fetch_raw(repo, p, branch)), relpaths)
+        for p, text in results:
+            if text is not None:
+                out[p] = text
+    return out
+
+
+def _pick_distractors(
+    pool: list[dict[str, Any]], exclude: set[str], n: int, rng: random.Random
+) -> list[dict[str, Any]]:
+    """Sample up to ``n`` tool schemas whose names are not in ``exclude``."""
+    candidates = [t for t in pool if t.get("name") not in exclude]
+    rng.shuffle(candidates)
+    return candidates[:n]
+
+
+# ============================================================================
+# API-Bank loader (multi-turn dialogues → single-turn samples)
+# ============================================================================
+#
+# API-Bank (AlibabaResearch/DAMO-ConvAI, ``api-bank/``) defines its APIs as
+# Python classes with ``description`` and ``input_parameters`` class
+# attributes (``api-bank/apis/*.py``), and multi-turn dialogues in
+# ``lv1-lv2-samples/level-1-given-desc/*.jsonl``.  Each dialogue line is one
+# turn: ``{"role": "User"|"AI", "text": ...}`` or
+# ``{"role": "API", "api_name": ..., "param_dict": ..., "result": ...}``.
+#
+# Only the pure level-1 dialogues (single target API, description given) are
+# used; level-2/3 samples rely on ToolSearcher / multi-API chains.  Every API
+# turn becomes one single-turn sample: the preceding User/AI turns form the
+# prompt (earlier API results are wrapped as ``<tool_response>`` user turns,
+# like ToolACE), the API call is the ground truth.  A few distractor schemas
+# from other APIs keep tool selection non-trivial.
+
+_API_BANK_REPO = "AlibabaResearch/DAMO-ConvAI"
+_API_BANK_TYPE_MAP = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "dict": "object",
+}
+
+
+def _parse_apibank_api_py(source: str) -> dict[str, Any] | None:
+    """Extract a tool schema from an API-Bank API class definition."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        description = ""
+        input_params: dict[str, Any] = {}
+        for stmt in node.body:
+            if not isinstance(stmt, ast.Assign):
+                continue
+            target = stmt.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if target.id == "description":
+                try:
+                    description = ast.literal_eval(stmt.value)
+                except (ValueError, SyntaxError):
+                    pass
+            elif target.id == "input_parameters":
+                try:
+                    input_params = ast.literal_eval(stmt.value)
+                except (ValueError, SyntaxError):
+                    pass
+        if not description and not input_params:
+            continue
+        properties = {}
+        for pname, pinfo in (input_params or {}).items():
+            if not isinstance(pinfo, dict):
+                continue
+            ptype = _API_BANK_TYPE_MAP.get(
+                str(pinfo.get("type", "str")).lower(),
+                "string",
+            )
+            properties[pname] = {
+                "type": ptype,
+                "description": str(pinfo.get("description", "")),
+            }
+        return {
+            "name": node.name,
+            "description": str(description),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": sorted(properties),
+            },
+        }
+    return None
+
+
+def load_apibank(max_samples: int) -> list[dict[str, Any]]:
+    """Load API-Bank level-1 dialogues as single-turn samples."""
+    logger.info("Loading API-Bank (%s)...", _API_BANK_REPO)
+    files = _github_tree(_API_BANK_REPO)
+    if not files:
+        logger.warning("API-Bank: repo tree unavailable")
+        return []
+
+    api_py_files = [
+        f
+        for f in files
+        if re.fullmatch(r"api-bank/apis/\w+\.py", f) and not f.endswith(("__init__.py", "api.py", "tool_search.py"))
+    ]
+    dialogue_files = [
+        f
+        for f in files
+        if f.startswith("api-bank/lv1-lv2-samples/level-1-given-desc/") and re.search(r"-level-1-\d+\.jsonl$", f)
+    ]
+    logger.info(
+        "API-Bank: %d API definitions, %d level-1 dialogues",
+        len(api_py_files),
+        len(dialogue_files),
+    )
+
+    schemas: dict[str, dict[str, Any]] = {}
+    for path, source in _fetch_raw_many(_API_BANK_REPO, api_py_files).items():
+        schema = _parse_apibank_api_py(source)
+        if schema:
+            schemas[schema["name"]] = schema
+    logger.info("API-Bank: parsed %d tool schemas", len(schemas))
+    if not schemas:
+        return []
+
+    rng = random.Random(_SEED)
+    pool = list(schemas.values())
+    tasks: list[dict[str, Any]] = []
+
+    for path, text in sorted(_fetch_raw_many(_API_BANK_REPO, dialogue_files).items()):
+        if len(tasks) >= max_samples:
+            break
+        turns = []
+        for line in text.splitlines():
+            try:
+                turns.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        history: list[dict] = []
+        n_calls = 0
+        for turn in turns:
+            if len(tasks) >= max_samples:
+                break
+            role = turn.get("role")
+            if role == "User":
+                history.append({"role": "user", "content": str(turn.get("text", ""))})
+            elif role == "AI":
+                history.append({"role": "assistant", "content": str(turn.get("text", ""))[:800]})
+            elif role == "API":
+                api_name = turn.get("api_name", "")
+                params = turn.get("param_dict") or {}
+                result = turn.get("result") or {}
+                if api_name in schemas and isinstance(params, dict):
+                    # Truncate long history, but keep the conversation
+                    # starting on a user turn (drop leading assistant /
+                    # tool_response fragments left by the cut).
+                    ctx = [dict(h) for h in history[-8:]]
+                    while ctx and ctx[0]["role"] != "user":
+                        ctx.pop(0)
+                    if not ctx:
+                        continue
+                    messages = [{"role": "system", "content": _GENERIC_TOOL_SYSTEM}]
+                    messages.extend(ctx)
+                    if any(m["role"] == "user" for m in messages):
+                        gt = [{"name": api_name, "arguments": params}]
+                        gt_names = {api_name}
+                        tools = [schemas[api_name]] + _pick_distractors(
+                            pool,
+                            gt_names,
+                            _N_DISTRACTORS,
+                            rng,
+                        )
+                        rng.shuffle(tools)
+                        n_calls += 1
+                        tasks.append(
+                            {
+                                "messages": messages,
+                                "tools": _normalize_tools(tools),
+                                "label": _format_gt(gt),
+                                "metadata": _make_meta(
+                                    "apibank",
+                                    f"apibank-{Path(path).stem}-c{n_calls}",
+                                    tools,
+                                    gt,
+                                ),
+                            }
+                        )
+                # Inject the API result so later calls in the same dialogue
+                # (e.g. token-dependent ones) stay grounded.
+                output = result.get("output") if isinstance(result, dict) else result
+                history.append(
+                    {
+                        "role": "user",
+                        "content": f"<tool_response>\n{json.dumps(output, ensure_ascii=False)[:500]}\n</tool_response>",
+                    }
+                )
+
+    logger.info("API-Bank: %d single-turn samples", len(tasks))
+    return tasks
+
+
+# ============================================================================
+# Seal-Tools loader (single-turn query + calling, tools from tool.jsonl)
+# ============================================================================
+#
+# Seal-Tools (fairyshine/Seal-Tools, ``Seal-Tools_Dataset/``) provides ~4k
+# tool schemas in ``tool.jsonl`` (``api_name``/``api_description``/
+# ``parameters``/``required``/``field``) and single-turn training queries in
+# ``train.jsonl`` (``{"id", "query", "calling": [{"api", "parameters",
+# "responses"}]}``).  Samples whose call parameters reference another call's
+# output (``"API_call_N"``, nested calls) are dropped — the pipeline is
+# single-turn with no execution.  Distractors are drawn from the same
+# ``field`` first (hard, same-category negatives), then the global pool.
+# Sibling tools that are indistinguishable from the label tool (e.g.
+# ``getMatchInfo`` / ``getFootballMatchInfo``: same field, identical
+# description) stay in the menu on purpose — the reward accepts either, see
+# ``reward/verifier.py:_tool_equivalence``.
+
+_SEAL_TOOLS_REPO = "fairyshine/Seal-Tools"
+_SEAL_TOOLS_TYPE_MAP = {
+    "str": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "list": "array",
+    "dict": "object",
+}
+
+
+def _sealtools_schema(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert one ``tool.jsonl`` entry to a normalised tool schema."""
+    name = raw.get("api_name", "")
+    if not name:
+        return None
+    properties = {}
+    for pname, pinfo in (raw.get("parameters") or {}).items():
+        if not isinstance(pinfo, dict):
+            continue
+        ptype = _SEAL_TOOLS_TYPE_MAP.get(
+            str(pinfo.get("type", "str")).lower(),
+            "string",
+        )
+        properties[pname] = {
+            "type": ptype,
+            "description": str(pinfo.get("description", "")),
+        }
+    return {
+        "name": name,
+        "description": str(raw.get("api_description", "")),
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": sorted(raw.get("required") or properties),
+        },
+    }
+
+
+def load_sealtools(max_samples: int) -> list[dict[str, Any]]:
+    """Load Seal-Tools train split as single-turn samples."""
+    logger.info("Loading Seal-Tools (%s)...", _SEAL_TOOLS_REPO)
+    tool_text = _fetch_raw(
+        _SEAL_TOOLS_REPO,
+        "Seal-Tools_Dataset/tool.jsonl",
+        branch="master",
+        timeout=300,
+    )
+    train_text = _fetch_raw(
+        _SEAL_TOOLS_REPO,
+        "Seal-Tools_Dataset/train.jsonl",
+        branch="master",
+        timeout=600,
+    )
+    if not tool_text or not train_text:
+        logger.warning("Seal-Tools: download failed")
+        return []
+
+    schemas: dict[str, dict[str, Any]] = {}
+    fields: dict[str, list[str]] = {}
+    for line in tool_text.splitlines():
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        schema = _sealtools_schema(raw)
+        if schema:
+            schemas[schema["name"]] = schema
+            fields.setdefault(str(raw.get("field", "")), []).append(schema["name"])
+    logger.info("Seal-Tools: %d tools in %d fields", len(schemas), len(fields))
+
+    rng = random.Random(_SEED)
+    pool = list(schemas.values())
+    tasks: list[dict[str, Any]] = []
+    n_nested = 0
+
+    for line in train_text.splitlines():
+        if len(tasks) >= max_samples:
+            break
+        try:
+            sample = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        query = sample.get("query", "")
+        calling = sample.get("calling") or []
+        if not query or not calling:
+            continue
+
+        gt = []
+        nested = False
+        for call in calling:
+            api = call.get("api", "")
+            params = call.get("parameters") or {}
+            if api not in schemas or not isinstance(params, dict):
+                nested = True
+                break
+            if any(isinstance(v, str) and "API_call" in v for v in params.values()):
+                nested = True
+                break
+            gt.append({"name": api, "arguments": params})
+        if nested or not gt:
+            n_nested += 1
+            continue
+
+        gt_names = {c["name"] for c in gt}
+        # Hard distractors first: same-field tools (similar functionality).
+        # Dedup by name — several GT tools may share one field, which would
+        # otherwise add the field's tools once per GT tool (duplicates could
+        # both be sampled, declaring the same tool twice in the prompt).
+        same_field: dict[str, dict[str, Any]] = {}
+        for name in gt_names:
+            field = next((f for f, names in fields.items() if name in names), None)
+            if field:
+                for n in fields[field]:
+                    if n in schemas:
+                        same_field.setdefault(n, schemas[n])
+        distractors = _pick_distractors(list(same_field.values()), gt_names, _N_DISTRACTORS, rng)
+        if len(distractors) < _N_DISTRACTORS:
+            distractors += _pick_distractors(
+                pool,
+                gt_names | {d["name"] for d in distractors},
+                _N_DISTRACTORS - len(distractors),
+                rng,
+            )
+        tools = [schemas[n] for n in sorted(gt_names)] + distractors
+        rng.shuffle(tools)
+
+        messages = [
+            {"role": "system", "content": _GENERIC_TOOL_SYSTEM},
+            {"role": "user", "content": query},
+        ]
+        tasks.append(
+            {
+                "messages": messages,
+                "tools": _normalize_tools(tools),
+                "label": _format_gt(gt),
+                "metadata": _make_meta(
+                    "sealtools",
+                    str(sample.get("id", f"sealtools-{len(tasks)}")),
+                    tools,
+                    gt,
+                ),
+            }
+        )
+
+    logger.info(
+        "Seal-Tools: %d samples (dropped %d nested/unresolvable)",
+        len(tasks),
+        n_nested,
+    )
+    return tasks
+
+
+# ============================================================================
+# Tool extraction
+# ============================================================================
+
+
+def _extract_tools_from_text(text: str) -> list[dict[str, Any]]:
+    """Extract tool definitions from system prompt text."""
+    tools = []
+    # Try to find the outermost JSON array of tools in the text
+    array_match = re.search(r"\[.*\]", text, re.DOTALL)
+    if array_match:
+        try:
+            candidates = json.loads(array_match.group(0))
+            if isinstance(candidates, list):
+                for c in candidates:
+                    if isinstance(c, dict) and "name" in c:
+                        tools.append(c)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    # Fallback: try extracting individual objects with nested braces
+    if not tools:
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    block = text[start : i + 1]
+                    try:
+                        obj = json.loads(block)
+                        if isinstance(obj, dict) and "name" in obj:
+                            tools.append(obj)
+                    except json.JSONDecodeError:
+                        pass
+                    start = -1
+    return tools
+
+
+def _parse_qwen_tool_calls(text: str) -> list[dict[str, Any]]:
+    """Parse Qwen XML tool calls from assistant response.
+
+    Format::
+
+        <tool_call>
+        <function=name>
+        <parameter=param>
+        value
+        </parameter>
+        </function>
+        </tool_call>
+    """
+    calls = []
+    for tc_match in re.finditer(
+        r"<tool_call>\s*(.*?)\s*</tool_call>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        block = tc_match.group(1)
+        # Parse function name — allow spaces/dots (e.g. ToolACE's
+        # "Get Competition Standings"); ``\w[\w.]*`` used to drop those.
+        func_match = re.search(r"<function=([^>\n]+?)\s*>", block)
+        if not func_match:
+            continue
+        func_name = func_match.group(1).strip()
+
+        # Parse parameters
+        args = {}
+        for pm in re.finditer(
+            r"<parameter=(\w+)>\s*(.*?)\s*</parameter>",
+            block,
+            re.DOTALL,
+        ):
+            pname = pm.group(1)
+            pval = pm.group(2).strip()
+            # Try JSON parse for structured values
+            try:
+                pval = json.loads(pval)
+            except (json.JSONDecodeError, TypeError):
+                pass
+            args[pname] = pval
+
+        calls.append({"name": func_name, "arguments": args})
+
+    # Fallback: JSON tool calls — bracket-matching handles nested args
+    if not calls:
+        depth = 0
+        start = -1
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(text[start : i + 1])
+                        if isinstance(obj, dict) and "name" in obj:
+                            calls.append(obj)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    start = -1
+
+    return calls
+
+
+# ============================================================================
+# Data augmentation — negative samples & robustness perturbations
+# ============================================================================
+#
+# Motivation: the raw datasets are (almost) all positive samples — the label
+# always contains the "correct" tool calls, which encourages shortcut learning
+# (memorising parameter names, copying schema defaults, blindly calling a
+# tool whose *name* matches the query).  To counter this, a fraction of the
+# samples with ground-truth tool calls is perturbed in one of four ways:
+#
+#   1a. tool_rename     — rename a label tool in the prompt (description
+#                         unchanged); the label follows the new name.
+#                         Teaches: bind to the description, not the name.
+#   1b. desc_replace    — replace a label tool's description with an
+#                         unrelated one; the label becomes empty (no tool
+#                         should be called).  This is the negative sample:
+#                         match_tool_calls_against_label() already penalises
+#                         spurious calls when the label is empty.
+#   2.  param_rename    — rename parameter names in the tool schema; the
+#                         label's argument keys follow (values unchanged).
+#                         Teaches: read parameter descriptions, don't
+#                         memorise canonical parameter names.
+#   3.  default_shuffle — randomise ``default`` values in the tool schema.
+#                         Teaches: don't copy schema defaults into calls.
+#
+#   4.  missing_info    — *select* positive samples whose label argument
+#                         values cannot be derived from the prompt (the
+#                         generator-invented slots, e.g. ``name='John'``
+#                         for a query that never mentions a name); empty
+#                         the label so the desired behaviour becomes
+#                         asking the user for the missing value.  These
+#                         are the BFCL miss_func/miss_param-style
+#                         negatives: calling the (still declared, still
+#                         fitting) tool is now spurious, and a fabricated
+#                         direct answer keeps the guess penalty.
+#
+# Each augmented sample gets ``metadata["augmented"] = <strategy>``.
+
+# Unrelated tool names used for renames — clearly off-topic for typical
+# function-calling queries, but with the original description kept they
+# remain the "correct" tool under a new name.
+_IRRELEVANT_TOOL_NAMES = [
+    "blend_smoothie_recipe",
+    "translate_morse_code",
+    "calculate_mortgage_rate",
+    "compose_haiku_poem",
+    "render_star_chart",
+    "tune_guitar_strings",
+    "estimate_paint_coverage",
+    "decode_vin_number",
+]
+
+# Unrelated descriptions used for desc_replace — after the swap the tool is
+# no longer suitable for the query, so the correct behaviour is *no* call.
+_IRRELEVANT_DESCRIPTIONS = [
+    "Render a 3D animation of a rotating geometric shape.",
+    "Compose a short poem about the changing seasons.",
+    "Estimate the calorie count of a dish from its photo.",
+    "Generate chord progressions for a given musical key.",
+    "Simulate the orbit of a satellite around a planet.",
+    "Design a knitting pattern for a winter scarf.",
+]
+
+# Tool names whose result is a deterministic function of the query — the
+# model can legitimately produce the answer itself (no external data
+# needed).  Used to tag derived negatives as "answerable direct": after
+# desc_replace / no_tools removes the tool, computing the answer manually
+# is good behaviour, not a blind guess.
+_SELF_COMPUTABLE_TOOL_RE = re.compile(
+    r"calc|comput|math|convert|translat|encod|decod|cipher|hash|morse"
+    r"|roman|base64|unit_",
+    re.IGNORECASE,
+)
+
+# Queries answerable by pure computation (the model can work them out
+# manually).  Conservative about dates/phone numbers: a bare "-" between
+# digits does NOT count; spaced arithmetic operators do.
+_SELF_COMPUTABLE_QUERY_RE = re.compile(
+    r"\d\s*[+*/×÷^]\s*\d"
+    r"|\d\s+-\s+\d"
+    r"|\d\s*%\s*of\s*\d"
+    r"|\b(?:calculate|compute|evaluate|how much is|square root of)\b[^.?!]*\d",
+    re.IGNORECASE,
+)
+
+# Generic parameter names used for param_rename.
+_GENERIC_PARAM_NAMES = [
+    "input_value",
+    "query_text",
+    "target_item",
+    "config_option",
+    "content_body",
+    "request_field",
+    "user_option",
+    "item_reference",
+]
+
+
+# ============================================================================
+# missing_info — argument-value provenance analysis
+# ============================================================================
+#
+# A label argument value that the model cannot derive from the prompt turns
+# "call the tool" into "guess the value".  The synthetic generators (APIGen /
+# ToolACE / Seal-Tools) produce these by construction: the query is written
+# *after* the call, so slots like ``name='John'`` need never surface in the
+# user's words.  ``_missing_arg_value`` finds them and
+# ``_augment_missing_info`` converts such samples into ask-the-user negatives.
+
+
+def _norm_tokens(text: Any) -> set[str]:
+    """Lowercase alphanumeric word tokens of ``text`` (for provenance tests)."""
+    return set(re.findall(r"[a-z0-9]+", str(text).lower()))
+
+
+# YYYY-MM-DD — a value the model may legitimately *derive* when the query
+# gives a relative date ("May 20th" with a known context year), so it does
+# not count as missing information.  It is deliberately impossible to know
+# whether the query's context pins the year, so treat derivable-shaped
+# values as present rather than teach abstention on a resolvable ask.
+_DATE_VALUE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _missing_arg_value(task: dict) -> tuple[str, str, Any] | None:
+    """First label argument value that is absent from the entire prompt.
+
+    "Absent" = no token of the value appears in the query, the non-user
+    history (assistant / tool_response turns), the tool schemas (defaults,
+    enums, examples), or as a partial token overlap with the query — the
+    places a policy could legitimately read the value from.  Date-shaped
+    values are exempt (derivable from a relative date, see
+    ``_DATE_VALUE_RE``).
+
+    Returns ``(tool_name, param_name, value)`` or ``None``.
+    """
+    query_tokens: set[str] = set()
+    other_tokens: set[str] = set()
+    for m in task.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, str):
+            continue
+        if m.get("role") == "user":
+            query_tokens |= _norm_tokens(content)
+        else:
+            other_tokens |= _norm_tokens(content)
+    schema_tokens: set[str] = set()
+    for tool_list in (task.get("tools"), task.get("metadata", {}).get("tools")):
+        for t in tool_list or []:
+            if isinstance(t, dict):
+                schema_tokens |= _norm_tokens(json.dumps(t, ensure_ascii=False))
+
+    gt = task.get("metadata", {}).get("ground_truth")
+    if not isinstance(gt, list):
+        return None
+    for call in gt:
+        if not isinstance(call, dict):
+            continue
+        for pname, value in (call.get("arguments") or {}).items():
+            tokens = _norm_tokens(value)
+            if not tokens or tokens & query_tokens:
+                continue
+            if tokens <= other_tokens or tokens <= schema_tokens:
+                continue
+            if _DATE_VALUE_RE.fullmatch(str(value).strip()):
+                continue
+            return (str(call.get("name", "")), str(pname), value)
+    return None
+
+
+def _augment_missing_info(task: dict, rng: random.Random) -> str | None:
+    """Strategy 4: convert a missing-slot positive into an ask-the-user negative.
+
+    The declared tools still fit the query — only a required value is
+    unknowable — so the schema is left untouched and the label becomes
+    ``[]``: the desired behaviour is asking the user for the missing
+    value (``REQUEST_INFO``), while calling the tool with a fabricated
+    value or guessing a direct answer keep their penalties.
+    """
+    missing = _missing_arg_value(task)
+    if missing is None:
+        return None
+    tool_name, pname, value = missing
+
+    task["label"] = ""
+    task["metadata"]["ground_truth"] = []
+    task["metadata"]["has_ground_truth"] = False
+    task["metadata"]["augmented"] = "missing_info"
+    task["metadata"]["augment_detail"] = {"tool": tool_name, "param": pname, "value": value}
+    return "missing_info"
+
+
+def _augment_tool_copies(task: dict, name: str):
+    """Yield every schema copy of tool ``name`` (top-level + metadata).
+
+    Tasks carry two independent normalised copies of the tool list —
+    ``task["tools"]`` and ``task["metadata"]["tools"]``.  Both must stay in
+    sync under any mutation.
+    """
+    seen = set()
+    for tool_list in (task.get("tools"), task.get("metadata", {}).get("tools")):
+        if not isinstance(tool_list, list):
+            continue
+        for t in tool_list:
+            if isinstance(t, dict) and t.get("name") == name and id(t) not in seen:
+                seen.add(id(t))
+                yield t
+
+
+def _label_tool_candidates(task: dict) -> list[str]:
+    """Names of tools that appear both in the label and in the prompt."""
+    gt = task.get("metadata", {}).get("ground_truth")
+    if not isinstance(gt, list) or not gt:
+        return []
+    label_names = {c.get("name") for c in gt if isinstance(c, dict) and c.get("name")}
+    prompt_names = {t.get("name") for t in (task.get("tools") or []) if isinstance(t, dict) and t.get("name")}
+    return sorted(label_names & prompt_names)
+
+
+def _rename_in_text(text: str, old: str, new: str) -> str:
+    return re.sub(r"\b" + re.escape(old) + r"\b", new, text)
+
+
+def _rename_in_messages(messages: list[dict], old: str, new: str) -> None:
+    """Keep embedded tool references (system prompt / history) consistent."""
+    for m in messages:
+        content = m.get("content")
+        if isinstance(content, str) and old in content:
+            m["content"] = _rename_in_text(content, old, new)
+
+
+def _augment_tool_rename(task: dict, rng: random.Random) -> str | None:
+    """Strategy 1a: rename a label tool in the prompt; label follows."""
+    candidates = _label_tool_candidates(task)
+    if not candidates:
+        return None
+    old = rng.choice(candidates)
+    existing = {t.get("name") for t in (task.get("tools") or []) if isinstance(t, dict)}
+    pool = [n for n in _IRRELEVANT_TOOL_NAMES if n not in existing]
+    if not pool:
+        return None
+    new = rng.choice(pool)
+
+    for t in _augment_tool_copies(task, old):
+        t["name"] = new
+    gt = task["metadata"]["ground_truth"]
+    for call in gt:
+        if isinstance(call, dict) and call.get("name") == old:
+            call["name"] = new
+    _rename_in_messages(task.get("messages") or [], old, new)
+    if isinstance(task.get("label"), str) and old in task["label"]:
+        task["label"] = _rename_in_text(task["label"], old, new)
+
+    task["metadata"]["augmented"] = "tool_rename"
+    task["metadata"]["augment_detail"] = {"old": old, "new": new}
+    return "tool_rename"
+
+
+def _augment_desc_replace(task: dict, rng: random.Random) -> str | None:
+    """Strategy 1b: swap a label tool's description for an unrelated one.
+
+    After the swap no declared tool fits the query, so this becomes a
+    **negative sample**: ground_truth is emptied (``[]``, not ``None`` —
+    the reward distinguishes "label says no tools" from "no label").
+
+    Declared tools that are indistinguishable from the label tool (identical
+    description — Seal-Tools' ``getMatchInfo`` / ``getFootballMatchInfo``)
+    would still answer the query, so their descriptions are swapped too.
+    Otherwise the label would punish a call the query invites.
+    """
+    candidates = _label_tool_candidates(task)
+    if not candidates:
+        return None
+    name = rng.choice(candidates)
+
+    descriptions = {
+        t.get("name"): str(t.get("description", "")).strip().lower() for t in (task.get("tools") or []) if t.get("name")
+    }
+    label_description = descriptions.get(name, "")
+    siblings = sorted(n for n, d in descriptions.items() if n != name and label_description and d == label_description)
+
+    # Distinct unrelated descriptions keep the swapped tools distinguishable
+    # from one another as well.
+    pool = list(_IRRELEVANT_DESCRIPTIONS)
+    rng.shuffle(pool)
+    for i, target in enumerate([name, *siblings]):
+        replacement = pool[i % len(pool)]
+        for t in _augment_tool_copies(task, target):
+            t["description"] = replacement
+
+    task["label"] = ""
+    task["metadata"]["ground_truth"] = []
+    task["metadata"]["has_ground_truth"] = False
+    task["metadata"]["augmented"] = "desc_replace"
+    task["metadata"]["augment_detail"] = {"tool": name, "siblings": siblings}
+    if _SELF_COMPUTABLE_TOOL_RE.search(name):
+        # The original tool was a deterministic computation (e.g. a
+        # calculator): after the swap the model can still answer the
+        # query by working it out manually — tag the sample so the
+        # reward does not guess-penalise a self-computed answer.
+        task["metadata"]["answerable_direct"] = True
+    return "desc_replace"
+
+
+def _augment_param_rename(task: dict, rng: random.Random) -> str | None:
+    """Strategy 2: rename schema parameter names; label keys follow."""
+    candidates = _label_tool_candidates(task)
+    if not candidates:
+        return None
+    rng.shuffle(candidates)
+
+    for name in candidates:
+        # Collect the union of schema properties across both copies.
+        props: dict[str, Any] = {}
+        for t in _augment_tool_copies(task, name):
+            params = t.get("parameters")
+            if isinstance(params, dict) and isinstance(params.get("properties"), dict):
+                props.update(params["properties"])
+        if not props:
+            continue
+
+        gt = task["metadata"]["ground_truth"]
+        gt_arg_keys = {
+            k for c in gt if isinstance(c, dict) and c.get("name") == name for k in (c.get("arguments") or {})
+        }
+        # Prefer renaming a parameter that the label actually uses.
+        choices = sorted(gt_arg_keys & set(props)) or sorted(props)
+        old = rng.choice(choices)
+        pool = [p for p in _GENERIC_PARAM_NAMES if p not in props]
+        if not pool:
+            continue
+        new = rng.choice(pool)
+
+        for t in _augment_tool_copies(task, name):
+            params = t.get("parameters")
+            if not isinstance(params, dict):
+                continue
+            p = params.get("properties")
+            if isinstance(p, dict) and old in p:
+                p[new] = p.pop(old)
+            req = params.get("required")
+            if isinstance(req, list):
+                params["required"] = [new if r == old else r for r in req]
+
+        for call in gt:
+            if isinstance(call, dict) and call.get("name") == name:
+                args = call.get("arguments")
+                if isinstance(args, dict) and old in args:
+                    args[new] = args.pop(old)
+
+        if isinstance(task.get("label"), str) and old in task["label"]:
+            task["label"] = _rename_in_text(task["label"], old, new)
+
+        task["metadata"]["augmented"] = "param_rename"
+        task["metadata"]["augment_detail"] = {"tool": name, "old": old, "new": new}
+        return "param_rename"
+    return None
+
+
+def _random_default_value(old: Any, ptype: str, rng: random.Random) -> Any:
+    """Random replacement for a schema ``default``, kept type-compatible."""
+    for _ in range(8):
+        if ptype == "integer":
+            v: Any = rng.randint(-1000, 1000)
+        elif ptype == "number":
+            v = round(rng.uniform(-1000, 1000), 2)
+        elif ptype == "boolean":
+            v = not old if isinstance(old, bool) else rng.random() < 0.5
+        elif ptype == "array":
+            v = []
+        elif ptype == "object":
+            v = {}
+        else:  # string / unknown
+            v = "".join(rng.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=8))
+        if v != old:
+            return v
+    return None
+
+
+def _augment_default_shuffle(task: dict, rng: random.Random) -> str | None:
+    """Strategy 3: randomise ``default`` values in the tool schema."""
+    changed: list[str] = []
+    for tool_list in (task.get("tools"), task.get("metadata", {}).get("tools")):
+        if not isinstance(tool_list, list):
+            continue
+        for t in tool_list:
+            if not isinstance(t, dict):
+                continue
+            params = t.get("parameters")
+            if not isinstance(params, dict) or not isinstance(params.get("properties"), dict):
+                continue
+            for pinfo in params["properties"].values():
+                if not isinstance(pinfo, dict) or "default" not in pinfo:
+                    continue
+                v = _random_default_value(
+                    pinfo["default"],
+                    str(pinfo.get("type", "string")),
+                    rng,
+                )
+                if v is not None:
+                    pinfo["default"] = v
+                    if t.get("name") not in changed:
+                        changed.append(t.get("name"))
+
+    if not changed:
+        return None
+    task["metadata"]["augmented"] = "default_shuffle"
+    task["metadata"]["augment_detail"] = {"tools": changed}
+    return "default_shuffle"
+
+
+_AUGMENT_STRATEGIES = (
+    _augment_tool_rename,
+    _augment_desc_replace,
+    _augment_param_rename,
+    _augment_default_shuffle,
+    _augment_missing_info,
+)
+
+
+def augment_tasks(
+    tasks: list[dict[str, Any]],
+    ratio: float,
+    rng: random.Random,
+) -> int:
+    """Perturb a ``ratio`` fraction of positive samples (label has tool calls).
+
+    Each selected sample is mutated in place by the first applicable
+    strategy from a shuffled order.  Returns the number of augmented tasks.
+    """
+    if ratio <= 0 or not tasks:
+        return 0
+
+    eligible = [
+        i
+        for i, t in enumerate(tasks)
+        if isinstance(t.get("metadata", {}).get("ground_truth"), list) and t["metadata"]["ground_truth"]
+    ]
+    rng.shuffle(eligible)
+    target = max(1, round(len(tasks) * ratio))
+
+    augmented = 0
+    for i in eligible[:target]:
+        strategies = list(_AUGMENT_STRATEGIES)
+        rng.shuffle(strategies)
+        for strategy in strategies:
+            if strategy(tasks[i], rng) is not None:
+                augmented += 1
+                break
+    return augmented
+
+
+def augment_missing_info_tasks(tasks: list[dict], ratio: float, rng: random.Random) -> int:
+    """Convert positives to ask-negatives until they hold ``ratio`` of negatives.
+
+    ``ratio`` is the desired **share of the final negative pool** (e.g.
+    ``0.40`` → missing_info should be ~40% of all negatives), not a fraction
+    of all samples.  Eligible = positive, not already augmented, and
+    carrying at least one label argument value absent from the prompt (see
+    :func:`_missing_arg_value`).  Eligible positives are converted until the
+    projected share reaches the target; when the pool runs out, everything
+    eligible is converted and a warning says what share is achievable.
+    """
+    if ratio <= 0 or not tasks:
+        return 0
+    eligible = [
+        i
+        for i, t in enumerate(tasks)
+        if isinstance(t.get("metadata", {}).get("ground_truth"), list)
+        and t["metadata"]["ground_truth"]
+        and not t.get("metadata", {}).get("augmented")
+        and _missing_arg_value(t) is not None
+    ]
+    rng.shuffle(eligible)
+    n_neg = sum(_is_negative(t) for t in tasks)
+    # Fixed point: converting k positives keeps the total constant, so the
+    # negative pool after conversion is (n_neg + k) and k must satisfy
+    # k = ratio * (n_neg + k)  →  k = ratio/(1-ratio) * n_neg.
+    target = round(n_neg * ratio / max(1e-9, 1.0 - ratio))
+    target = min(target, len(eligible))
+
+    converted = 0
+    for i in eligible[:target]:
+        if _augment_missing_info(tasks[i], rng) is not None:
+            converted += 1
+    full_target = round(n_neg * ratio / max(1e-9, 1.0 - ratio))
+    if converted < full_target:
+        logger.warning(
+            "missing_info: eligible pool exhausted at %d conversions — "
+            "projected share %.1f%% of negatives is below the %.0f%% target",
+            converted,
+            100 * converted / max(1, n_neg + converted),
+            100 * ratio,
+        )
+    return converted
+
+
+# ============================================================================
+# Negative-sample mix control
+# ============================================================================
+
+
+def _is_negative(task: dict) -> bool:
+    """Label says "no tools needed" (``[]`` — not to be confused with no label)."""
+    gt = task.get("metadata", {}).get("ground_truth")
+    return isinstance(gt, list) and not gt
+
+
+def strip_tool_declarations(tasks: list[dict], ratio: float, rng: random.Random) -> int:
+    """Blank the tool list of a fraction of *original* negatives.
+
+    Produces the "no tools declared" negative type: the prompt offers no
+    tools at all, so the correct behaviour is to say so / ask for info.
+    Only untouched negatives are eligible — ``desc_replace`` samples keep
+    their (now unsuitable) declarations by design.  Both tool copies
+    (``task["tools"]`` and ``task["metadata"]["tools"]``) are blanked so
+    ``to_verl_rows`` emits an empty list.
+    """
+    idx = [i for i, t in enumerate(tasks) if _is_negative(t) and not t.get("metadata", {}).get("augmented")]
+    rng.shuffle(idx)
+    target = round(len(idx) * ratio)
+    for i in idx[:target]:
+        tasks[i]["tools"] = []
+        tasks[i]["metadata"]["tools"] = []
+        tasks[i]["metadata"]["augmented"] = "no_tools"
+    return min(target, len(idx))
+
+
+def trim_negatives(
+    tasks: list[dict],
+    neg_ratio: float,
+    rng: random.Random,
+    top_up: bool = True,
+) -> list[dict]:
+    """Adjust the negative share so neg/(neg+pos) ≈ ``neg_ratio``.
+
+    Excess negatives are randomly dropped.  When negatives fall short of the
+    target (e.g. after adding positive-heavy datasets), the deficit is filled
+    by converting untouched positive samples with ``desc_replace`` — the
+    declared tools no longer fit the query, so the label becomes empty.
+    """
+    n_neg = sum(_is_negative(t) for t in tasks)
+    n_pos = len(tasks) - n_neg
+    target = round(n_pos * neg_ratio / max(1e-9, 1.0 - neg_ratio))
+
+    # Top-up: converting a positive into a negative shrinks n_pos, so the
+    # fixed-point target is simply neg_ratio * total (total is unchanged).
+    topup_target = round(len(tasks) * neg_ratio)
+    if n_neg < topup_target and top_up:
+        # Eligible donors: positive samples whose label tool(s) appear in the
+        # prompt (required by desc_replace), not already augmented.
+        donors = [
+            i
+            for i, t in enumerate(tasks)
+            if not _is_negative(t)
+            and isinstance(t.get("metadata", {}).get("ground_truth"), list)
+            and t["metadata"]["ground_truth"]
+            and not t.get("metadata", {}).get("augmented")
+        ]
+        rng.shuffle(donors)
+        topped = 0
+        for i in donors:
+            if n_neg >= topup_target:
+                break
+            if _augment_desc_replace(tasks[i], rng) is not None:
+                n_neg += 1
+                topped += 1
+        if topped:
+            logger.info(
+                "Topped up %d negatives via desc_replace (deficit %d)",
+                topped,
+                topup_target - n_neg,
+            )
+        if n_neg < topup_target:
+            logger.warning(
+                "Negative deficit %d remains (no more convertible positives)",
+                topup_target - n_neg,
+            )
+        # Recompute the trim target against the reduced positive count.
+        n_pos = len(tasks) - n_neg
+        target = round(n_pos * neg_ratio / max(1e-9, 1.0 - neg_ratio))
+
+    if n_neg <= target:
+        logger.info(
+            "Negatives: %d/%d (%.1f%%), target %.0f%% — keeping all",
+            n_neg,
+            len(tasks),
+            100 * n_neg / max(1, len(tasks)),
+            100 * neg_ratio,
+        )
+        return tasks
+    neg_idx = [i for i, t in enumerate(tasks) if _is_negative(t)]
+    rng.shuffle(neg_idx)
+    drop = set(neg_idx[target:])
+    kept = [t for i, t in enumerate(tasks) if i not in drop]
+    logger.info(
+        "Trimmed negatives %d → %d (%.1f%% of %d samples)",
+        n_neg,
+        target,
+        100 * target / len(kept),
+        len(kept),
+    )
+    return kept
+
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+
+def validate_tasks(tasks: list) -> list:
+    valid = []
+    for t in tasks:
+        msgs = t.get("messages", [])
+        if not msgs:
+            continue
+        tools = t.get("tools", t.get("metadata", {}).get("tools", []))
+        if not tools:
+            continue
+        user_content = next(
+            (m["content"] for m in msgs if m.get("role") == "user"),
+            "",
+        )
+        if len(user_content) > 65536:
+            continue
+        valid.append(t)
+    removed = len(tasks) - len(valid)
+    if removed:
+        logger.info("Filtered %d invalid (%d remaining)", removed, len(valid))
+    return valid
+
+
+def tag_answerable_direct_negatives(tasks: list[dict]) -> int:
+    """Tag negatives whose query the model can answer by pure computation.
+
+    Sets ``metadata["answerable_direct"] = True`` on every negative whose
+    last user message looks arithmetic / self-computable, so the reward
+    skips the keyword guess penalty: working out a value manually when no
+    tool fits is legitimate behaviour, not a blind guess.  desc_replace
+    negatives whose original label tool was self-computable are already
+    tagged at augmentation time and counted separately there.
+    """
+    tagged = 0
+    for t in tasks:
+        meta = t.get("metadata", {})
+        if not _is_negative(t) or meta.get("answerable_direct"):
+            continue
+        query = next(
+            (str(m.get("content", "")) for m in reversed(t.get("messages") or []) if m.get("role") == "user"),
+            "",
+        )
+        if query and _SELF_COMPUTABLE_QUERY_RE.search(query):
+            meta["answerable_direct"] = True
+            tagged += 1
+    return tagged
+
+
+# ============================================================================
+# verl schema conversion
+# ============================================================================
+
+
+def to_verl_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert slime task dicts to verl RLHFDataset rows."""
+    rows = []
+    for i, t in enumerate(tasks):
+        meta = t["metadata"]
+        tools = t.get("tools") or meta.get("tools") or []
+        rows.append(
+            {
+                "data_source": _DATA_SOURCE,
+                "prompt": t["messages"],
+                "tools": tools,
+                "reward_model": {"style": "rule", "ground_truth": t.get("label", "")},
+                "extra_info": {
+                    "index": i,
+                    "task_id": meta.get("task_id", f"task-{i}"),
+                    "source": meta.get("source", "unknown"),
+                    "tools": tools,
+                    # Stored as a JSON string: argument keys recur across
+                    # datasets with different value types (e.g. after
+                    # param_rename), which breaks pyarrow's struct type
+                    # unification at parquet write time.  The reward's
+                    # ``_to_dict_list`` parses the string back.
+                    "ground_truth_calls": (
+                        json.dumps(meta["ground_truth"], ensure_ascii=False)
+                        if meta.get("ground_truth") is not None
+                        else None
+                    ),
+                    "augmented": meta.get("augmented", ""),
+                    "answerable_direct": bool(meta.get("answerable_direct")),
+                    # JSON blob of ``augment_detail`` — which slot was
+                    # declared unknowable (tool/param/value) — for offline
+                    # analysis of the missing_info negatives.
+                    "augment_detail": (
+                        json.dumps(meta["augment_detail"], ensure_ascii=False)
+                        if meta.get("augment_detail") is not None
+                        else None
+                    ),
+                },
+            }
+        )
+    return rows
+
+
+def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    # Explicit Arrow schema instead of pandas inference: the ``tools`` column
+    # legitimately mixes fully-populated tool dicts with ``[]`` (no_tools
+    # negatives), which newer pyarrow refuses to unify ("cannot mix list and
+    # non-list").  Declaring list<struct> accepts both and keeps the on-disk
+    # format readable by RLHFDataset.  ``extra_info`` stays a plain JSON
+    # object column via the map<string, string> type — every value it carries
+    # is a str / bool / None after ``to_verl_rows``.
+    schema = pa.schema(
+        [
+            ("data_source", pa.string()),
+            ("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))),
+            (
+                "tools",
+                pa.list_(
+                    pa.struct(
+                        [
+                            ("description", pa.string()),
+                            ("name", pa.string()),
+                            ("parameters", pa.string()),  # JSON blob
+                        ]
+                    )
+                ),
+            ),
+            ("reward_model", pa.struct([("ground_truth", pa.string()), ("style", pa.string())])),
+            ("extra_info", pa.map_(pa.string(), pa.string())),
+        ]
+    )
+
+    def _cell(value: Any) -> str:
+        """Scalar cell for the extra_info map.
+
+        Strings pass through untouched; every other type (bool, list, dict,
+        None …) is JSON-encoded so the map<string,string> column stays
+        uniform.  Booleans become the JSON literals ``true``/``false``.
+        """
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    pyrows = []
+    for r in rows:
+        tools = r.get("tools") or []
+        extra = r.get("extra_info") or {}
+        pyrows.append(
+            {
+                "data_source": r["data_source"],
+                "prompt": [
+                    {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+                    for m in (r["prompt"] or [])
+                    if isinstance(m, dict)
+                ],
+                "tools": [
+                    {
+                        "name": str(t.get("name", "")),
+                        "description": str(t.get("description", "")),
+                        "parameters": _cell(t.get("parameters", {})),
+                    }
+                    for t in tools
+                    if isinstance(t, dict)
+                ],
+                "reward_model": {
+                    "style": str((r.get("reward_model") or {}).get("style", "rule")),
+                    "ground_truth": str((r.get("reward_model") or {}).get("ground_truth") or ""),
+                },
+                # See ``_cell``: non-string leaves are JSON-encoded so the
+                # map<string, string> column stays uniform.
+                "extra_info": [
+                    (str(k), _cell(v)) for k, v in extra.items()
+                ],
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(pyrows, schema=schema), path)
+    logger.info("Wrote %d rows → %s", len(pyrows), path)
+
+
+# ============================================================================
+# Train/val split (conversation-group aware)
+# ============================================================================
+
+
+def _split_group_key(task: dict[str, Any]) -> str:
+    """Conversation-level group key for leakage-free train/val splitting.
+
+    ToolACE ids look like ``toolace-3-t1`` (turn 1 of conversation 3) and
+    API-Bank augments append ``-c<N>``; turns of one conversation must stay
+    in the same split, otherwise near-duplicate context leaks into val.
+    """
+    tid = str(task.get("metadata", {}).get("task_id", ""))
+    return re.sub(r"-[tc]\d+$", "", tid)
+
+
+def group_aware_split(tasks: list[dict[str, Any]], n_val: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split *tasks* into (train, val) without splitting a conversation."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for t in tasks:
+        groups.setdefault(_split_group_key(t), []).append(t)
+    val_tasks: list[dict[str, Any]] = []
+    train_tasks: list[dict[str, Any]] = []
+    for group in groups.values():
+        if len(val_tasks) + len(group) <= n_val:
+            val_tasks.extend(group)
+        else:
+            train_tasks.extend(group)
+    return train_tasks, val_tasks
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download tool-use datasets for Qwen3-4B RL (verl)")
+    parser.add_argument("-o", "--output-dir", required=True)
+    parser.add_argument(
+        "--datasets",
+        default=",".join(_DEFAULT_DATASETS),
+        help="Comma-separated list, or 'all' (= the default "
+        "mix). BFCL is excluded by default (leakage risk); "
+        "pass it explicitly to include it.",
+    )
+    parser.add_argument("--max-samples", type=int, default=_DEFAULT_MAX)
+    parser.add_argument("--seed", type=int, default=_SEED)
+    parser.add_argument(
+        "--val-samples", type=int, default=256, help="Number of samples held out for validation parquet."
+    )
+    parser.add_argument(
+        "--keep-unlabeled",
+        action="store_true",
+        help="Keep samples without structured ground truth (they would need "
+        "the RM reward mode, which is not migrated — by default they are dropped).",
+    )
+    parser.add_argument(
+        "--augment-ratio",
+        type=float,
+        default=0.15,
+        help="Fraction of positive samples to perturb for robustness "
+        "(tool/param renames, negative samples, default shuffle). 0 disables.",
+    )
+    parser.add_argument(
+        "--neg-ratio",
+        type=float,
+        default=0.30,
+        help="Target fraction of negative (no-tool-needed) samples in the "
+        "final mix; excess negatives are randomly dropped, deficits are "
+        "filled by converting positives via desc_replace (see "
+        "--no-neg-topup). 0 disables.",
+    )
+    parser.add_argument(
+        "--no-neg-topup",
+        action="store_true",
+        help="Disable topping up negatives via desc_replace when the negative share falls short of --neg-ratio.",
+    )
+    parser.add_argument(
+        "--no-tool-neg-ratio",
+        type=float,
+        default=0.10,
+        help="Fraction of original negatives stripped of tool declarations "
+        "('no tools declared' negative type). 0 disables.",
+    )
+    parser.add_argument(
+        "--missing-info-ratio",
+        type=float,
+        default=0.40,
+        help="Target share of the negative pool filled by ask-the-user "
+        "negatives (missing_info): positives whose label argument values "
+        "cannot be derived from the prompt are converted (BFCL "
+        "miss_param-style). 0.40 means ~40%% of all negatives should be "
+        "missing_info after conversion; 0 disables. The share may fall "
+        "short when the eligible pool (unknowable-slot positives) runs out.",
+    )
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    names = list(_DEFAULT_DATASETS) if args.datasets == "all" else [n.strip() for n in args.datasets.split(",")]
+
+    loaders = {
+        "apigen": load_apigen,
+        "toolace": load_toolace,
+        "hammer": load_hammer,
+        "bfcl": load_bfcl,
+        "apibank": load_apibank,
+        "sealtools": load_sealtools,
+    }
+
+    all_tasks = []
+    for name in names:
+        if name not in loaders:
+            logger.warning("Unknown %r, available: %s", name, sorted(loaders))
+            continue
+        tasks = loaders[name](args.max_samples)
+        tasks = validate_tasks(tasks)
+        if tasks and args.augment_ratio > 0:
+            n_aug = augment_tasks(
+                tasks,
+                args.augment_ratio,
+                random.Random(args.seed),
+            )
+            logger.info("Augmented %d/%d %s samples", n_aug, len(tasks), name)
+        if tasks:
+            all_tasks.extend(tasks)
+        else:
+            logger.warning("No samples for %s", name)
+
+    if not all_tasks:
+        logger.error("No datasets loaded.")
+        sys.exit(1)
+
+    # RM mode is not migrated: drop samples without structured ground truth.
+    if not args.keep_unlabeled:
+        before = len(all_tasks)
+        all_tasks = [t for t in all_tasks if t.get("metadata", {}).get("ground_truth") is not None]
+        dropped = before - len(all_tasks)
+        if dropped:
+            logger.info(
+                "Dropped %d unlabeled samples (RM mode not migrated; --keep-unlabeled to disable)",
+                dropped,
+            )
+
+    if not all_tasks:
+        logger.error("No labeled samples left after filtering.")
+        sys.exit(1)
+
+    # Ask-the-user negatives: convert positives with unknowable argument
+    # slots (generator-invented values) before the negative-share trim so
+    # the converted samples count towards the target ratio.  The ratio is
+    # the desired share of the negative pool, and the random trim below
+    # drops negatives uniformly, so oversample slightly: converting for a
+    # share s of pre-trim negatives lands at ~s after the trim too.
+    if args.missing_info_ratio > 0:
+        n_missing = augment_missing_info_tasks(
+            all_tasks,
+            args.missing_info_ratio,
+            random.Random(args.seed),
+        )
+        logger.info(
+            "Converted %d positives to ask-negatives (missing_info)",
+            n_missing,
+        )
+
+    # Negative-sample shaping: first strip tool declarations from a small
+    # fraction of negatives ("no tools declared" type), then trim the
+    # overall negative share to the target ratio.
+    if args.no_tool_neg_ratio > 0:
+        n_stripped = strip_tool_declarations(
+            all_tasks,
+            args.no_tool_neg_ratio,
+            random.Random(args.seed),
+        )
+        logger.info(
+            "Stripped tool declarations from %d negatives (no-tools type)",
+            n_stripped,
+        )
+    if args.neg_ratio > 0:
+        all_tasks = trim_negatives(
+            all_tasks,
+            args.neg_ratio,
+            random.Random(args.seed),
+            top_up=not args.no_neg_topup,
+        )
+
+    n_answerable = tag_answerable_direct_negatives(all_tasks)
+    logger.info(
+        "Tagged %d negatives as answerable-direct (self-computable query)",
+        n_answerable,
+    )
+
+    rng = random.Random(args.seed)
+    rng.shuffle(all_tasks)
+
+    n_val = min(args.val_samples, max(0, len(all_tasks) // 10))
+    # Split by conversation group: turns of one ToolACE/API-Bank
+    # conversation must not straddle train/val (near-duplicate leakage).
+    train_tasks, val_tasks = group_aware_split(all_tasks, n_val)
+
+    write_parquet(to_verl_rows(train_tasks), output_dir / "train.parquet")
+    # Always write val.parquet — even when empty — so smoke runs with tiny
+    # datasets don't crash the training script on a missing file.
+    write_parquet(to_verl_rows(val_tasks), output_dir / "val.parquet")
+
+    logger.info("Done! train=%d val=%d → %s", len(train_tasks), len(val_tasks), output_dir)
+    for src in sorted(set(t["metadata"]["source"] for t in all_tasks)):
+        logger.info(
+            "  %s: %d",
+            src,
+            sum(1 for t in all_tasks if t["metadata"]["source"] == src),
+        )
+
+
+if __name__ == "__main__":
+    main()
