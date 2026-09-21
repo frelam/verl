@@ -509,6 +509,213 @@ def test_pass_check_flips_with_tool_correctness(keyword_mode):
 
 
 # ============================================================================
+# Regression: the clarification lexicon is clause-local, not reply-global
+# ============================================================================
+#
+# A reply-global check let the question mark and the wh-word come from
+# different sentences, so a fabricated answer plus any "?" scored
+# REQUEST_INFO (Dim 1 = 1.0).  The hint pool made it worse: the hints are
+# injected into the system prompt, and 11 of the 12 variants contain a
+# wh-word ("When you have insufficient information ..."), so echoing the
+# hint and appending a bare "?" reached full marks on a no-tool label.
+
+def test_classify_wh_word_in_other_sentence_is_guess():
+    # wh-word in the first sentence, "?" in the second → not a request.
+    assert classify_abstention(
+        _think_text("When I consider the data, the answer is 42?")
+    ) is AbstentionClass.GUESS
+    assert classify_abstention(
+        _think_text("When I consider the data, the answer is Paris?")
+    ) is AbstentionClass.GUESS
+
+
+def test_classify_rhetorical_tail_is_guess():
+    # A wh-word that does not lead the asking part is a rhetorical tail on
+    # the fabricated answer, not a request for information.
+    for reply in (
+        "The answer is 42, what?",
+        "The answer is 42, what? when?",
+        "The answer is 42, which is correct?",
+        "The capital of France is Paris. Who is asking?",
+        "The capital of France is Paris. Who's asking?",
+        "The capital of France is Paris. Who cares?",
+        "The capital of France is Paris. Why bother?",
+        "The capital of France is Paris. What does it matter?",
+        "The capital of France is Paris. What's the point?",
+        # Relative-clause wh ("which you already know") — declarative with a
+        # hint-echoed wh-word, no auxiliary: not a question.
+        "The capital of France is Paris, which you already know?",
+        "The capital of France is Paris, which you know?",
+        "The capital of France is Paris, what you asked for?",
+        "The capital of France is Paris, what you said?",
+        "The capital of France is Paris, who you are?",
+        "The answer is 42, which you said?",
+        "This is what you asked?",
+        "The answer is what you said?",
+        "When I consider the data, the answer is what you think?",
+        # Phatic modal+you — no request verb behind "could/would/can you".
+        "The capital of France is Paris. Can you imagine?",
+        "Paris. Could you believe it?",
+        "Paris. Would you believe it?",
+        "Paris. Can you believe this?",
+        "Paris. Would you look at that?",
+        "Paris. Can you beat that?",
+        # Deliberation register (the hint pool's own voice) — not a
+        # question to the user, even with a genuine-looking tail.
+        "Should I go ahead?",
+        "Shall we proceed?",
+        "Should I check the weather?",
+        "Am I assuming anything I shouldn't?",
+        "Before answering, ask yourself: Am I assuming anything I shouldn't?",
+        # Fabricated answer with a courtesy/vague question bolted on.
+        "The answer is 42. Is that right?",
+        "The answer is 42. Do you agree?",
+        "The answer is 42. How about that?",
+        "I checked the data and the weather in Paris is 22 degrees. Which city do you mean?",
+    ):
+        assert classify_abstention(_think_text(reply)) is (
+            AbstentionClass.GUESS
+        ), reply
+
+
+def test_classify_courtesy_tail_with_clarify_word_is_guess():
+    # A courtesy question can contain a clarify-lexicon word ("what else",
+    # "more details").  The courtesy filter is applied to the asking clause
+    # itself, so it must still suppress it.
+    for reply in (
+        "The capital of France is Paris. What else would you like to know?",
+        "The capital of France is Paris. Let me know if you need more details?",
+        "The answer is 42. What do you think?",
+        "The capital of France is Paris. How can I help you further?",
+    ):
+        assert classify_abstention(_think_text(reply)) is (
+            AbstentionClass.GUESS
+        ), reply
+
+
+def test_classify_wh_fragment_is_guess():
+    # A wh-word with no question body ("When?", "What?") is a fragment,
+    # not a request for information.
+    assert classify_abstention(_think_text("When? Paris.")) is AbstentionClass.GUESS
+    assert classify_abstention(_think_text("What? Paris.")) is AbstentionClass.GUESS
+    assert classify_abstention(_think_text("Hmm?")) is AbstentionClass.GUESS
+
+
+def test_classify_stray_question_mark_after_answer_is_guess():
+    # Guards (these were GUESS before the clause-locality rule too — they
+    # pin that the new terminator handling did not start treating a stray
+    # "?" as a question).
+    assert classify_abstention(
+        _think_text("The capital of France is Paris.?")
+    ) is AbstentionClass.GUESS
+    assert classify_abstention(
+        _think_text("The answer is 42?")
+    ) is AbstentionClass.GUESS
+    # Discriminating: the wh-word is present but sits in another clause.
+    assert classify_abstention(
+        _think_text("The answer is 42. When I consider the data, the answer is 42?")
+    ) is AbstentionClass.GUESS
+
+
+def test_classify_clarification_still_detected():
+    # Recall guard: the clause-local rule must not cost the real cases.
+    for reply in (
+        "Which city do you mean?",
+        "Could you please tell me which city you mean?",
+        "Which city should I look up?",
+        "What date range are you interested in?",
+        "Could you provide the account id?",
+        "How many results should I return?",
+        "Which city?",
+        # Subordinate opener, but the question is in the final segment.
+        "If you mean Paris, which date range do you need?",
+        # A comma before the asking part must not break it.
+        "Which city should I use, Paris or Lyon?",
+        "What date works best for you, Monday or Tuesday?",
+        # Abbreviation / ellipsis / hard wrap must not chop the clause.
+        "Do you mean Acme Inc.?",
+        "What about the U.S.?",
+        "Which city do you mean...?",
+        "Which city do you\nmean?",
+        # A real question in the sentence after a courtesy one still counts.
+        "Let me know if you need anything else. Which city do you mean?",
+        # Subject-auxiliary inversion / modal-I asks — no clarify lexicon.
+        "Is Paris the city you meant?",
+        "Do you need Celsius or Fahrenheit?",
+        "Should the answer be in metric?",
+        "May I assume Paris?",
+        "Can you confirm the date?",
+        "Do you mean Paris, France or Paris, Texas?",
+        "Would you like me to use the Paris office?",
+        "Should I use the London office?",
+        # Lead noise / greeting before the question must not break it.
+        "Sure, I can help! Just tell me which city?",
+        "OK - what should I use as the date?",
+        "No problem, but which account number?",
+        "Sorry, but which account should I query?",
+        "You mentioned a city, but which one?",
+        # "What's..." contraction.
+        "What's the city name?",
+        # Clarify-lexicon statements stay recall-misses by design: no "?",
+        # so they cannot be clause-local questions (a plain imperative
+        # "Please provide the city name." still reads as an instruction).
+    ):
+        assert classify_abstention(_think_text(reply)) is (
+            AbstentionClass.REQUEST_INFO
+        ), reply
+
+
+def test_keyword_hint_echo_plus_question_mark_is_guess(keyword_mode):
+    # The hint pool is part of the system prompt, so a policy can echo it.
+    # Echoing a variant — or its period-stripped last sentence — and
+    # appending "?" must not buy Dim 1.
+    from examples.tool_rl.hint_injection import HINT_VARIANTS
+
+    for i, variant in enumerate(HINT_VARIANTS):
+        for resp in (
+            variant + "? The capital of France is Paris.",
+            variant.rstrip().rstrip(".!?") + "? The capital of France is Paris.",
+        ):
+            res = compute_score("tool_rl", resp, "", _extra_info())
+            assert res["abstention_class"] == int(AbstentionClass.GUESS), (i, resp[-40:])
+            assert res["tool_correctness"] == 0.0, (i, resp[-40:])
+
+
+def test_keyword_hint_echo_plus_rhetorical_question_is_guess(keyword_mode):
+    # A rhetorical question appended to an echoed hint used to supply the
+    # missing half of the hack (hint → wh-word, suffix → "?").
+    from examples.tool_rl.hint_injection import HINT_VARIANTS
+
+    suffixes = (
+        " What do you think?",
+        " What else?",
+        " What's next?",
+        " What would you like to know?",
+        " How can I help you further?",
+        " Who is asking?",
+    )
+    for i, variant in enumerate(HINT_VARIANTS):
+        for suffix in suffixes:
+            resp = variant + suffix
+            res = compute_score("tool_rl", resp, "", _extra_info())
+            assert res["abstention_class"] == int(AbstentionClass.GUESS), (i, suffix)
+            assert res["tool_correctness"] == 0.0, (i, suffix)
+
+
+def test_keyword_concatenated_hints_are_guess(keyword_mode):
+    # Two variants in one reply (multi-turn / double injection) used to
+    # supply both halves of the hack: v5's "?" and another variant's
+    # wh-word.  Clause-locality closes the cross-variant path too.
+    from examples.tool_rl.hint_injection import HINT_VARIANTS
+
+    joined = "\n".join(HINT_VARIANTS)
+    for resp in (joined, joined + " The capital of France is Paris."):
+        res = compute_score("tool_rl", resp, "", _extra_info())
+        assert res["abstention_class"] == int(AbstentionClass.GUESS)
+        assert res["tool_correctness"] == 0.0
+
+
+# ============================================================================
 # Regression: hedged guesses must not be rewarded as abstentions
 # ============================================================================
 
