@@ -268,10 +268,24 @@ def compute_score(
     """
     extra_info = dict(extra_info or {})
     available_tools = _to_dict_list(extra_info.get("tools"))
+
+    def _flag(name: str) -> bool:
+        """Read a boolean tag from extra_info across storage variants.
+
+        verl round-trips the parquet ``extra_info`` map as JSON, so the tag
+        may arrive as a real bool, the string ``"true"``/``"false"`` (the
+        JSON literals the writer emits), or ``"True"``-style str() casts
+        from older files.
+        """
+        value = extra_info.get(name)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() == "true"
+
     # Data-prep tag: negative sample whose query the model can answer by
     # pure computation (self-computable original tool / arithmetic query)
     # — a self-computed direct answer is legitimate, not a guess.
-    answerable_direct = bool(extra_info.get("answerable_direct"))
+    answerable_direct = _flag("answerable_direct")
     ground_truth_calls = extra_info.get("ground_truth_calls", None)
     task_id = extra_info.get("task_id", "unknown")
 

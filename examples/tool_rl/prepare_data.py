@@ -1826,8 +1826,16 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
         ]
     )
 
-    def _cell(value: Any) -> Any:
-        return json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    def _cell(value: Any) -> str:
+        """Scalar cell for the extra_info map.
+
+        Strings pass through untouched; every other type (bool, list, dict,
+        None …) is JSON-encoded so the map<string,string> column stays
+        uniform.  Booleans become the JSON literals ``true``/``false``.
+        """
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False)
 
     pyrows = []
     for r in rows:
@@ -1854,8 +1862,8 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
                     "style": str((r.get("reward_model") or {}).get("style", "rule")),
                     "ground_truth": str((r.get("reward_model") or {}).get("ground_truth") or ""),
                 },
-                # JSON-encode non-string leaves (bools) so the map stays
-                # uniform; the reward reads them through json.loads.
+                # See ``_cell``: non-string leaves are JSON-encoded so the
+                # map<string, string> column stays uniform.
                 "extra_info": [
                     (str(k), _cell(v)) for k, v in extra.items()
                 ],
