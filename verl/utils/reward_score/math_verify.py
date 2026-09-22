@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import multiprocessing
 import threading
 from concurrent.futures import ProcessPoolExecutor
@@ -29,13 +30,34 @@ except ImportError:
 _pool = None
 _pool_lock = threading.Lock()
 
+# Raw model outputs here can be 16k-token chain-of-thought.  Scoring only
+# needs the final answer, which the prompt format pins to the end of the
+# response, and math_verify tries extraction matches rightmost-first, so
+# parsing only a tail window keeps semantics while bounding regex/sympy
+# work per sample.
+_PRED_PARSE_MAX_CHARS = 8192
+
+
+def _silence_math_verify_logs():
+    """Process-pool initializer: keep math_verify's loggers quiet in workers.
+
+    On parse timeout math_verify logs the *entire* prediction at WARNING
+    ("Timeout during parsing: {pred}") -- with 16k-token CoT outputs this
+    floods fully-async training logs, since pool-worker stderr lands there.
+    """
+    logging.getLogger("math_verify").setLevel(logging.CRITICAL)
+
 
 def _get_pool():
     global _pool
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=4, mp_context=multiprocessing.get_context("spawn"))
+                _pool = ProcessPoolExecutor(
+                    max_workers=4,
+                    mp_context=multiprocessing.get_context("spawn"),
+                    initializer=_silence_math_verify_logs,
+                )
     return _pool
 
 
@@ -48,7 +70,13 @@ def _verify_in_subprocess(ground_truth_boxed: str, model_output: str) -> float:
     pred_targets = (ExprExtractionConfig(), LatexExtractionConfig())
 
     extracted_gold = parse(ground_truth_boxed, gold_targets)
-    extracted_pred = parse(model_output, pred_targets)
+    # Tail window only (see _PRED_PARSE_MAX_CHARS).  Keep the default finite
+    # parsing_timeout on purpose rather than parsing_timeout=None: the inner
+    # signal.alarm is what actually frees a worker stuck on a pathological
+    # input -- future.result(timeout=...) in compute_score() only unblocks
+    # the caller, it cannot reclaim the worker process.  The timeout's
+    # WARNING log is silenced by _silence_math_verify_logs above.
+    extracted_pred = parse(model_output[-_PRED_PARSE_MAX_CHARS:], pred_targets)
     if extracted_gold and extracted_pred:
         return max(1.0 if any(verify(g, p) for g in extracted_gold) else 0.0 for p in extracted_pred)
     return 0.0
