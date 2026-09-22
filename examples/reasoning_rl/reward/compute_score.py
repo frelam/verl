@@ -619,6 +619,24 @@ def _strip_unevaluated(exprs) -> list:
     return [_strip(e) for e in exprs]
 
 
+def _dedupe_keep_order(exprs) -> list:
+    """Dedupe keeping first-occurrence order.  ``dict.fromkeys`` needs hashable
+    items, but a parsed matrix answer yields sympy's unhashable
+    ``MutableDenseMatrix`` -- probe those with equality instead of hashing."""
+    seen, unhashable, out = set(), [], []
+    for e in exprs:
+        try:
+            if e in seen:
+                continue
+            seen.add(e)
+        except TypeError:
+            if any(e == u for u in unhashable):
+                continue
+            unhashable.append(e)
+        out.append(e)
+    return out
+
+
 def _conditional_match(solution_str: str, ground_truth: str) -> bool:
     """Last resort for ground truths left as unevaluated general formulas.
 
@@ -661,7 +679,7 @@ def _conditional_match(solution_str: str, ground_truth: str) -> bool:
         return out
 
     gt_exprs = _strip_unevaluated(_flatten(gt_exprs))
-    pred_exprs = list(dict.fromkeys(_strip_unevaluated(_flatten(pred_exprs))))  # dedupe, keep order
+    pred_exprs = _dedupe_keep_order(_strip_unevaluated(_flatten(pred_exprs)))
     if not (0 < len(gt_exprs) <= _COND_MAX_GT_EXPRS) or not (0 < len(pred_exprs) <= _COND_MAX_PRED_EXPRS):
         return False
     gt_symbols = sorted(set().union(*(e.free_symbols for e in gt_exprs)), key=str)
@@ -672,7 +690,14 @@ def _conditional_match(solution_str: str, ground_truth: str) -> bool:
         sigma = dict(zip(gt_symbols, mapping))
         if all(sigma[s] == s for s in gt_symbols):
             continue  # identity: the strict verifiers already had their say
-        if all(any(g.subs(sigma) == p for p in pred_exprs) for g in gt_exprs):
+        try:
+            matched = all(any(g.subs(sigma) == p for p in pred_exprs) for g in gt_exprs)
+        except Exception:
+            # subs may rebuild held expressions, e.g. an inequality chain
+            # parsed with evaluate=False goes non-real (``m < 2*I``) and
+            # raises TypeError -- that mapping is simply not a witness.
+            continue
+        if matched:
             return True
     return False
 
@@ -718,8 +743,8 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
         return False
     # No Boolean filtering: relations fail float()/evalf below and self-exclude.
     gt_exprs = _strip_unevaluated(x for e in gt_exprs for x in (e.args if isinstance(e, sp.FiniteSet) else (e,)))
-    pred_exprs = list(
-        dict.fromkeys(_strip_unevaluated(x for e in pred_exprs for x in (e.args if isinstance(e, sp.FiniteSet) else (e,))))
+    pred_exprs = _dedupe_keep_order(
+        _strip_unevaluated(x for e in pred_exprs for x in (e.args if isinstance(e, sp.FiniteSet) else (e,)))
     )
     if not (0 < len(gt_exprs) <= _COND_MAX_GT_EXPRS) or not (0 < len(pred_exprs) <= _COND_MAX_PRED_EXPRS):
         return False

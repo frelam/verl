@@ -27,7 +27,9 @@ from compute_score import (
     _REP_MIN_COUNT,
     _align_callable_name,
     _conditional_match,
+    _dedupe_keep_order,
     _evaluated_gt_match,
+    _math_last_resort,
     _normalized_text_match,
     _repetition_penalty,
     _yes_no_match,
@@ -499,6 +501,25 @@ class TestConditionalMatch:
         resp = think_wrap("The final answer is: $\\boxed{T}$ and $\\boxed{2T}$.")
         assert not _conditional_match(resp, "yes, it is possible")
 
+    def test_non_real_relational_subs_no_crash(self):
+        # Regression (production TypeError): math_verify holds ``m < I*I*I``
+        # unevaluated; rebuilding the relational under a symbol mapping makes
+        # it non-real and raises -- that mapping must count as no match.
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{n}$.")
+        assert not _conditional_match(resp, "$m < I \\cdot I \\cdot I$")
+        assert not _conditional_match(resp, "$m < 2I$")
+        assert not _math_last_resort(resp, "$m < I \\cdot I \\cdot I$")
+
+    def test_collapsed_and_subs_no_crash(self):
+        # Regression (production AttributeError): under ``m->n`` the chained
+        # equality Eq(m,n)&Eq(n,1) collapses to a bare Equality, and
+        # latex2sympy2_extended's And.__new__ fails on it -- no match then.
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{k}$.")
+        assert not _conditional_match(resp, "$m = n = 1$")
+        assert not _math_last_resort(resp, "$m = n = 1$")
+
 
 class TestEvaluatedGtMatch:
     """Helper-level checks for the sample-point numeric equivalence last resort."""
@@ -527,6 +548,30 @@ class TestEvaluatedGtMatch:
         pytest.importorskip("math_verify")
         # Relations are excluded here; they belong to _normalized_text_match.
         assert not _evaluated_gt_match(think_wrap("\\boxed{y_2 < y_1 < y_3}"), "y2 < y1 < y3")
+
+
+class TestMatrixAnswerNoCrash:
+    """Regression: a parsed matrix answer is an unhashable MutableDenseMatrix
+    and crashed the last-resort dedup (``dict.fromkeys``) in production."""
+
+    RESP = "The answer is $\\boxed{\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}}$."
+
+    def test_dedupe_keep_order_unhashable(self):
+        sp = pytest.importorskip("sympy")
+        m = sp.Matrix([[1, 2], [3, 4]])
+        assert _dedupe_keep_order([m, m, sp.Integer(5), sp.Integer(5)]) == [m, sp.Integer(5)]
+
+    def test_conditional_match_matrix_no_crash(self):
+        pytest.importorskip("math_verify")
+        assert not _conditional_match(think_wrap(self.RESP), "$C + T$")
+
+    def test_evaluated_gt_match_matrix_no_crash(self):
+        pytest.importorskip("math_verify")
+        assert not _evaluated_gt_match(think_wrap(self.RESP), "\\frac{3}{4}")
+
+    def test_math_last_resort_matrix_no_crash(self):
+        pytest.importorskip("math_verify")
+        assert not _math_last_resort(think_wrap(self.RESP), "2.5")
 
 
 def _loop(k: int) -> str:
