@@ -1348,9 +1348,9 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
 # the original absolute floor (calibrated on death loops, not prose), long
 # texts only get charged when one n-gram occupies >1/_REP_RATIO of all
 # n-gram positions -- the signature of a loop, not of verbose reasoning.
-_REP_NGRAM = 4
+_REP_NGRAM = 5
 _REP_MIN_COUNT = 15
-_REP_RATIO = 50
+_REP_RATIO = 100
 _REP_STEP = 0.1
 _REP_FLOOR = -1.0
 
