@@ -1820,53 +1820,77 @@ def to_verl_rows(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
-    import pandas as pd
-    import pyarrow as pa
-    import pyarrow.parquet as pq
+def _parquet_schema():
+    """On-disk Arrow schema for the tool_rl v2 parquets.
 
-    # Explicit Arrow schema instead of pandas inference: the ``tools`` column
-    # legitimately mixes fully-populated tool dicts with ``[]`` (no_tools
-    # negatives), which newer pyarrow refuses to unify ("cannot mix list and
-    # non-list").  Declaring list<struct> accepts both and keeps the on-disk
-    # format readable by RLHFDataset.  ``extra_info`` stays a plain JSON
-    # object column via the map<string, string> type — every value it carries
-    # is a str / bool / None after ``to_verl_rows``.
-    schema = pa.schema(
+    Explicit schema instead of pandas inference: the ``tools`` column
+    legitimately mixes fully-populated tool dicts with ``[]`` (no_tools
+    negatives), which newer pyarrow refuses to unify ("cannot mix list and
+    non-list").  Declaring list<struct> accepts both and keeps the on-disk
+    format readable by HF ``datasets`` (used by verl's RLHFDataset).
+
+    ``extra_info`` is a struct of natively-typed, nullable fields.  It used
+    to be a ``map<string, string>``, but ``datasets`` cannot map an Arrow
+    map type to a datasets dtype and crashes at schema-parse time
+    ("Arrow type map<string, string ('extra_info')> does not have a
+    datasets dtype equivalent").  Structured blobs (tool schemas, GT calls,
+    augment detail) stay JSON strings so mixed value types never reach
+    pyarrow's struct unification.
+    """
+    import pyarrow as pa
+
+    tool_struct = pa.struct(
+        [
+            ("description", pa.string()),
+            ("name", pa.string()),
+            ("parameters", pa.string()),  # JSON blob
+        ]
+    )
+    return pa.schema(
         [
             ("data_source", pa.string()),
             ("prompt", pa.list_(pa.struct([("content", pa.string()), ("role", pa.string())]))),
+            ("tools", pa.list_(tool_struct)),
+            ("reward_model", pa.struct([("ground_truth", pa.string()), ("style", pa.string())])),
             (
-                "tools",
-                pa.list_(
-                    pa.struct(
-                        [
-                            ("description", pa.string()),
-                            ("name", pa.string()),
-                            ("parameters", pa.string()),  # JSON blob
-                        ]
-                    )
+                "extra_info",
+                pa.struct(
+                    [
+                        ("index", pa.int64()),
+                        ("task_id", pa.string()),
+                        ("source", pa.string()),
+                        ("tools", pa.list_(tool_struct)),
+                        ("ground_truth_calls", pa.string()),  # JSON blob or null
+                        ("augmented", pa.string()),
+                        ("answerable_direct", pa.bool_()),
+                        ("augment_detail", pa.string()),  # JSON blob or null
+                    ]
                 ),
             ),
-            ("reward_model", pa.struct([("ground_truth", pa.string()), ("style", pa.string())])),
-            ("extra_info", pa.map_(pa.string(), pa.string())),
         ]
     )
 
-    def _cell(value: Any) -> str:
-        """Scalar cell for the extra_info map.
 
-        Strings pass through untouched; every other type (bool, list, dict,
-        None …) is JSON-encoded so the map<string,string> column stays
-        uniform.  Booleans become the JSON literals ``true``/``false``.
-        """
-        if isinstance(value, str):
-            return value
-        return json.dumps(value, ensure_ascii=False)
+def _tool_cells(tools: Any) -> list[dict[str, str]]:
+    """Normalise a tool list to the on-disk struct cells (parameters as JSON)."""
+    return [
+        {
+            "name": str(t.get("name", "")),
+            "description": str(t.get("description", "")),
+            "parameters": t["parameters"] if isinstance(t.get("parameters"), str) else json.dumps(t.get("parameters", {}), ensure_ascii=False),
+        }
+        for t in (tools or [])
+        if isinstance(t, dict)
+    ]
 
+
+def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = _parquet_schema()
     pyrows = []
     for r in rows:
-        tools = r.get("tools") or []
         extra = r.get("extra_info") or {}
         pyrows.append(
             {
@@ -1876,24 +1900,34 @@ def write_parquet(rows: list[dict[str, Any]], path: Path) -> None:
                     for m in (r["prompt"] or [])
                     if isinstance(m, dict)
                 ],
-                "tools": [
-                    {
-                        "name": str(t.get("name", "")),
-                        "description": str(t.get("description", "")),
-                        "parameters": _cell(t.get("parameters", {})),
-                    }
-                    for t in tools
-                    if isinstance(t, dict)
-                ],
+                "tools": _tool_cells(r.get("tools")),
                 "reward_model": {
                     "style": str((r.get("reward_model") or {}).get("style", "rule")),
                     "ground_truth": str((r.get("reward_model") or {}).get("ground_truth") or ""),
                 },
-                # See ``_cell``: non-string leaves are JSON-encoded so the
-                # map<string, string> column stays uniform.
-                "extra_info": [
-                    (str(k), _cell(v)) for k, v in extra.items()
-                ],
+                # Native-typed struct fields (see ``_parquet_schema``); keys
+                # missing from ``extra`` become nulls.  ground_truth_calls /
+                # augment_detail already arrive as JSON strings from
+                # ``to_verl_rows``, tool schemas go through ``_tool_cells``
+                # so their parameters match the top-level ``tools`` column.
+                "extra_info": {
+                    "index": int(extra.get("index", 0)),
+                    "task_id": str(extra.get("task_id", "")),
+                    "source": str(extra.get("source", "")),
+                    "tools": _tool_cells(extra.get("tools")),
+                    "ground_truth_calls": (
+                        extra.get("ground_truth_calls")
+                        if extra.get("ground_truth_calls") is None or isinstance(extra.get("ground_truth_calls"), str)
+                        else json.dumps(extra.get("ground_truth_calls"), ensure_ascii=False)
+                    ),
+                    "augmented": str(extra.get("augmented", "")),
+                    "answerable_direct": bool(extra.get("answerable_direct")),
+                    "augment_detail": (
+                        extra.get("augment_detail")
+                        if extra.get("augment_detail") is None or isinstance(extra.get("augment_detail"), str)
+                        else json.dumps(extra.get("augment_detail"), ensure_ascii=False)
+                    ),
+                },
             }
         )
     pq.write_table(pa.Table.from_pylist(pyrows, schema=schema), path)
