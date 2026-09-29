@@ -60,7 +60,8 @@
 #   regressions.
 #
 # Optional env knobs (on top of the sync script's REASONING_RL_SYSTEM_PROMPT /
-# SANDBOX_FUSION_URL / TRAIN_FILES / VAL_FILES / RESUME_MODE / RESUME_PATH):
+# SANDBOX_FUSION_URL / TRAIN_FILES / VAL_FILES / RESUME_MODE / RESUME_PATH /
+# REWARD_PATH / WEIGHT_DECAY):
 #   NNODES_TRAIN=1 NNODES_ROLLOUT=1         disaggregated node split
 #   NGPUS_TRAIN=8 NGPUS_ROLLOUT=8           NPUs per side (8+8 = the 16 on node)
 #   MAX_NUM_SEQS=128 ENFORCE_EAGER=False    vllm-ascend concurrency / graph mode
@@ -137,6 +138,8 @@ max_response_length=${MAX_RESPONSE_LENGTH:-8192}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((max_prompt_length + max_response_length))}
 
 actor_lr=${ACTOR_LR:-1e-6}
+# AdamW weight decay for the actor optimiser (actor.optim config default 0.01).
+weight_decay=${WEIGHT_DECAY:-0.01}
 entropy_coeff=${ENTROPY_COEFF:-0}
 # Compute per-token categorical entropy during the TRAINER's forward pass (the
 # update_actor rollout-compute_lp path). In fully async the old_log_prob forward
@@ -247,6 +250,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 PROJECT_NAME=${PROJECT_NAME:-verl_reasoning_rl}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_reasoning_rl_fully_async_$(date +%Y%m%d_%H%M)}
+
+# Reward-file hot-swap seam, same semantics as the sync script: the default is
+# the four-domain dispatcher; the hallucination stage points it at
+# hallucination_compute_score.py, which delegates every non-`halluc_*` row back
+# to that same file (HALLUCINATION_RL_DESIGN.md section 7.3 / Q3).
+reward_path=${REWARD_PATH:-"$REPO_ROOT/examples/reasoning_rl/reward/compute_score.py"}
 ########################### end user-adjustable ###########################
 
 DATA=(
@@ -278,6 +287,7 @@ MODEL=(
 
 ACTOR=(
     actor_rollout_ref.actor.optim.lr=${actor_lr}
+    actor_rollout_ref.actor.optim.weight_decay=${weight_decay}
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.use_dynamic_bsz=True
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
@@ -395,7 +405,7 @@ ROLLOUT=(
 )
 
 REWARD=(
-    reward.custom_reward_function.path="$REPO_ROOT/examples/reasoning_rl/reward/compute_score.py"
+    reward.custom_reward_function.path="$reward_path"
     reward.custom_reward_function.name=compute_score
     reward.reward_manager.name=naive
 )
