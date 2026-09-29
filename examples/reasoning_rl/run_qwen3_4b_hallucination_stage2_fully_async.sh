@@ -1,0 +1,531 @@
+#!/usr/bin/env bash
+# Hallucination-resistance stage 2 (HALLUCINATION_RL_DESIGN.md) | Qwen3-4B | DAPO | FSDP2 | vLLM
+#
+#   FULLY ASYNC variant — STANDALONE recipe. This is a full copy of
+#   run_qwen3_4b_reasoning_rl_fully_async.sh with the stage-2 defaults baked in:
+#     * data  -> $DATA_ROOT/final_halluc/{train,val}.parquet (the stage-2 mix;
+#       build it first with build_hallucination_stage2_data.sh)
+#     * reward -> hallucination_compute_score.py (halluc_* rows scored by the
+#       abstention dispatcher; every other row delegates back to compute_score.py,
+#       so the mixed parquet keeps the stage-1 domains scoring unchanged)
+#     * resume -> RESUME_MODE=resume_path + RESUME_PATH=<stage-1 ckpt> REQUIRED
+#       (the mid-training hand-off; RESUME_MODE=disable starts fresh but then
+#       stage-1 training never happened)
+#   CONFIG IS DUPLICATED BY DESIGN: when changing the base fully-async recipe,
+#   port the change here manually (and vice versa).
+#
+#   Trainer and Rollouter run on DISAGGREGATED resources and train/generate in
+#   parallel (verl.experimental.fully_async_policy, docs/advance/fully_async.md).
+#   Rollouter streams samples into a MessageQueue; Trainer fetches
+#   require_batches*ppo_mini_batch_size prompts at a time and NCCL-syncs weights
+#   back every trigger_parameter_sync_step fetches.
+#
+#   ASCEND NPU edition — single node, 16 NPUs, split 8 (Trainer) : 8 (Rollouter).
+#   NPU-specific deltas vs a GPU run (from the repo's NPU fully-async recipes
+#   verl/experimental/fully_async_policy/shell/*_npu.sh):
+#     * trainer.device=npu (auto_set_device would also detect it; explicit here).
+#     * actor_rollout_ref.actor.use_torch_compile=False — the config default is
+#       True, which is CUDA-oriented; keep it off on Ascend.
+#     * actor_rollout_ref.nccl_timeout raised to 7200s — HCCL init/collectives
+#       are slower to time out under load; the 600s default is too tight.
+#     * actor_rollout_ref.rollout.enable_sleep_mode=False — sleep/wake on
+#       vllm-ascend is version-dependent; the NPU DAPO recipe disables it.
+#       If partial_rollout behaves oddly, try toggling this (the geo3k NPU
+#       recipe leaves it at the default True).
+#     * rollout.max_num_seqs / max_num_batched_tokens set explicitly, as
+#       recommended for vllm-ascend.
+#   Requires: torch_npu + vllm-ascend environment (see
+#   docs/ascend_tutorial/model_support/examples/ascend_vllm_best_practices.rst).
+#
+# Fully-async mechanics (identical to the stage-1 fully-async recipe):
+#   * Entry point is verl.experimental.fully_async_policy.fully_async_main
+#     (config fully_async_ppo_trainer.yaml), not verl.trainer.main_ppo.
+#   * Resources are split: NNODES_TRAIN/NGPUS_TRAIN for the Trainer,
+#     NNODES_ROLLOUT/NGPUS_ROLLOUT for the Rollouter (no colocate hybrid engine,
+#     actor_rollout_ref.hybrid_engine=False).
+#   * data.train_batch_size is INERT (must be 0); the sample budget is
+#     rollout.total_rollout_steps (= train_batch_size-equivalent * TOTAL_STEPS).
+#   * old_log_prob comes from the ROLLOUTER (use_rollout_log_probs=True +
+#     algorithm.rollout_correction.bypass_mode=True, the yaml default). Under
+#     staleness_threshold>0 those log-probs are up to ~1 param version old,
+#     so the ppo_clip ratio pi_theta/pi_rollout is an IS ratio (the intended
+#     off-policy trade-off of async training).
+#   * NOT SUPPORTED here (streaming pipeline has no equivalent):
+#       - tiered hard-sample replay (HardReplaySampler / REASONING_RL_HARD_REPLAY)
+#       - DAPO dynamic sampling (algorithm.filter_groups): uniform-reward groups
+#         are NOT filtered/refilled; every generated group is trained on once.
+#   * test_freq / save_freq are in PARAM-VERSION units. With the defaults
+#     (require_batches=4, ppo_mini_batch_size=64, trigger_parameter_sync_step=1)
+#     one param version consumes 4*64*1 = 256 prompts = one sync step, so
+#     frequencies and global_step_N checkpoints stay numerically comparable
+#     to the sync runs, and sync <-> fully-async checkpoints are
+#     interchangeable (same actor/ layout).
+#
+# Mode (docs/advance/fully_async.md "Supported Modes"): defaults give
+#   "async stream pipeline with partial rollout" (mode 4, fastest):
+#     staleness_threshold=0.5 + partial_rollout=True — up to 50% of a fetched
+#     training batch may be stale (generated under an older param version).
+#   1 is the max useful staleness (>1 buys no extra speed, per fully_async.md);
+#   raise STALENESS_THRESHOLD toward 1 for more throughput, lower (e.g. 0.1)
+#   if training looks unstable. Set STALENESS_THRESHOLD=0 PARTIAL_ROLLOUT=False
+#   for the synchronous streaming variant (mode 2) when debugging accuracy
+#   regressions.
+#
+# Usage:
+#   RESUME_PATH=<stage1_ckpt_dir> bash run_qwen3_4b_hallucination_stage2_fully_async.sh
+#
+# Optional env knobs (REASONING_RL_SYSTEM_PROMPT / SANDBOX_FUSION_URL /
+# TRAIN_FILES / VAL_FILES / RESUME_MODE / REWARD_PATH / WEIGHT_DECAY, plus):
+#   NNODES_TRAIN=1 NNODES_ROLLOUT=1         disaggregated node split
+#   NGPUS_TRAIN=8 NGPUS_ROLLOUT=8           NPUs per side (8+8 = the 16 on node)
+#   MAX_NUM_SEQS=128 ENFORCE_EAGER=False    vllm-ascend concurrency / graph mode
+#   NCCL_TIMEOUT=7200                       HCCL collective timeout (s)
+#   TOTAL_STEPS=400                         total_rollout_steps = 256 * TOTAL_STEPS
+#   STALENESS_THRESHOLD=0.5                 max fraction of stale samples (0.5 = 50%;
+#                                           1 = 100% most aggressive; lower if unstable)
+#   REQUIRE_BATCHES=4                       mini-batches fetched per training round
+#   TRIGGER_PARAMETER_SYNC_STEP=1           rounds between weight syncs
+#   PARTIAL_ROLLOUT=True                    interrupt+resume in-flight gens on sync
+#   USE_KL_LOSS=0 REF_MODEL_PATH=...        add colocated KL-to-ref anchor (see above);
+#                                           ref shares the trainer NPUs (no extra devices)
+#   USE_TRAINER_DO_VALIDATE=0               1 = validate on hybrid replicas using
+#                                           trainer GPUs (faster val, but trainer
+#                                           must then share GPU memory: keep
+#                                           ROLLOUT_GPU_MEM_UTIL low, e.g. 0.3-0.5)
+#   VAL_N=1                                 validation samples per prompt (pass@N)
+#   FSDP_STRATEGY=fsdp2                     trainer FSDP strategy
+
+set -xeuo pipefail
+
+# vLLM V1 engine is required for async (server-mode) rollout.
+export VLLM_USE_V1=1
+
+# Ascend/HCCL runtime knobs (single node). Overridable from the environment.
+# HCCL collectives + vllm-ascend engine bring-up can exceed the tight defaults
+# on long runs; align with docs/ascend_tutorial recommendations.
+export HCCL_EXEC_TIMEOUT=${HCCL_EXEC_TIMEOUT:-3600}
+export HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-3600}
+export HCCL_ASYNC_ERROR_HANDLING=${HCCL_ASYNC_ERROR_HANDLING:-0}
+# Ray must not overwrite the NPU visibility set by the driver/launcher.
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=${RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES:-1}
+# All 16 NPUs on the node (Trainer pool takes 8, Rollouter pool takes 8).
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+
+########################### user-adjustable ###########################
+MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
+# Disaggregated resource pools: single node, 16 NPUs -> 8 Trainer : 8 Rollouter.
+# Ideal split makes rollout time ~ train time; tune from the
+# rollouter/idle_ratio vs trainer/idle_ratio metrics.
+NNODES_TRAIN=${NNODES_TRAIN:-1}
+NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
+NGPUS_TRAIN=${NGPUS_TRAIN:-8}
+NGPUS_ROLLOUT=${NGPUS_ROLLOUT:-8}
+
+# Stage-2 mix produced by build_hallucination_stage2_data.sh. TRAIN_FILES /
+# VAL_FILES remain an explicit override seam (same semantics as the stage-1
+# recipe).
+DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final_halluc}
+train_files=${TRAIN_FILES:-"['$DATA_DIR/train.parquet']"}
+val_files=${VAL_FILES:-"['$DATA_DIR/val.parquet']"}
+
+# Stage 2 resumes from the stage-1 checkpoint. Fully-async checkpoints carry the
+# actor weights plus the rollouter dataloader state (data.pt), so resume_path
+# restores the data cursor. Note: in-flight (queued) samples are lost on save.
+RESUME_MODE=${RESUME_MODE:-resume_path}
+RESUME_PATH=${RESUME_PATH:-}
+
+# Only used to derive the sample budget and to keep param-version == sync-step
+# accounting (see header). Not passed to the config (train_batch_size stays 0).
+train_batch_size=${TRAIN_BATCH_SIZE:-128}
+ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-64}
+# Dataset prompt caps are far below ceiling (math ~2k, code up to ~4k per DESIGN.md
+# section 8); 8192 is enough headroom so nothing gets truncated.
+max_prompt_length=${MAX_PROMPT_LENGTH:-4096}
+# response curriculum: 8192 -> 16384 -> 24576 (raise between runs; DESIGN.md
+# section 8). NOTE: Qwen3-4B's native context is 32768, so keep
+# max_prompt_length + max_response_length <= 32768 or vLLM silently clamps.
+max_response_length=${MAX_RESPONSE_LENGTH:-8192}
+# dynamic-bsz packing budget MUST cover the longest single (prompt+response) sequence
+# or the tail gets dropped. Default = max_prompt + max_response.
+ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-$((max_prompt_length + max_response_length))}
+
+actor_lr=${ACTOR_LR:-1e-6}
+# AdamW weight decay for the actor optimiser (actor.optim config default 0.01).
+weight_decay=${WEIGHT_DECAY:-0.01}
+entropy_coeff=${ENTROPY_COEFF:-0}
+# Compute per-token categorical entropy during the TRAINER's forward pass (the
+# update_actor rollout-compute_lp path). In fully async the old_log_prob forward
+# is bypassed, so this is the metric source that emits `actor/entropy_loss`
+# (mean entropy over response tokens). Requires a model forward to be run.
+# NOTE: entropy_coeff is 0, so this is a pure observation metric, no loss impact.
+calculate_entropy=${CALCULATE_ENTROPY:-True}
+# Compute entropy from logits in chunks (chunk_size tokens at a time) instead of
+# materialising the full [bsz*seq_len, voc] tensor. Reduces peak GPU memory when
+# recomputing old_log_prob (calculate_entropy=True) on a tight trainer split
+# (e.g. 12+4 GPUs); the logits tensor is the dominant memory consumer there.
+entropy_from_logits_with_chunking=${ENTROPY_FROM_LOGITS_WITH_CHUNKING:-True}
+entropy_from_logits_chunk_size=${ENTROPY_FROM_LOGITS_CHUNK_SIZE:-2048}
+# Gradient checkpoint the entropy computation: recompute the log_softmax
+# intermediate in the backward instead of saving it, freeing the [tokens, voc]
+# activation (a peak-memory win on long-context training). Trade-off: one extra
+# O(tokens*voc) recompute per micro-batch. Mutually exclusive with the chunked
+# path above (code picks checkpointing if this is on).
+entropy_checkpointing=${ENTROPY_CHECKPOINTING:-True}
+# clip-higher: keep epsilon_low at 0.2, raise epsilon_high (DAPO). Consumed by
+# the ppo_clip loss (loss_type of the bypass_mode loss) below.
+clip_ratio_low=${CLIP_RATIO_LOW:-0.2}
+clip_ratio_high=${CLIP_RATIO_HIGH:-0.5}
+
+# Optional KL-to-ref anchor (colocated reference policy, Role.RefPolicy). The
+# default fully-async stack needs no separate ref model — the ppo_clip ratio
+# already anchors pi_theta to the ROLLOUTER's log-probs (stale up to ~1 param
+# version). Set USE_KL_LOSS=1 to additionally load a ref policy and add
+# kl_loss_coef * KL(pi_theta || pi_ref) to the policy loss (stability anchor,
+# orthogonal to algorithm.use_kl_in_reward).
+#   REF_MODEL_PATH defaults to MODEL_PATH (a frozen just-heavy base fit is the
+#   usual choice); the ref worker is COLOCATED with the Actor on the Trainer
+#   pool (shares the trainer NPUs) — no extra devices required.
+use_kl_loss=${USE_KL_LOSS:-0}
+kl_loss_coef=${KL_LOSS_COEF:-0.001}
+ref_model_path=${REF_MODEL_PATH:-}
+
+rollout_tp=${ROLLOUT_TP:-1}
+# Rollout NPUs are dedicated here (no colocate), so 0.8 is safe. Lower to
+# 0.3-0.5 if USE_TRAINER_DO_VALIDATE=1 (hybrid replicas share trainer NPUs).
+rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.8}
+rollout_n=${ROLLOUT_N:-16}
+temperature=${TEMPERATURE:-1.0}
+val_n=${VAL_N:-1}
+# vllm-ascend tuning (see NPU recipes): cap concurrent seqs per replica and
+# give the batched-token budget explicitly. enforce_eager=False keeps ACL
+# graph mode on; set ENFORCE_EAGER=True to debug graph-mode issues.
+max_num_seqs=${MAX_NUM_SEQS:-128}
+enforce_eager=${ENFORCE_EAGER:-False}
+# HCCL collective timeout (s); config default 600 is too tight for Ascend.
+nccl_timeout=${NCCL_TIMEOUT:-7200}
+
+# Sample budget: total_rollout_steps is counted in PROMPTS (one prompt ->
+# rollout_n trajectories). total_epochs only sets the dataloader replay
+# runway; the explicit total_rollout_steps cap stops the run first.
+total_steps=${TOTAL_STEPS:-400}
+# Direct sample-budget override: set TOTAL_ROLLOUT_STEPS to pin the exact
+# budget and bypass the derived train_batch_size * total_steps formula (useful
+# when train_batch_size does not divide the target). Default 140000.
+total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-140000}
+total_epochs=${TOTAL_EPOCHS:-10}
+
+# In param-version units (1 param version = require_batches * ppo_mini_batch_size
+# * trigger_parameter_sync_step prompts = 256 with the defaults below).
+save_freq=${SAVE_FREQ:-20}
+test_freq=${TEST_FREQ:-10}
+# Save val trajectories to wandb/swanlab: on each validation (which runs every
+# TEST_FREQ param-version steps), log the first LOG_VAL_GENERATIONS val samples
+# as a table. So "every N steps" == TEST_FREQ steps x this many samples per
+# validation. 0 disables trajectory logging.
+log_val_generations=${LOG_VAL_GENERATIONS:-5}
+
+# Fully async knobs (docs/advance/fully_async.md "Parameter Description").
+# staleness_threshold: fraction of a training batch that may be stale (samples
+# generated under an older param version). 0.5 = up to 50% stale; 1 is the
+# max useful value (>1 buys no extra speedup, per fully_async.md).
+staleness_threshold=${STALENESS_THRESHOLD:-0.5}
+require_batches=${REQUIRE_BATCHES:-4}
+trigger_parameter_sync_step=${TRIGGER_PARAMETER_SYNC_STEP:-1}
+partial_rollout=${PARTIAL_ROLLOUT:-True}
+use_trainer_do_validate=${USE_TRAINER_DO_VALIDATE:-0}
+
+# Rollout Rejection Sampling (RS) on the bypass-mode loss. In fully async the
+# ppo_clip ratio = pi_theta / pi_rollout (the IS ratio); with staleness>0 samples
+# can be up to ~1 param version old, so the ratio drifts from 1. RS masks the
+# sequences whose per-sequence mean log-ratio drifts too far, hardening the
+# off-policy step. Ratio-based mode (ideal ratio = 1). NOTE: on the V1 trainer
+# the loss only reads ACTOR.policy_loss.rollout_correction.* (algorithm.* drives
+# only the data-side bypass and is NOT injected into the loss), so RS must be
+# wired via `actor.policy_loss.rollout_correction.*`.
+enable_rollout_rs=${ENABLE_ROLLOUT_RS:-1}
+#   token_k1     token-level ratio RS, lower_upper ratio bounds (default; matches
+#                the geo3k NPU async recipe's choice)
+#   seq_mean_k1  geometric-mean ratio RS, lower_upper ratio bounds
+#   seq_mean_k3  sequence-level RS on exp(r)-1-log(r) (upper-bound only)
+rollout_rs=${ROLLOUT_RS:-token_k1}
+# For *k1 modes: "lower_upper" ratio band (reciprocal saturates the lower side);
+# geo3k NPU async used token_k1 with "0.6_1.6". "0.999_1.001" = ±0.1% band.
+rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-0.6_1.6}
+
+fsdp_strategy=${FSDP_STRATEGY:-fsdp2}
+
+# Optional system prompt injected into every train/val prompt (dataset level).
+# Empty (default) leaves prompts untouched.
+system_prompt=${REASONING_RL_SYSTEM_PROMPT:-}
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+PROJECT_NAME=${PROJECT_NAME:-verl_reasoning_rl}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_hallucination_stage2_$(date +%Y%m%d_%H%M)}
+
+# Stage-2 reward: the abstention dispatcher. `halluc_*` rows are scored by the
+# hallucination logic; every other row is delegated back to compute_score.py,
+# so the mixed parquet keeps the stage-1 domains scoring unchanged
+# (HALLUCINATION_RL_DESIGN.md section 7.3 / Q3). REWARD_PATH stays an override.
+reward_path=${REWARD_PATH:-"$REPO_ROOT/examples/reasoning_rl/reward/hallucination_compute_score.py"}
+########################### end user-adjustable ###########################
+
+########################### pre-flight checks ###########################
+# Stage 2 resumes from a stage-1 checkpoint. Starting fresh is possible
+# (RESUME_MODE=disable) but then the stage-1 training never happened.
+if [ "$RESUME_MODE" = "resume_path" ] && [ -z "$RESUME_PATH" ]; then
+    echo "ERROR: stage 2 resumes from a stage-1 checkpoint; set RESUME_PATH=<ckpt_dir>" >&2
+    exit 1
+fi
+# The stage-2 mix must exist (build_hallucination_stage2_data.sh). Only check
+# the default paths — explicit TRAIN_FILES/VAL_FILES overrides are the user's
+# responsibility.
+if [ -z "${TRAIN_FILES:-}" ] && [ ! -f "$DATA_DIR/train.parquet" ]; then
+    echo "ERROR: $DATA_DIR/train.parquet missing; run build_hallucination_stage2_data.sh first" >&2
+    exit 1
+fi
+if [ -z "${VAL_FILES:-}" ] && [ ! -f "$DATA_DIR/val.parquet" ]; then
+    echo "ERROR: $DATA_DIR/val.parquet missing; run build_hallucination_stage2_data.sh first" >&2
+    exit 1
+fi
+if [ ! -f "$reward_path" ]; then
+    echo "ERROR: reward file missing: $reward_path" >&2
+    exit 1
+fi
+
+DATA=(
+    algorithm.adv_estimator=grpo
+    algorithm.use_kl_in_reward=False
+    data.train_files="$train_files"
+    data.val_files="$val_files"
+    # In fully async, train_batch_size is inert (must be 0) and generation is
+    # streamed one prompt at a time (gen_batch_size=1).
+    data.train_batch_size=0
+    data.gen_batch_size=1
+    # AgentLoop server mode consumes raw chat and applies the template itself.
+    data.return_raw_chat=True
+    data.max_prompt_length=${max_prompt_length}
+    data.max_response_length=${max_response_length}
+    data.truncation='left'
+    data.filter_overlong_prompts=True
+    # Custom dataset: REASONING_RL_SYSTEM_PROMPT injection (pass-through
+    # otherwise). create_rl_dataset honors data.custom_cls in the Rollouter.
+    data.custom_cls.path="$REPO_ROOT/examples/reasoning_rl/reasoning_rl_dataset.py"
+    data.custom_cls.name=ReasoningRLDataset
+)
+
+MODEL=(
+    actor_rollout_ref.model.path="$MODEL_PATH"
+    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.model.enable_gradient_checkpointing=True
+)
+
+ACTOR=(
+    actor_rollout_ref.actor.optim.lr=${actor_lr}
+    actor_rollout_ref.actor.optim.weight_decay=${weight_decay}
+    actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
+    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+    actor_rollout_ref.actor.use_kl_loss=False
+    actor_rollout_ref.actor.entropy_coeff=${entropy_coeff}
+    # Emit actor/entropy_loss during the trainer forward. entropy_coeff=0 so it
+    # is a pure observation metric (no loss impact).
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy}
+    # Chunked entropy computation (lower peak memory during old_log_prob forward).
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=${entropy_from_logits_with_chunking}
+    actor_rollout_ref.actor.entropy_from_logits_chunk_size=${entropy_from_logits_chunk_size}
+    # Gradient-checkpoint the entropy backward (recompute instead of saving the
+    # [tokens, voc] log_softmax intermediate). Wins peak memory; costs recompute.
+    actor_rollout_ref.actor.entropy_checkpointing=${entropy_checkpointing}
+    # clip-higher (DAPO): epsilon_low fixed, epsilon_high raised.
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low}
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high}
+    actor_rollout_ref.actor.clip_ratio_c=10.0
+    # token-level policy gradient loss (DAPO).
+    actor_rollout_ref.actor.loss_agg_mode=token-mean
+    # PPO-clip via the bypass_mode loss (2 policies: pi_rollout=pi_old, pi_theta).
+    # loss_type defaults to "ppo_clip", so the clip-higher knobs above take
+    # effect. NOTE: the loss reads actor.policy_loss.rollout_correction (defaults:
+    # seq-level IS for metrics only, no rejection sampling) — on the V1 path
+    # algorithm.rollout_correction only drives the trainer-side data bypass and
+    # is NOT injected into the loss.
+    actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode
+    # NOTE: actor.strategy is the canonical FSDP-version switch — FSDPActorConfig
+    #.__post_init__ copies it onto engine.strategy (overwriting whatever sits in
+    # fsdp_config.strategy). fsdp2 is validated on Ascend (geo3k NPU recipe).
+    actor_rollout_ref.actor.strategy=${fsdp_strategy}
+    actor_rollout_ref.actor.fsdp_config.param_offload=False
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
+    # Overlap next-layer param all-gather with current-layer compute. FSDP2 path
+    # uses set_modules_to_forward_prefetch (depth=1, mirrors FSDP1); validated on
+    # Ascend in the geo3k NPU recipe. No-op on torch<2.5 (guarded by hasattr).
+    actor_rollout_ref.actor.fsdp_config.forward_prefetch=True
+    # Config default is True (CUDA-oriented); torch.compile is kept off on NPU.
+    actor_rollout_ref.actor.use_torch_compile=False
+    # HCCL collective timeout (s); default 600 is too tight on Ascend.
+    actor_rollout_ref.nccl_timeout=${nccl_timeout}
+    # Only persist weights + bookkeeping (global_step/RNG); skip optimizer
+    # state to save ~half the checkpoint disk.
+    actor_rollout_ref.actor.checkpoint.save_contents='["model","extra"]'
+    # Fully async: Trainer and Rollouter are disaggregated (no hybrid engine).
+    # old_log_prob comes from the ROLLOUTER — both flags below are ON:
+    #   use_rollout_log_probs=True  -> actor consumes rollout-returned log-probs
+    #   bypass_mode=True            -> Trainer never recomputes old_log_prob
+    # (bypass_mode is also the default in fully_async_ppo_trainer.yaml; pinned
+    # explicitly here.) Under staleness_threshold=1 these log-probs can be up
+    # to ~1 param version old — the intended off-policy trade-off.
+    actor_rollout_ref.hybrid_engine=False
+    actor_rollout_ref.actor.use_rollout_log_probs=True
+    algorithm.rollout_correction.bypass_mode=True
+)
+
+# Rollout RS is read from ACTOR.policy_loss.rollout_correction (the loss
+# reads it on the V1 path; algorithm.rollout_correction only drives the data
+# bypass and is NOT injected into the loss). Config here rather than inside the
+# ACTOR=( ) array literal so the toggle stays a plain top-level conditional.
+# NOTE: rollout_correction is absent under policy_loss in the generated yaml
+# (PolicyLossConfig materializes it via default_factory), so plain `key=value`
+# overrides fail Hydra composition ("Could not override ... use +key=value").
+# The ++ prefix (append-or-override) is required, same as enable_sleep_mode.
+if [ "$enable_rollout_rs" = "1" ]; then
+    ACTOR+=(
+        ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs=${rollout_rs}
+        ++actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold}
+    )
+fi
+
+# Optional KL-to-ref anchor: spawns a colocated ref policy (Role.RefPolicy) on
+# the Trainer pool and adds kl_loss_coef * KL(pi_theta || pi_ref) to the policy
+# loss. need_reference_policy() keys off use_kl_loss — VERL only materialises
+# the ref worker group and runs the _fit_compute_ref_log_prob pass when this
+# flag is True. ref strategy/fsdp_config interpolate from the actor block;
+# ref.fsdp_config does NOT override them here (only forward_prefetch is set, to
+# mirror the sync run; it is a per-worker CPU-side prefetch flag, safe).
+if [ "$use_kl_loss" = "1" ]; then
+    ref_model_path=${ref_model_path:-$MODEL_PATH}
+    ACTOR+=(
+        actor_rollout_ref.ref.model.path="$ref_model_path"
+        actor_rollout_ref.ref.fsdp_config.forward_prefetch=True
+        actor_rollout_ref.actor.use_kl_loss=True
+        actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef}
+    )
+fi
+
+ROLLOUT=(
+    actor_rollout_ref.rollout.name=vllm
+    # Server-mode (AgentLoop) rollout is mandatory for fully async.
+    actor_rollout_ref.rollout.mode=async
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp}
+    actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_mem_util}
+    actor_rollout_ref.rollout.n=${rollout_n}
+    actor_rollout_ref.rollout.temperature=${temperature}
+    # pure temperature sampling: top_k=-1 and top_p=1.0 both disable (no topk/topp).
+    actor_rollout_ref.rollout.top_k=-1
+    actor_rollout_ref.rollout.top_p=1.0
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+    # vllm-ascend knobs (NPU recipes): explicit concurrency/token budgets and
+    # ACL graph mode; sleep mode off (see header note).
+    actor_rollout_ref.rollout.max_num_seqs=${max_num_seqs}
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length))
+    actor_rollout_ref.rollout.enforce_eager=${enforce_eager}
+    +actor_rollout_ref.rollout.enable_sleep_mode=False  # key absent in trainer-side rollout schema, needs +
+    # REQUIRED by fully async: Rollouter must return per-token log-probs
+    # (asserted in FullyAsyncRollouter._validate_config).
+    actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True
+    actor_rollout_ref.rollout.val_kwargs.n=${val_n}
+)
+
+REWARD=(
+    reward.custom_reward_function.path="$reward_path"
+    reward.custom_reward_function.name=compute_score
+    reward.reward_manager.name=naive
+)
+
+# sandbox-fusion URL rides through reward_kwargs (merged into every
+# compute_score call by verl's _call_with_kwargs wrapper).
+if [ -n "${SANDBOX_FUSION_URL:-}" ]; then
+    REWARD+=(
+        "+reward.custom_reward_function.reward_kwargs.sandbox_fusion_url=${SANDBOX_FUSION_URL}"
+    )
+fi
+
+TRAINER=(
+    # Ascend NPU platform (auto_set_device would also detect it; be explicit).
+    trainer.device=npu
+    trainer.balance_batch=True
+    trainer.logger='["console","wandb"]'
+    trainer.project_name=${PROJECT_NAME}
+    trainer.experiment_name=${EXPERIMENT_NAME}
+    # Trainer-side resources (the Rollouter pool is configured in ASYNC below).
+    trainer.n_gpus_per_node=${NGPUS_TRAIN}
+    trainer.nnodes=${NNODES_TRAIN}
+    trainer.val_before_train=True
+    # save_freq / test_freq are in param-version units (see header). Validation
+    # runs on the Rollouter unless USE_TRAINER_DO_VALIDATE=1.
+    trainer.save_freq=${save_freq}
+    trainer.test_freq=${test_freq}
+    # Save the first log_val_generations val trajectories to the logger
+    # (wandb/swanlab) on each validation (runs every test_freq steps).
+    trainer.log_val_generations=${log_val_generations}
+    # Only sets the dataloader replay runway; total_rollout_steps stops the run.
+    trainer.total_epochs=${total_epochs}
+)
+
+ASYNC=(
+    # Rollouter-side resources (top-level rollout.*; fully_async_main mirrors
+    # them into actor_rollout_ref.rollout).
+    rollout.nnodes=${NNODES_ROLLOUT}
+    rollout.n_gpus_per_node=${NGPUS_ROLLOUT}
+    # Total prompts to generate across the whole run (prompt units).
+    rollout.total_rollout_steps=${total_rollout_steps}
+    # Fully async scheduling knobs. Defaults: mode 4 (async stream pipeline
+    # with partial rollout) at max staleness (threshold=1, see header).
+    async_training.staleness_threshold=${staleness_threshold}
+    async_training.trigger_parameter_sync_step=${trigger_parameter_sync_step}
+    async_training.require_batches=${require_batches}
+    async_training.partial_rollout=${partial_rollout}
+    async_training.use_trainer_do_validate=$([ "$use_trainer_do_validate" = "1" ] && echo True || echo False)
+)
+
+# Mid-training resume: continue from the stage-1 checkpoint with the stage-2 mix.
+if [ -n "$RESUME_MODE" ]; then
+    TRAINER+=(
+        trainer.resume_mode=${RESUME_MODE}
+    )
+    if [ -n "$RESUME_PATH" ]; then
+        TRAINER+=(
+            trainer.resume_from_path=${RESUME_PATH}
+        )
+    fi
+fi
+
+# System prompt injection (ReasoningRLDataset prepends it to every prompt at
+# load time). The dataset is constructed inside the remote FullyAsyncTaskRunner,
+# so the value must ride the Ray runtime env to reach it.
+if [ -n "$system_prompt" ]; then
+    export REASONING_RL_SYSTEM_PROMPT="$system_prompt"
+    DATA+=(
+        "+ray_kwargs.ray_init.runtime_env.env_vars.REASONING_RL_SYSTEM_PROMPT=\"$system_prompt\""
+    )
+fi
+
+if [ "${REASONING_RL_HARD_REPLAY:-0}" = "1" ]; then
+    echo "Fully async does not support hard replay / filter_groups (streaming pipeline)." >&2
+    echo "Unset REASONING_RL_HARD_REPLAY, or use the sync DAPO recipe instead." >&2
+    exit 1
+fi
+
+########################### launch ###########################
+python3 -m verl.experimental.fully_async_policy.fully_async_main \
+    "${DATA[@]}" \
+    "${MODEL[@]}" \
+    "${ACTOR[@]}" \
+    "${ROLLOUT[@]}" \
+    "${REWARD[@]}" \
+    "${TRAINER[@]}" \
+    "${ASYNC[@]}" \
+    "$@"
