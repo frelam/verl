@@ -759,3 +759,40 @@ class TestMathMatch:
 
     def test_pathological_prediction_does_not_raise(self):
         assert math_match("\\" * 400 + "{", "540") is False
+
+    # --- last-resort matchers reachable through the re-wrapped bare \boxed{} ---
+    #
+    # math_match hands _math_score a synthesized "\\boxed{...}" string with no
+    # think block.  _extract_final_response used to return "" for that shape,
+    # which silently disabled every response-parsing last resort on this path
+    # (_gt_segment_match / _or_branch_match / _conditional_match /
+    # _evaluated_gt_match).  These tests pin the fix down.
+
+    def test_prose_gt_segment_recovered(self):
+        # Big-Math prose gt whose trailing $W$ segment hijacked the gold parse.
+        pytest.importorskip("math_verify")
+        gt = (
+            "The solution to the equation $ax \\exp(bx)=c$ is given by "
+            "$x = \\frac{1}{b}W\\left(\\frac{bc}{a}\\right)$, where $W$ is the Lambert W-function."
+        )
+        assert math_match("\\dfrac{W\\left( \\dfrac{bc}{a} \\right)}{b}", gt) is True
+        # Swapped arguments are NOT equivalent and must still score 0.
+        assert math_match("\\dfrac{W\\left( \\dfrac{ac}{b} \\right)}{b}", gt) is False
+
+    def test_or_branch_credited(self):
+        # One correct branch of an "X or Y" multi-solution gt earns credit.
+        pytest.importorskip("math_verify")
+        assert math_match("4", r"-12 \text{ or } 4") is True
+        assert math_match("5", r"-12 \text{ or } 4") is False
+
+    def test_evaluated_gt_form_recovered(self):
+        pytest.importorskip("math_verify")
+        assert math_match("0.81a", "a(1 - 10\\%)^2") is True
+
+    def test_single_letter_mcq_not_relabelled(self):
+        # Enabling the response-parsing fallbacks on this path must not import
+        # the MCQ free-1.0 hole: a bare-symbol gold is never identified with a
+        # different single-letter prediction.
+        pytest.importorskip("math_verify")
+        assert math_match("C", "A") is False
+        assert math_match("d", "C") is False

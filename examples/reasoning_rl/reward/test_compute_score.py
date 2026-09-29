@@ -29,8 +29,12 @@ from compute_score import (
     _conditional_match,
     _dedupe_keep_order,
     _evaluated_gt_match,
+    _extract_final_response,
+    _gt_segment_match,
+    _labeled_decimal_match,
     _math_last_resort,
     _normalized_text_match,
+    _or_branch_match,
     _repetition_penalty,
     _yes_no_match,
     compute_score,
@@ -161,6 +165,16 @@ class TestLogicAnswerMatch:
     def test_bold_emphasis_stripped(self):
         # SynLogic web_of_lies asks for 'The answer is **yes, no**'.
         assert logic_answer_match("**no, no, no, yes**", "no, no, no, yes")
+
+    def test_latex_text_wrapper_stripped(self):
+        # Regression (reward_bug2 idx 208, space_reasoning_tree): the model
+        # boxed \text{cucumber, ...} and scored 0 against the bare ground
+        # truth; wrappers are presentation in the logic domain too.
+        gt = "cucumber, rope, science kit, whiteboard"
+        assert logic_answer_match("\\text{cucumber, rope, science kit, whiteboard}", gt)
+        assert logic_answer_match("\\mathrm{cucumber,\\ rope,\\ science\\ kit,\\ whiteboard}", gt)
+        assert not logic_answer_match("\\text{cucumber}", gt)
+        assert not logic_answer_match("\\text{cucumber, rope, science kit, whiteboard}", "cucumber")
 
     def test_token_spacing_still_significant(self):
         # Loose form must not collapse spaces between tokens.
@@ -468,6 +482,15 @@ class TestNormalizedTextMatch:
     def test_no_boxed_no_match(self):
         assert not _normalized_text_match(think_wrap("the answer is y2 < y1 < y3"), "y2 < y1 < y3")
 
+    def test_text_wrapper_unwrapped(self):
+        # stem rows answer fill-in-the-blank prompts with \text{...}; the
+        # command name must not become part of the compared text.
+        assert _normalized_text_match(think_wrap("\\boxed{\\text{negative number}}"), "negative number")
+        assert _normalized_text_match(think_wrap("\\boxed{\\mathrm{negative\\ number}}"), "negative number")
+
+    def test_text_wrapper_wrong_content_rejected(self):
+        assert not _normalized_text_match(think_wrap("\\boxed{\\text{positive number}}"), "negative number")
+
 
 class TestConditionalMatch:
     """Helper-level checks for the symbol-identification last resort."""
@@ -520,6 +543,24 @@ class TestConditionalMatch:
         assert not _conditional_match(resp, "$m = n = 1$")
         assert not _math_last_resort(resp, "$m = n = 1$")
 
+    def test_single_letter_mcq_gt_not_relabelled(self):
+        # Regression: a bare-symbol ground truth made every A-E MCQ row a free
+        # 1.0 -- sigma={A: C} "matched" a wrong C against an A gold.  (Correct
+        # letters are the strict verifiers' territory, not this fallback's.)
+        pytest.importorskip("math_verify")
+        assert not _conditional_match(think_wrap("The answer is $\\boxed{C}$."), "A")
+        assert not _conditional_match(think_wrap("The answer is $\\boxed{d}$."), "C")
+        assert not _conditional_match(think_wrap("The answer is $\\boxed{\\text{A}}$."), "B")
+        assert not _math_last_resort(think_wrap("The answer is $\\boxed{C}$."), "A")
+
+    def test_long_text_token_mcq_gt_not_relabelled(self):
+        # A lone \text{...} token parses as one symbol; it must not be
+        # identified with a single-letter gold either.
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{\\text{Recommend statin therapy}}$.")
+        assert not _conditional_match(resp, "D")
+        assert not _math_last_resort(resp, "D")
+
 
 class TestEvaluatedGtMatch:
     """Helper-level checks for the sample-point numeric equivalence last resort."""
@@ -550,6 +591,119 @@ class TestEvaluatedGtMatch:
         assert not _evaluated_gt_match(think_wrap("\\boxed{y_2 < y_1 < y_3}"), "y2 < y1 < y3")
 
 
+class TestGtSegmentMatch:
+    """Helper-level checks for the prose-ground-truth segment retry.
+
+    Production regression: the Big-Math ground truth stores a full prose
+    sentence whose LAST ``$...$`` segment is decoration (``where $W$ is the
+    Lambert W-function``).  verl's wrapper wraps the whole sentence in
+    ``\boxed{...}`` and math_verify extracts rightmost-first, so the gold
+    parsed as the bare symbol ``W`` and the correct ``W(bc/a)/b`` scored 0.
+    """
+
+    GT = (
+        "The solution to the equation $ax \\exp(bx)=c$ is given by "
+        "$x = \\frac{1}{b}W\\left(\\frac{bc}{a}\\right)$, where $W$ is the Lambert W-function."
+    )
+
+    def test_answer_segment_recovered(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The final answer is: $\\boxed{\\dfrac{W\\left( \\dfrac{bc}{a} \\right)}{b}}$.")
+        assert _gt_segment_match(resp, self.GT)
+        assert _math_last_resort(resp, self.GT)
+
+    def test_equation_form_answer_recovered(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The final answer is: $\\boxed{x = \\frac{1}{b}W\\left(\\frac{bc}{a}\\right)}$.")
+        assert _gt_segment_match(resp, self.GT)
+
+    def test_wrong_answer_rejected(self):
+        pytest.importorskip("math_verify")
+        # Swapped arguments: W(ac/b)/b is NOT equivalent to W(bc/a)/b.
+        resp = think_wrap("The final answer is: $\\boxed{\\dfrac{W\\left( \\dfrac{ac}{b} \\right)}{b}}$.")
+        assert not _gt_segment_match(resp, self.GT)
+        assert not _math_last_resort(resp, self.GT)
+
+    def test_single_segment_gt_out_of_scope(self):
+        pytest.importorskip("math_verify")
+        # One-segment prose gts are the strict verifier's territory.
+        assert not _gt_segment_match(think_wrap("The answer is $\\boxed{5}$."), "The answer is $5$.")
+        assert not _gt_segment_match(think_wrap("The answer is $\\boxed{5}$."), "5")
+
+    def test_no_response_no_match(self):
+        pytest.importorskip("math_verify")
+        assert not _gt_segment_match("", self.GT)
+
+
+class TestOrBranchMatch:
+    """Helper-level checks for the "X or Y" multi-solution last resort.
+
+    Production regression: a multi-solution ground truth parses into a
+    ``FiniteSet`` and the strict verifier demands the WHOLE set, so a response
+    boxing one correct branch (``4`` for ``-12 \text{ or } 4``) scored 0.
+    """
+
+    def test_single_numeric_branch_credited(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{4}$.")
+        assert _or_branch_match(resp, r"-12 \text{ or } 4")
+        assert _math_last_resort(resp, r"-12 \text{ or } 4")
+
+    def test_single_coordinate_branch_credited(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{(-5, 2)}$.")
+        assert _or_branch_match(resp, r"(3,2) \text{ or } (-5,2)")
+
+    def test_wrong_branch_rejected(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{5}$.")
+        assert not _or_branch_match(resp, r"-12 \text{ or } 4")
+        assert not _math_last_resort(resp, r"-12 \text{ or } 4")
+
+    def test_comma_list_not_treated_as_or(self):
+        # A comma ground truth usually requires BOTH values; without an
+        # explicit "or" marker one member must not be credited.
+        pytest.importorskip("math_verify")
+        assert not _or_branch_match(think_wrap("The answer is $\\boxed{1}$."), "1, 2")
+
+    def test_prose_or_without_branch_set_rejected(self):
+        pytest.importorskip("math_verify")
+        assert not _or_branch_match(think_wrap("The answer is $\\boxed{4}$."), "4 or more")
+
+
+class TestLabeledDecimalMatch:
+    """Helper-level checks for the labelled/percent decimal last resort."""
+
+    GT_LIST = "Adobe Systems Stock: 0.3114, Dow Chemical Stock: 0.3442, Office Depot Stock: 0.3442"
+
+    def test_coarser_prediction_consistent_with_gt(self):
+        # 6.535% correctly rounds to 6.54% at the prediction's precision.
+        assert _labeled_decimal_match(think_wrap("The answer is $\\boxed{6.54\\%}$."), "6.535%")
+
+    def test_coarser_prediction_boundary_artifact_rejected(self):
+        # Regression: 6.53%'s wide bucket clipped the gt interval's edge and
+        # scored 1.0, but every value writable as 6.535% rounds to 6.54%,
+        # never to 6.53% -- the overlap was a boundary artifact.
+        assert not _labeled_decimal_match(think_wrap("The answer is $\\boxed{6.53\\%}$."), "6.535%")
+
+    def test_truncated_labelled_list_still_credited(self):
+        # Same-precision predictions: the trunc-aware interval alone decides.
+        resp = think_wrap("$\\boxed{0.3115}$, $\\boxed{0.3443}$, $\\boxed{0.3443}$")
+        assert _labeled_decimal_match(resp, self.GT_LIST)
+
+    def test_coarser_list_predictions_consistent(self):
+        resp = think_wrap("$\\boxed{0.31}$, $\\boxed{0.34}$, $\\boxed{0.34}$")
+        assert _labeled_decimal_match(resp, self.GT_LIST)
+
+    def test_coarser_list_prediction_inconsistent_rejected(self):
+        # 0.3442 rounds to 0.34, not 0.35, at the prediction's precision.
+        resp = think_wrap("$\\boxed{0.31}$, $\\boxed{0.34}$, $\\boxed{0.35}$")
+        assert not _labeled_decimal_match(resp, self.GT_LIST)
+
+    def test_trailing_comma_integer_gt(self):
+        assert _labeled_decimal_match(think_wrap("The answer is $\\boxed{54}$."), "54,")
+
+
 class TestMatrixAnswerNoCrash:
     """Regression: a parsed matrix answer is an unhashable MutableDenseMatrix
     and crashed the last-resort dedup (``dict.fromkeys``) in production."""
@@ -572,6 +726,30 @@ class TestMatrixAnswerNoCrash:
     def test_math_last_resort_matrix_no_crash(self):
         pytest.importorskip("math_verify")
         assert not _math_last_resort(think_wrap(self.RESP), "2.5")
+
+
+class TestExtractFinalResponse:
+    """The response-body extractor must also serve think-block-free input.
+
+    The hallucination dispatcher's ``math_match`` synthesizes a bare
+    ``\\boxed{...}`` string (no think tags) and hands it to ``_math_score``;
+    returning "" for that shape silently disabled every response-parsing last
+    resort (``_gt_segment_match`` / ``_or_branch_match`` /
+    ``_conditional_match`` / ``_evaluated_gt_match``) on that path.
+    """
+
+    def test_think_block_returns_body(self):
+        assert _extract_final_response(think_wrap("The answer is $\\boxed{4}$.")) == "The answer is $\\boxed{4}$."
+
+    def test_no_think_block_returns_whole_string(self):
+        assert _extract_final_response("\\boxed{4}") == "\\boxed{4}"
+        assert _extract_final_response("  \\boxed{4}  ") == "\\boxed{4}"
+
+    def test_bare_boxed_reaches_response_parsing_last_resorts(self):
+        # End-to-end on the hallucination input shape: the "X or Y" branch
+        # matcher must see the boxed answer, not an empty response.
+        pytest.importorskip("math_verify")
+        assert _math_last_resort("\\boxed{4}", r"-12 \text{ or } 4")
 
 
 def _loop(k: int) -> str:
