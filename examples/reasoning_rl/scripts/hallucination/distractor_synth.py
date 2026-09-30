@@ -935,6 +935,10 @@ def load_main_pool(
             payload = json.loads(row["reward_model"]["ground_truth"])
         except (ValueError, KeyError, TypeError):
             continue
+        # A bare scalar (e.g. ground_truth is just "12.5") json-loads fine but is
+        # not the {"answer": ...} payload -- skip it like an unparsable one.
+        if not isinstance(payload, dict):
+            continue
         answer = payload.get("answer")
         if not answer:
             continue
