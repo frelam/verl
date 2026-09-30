@@ -693,6 +693,37 @@ def _dedupe_keep_order(exprs) -> list:
     return out
 
 
+# math_verify's LatexExtractionConfig fails on two ground-truth shapes common
+# in Big-Math prose answers, leaving the symbolic fallbacks below with a bare
+# ``1`` / raw string instead of a real expression:
+#   1. explicit-size delimiters (``\Big(`` / ``\bigg[`` ...), which it does not
+#      recognise -- ``\left(``/``\right)`` are supported and mean the same;
+#   2. a conditional bar inside a function's argument list (``l(\theta|x_{1:n})``
+#      -- probability-style ``given`` notation), which it cannot tokenise.
+# Rewrite both before parsing.  A no-op on strings that carry neither.
+_BIG_DELIM_RE = re.compile(r"\\(?:[Bb]ig{1,2})([lr])?(?=[\(\[\{\\\|\)\]\}])")
+# ``f(\theta|x_{1:n})`` -> ``f(\theta)``: drop ``|...`` up to the closing paren.
+_COND_BAR_RE = re.compile(r"\|[^()]*(?=\))")
+
+
+def _normalise_gt_latex(text: str) -> str:
+    """Rewrite ground-truth LaTeX into a shape math_verify can parse."""
+
+    def _delim(m: re.Match) -> str:
+        side = m.group(1)
+        if side is None:
+            # Decide by the delimiter that follows: ( [ { open, ) ] } close, and
+            # for the escaped \{ \} \| forms the char after the backslash does.
+            nxt = text[m.end() : m.end() + 1]
+            if nxt == "\\":
+                nxt = text[m.end() + 1 : m.end() + 2]
+            side = "l" if nxt in "([{" else "r"
+        return "\\left" if side == "l" else "\\right"
+
+    text = _BIG_DELIM_RE.sub(_delim, text)
+    return _COND_BAR_RE.sub("", text)
+
+
 def _conditional_match(solution_str: str, ground_truth: str) -> bool:
     """Last resort for ground truths left as unevaluated general formulas.
 
@@ -717,10 +748,14 @@ def _conditional_match(solution_str: str, ground_truth: str) -> bool:
         return False
     try:
         # parsing_timeout=None: signal-based timeouts only work in the main
-        # thread, but rewards run in a worker-thread pool.
-        gt_exprs = _sympy_exprs(parse(ground_truth, (LatexExtractionConfig(),), parsing_timeout=None))
+        # thread, but rewards run in a worker-thread pool.  The ground truth is
+        # normalised first: math_verify cannot tokenise ``\Big(`` delimiters or
+        # a conditional bar in a function's arguments (``l(\theta|x_{1:n})``),
+        # and would otherwise hand back a bare ``1`` for the gold.
+        gt_text = _normalise_gt_latex(ground_truth)
+        gt_exprs = _sympy_exprs(parse(gt_text, (LatexExtractionConfig(),), parsing_timeout=None))
         if not gt_exprs:  # datasets often keep bare LaTeX without $...$
-            gt_exprs = _sympy_exprs(parse(f"${ground_truth}$", (LatexExtractionConfig(),), parsing_timeout=None))
+            gt_exprs = _sympy_exprs(parse(f"${gt_text}$", (LatexExtractionConfig(),), parsing_timeout=None))
         pred_exprs = _sympy_exprs(
             parse(response, (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None)
         )
@@ -751,6 +786,13 @@ def _conditional_match(solution_str: str, ground_truth: str) -> bool:
     universe = sorted(set(gt_symbols) | set().union(*(e.free_symbols for e in pred_exprs)), key=str)
     if not (0 < len(gt_symbols) <= _COND_MAX_GT_SYMBOLS) or len(universe) > _COND_MAX_SYMBOLS:
         return False
+    # An expression whose gold symbols are *only renamed* between gold and
+    # prediction (``w_k p(x_i|...)`` vs ``\alpha f_1(x_i) + (1-\alpha) f_2(x_i)``
+    # -- the mixture log-likelihood keeps the same unknowns under different
+    # names) cannot be matched by a one-symbol-at-a-time substitution: the
+    # prediction's ``1-\alpha`` needs the gold's ``w_2`` to map to a *term*, not
+    # a symbol.  That class is numeric-identity, not a prompt-condition
+    # substitution, so it is left to ``_evaluated_gt_match``.
     for mapping in itertools.product(universe, repeat=len(gt_symbols)):
         sigma = dict(zip(gt_symbols, mapping))
         if all(sigma[s] == s for s in gt_symbols):
@@ -797,10 +839,14 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
         return False
     try:
         # parsing_timeout=None: signal-based timeouts only work in the main
-        # thread, but rewards run in a worker-thread pool.
-        gt_exprs = _sympy_exprs(parse(ground_truth, (LatexExtractionConfig(),), parsing_timeout=None))
+        # thread, but rewards run in a worker-thread pool.  The ground truth is
+        # normalised first: math_verify cannot tokenise ``\Big(`` delimiters or
+        # a conditional bar in a function's arguments (``l(\theta|x_{1:n})``),
+        # and would otherwise hand back a bare ``1`` for the gold.
+        gt_text = _normalise_gt_latex(ground_truth)
+        gt_exprs = _sympy_exprs(parse(gt_text, (LatexExtractionConfig(),), parsing_timeout=None))
         if not gt_exprs:  # datasets often keep bare LaTeX without $...$
-            gt_exprs = _sympy_exprs(parse(f"${ground_truth}$", (LatexExtractionConfig(),), parsing_timeout=None))
+            gt_exprs = _sympy_exprs(parse(f"${gt_text}$", (LatexExtractionConfig(),), parsing_timeout=None))
         pred_exprs = _sympy_exprs(
             parse(response, (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None)
         )
@@ -813,13 +859,90 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
     )
     if not (0 < len(gt_exprs) <= _COND_MAX_GT_EXPRS) or not (0 < len(pred_exprs) <= _COND_MAX_PRED_EXPRS):
         return False
-    if len(set().union(*(e.free_symbols for e in gt_exprs + pred_exprs))) > _COND_MAX_SYMBOLS:
+
+    def _numerisable(e):
+        """Reduce an expression to one whose numeric value identifies it.
+
+        Two gold shapes defeat a plain ``evalf``:
+          * an ``Equality`` (``l(\\theta) = ...``) -- numeric comparison belongs
+            to the right-hand side, and the left-hand side is just the answer's
+            own label, so keep the rhs;
+          * an undefined-function call (``p(x_i)``, ``f_1(x_i)``) -- ``evalf``
+            cannot evaluate it, so replace every call with a fresh symbol that
+            encodes the function name AND its arguments (``p(x_i)`` and
+            ``p(x_j)`` must stay distinct).
+        The mapping from call to symbol is rebuilt per expression; the caller
+        then aligns the two sides' symbols by position before comparing.
+        """
+        import sympy as sp  # lazy; callers already guard the ImportError
+
+        if isinstance(e, sp.Equality):
+            e = e.rhs
+        mapping = {}
+
+        def _repl(node):
+            if isinstance(node, sp.core.function.AppliedUndef):
+                key = (str(node.func), tuple(str(a) for a in node.args))
+                if key not in mapping:
+                    mapping[key] = sp.Symbol(f"__f{len(mapping)}")
+                return mapping[key]
+            return node
+
+        try:
+            e = e.replace(lambda n: isinstance(n, sp.core.function.AppliedUndef), _repl)
+        except Exception:
+            return None
+        return e
+
+    gt_num = [e for e in (_numerisable(g) for g in gt_exprs) if e is not None]
+    pred_num = [e for e in (_numerisable(p) for p in pred_exprs) if e is not None]
+    if not gt_num or not pred_num:
+        return False
+    if len(set().union(*(e.free_symbols for e in gt_num + pred_num))) > _COND_MAX_SYMBOLS:
         return False
 
     def _equiv(g, p) -> bool:
         if g == p:
             return True
-        syms = sorted(g.free_symbols | p.free_symbols, key=str)
+        # Coefficient matching: expand both sides and compare, monomial by
+        # monomial, the numeric value of each coefficient.  Two expressions are
+        # identical iff every shared monomial carries the same coefficient and
+        # no monomial appears on only one side, and -- unlike a raw sampling
+        # test -- this stays correct when the two sides name the same unknowns
+        # differently: the predicted symbols are first mapped onto the gold's
+        # by position, and a notation-only difference (``w_k p(x_i)`` vs
+        # ``\alpha f_1(x_i) + (1-\alpha) f_2(x_i)``) then gives each monomial
+        # (``f_1``, ``f_2``) matching coefficients on both sides.
+        g_syms = sorted(g.free_symbols, key=str)
+        p_syms = sorted(p.free_symbols, key=str)
+        if len(g_syms) != len(p_syms):
+            return False  # genuinely different unknowns
+        # A bare-symbol ground truth (a single-letter MCQ answer like "C", or a
+        # lone \text{...} token) must NOT be relabelled onto the prediction:
+        # position-aligning A->C would "match" a wrong C against an A gold.
+        # Only a compound gold expression can exhibit a notation-only
+        # difference worth crediting.  Same guard as _conditional_match.
+        if isinstance(g, sp.Symbol):
+            return False
+        p = p.subs(dict(zip(p_syms, g_syms)))
+        try:
+            g_poly = sp.Poly(sp.expand(g), *g_syms) if g_syms else None
+            p_poly = sp.Poly(sp.expand(p), *g_syms) if g_syms else None
+        except Exception:
+            g_poly = p_poly = None  # not polynomial (e.g. has log): fall through to sampling
+        if g_poly is not None and p_poly is not None:
+            if set(g_poly.monoms()) != set(p_poly.monoms()):
+                return False
+            g_coeffs = [g_poly.coeff_monomial(m) for m in g_poly.monoms()]
+            p_coeffs = [p_poly.coeff_monomial(m) for m in p_poly.monoms()]
+            # Coefficients may themselves be symbolic (``1-\alpha``); compare
+            # them numerically at the same fixed points used below.
+            return all(_numeric_equiv(gc, pc) for gc, pc in zip(g_coeffs, p_coeffs))
+        return _numeric_equiv(g, p, syms=g_syms)
+
+    def _numeric_equiv(g, p, syms=None) -> bool:
+        """Numeric identity at the fixed non-integer sample points."""
+        syms = sorted(g.free_symbols | p.free_symbols, key=str) if syms is None else syms
         if not syms:
             try:
                 return math.isclose(float(g.evalf()), float(p.evalf()), rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL)
@@ -832,7 +955,7 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
                 gv = float(g.subs(subs).evalf())
                 pv = float(p.subs(subs).evalf())
             except Exception:
-                continue  # singular point / non-numeric (e.g. relation); next round
+                continue  # singular point / non-numeric; next round
             if not (math.isfinite(gv) and math.isfinite(pv)):
                 continue
             if not math.isclose(gv, pv, rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL):
@@ -840,7 +963,7 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
             hits += 1
         return hits >= 2
 
-    return all(any(_equiv(g, p) for p in pred_exprs) for g in gt_exprs)
+    return all(any(_equiv(g, p) for p in pred_num) for g in gt_num)
 
 
 # Prose ground truths ("The solution ... is given by $x = ...$, where $W$ is
@@ -894,7 +1017,7 @@ def _gt_segment_match(solution_str: str, ground_truth: str) -> bool:
         return False
     for seg in segs:
         try:
-            golds = parse(f"${seg}$", (LatexExtractionConfig(),), parsing_timeout=None)
+            golds = parse(f"${_normalise_gt_latex(seg)}$", (LatexExtractionConfig(),), parsing_timeout=None)
         except Exception:
             continue
         for g in golds:
@@ -951,10 +1074,12 @@ def _or_branch_match(solution_str: str, ground_truth: str) -> bool:
         # parsing_timeout=None: signal-based timeouts only work in the main
         # thread, but rewards run in a worker-thread pool.  The ground truth is
         # parsed the way verl's math_verify wrapper presents it (wrapped in
-        # \boxed{...}), so the branch set matches what the strict path saw.
-        golds = _sympy_exprs(parse(f"\\boxed{{{ground_truth}}}", (LatexExtractionConfig(),), parsing_timeout=None))
+        # \boxed{...}), so the branch set matches what the strict path saw, and
+        # is normalised so ``\Big(`` / conditional-bar shapes parse at all.
+        gt_text = _normalise_gt_latex(ground_truth)
+        golds = _sympy_exprs(parse(f"\\boxed{{{gt_text}}}", (LatexExtractionConfig(),), parsing_timeout=None))
         if not golds:
-            golds = _sympy_exprs(parse(ground_truth, (LatexExtractionConfig(),), parsing_timeout=None))
+            golds = _sympy_exprs(parse(gt_text, (LatexExtractionConfig(),), parsing_timeout=None))
         pred_exprs = _sympy_exprs(
             parse(response, (ExprExtractionConfig(), LatexExtractionConfig()), parsing_timeout=None)
         )
