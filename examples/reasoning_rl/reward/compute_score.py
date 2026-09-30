@@ -1554,11 +1554,11 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
 # right answer -- e.g. a repeated <answer> fence whose last copy is correct --
 # and would otherwise collect full credit.  A single word n-gram occurring
 # more than ``_rep_threshold(len)`` times marks the trajectory as a death loop;
-# every occurrence past the threshold costs ``_REP_STEP``, penalties from
-# several looped n-grams add up, and ``_repetition_adjusted`` floors the
-# final score at ``_REP_FLOOR``.  Applied to every returned score, including
-# format-gate and verifier-crash zeros: a degenerate sample deserves the
-# penalty regardless of correctness.
+# every ``_REP_STEP_PER`` occurrences past the threshold cost ``_REP_STEP``,
+# penalties from several looped n-grams add up, and ``_repetition_adjusted``
+# floors the final score at ``_REP_FLOOR``.  Applied to every returned score,
+# including format-gate and verifier-crash zeros: a degenerate sample deserves
+# the penalty regardless of correctness.
 #
 # The threshold is length-scaled: a fixed count cannot separate a death loop
 # from normal discourse once the response-length curriculum reaches 16k-24k
@@ -1571,8 +1571,9 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
 # n-gram positions -- the signature of a loop, not of verbose reasoning.
 _REP_NGRAM = 5
 _REP_MIN_COUNT = 15
-_REP_RATIO = 100
+_REP_RATIO = 50
 _REP_STEP = 0.1
+_REP_STEP_PER = 10
 _REP_FLOOR = -1.0
 
 
@@ -1581,15 +1582,16 @@ def _rep_threshold(total_ngrams: int) -> int:
 
 
 def _repetition_penalty(text: str) -> float:
-    """Death-loop penalty in points: per word n-gram, each occurrence past
-    ``_rep_threshold`` costs ``_REP_STEP``; multiple looped n-grams stack."""
+    """Death-loop penalty in points: excess occurrences of any word n-gram past
+    ``_rep_threshold`` are summed across all looped n-grams, and every full
+    ``_REP_STEP_PER`` of them costs ``_REP_STEP``."""
     words = text.split()
     if len(words) < _REP_NGRAM + _REP_MIN_COUNT:  # too short to loop past the threshold
         return 0.0
     counts = Counter(zip(*(words[i:] for i in range(_REP_NGRAM))))
     threshold = _rep_threshold(len(words) - _REP_NGRAM + 1)
     excess = sum(count - threshold for count in counts.values() if count > threshold)
-    return _REP_STEP * excess
+    return _REP_STEP * (excess // _REP_STEP_PER)
 
 
 def _repetition_adjusted(solution_str: str, score: float) -> float:
@@ -1625,9 +1627,10 @@ def compute_score(
     row or a crafted answer fails closed with a logged 0 instead.
 
     Every returned score is repetition-adjusted (``_repetition_adjusted``): a
-    degenerate, heavily self-repeating generation loses 0.1 per redundant
-    n-gram past a length-scaled allowance, floored at -1 -- repetition loops
-    can no longer collect full credit just because the last copy is right.
+    degenerate, heavily self-repeating generation loses 0.1 per 10 redundant
+    n-gram occurrences past a length-scaled allowance, floored at -1 --
+    repetition loops can no longer collect full credit just because the last
+    copy is right.
     """
     if not format_ok(solution_str):
         return {"score": _repetition_adjusted(solution_str, 0.0)}

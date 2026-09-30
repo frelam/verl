@@ -754,8 +754,8 @@ class TestExtractFinalResponse:
 
 def _loop(k: int) -> str:
     # k copies of an 8-word block separated by a unique token, so exactly the
-    # block's 5 internal word 4-grams repeat (each k times); k > 15 is a death
-    # loop with k - 15 excess occurrences per gram.
+    # block's 4 internal word 5-grams repeat (each k times); k > 15 is a death
+    # loop with 4 * (k - 15) excess occurrences in total.
     return " ".join(f"a b c d e f g h s{i}" for i in range(k))
 
 
@@ -765,18 +765,21 @@ class TestRepetitionPenalty:
         # so the length-scaled term is inactive and the floor of 15 applies).
         assert _repetition_penalty(_loop(15)) == 0.0
 
-    def test_step_per_excess_occurrence(self):
-        # A single looped n-gram: n words of "x" give one 4-gram seen n-3
-        # times, so the excess over 15 is n-18.  All below the ratio term
-        # kicks in (total ngrams < 750), so the floor of 15 governs.
-        assert _repetition_penalty(" ".join(["x"] * 19)) == pytest.approx(0.1)
-        assert _repetition_penalty(" ".join(["x"] * 20)) == pytest.approx(0.2)
-        assert _repetition_penalty(" ".join(["x"] * 33)) == pytest.approx(1.5)
+    def test_step_per_ten_excess_occurrences(self):
+        # A single looped n-gram: n words of "x" give one 5-gram seen n-4
+        # times, so the excess over 15 is n-19.  All below the ratio term
+        # kicks in (total ngrams < 750), so the floor of 15 governs, and every
+        # full 10 excess occurrences cost 0.1.
+        assert _repetition_penalty(" ".join(["x"] * 28)) == 0.0  # 9 excess: no full step yet
+        assert _repetition_penalty(" ".join(["x"] * 29)) == pytest.approx(0.1)
+        assert _repetition_penalty(" ".join(["x"] * 39)) == pytest.approx(0.2)
+        assert _repetition_penalty(" ".join(["x"] * 169)) == pytest.approx(1.5)
 
     def test_multiple_looped_ngrams_stack(self):
-        # _loop(16) loops 5 distinct 4-grams once each past the threshold.
-        assert _repetition_penalty(_loop(16)) == pytest.approx(0.5)
-        assert _repetition_penalty(_loop(17)) == pytest.approx(1.0)
+        # _loop(18) loops 4 distinct 5-grams 3 times each past the threshold
+        # (12 excess -> 0.1); _loop(28) gives 4 * 13 = 52 excess -> 0.5.
+        assert _repetition_penalty(_loop(18)) == pytest.approx(0.1)
+        assert _repetition_penalty(_loop(28)) == pytest.approx(0.5)
 
     def test_short_or_clean_text_free(self):
         assert _repetition_penalty("too short") == 0.0
@@ -797,47 +800,47 @@ class TestRepetitionPenalty:
     def test_long_death_loop_still_penalised(self):
         # A real death loop dominates the text -- exactly what the ratio term
         # encodes.  300 copies of an 8-word block appended to 10k filler words
-        # (12,700 words total -> 12,697 ngrams -> threshold 253): each of the
-        # block's 5 internal 4-grams is seen 300 times, past the threshold,
+        # (12,700 words total -> 12,696 ngrams -> threshold 253): each of the
+        # block's 4 internal 5-grams is seen 300 times, 47 past the threshold,
         # so the penalty fires at a length where the old flat threshold of 15
         # would have charged 285 phantom excesses per gram.
         filler = " ".join(f"f{i}" for i in range(10_000))
         loop = " ".join(f"a b c d e f g h s{i}" for i in range(300))
         text = filler + " " + loop
-        total = len(text.split()) - 3
+        total = len(text.split()) - 4
         threshold = max(_REP_MIN_COUNT, total // 50)
         assert threshold == 253
-        assert _repetition_penalty(text) == pytest.approx(0.1 * 5 * (300 - threshold))
+        assert _repetition_penalty(text) == pytest.approx(0.1 * (4 * (300 - threshold) // 10))
 
     def test_correct_but_degenerate_scores_below_one(self):
         # Space-padded so the think tags don't merge into the edge grams.
         gt = json.dumps({"answer": "6", "task": "maze"})
-        res = compute_score("logic_reasoning_gym", think_wrap("6", think=f" {_loop(16)} "), gt)
+        res = compute_score("logic_reasoning_gym", think_wrap("6", think=f" {_loop(28)} "), gt)
         assert res["score"] == pytest.approx(0.5)
 
     def test_heavy_repetition_hits_floor(self):
         gt = json.dumps({"answer": "6", "task": "maze"})
-        res = compute_score("logic_reasoning_gym", think_wrap("6", think=f" {_loop(30)} "), gt)
+        res = compute_score("logic_reasoning_gym", think_wrap("6", think=f" {_loop(65)} "), gt)
         assert res["score"] == -1.0
 
     def test_wrong_and_degenerate_also_floored(self):
         # The penalty is correctness-agnostic: a degenerate miss goes below 0.
         gt = json.dumps({"answer": "6", "task": "maze"})
-        res = compute_score("logic_reasoning_gym", think_wrap("7", think=f" {_loop(30)} "), gt)
+        res = compute_score("logic_reasoning_gym", think_wrap("7", think=f" {_loop(40)} "), gt)
         assert res["score"] == -1.0
 
     def test_repeated_answer_block_like_reported_case(self):
-        # The reported dump: a correct <answer> fence pasted ~20 times.
+        # The reported dump: a correct <answer> fence pasted over and over.
         seq = "7 2 2 6 7 4 4 3 7 5 5 8 9 2 6 0 0 2 6 6 7 4 4 9 7 5 7 3 0 4"
         gt = json.dumps({"answer": seq, "task": "maze"})
-        response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 20)
+        response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 30)
         res = compute_score("logic_reasoning_gym", think_wrap(response), gt)
         assert res["score"] == -1.0
 
     def test_fifteen_copies_still_free(self):
-        # 15 copies loop every block-internal 4-gram exactly 15 times: the
+        # 15 copies loop every block-internal 5-gram exactly 15 times: the
         # threshold is only crossed by the 16th occurrence.  (The seq uses
-        # distinct tokens so no 4-gram already repeats inside one copy.)
+        # distinct tokens so no 5-gram already repeats inside one copy.)
         seq = " ".join(str(i) for i in range(30))
         gt = json.dumps({"answer": seq, "task": "maze"})
         response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 15)
@@ -845,13 +848,13 @@ class TestRepetitionPenalty:
         assert res["score"] == 1.0
 
     def test_gram_repeating_inside_each_copy_counts_too(self):
-        # The reported case's seq repeats "6 7 4 4" twice per copy, so already
-        # at 15 copies that 4-gram is seen 30 times -> 15 excess -> -1.5.
-        seq = "7 2 2 6 7 4 4 3 7 5 5 8 9 2 6 0 0 2 6 6 7 4 4 9 7 5 7 3 0 4"
+        # The seq repeats "1 2 3 4 5" twice per copy, so already at 15 copies
+        # that 5-gram is seen 30 times -> 15 excess -> -0.1.
+        seq = "6 7 8 9 10 1 2 3 4 5 11 12 13 14 15 1 2 3 4 5 16 17 18 19 20"
         gt = json.dumps({"answer": seq, "task": "maze"})
         response = "\n".join(["```", f"<answer>{seq}</answer>", "```"] * 15)
         res = compute_score("logic_reasoning_gym", think_wrap(response), gt)
-        assert res["score"] == pytest.approx(-0.5)
+        assert res["score"] == pytest.approx(0.9)
 
     def test_clean_correct_answer_unaffected(self):
         gt = json.dumps({"answer": "6", "task": "maze"})

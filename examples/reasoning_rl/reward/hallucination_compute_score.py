@@ -79,13 +79,21 @@ try:
     from examples.reasoning_rl.reward.compute_score import _extract_boxed
     from examples.reasoning_rl.reward.compute_score import _math_score
     from examples.reasoning_rl.reward.compute_score import _normalise_text
+    from examples.reasoning_rl.reward.compute_score import _repetition_adjusted
     from examples.reasoning_rl.reward.compute_score import compute_score as _base_compute_score
     from examples.reasoning_rl.reward.compute_score import format_ok
     from examples.reasoning_rl.reward.compute_score import logic_answer_match
 except ImportError:
     # Fallback when run as a plain module without the repo on sys.path.
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from compute_score import _extract_boxed, _math_score, _normalise_text, format_ok, logic_answer_match
+    from compute_score import (
+        _extract_boxed,
+        _math_score,
+        _normalise_text,
+        _repetition_adjusted,
+        format_ok,
+        logic_answer_match,
+    )
     from compute_score import compute_score as _base_compute_score
 
 # The prefix that marks a row as belonging to the hallucination domain.  It is
@@ -569,11 +577,17 @@ def compute_score(
     ``reward_extra_info`` and DAPO ``filter_groups.metric=score`` keeps working.
     ``**kwargs`` (sandbox URL, semaphores, memory limit, ...) are forwarded to the
     stage-1 dispatcher untouched, so a single mixed parquet serves both.
+
+    Hallucination rows are repetition-adjusted exactly like stage-1 rows
+    (``_repetition_adjusted``): a degenerate, self-repeating generation loses
+    credit even when the abstention verdict itself is right, and the
+    format-gate/crash zeros are adjusted too, so a death loop can never score
+    above a clean refusal.
     """
     if not isinstance(data_source, str) or not data_source.startswith(HALLUC_PREFIX):
         return _base_compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
     try:
-        return {"score": score_halluc_row(data_source, solution_str, ground_truth, extra_info)}
+        return {"score": _repetition_adjusted(solution_str, score_halluc_row(data_source, solution_str, ground_truth, extra_info))}
     except Exception:
         logger.exception("[halluc] dispatcher crashed for %s; scoring 0", data_source)
-        return {"score": 0.0}
+        return {"score": _repetition_adjusted(solution_str, 0.0)}

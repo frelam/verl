@@ -796,3 +796,51 @@ class TestMathMatch:
         pytest.importorskip("math_verify")
         assert math_match("C", "A") is False
         assert math_match("d", "C") is False
+
+
+# ---------------------------------------------------------------------------
+# repetition penalty (shared with stage 1 via _repetition_adjusted)
+# ---------------------------------------------------------------------------
+
+
+def _loop(k: int) -> str:
+    # Same death-loop shape as test_compute_score.TestRepetitionPenalty: k
+    # copies of an 8-word block, 4 internal 5-grams seen k times each.
+    return " ".join(f"a b c d e f g h s{i}" for i in range(k))
+
+
+class TestRepetitionPenalty:
+    """Hallucination rows go through the same n-gram penalty as stage 1."""
+
+    def test_correct_but_degenerate_scores_below_one(self):
+        # _loop(28): 4 * 13 = 52 excess occurrences -> -0.5 on a correct row.
+        res = compute_score(
+            "halluc_math_gsmic",
+            think_wrap("\\boxed{540}", think=f" {_loop(28)} "),
+            gt_json(solvable=True, answer="540"),
+        )
+        assert res["score"] == pytest.approx(0.5)
+
+    def test_death_loop_hits_floor_even_on_fabrication(self):
+        # Fabricating on an unsolvable row is already -1; the penalty keeps a
+        # heavily looped *correct* refusal from scoring above a clean one.
+        res = compute_score(
+            "halluc_math_gsmic",
+            think_wrap("\\boxed{540}", think=f" {_loop(65)} "),
+            gt_json(solvable=True, answer="540"),
+        )
+        assert res["score"] == -1.0
+
+    def test_format_gate_zero_is_adjusted_too(self):
+        # A degenerate generation without the template shape goes below 0,
+        # exactly like the stage-1 format-gate path.
+        res = compute_score("halluc_math_gsmic", _loop(65), gt_json(solvable=True, answer="540"))
+        assert res["score"] == -1.0
+
+    def test_clean_correct_answer_unaffected(self):
+        res = compute_score(
+            "halluc_math_gsmic",
+            think_wrap("\\boxed{540}"),
+            gt_json(solvable=True, answer="540"),
+        )
+        assert res["score"] == 1.0
