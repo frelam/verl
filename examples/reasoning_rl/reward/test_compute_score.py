@@ -590,6 +590,21 @@ class TestEvaluatedGtMatch:
         # Relations are excluded here; they belong to _normalized_text_match.
         assert not _evaluated_gt_match(think_wrap("\\boxed{y_2 < y_1 < y_3}"), "y2 < y1 < y3")
 
+    def test_unevaluated_sum_excluded_before_evalf(self):
+        pytest.importorskip("math_verify")
+        # Production SIGSEGV: the Big-Math mixture log-likelihood ground truth
+        # carries an unevaluated nested Sum; sympy's evalf on it recurses via
+        # euler_maclaurin until the reward worker thread's C stack overflows.
+        # _numerisable must drop Sum/Product/Integral expressions so this
+        # returns False instead of crashing the worker (accepted false
+        # negative, per the out-of-scope nested-index-sum decision).
+        gt = "\\sum_{i=1}^{n} \\log\\left(\\sum_{k=1}^{2} w_k p(x_i)\\right)"
+        assert not _evaluated_gt_match(think_wrap("\\boxed{\\sum_{k=1}^{2} w_k p(x_1)}"), gt)
+        # The closed form of a sum must NOT match the unevaluated-sum gt here.
+        assert not _evaluated_gt_match(
+            think_wrap("\\boxed{\\frac{n(n+1)(2n+1)}{6}}"), "\\sum_{k=1}^{n} k^2"
+        )
+
 
 class TestGtSegmentMatch:
     """Helper-level checks for the prose-ground-truth segment retry.

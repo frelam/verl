@@ -878,6 +878,15 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
 
         if isinstance(e, sp.Equality):
             e = e.rhs
+        # Unevaluated Sum/Product/Integral: sympy's evalf descends into
+        # euler_maclaurin for a symbolic-bounds or nested Sum and can recurse
+        # until the worker THREAD's C stack overflows -- a SIGSEGV that kills
+        # the whole reward worker, which try/except cannot catch (observed in
+        # production on the Big-Math mixture log-likelihood ground truth
+        # ``Σ_i log Σ_k w_k p(x_i|μ_k,σ²_k)``).  Exclude them here; they stay
+        # the accepted out-of-scope false-negative class instead of crashing.
+        if e.has(sp.Sum, sp.Product, sp.Integral):
+            return None
         mapping = {}
 
         def _repl(node):
