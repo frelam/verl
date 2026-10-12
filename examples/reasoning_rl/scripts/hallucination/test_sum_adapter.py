@@ -681,7 +681,7 @@ def test_reward_cells_on_a_built_row(tmp_path):
     other = "B" if named == "A" else "A"
     assert _score(f"\\boxed{{{named}: 49}}", ground_truth) == 1.0
     assert _score(f"\\boxed{{{other}: 49}}", ground_truth) == 0.0  # wrong id, gold answer text
-    assert _score(f"\\boxed{{{named}: 50}}", ground_truth) == 0.5  # right id, wrong answer
+    assert _score(f"\\boxed{{{named}: 50}}", ground_truth) == 0.0  # AND-gated: right id, wrong answer
     assert _score("\\boxed{49}", ground_truth) == 0.0  # bare number: no id
     assert _score("\\boxed{UNSOLVABLE}", ground_truth) == 0.0
     assert _score("the answer is 49", ground_truth) == 0.0  # no box at all
@@ -696,7 +696,7 @@ def test_reward_parse_equivalence_and_wrong_id(tmp_path):
     assert _score("\\boxed{A:49}", ground_truth) == 1.0  # no space after the colon
     assert _score("\\boxed{B: 49}", ground_truth) == 0.0
     assert _score("\\boxed{b: 49}", ground_truth) == 0.0
-    assert _score("\\boxed{A: 50}", ground_truth) == 0.5
+    assert _score("\\boxed{A: 50}", ground_truth) == 0.0  # AND-gated: right id, wrong answer
     assert _score("\\boxed{A: 49} and \\boxed{B: 49}", ground_truth) == 0.0  # the last box rules
 
 
@@ -716,8 +716,9 @@ def test_reward_ab_swap_invariance(tmp_path):
             assert _score(f"\\boxed{{{other}: {answer}}}", swapped_ground_truth) == 1.0
             assert _score(f"\\boxed{{{other}: {answer}}}", ground_truth) == 0.0
             assert _score(f"\\boxed{{{named}: {answer}}}", swapped_ground_truth) == 0.0
-            assert _score(f"\\boxed{{{named}: {wrong}}}", ground_truth) == 0.5
-            assert _score(f"\\boxed{{{other}: {wrong}}}", swapped_ground_truth) == 0.5
+            # AND-gated: the right pick with a wrong answer earns nothing.
+            assert _score(f"\\boxed{{{named}: {wrong}}}", ground_truth) == 0.0
+            assert _score(f"\\boxed{{{other}: {wrong}}}", swapped_ground_truth) == 0.0
 
 
 # ---------------------------------------------------------------------------

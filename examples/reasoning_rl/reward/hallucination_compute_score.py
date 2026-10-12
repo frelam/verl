@@ -31,7 +31,7 @@ situation                                    model writes, last line
 ===========================================  =====================================
 solvable, numeric/expression                  ``\\boxed{<answer>}``
 solvable, name -> role pairs (K&K, D19)       ``\\boxed{<name>: <role>, …}``
-solvable, judgement + answer (D24/D27)        ``\\boxed{<answer>}``  (0.5 + 0.5)
+solvable, judgement + answer (D24/D27)        ``\\boxed{<answer>}``  (both layers required)
 solvable, "is this answerable?" (CREPE)       ``\\boxed{SOLVABLE}``
 paired judge-then-solve (SUM, D23)            ``\\boxed{<A|B>: <answer>}``
 unsolvable, with diagnosis label              ``\\boxed{UNSOLVABLE: <option id>}``
@@ -43,8 +43,11 @@ one is `status="none"` and scores 0.  Nothing about the reasoning text itself is
 graded (design decision D4 dropped the consistency aux term), so a model may say
 "contradiction" mid-thought without penalty.
 
-The main reward is ``{+1, 0, -1}``, with ``+0.5`` partial credit on the two-layer
-tasks (design doc section 6).  ``-1`` is symmetric by construction and applies in
+The main reward is ``{+1, 0, -1}``.  The two-layer tasks (``pair_task`` /
+``two_layer`` / ``solvable_answer``) are AND-gated: the solvability judgement
+earns nothing on its own, only a correct judgement *and* a correct answer score
+``+1`` -- a ``+0.5`` judgement-only credit would reward guessing "solvable".
+``-1`` is symmetric by construction and applies in
 exactly two places: fabricating an answer on an unsolvable row, and refusing on a
 ``judgment_only`` row (CREPE-normal).  Every *other* solvable branch scores a
 misrefusal 0 rather than -1 -- that is what section 6's pseudocode specifies and
@@ -464,8 +467,8 @@ def score_from_status(ground_truth: dict, status: str, answer: str | None, optio
 
     ``-1`` appears exactly twice: fabricating an answer on an unsolvable row, and
     refusing on a ``judgment_only`` row.  Every other solvable branch is
-    ``{+1, 0}`` (plus the two-layer ``+0.5``), which is what D24/D26 restate as
-    "误拒 → 0（与普通可解行一致）".
+    ``{+1, 0}``, with the two-layer branches AND-gated (judgement alone scores
+    0), which is what D24/D26 restate as "误拒 → 0（与普通可解行一致）".
     """
     if "solvable" not in ground_truth:
         logger.warning("[halluc] ground_truth has no 'solvable' key; scoring 0")
@@ -475,25 +478,26 @@ def score_from_status(ground_truth: dict, status: str, answer: str | None, optio
     if solvable:
         if ground_truth.get("pair_task"):
             # SUM (D23): first judge which of A/B is solvable, then answer it.
-            # A wrong id gets nothing at all -- including no answer-layer credit
-            # even when the answer text happens to equal the gold.
+            # AND-gated: a right pick with a wrong answer scores 0, so the
+            # judgement layer alone is worth nothing (a wrong id already gets
+            # nothing -- including no credit when the answer text equals the gold).
             side, pair_answer = parse_pair(answer)
             if side is None or side != str(ground_truth.get("answerable_id", "")).upper():
                 return 0.0
-            return 0.5 + 0.5 * float(math_match(pair_answer, ground_truth.get("answer")))
+            return 1.0 if math_match(pair_answer, ground_truth.get("answer")) else 0.0
         if ground_truth.get("two_layer"):
             # UMWP-answerable (D24): producing an answer *is* the judgement, so a
-            # refusal fails the judgement layer and earns nothing.
+            # refusal fails the judgement layer.  AND-gated: a wrong answer earns
+            # nothing either -- both layers must pass for any credit.
             if status != STATUS_ANSWER:
                 return 0.0
-            return 0.5 + 0.5 * float(math_match(answer, ground_truth.get("answer")))
+            return 1.0 if math_match(answer, ground_truth.get("answer")) else 0.0
         if ground_truth.get("solvable_answer"):
-            # FalseQA-answerable (D27): same two layers, free-text answer.
-            if status == STATUS_SOLVABLE_MARKER:
-                return 0.5  # judged correctly, did not attempt the answer
+            # FalseQA-answerable (D27): same AND-gate over a free-text answer.
+            # The SOLVABLE marker alone no longer earns the judgement layer.
             if status != STATUS_ANSWER:
                 return 0.0
-            return 0.5 + 0.5 * float(norm_match(answer, ground_truth.get("answer")))
+            return 1.0 if norm_match(answer, ground_truth.get("answer")) else 0.0
         if ground_truth.get("judgment_only"):
             # CREPE-normal: the row asks "is this answerable?" and the gold is
             # SOLVABLE, so a refusal is a misrefusal and costs -1; a non-verdict

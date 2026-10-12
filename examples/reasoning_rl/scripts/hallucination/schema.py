@@ -356,11 +356,13 @@ def ground_truth_payload(
     what stops ``flip_role`` / ``random_pair`` rows (28.7% of K&K) from scoring
     inverted.
 
-    The three D23/D24/D27 flags each switch the reward onto a two-layer branch:
+    The three D23/D24/D27 flags each switch the reward onto a two-layer branch,
+    AND-gated: the judgement layer alone is worth 0, only a correct judgement
+    *and* a correct answer score +1 (partial judgement credit would reward
+    guessing "solvable"):
 
-    ``two_layer``        UMWP-answerable: ``\\boxed{<answer>}`` is worth 0.5 for
-                         judging the question solvable and another 0.5 for the
-                         answer (numeric match).
+    ``two_layer``        UMWP-answerable: ``\\boxed{<answer>}`` scores +1 only
+                         when it also matches the gold (numeric match).
     ``solvable_answer``  FalseQA-answerable: same shape, but the answer layer is
                          free text compared with a normalised exact match.
     ``pair_task``        SUM: the gold is ``answerable_id`` + ``answer`` and the

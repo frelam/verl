@@ -567,7 +567,7 @@ def test_section9_reward_cells_two_layer_and_three_tier(tmp_path):
     ground_truth = two_layer["reward_model"]["ground_truth"]
     assert score(two_layer, ground_truth, r"\boxed{1.0}") == 1.0  # judged solvable + solved
     assert score(two_layer, ground_truth, r"\boxed{1}") == 1.0  # 1.0 == 1 as a number
-    assert score(two_layer, ground_truth, r"\boxed{2}") == 0.5  # judged, not solved
+    assert score(two_layer, ground_truth, r"\boxed{2}") == 0.0  # AND-gated: judged, not solved
     assert score(two_layer, ground_truth, r"\boxed{SOLVABLE}") == 0.0  # verdict is not an answer
     assert score(two_layer, ground_truth, r"\boxed{UNSOLVABLE}") == 0.0  # misrefusal
     assert score(two_layer, ground_truth, "the answer is not boxed") == 0.0

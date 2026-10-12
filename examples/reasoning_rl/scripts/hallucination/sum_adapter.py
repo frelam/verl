@@ -48,9 +48,10 @@ gets one judgement-then-solve row that carries both sides by construction.
   landed on, ``answer`` = the raw ``ground_truth`` column (stored verbatim, so the
   audit can compare it byte for byte), ``has_diagnosis_label=false``,
   ``perturbation_type=null`` -- section 3's SUM row example;
-* reward (section 6): correct id + ``math_match`` answer -> 1.0; correct id +
-  wrong answer -> 0.5; wrong or unparseable id -> 0, with **no answer-layer credit
-  even when the answer text equals the gold**; a bare number, ``UNSOLVABLE`` or no
+* reward (section 6, AND-gated): correct id + ``math_match`` answer -> 1.0;
+  correct id + wrong answer -> 0 (the judgement layer alone earns nothing);
+  wrong or unparseable id -> 0, with **no answer-layer credit even when the
+  answer text equals the gold**; a bare number, ``UNSOLVABLE`` or no
   ``\\boxed{}`` -> 0.
 
 ``answerable_id`` is by construction the label of the question whose text is the

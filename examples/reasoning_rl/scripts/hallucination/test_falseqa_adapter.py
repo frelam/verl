@@ -741,15 +741,15 @@ def test_four_tier_reward_cells_for_a_diag_row(tmp_path):
 
 
 def test_two_layer_reward_cells_for_an_answerable_row(tmp_path):
-    """Two-layer (D27/§6): judgement +0.5, normalised answer match +0.5."""
+    """Two-layer (D27/§6), AND-gated: judgement + answer must both pass for +1."""
     rows, _ = _build(tmp_path, COLD)
     answerable = _by_id(rows)["falseqa-real-train-0"]
     answer = json.loads(answerable["reward_model"]["ground_truth"])["answer"]
     assert _reward(answerable, f"\\boxed{{{answer}}}") == 1.0
     # norm_match: case, punctuation and articles are not part of the answer
     assert _reward(answerable, f"\\boxed{{{answer.upper()}}}") == 1.0
-    assert _reward(answerable, "\\boxed{SOLVABLE}") == 0.5
-    assert _reward(answerable, "\\boxed{something else}") == 0.5
+    assert _reward(answerable, "\\boxed{SOLVABLE}") == 0.0
+    assert _reward(answerable, "\\boxed{something else}") == 0.0
     assert _reward(answerable, "\\boxed{UNSOLVABLE}") == 0.0
     assert _reward(answerable, "\\boxed{UNSOLVABLE: A}") == 0.0
     assert _reward(answerable, "no box at all") == 0.0

@@ -72,8 +72,9 @@ the unfiltered estimator is numerically unstable on this corpus (see
 
 **Reward cells (section 9).**  The two shipped sides' reward cells are pinned
 against the *frozen* reward module (``reward/hallucination_compute_score.py``,
-loaded by path): for ``two_layer`` the gold answer scores +1, a wrong answer +0.5,
-and ``SOLVABLE`` / ``UNSOLVABLE`` / no ``\\boxed{}`` 0; for the three-tier bare
+loaded by path): for ``two_layer`` the gold answer scores +1, a wrong answer 0
+(AND-gated: judging solvable alone earns nothing), and ``SOLVABLE`` /
+``UNSOLVABLE`` / no ``\\boxed{}`` 0; for the three-tier bare
 side ``UNSOLVABLE`` (with or without an option id) scores +1 and a fabricated
 answer -1.  The same bare row scored with a *four-tier* ground truth must give
 ``\\boxed{UNSOLVABLE}`` 0 and only the right option id +1 -- the branch-dependent
@@ -592,8 +593,9 @@ def _evenly_spaced(rows: list[dict], count: int) -> list[dict]:
 def reward_cells(rows: list[dict], reporter: Reporter) -> None:
     """Pin section 9's reward cells for the two shipped sides.
 
-    Two-layer (D24): the gold answer is worth +1, a wrong answer +0.5 (judged
-    solvable, not solved), and ``SOLVABLE`` / ``UNSOLVABLE`` / no ``\\boxed{}`` 0 --
+    Two-layer (D24), AND-gated: the gold answer is worth +1, a wrong answer 0
+    (judged solvable but not solved -- the judgement layer alone earns nothing),
+    and ``SOLVABLE`` / ``UNSOLVABLE`` / no ``\\boxed{}`` 0 --
     producing an answer *is* the judgement, so a refusal earns nothing.
     Three-tier bare: ``\\boxed{UNSOLVABLE}`` scores +1 whether or not an option id
     follows (there is no option block to point at), a fabricated answer -1.
@@ -622,7 +624,7 @@ def reward_cells(rows: list[dict], reporter: Reporter) -> None:
             continue
         cells = (
             (rf"\boxed{{{gold}}}", 1.0, "gold answer"),
-            (rf"\boxed{{{wrong}}}", 0.5, "wrong answer (judged, not solved)"),
+            (rf"\boxed{{{wrong}}}", 0.0, "wrong answer (AND-gated: judged, not solved)"),
             (r"\boxed{SOLVABLE}", 0.0, "verdict instead of the answer"),
             (r"\boxed{UNSOLVABLE}", 0.0, "misrefusal"),
             (r"\boxed{UNSOLVABLE: A}", 0.0, "misrefusal with an option id"),

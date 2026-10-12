@@ -86,9 +86,10 @@ The answerable side: a two-layer reward with an isomorphic placeholder block (D2
 
 ``label=0`` is the repaired twin.  It is a *solvable* row whose gold is the
 source's own ``answer`` field, verbatim, scored by the two-layer
-``solvable_answer`` branch of section 6: ``\\boxed{<answer>}`` = 0.5 for judging
-the question answerable plus 0.5 for a normalised exact match, ``\\boxed{SOLVABLE}``
-= 0.5, a refusal = 0.  ``correct_option_id`` is ``None`` -- there is no correct
+``solvable_answer`` branch of section 6, AND-gated: ``\\boxed{<answer>}`` = 1
+only when it is also a normalised exact match of the gold (judging answerable
+alone earns nothing), ``\\boxed{SOLVABLE}`` = 0, a refusal = 0.
+``correct_option_id`` is ``None`` -- there is no correct
 option -- but the row still carries a **placeholder replacement-pair block** so
 that template A looks identical on both sides (section 5.1/5.2, the D18
 isomorphism hard constraint): same wording, same k=3, left item an in-passage
@@ -161,8 +162,8 @@ by ``verify_falseqa.py``; 1,187 / 491 / 687 pairs).
    (0 of the eligible train pairs) and the stored value is the raw field with
    surrounding whitespace stripped.  67.8% of the source's answerable answers are
    free text, which section 6 scores with ``norm_match``; the paraphrase noise
-   (a correct answer that fails normalised exact match loses 0.5 of 1.0) is the
-   documented trade-off of Q17 and the reason the answer layer is only worth half.
+   (a correct answer that fails normalised exact match loses the whole +1 under
+   the AND-gate) is the documented trade-off of Q17.
 
 3. **The placeholder block mirrors the pair's own diagnosis-side shape.**  D27
    fixes the text ("in-passage left, out-of-passage same-type same-length rights")

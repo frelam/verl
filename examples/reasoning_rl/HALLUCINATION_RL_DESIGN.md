@@ -26,7 +26,7 @@
 | D11 | K&K 定位 | 实测 48,076 行**全部唯一可解** → 纯**可解锚点**：不生成选项、不进四档；按 `(人数, index)` 组内去重、只用 N≥4；训练池 **≈5,000 组** |
 | D12 | MiP 定位 | 不可解侧选项集**必然泄题**（"选题面里唯一找不到的那句"命中 95.6%）→ **不做诊断**，`has_diagnosis_label=false`，只判拒答（bare `\boxed{UNSOLVABLE}`，prompt 不附选项块）；可解侧不进池；入池 **276** 条不可解行 |
 | D13 | FalseQA 定位 | **保留四档诊断**：gold 由索引对齐的配对 diff 提取（假前提片段就在题面里，pointer gold 可知）。选项语义后被 **D21** 改写为「替换对」 |
-| D14 | FalseQA 可解侧判断入池 | **已被 D22 作废、D27 部分复活**（label=0 以两层 reward 入池：判断 +0.5 / 答案 +0.5，非纯判断型） |
+| D14 | FalseQA 可解侧判断入池 | **已被 D22 作废、D27 部分复活**（label=0 以两层 reward 入池，非纯判断型；原判断 +0.5 / 答案 +0.5 的部分分已改为 **AND 门控**：两层都对 +1，否则 0） |
 | D15 | 选项数 k | **k = 3**（1 正确 + 2 干扰，A/B/C）。k 是覆盖率参数不是抗蒙参数；同一模板内各子集**必须同 k** |
 | D16 | 不可解侧扩源 | 纳入 **SUM**（MIT，train 36,480）、**UMWP**（CC-BY-SA-4.0，5,200，配对 100%）、**KUQ**（MIT，6,884；后被 **D25** 移出）、**TreeCut**（Apache-2.0，生成器可无限产，L1 构造即证明但 L3 需先修；D26 后正样本也入池）、**CREPE**（BSD，HF 镜像；只能进判断型——`presuppositions` 仅 1.1% 是题面逐字 span）。**排除** SQuAD 2.0（判不可解需 NLI）与 GSM-DC（仅 6,300 样例） |
 | D17 | 干扰项合成 | **不引新源**：规则复用 GSM-IC 的 242 条 `sentence_template`（全部由 `{role}`/`{number}` 参数化）施加到可解原题，答案不变、gold 不变、走 `_math_score`；难度梯度沿用 GSM-IC 自带三组天然配平标注 |
@@ -35,11 +35,11 @@
 | D20 | K&K clean | **不入池**：只用 `K-and-K/perturbed-knights-and-knaves`（41,176 行，6 扰动族）；组内去重保留（每组候选变体 ≤6）；训练池按组计仍 **≈5,000 组** |
 | D21 | FalseQA 选项契约 | 选项为**「假前提片段 → 替换词」替换对**：gold = `假前提片段 -> 配对真前提片段`（由索引对齐配对 diff 提取）；2 个干扰对**左项固定为同一假前提片段、右项为题面外同类等长词**（k=3 沿用 D15）。左项无信息、区分度全在右项；三个右项**全部题面外** → "选右项不在题面内的那对"等表层捷径对三项均等命中 ≈ 随机 |
 | D22 | FalseQA 可解侧 | **已被 D27 作废**（label=0 复活入池）。原口径：只用不可解侧（label=1 入池，label=0 不入池）；模板 A 的可解行改由 UMWP-answerable 承担 |
-| D23 | SUM 配对判断任务 | SUM 不拆四档/三档；每行 = 一对题：**prompt 同含 answerable / unanswerable 两问（A/B 顺序行级随机 50:50）**，模型先判哪个可解再解答，输出 `\boxed{<ID>: <答案>}`；**两层 reward**：判断对 +0.5、答案再对 +0.5（判断错则答案层不给分）。依据：SUM 题面词袋 NB 五折 balanced-acc ≈ **0.50**，判断无表层捷径 |
-| D24 | UMWP 全部两层化 | UMWP 只消费 `question / answer / answerable` 三字段，统一两层 reward：**answerable 侧**输出 `\boxed{答案}`——给出答案即判定"可解"+0.5、答案再对 +0.5（拒答则判断层失败 0 分）；**unanswerable 侧**三档 bare——`\boxed{UNSOLVABLE}` 即 +1。**放弃可见缺陷类四档诊断**（同题等长跨度选项整体废弃），四档诊断源只剩 FalseQA 928 条（**D26** 后 TreeCut 负样本四档化，四档合计 5,835）；cat 分类只用于缺陷类型统计，不再决定契约分支 |
+| D23 | SUM 配对判断任务 | SUM 不拆四档/三档；每行 = 一对题：**prompt 同含 answerable / unanswerable 两问（A/B 顺序行级随机 50:50）**，模型先判哪个可解再解答，输出 `\boxed{<ID>: <答案>}`；**两层 reward（AND 门控）**：判断与答案都对 +1；判断错、答案错或未解答均为 0（原判断 +0.5 / 答案 +0.5 的部分分已废弃——判断层随机下限 50%，部分分会奖励瞎猜，见 §11 风险 8）。依据：SUM 题面词袋 NB 五折 balanced-acc ≈ **0.50**，判断无表层捷径 |
+| D24 | UMWP 全部两层化 | UMWP 只消费 `question / answer / answerable` 三字段，统一两层 reward（AND 门控）：**answerable 侧**输出 `\boxed{答案}`——给出答案即判定"可解"，答案也对才 +1（判对答错 / 拒答均 0 分）；**unanswerable 侧**三档 bare——`\boxed{UNSOLVABLE}` 即 +1。**放弃可见缺陷类四档诊断**（同题等长跨度选项整体废弃），四档诊断源只剩 FalseQA 928 条（**D26** 后 TreeCut 负样本四档化，四档合计 5,835）；cat 分类只用于缺陷类型统计，不再决定契约分支 |
 | D25 | KUQ 移出 | **KUQ 整体不入池**：无可验证答案、只能判断是否 unknown，判断信号缺答案层约束、模型容易瞎猜 |
 | D26 | TreeCut 正负双侧入池 + 负样本四档化 | TreeCut **正样本（可解）入池**：输出 `\boxed{答案}`，prompt 带**占位选项块**（题面条件中随机抽 k=3 条换变量名/变量值生成，无正确项），误拒 → 0（与普通可解行一致）；**负样本升四档诊断**：gold = 生成器剪掉的边（`cut` 已知），选项 = 生成器顺带产出的候选缺失条件（k=3，全部题面外），`\boxed{UNSOLVABLE: <ID>}` 命中才 +1。**正负 prompt 同带选项块**（模板 A 外观同构，同 k=3，D15），消除"有选项块 ⇒ UNSOLVABLE"捷径；负样本选项集须过 MiP 同款泄题测试（§9）。配额：正 1,000（GSM-IC 合成干扰让渡 1,400→400；**D27 后再让渡至 500**）/ 负 4,907（三档→四档，不可解侧不变） |
-| D27 | FalseQA 双侧入池（label=0 复活） | **作废 D22 的"label=0 不入池"**：answerable 侧 928 条入池，与 label=1 索引对齐配对、**按对划分 split**（同对不进异侧）；走**两层 reward**（gt 键 `solvable_answer`）：`\boxed{答案}` → 判可解 +0.5、与 gold（label=0 answer）`norm_match` 再 +0.5；`\boxed{SOLVABLE}` → 判可解对但未解答 +0.5；误拒（`UNSOLVABLE` 任意形态）→ 0。label=0 answer 67.8% 为自由文本短答 → 答案层用归一化精确匹配（大小写/标点/冠词），噪声抽检见 Q17。**answerable 侧同样带占位替换对选项块**（题面内左项 + 题面外同类等长右项，k=3 无正确项），模板 A 外观与不可解侧同构，防"无选项块 ⇒ SOLVABLE"格式记忆。配额：行 3 扩为 UMWP 550 + FalseQA-ans 928 = 1,478；让渡 TreeCut 正 1,000→500、GSM-IC 1,200→772（§4.8） |
+| D27 | FalseQA 双侧入池（label=0 复活） | **作废 D22 的"label=0 不入池"**：answerable 侧 928 条入池，与 label=1 索引对齐配对、**按对划分 split**（同对不进异侧）；走**两层 reward（AND 门控**，gt 键 `solvable_answer`）：`\boxed{答案}` 与 gold（label=0 answer）`norm_match` 通过才 +1（判对答错 → 0）；`\boxed{SOLVABLE}` → 0；误拒（`UNSOLVABLE` 任意形态）→ 0。label=0 answer 67.8% 为自由文本短答 → 答案层用归一化精确匹配（大小写/标点/冠词），噪声抽检见 Q17。**answerable 侧同样带占位替换对选项块**（题面内左项 + 题面外同类等长右项，k=3 无正确项），模板 A 外观与不可解侧同构，防"无选项块 ⇒ SOLVABLE"格式记忆。配额：行 3 扩为 UMWP 550 + FalseQA-ans 928 = 1,478；让渡 TreeCut 正 1,000→500、GSM-IC 1,200→772（§4.8） |
 
 ---
 
@@ -108,8 +108,8 @@ SUM 配对任务（D23）把"识别可解"与"解出答案"绑定在同一行里
 | `correct_option_id` | 同上 | `solvable=false` 且 `has_diagnosis_label=true` 时必填 |
 | `has_diagnosis_label` | 同上 | 决定四档 / 三档；**不是 `solvable=false` 的同义词**（MiP/UMWP/CREPE 等为 `false`；TreeCut 负样本为 `true`，D26） |
 | `judgment_only` | 同上 | `true` 时该条**只判"是否可答"**（期望 `\boxed{SOLVABLE}`），不做数值匹配；仅用于 CREPE-normal |
-| `two_layer` | 同上 | ⚠️ **UMWP-answerable 专用（D24）**：`true` 时走两层 reward——给出答案即判定"可解"+0.5，答案再对 +0.5 |
-| `solvable_answer` | 同上 | ⚠️ **FalseQA-answerable 专用（D27）**：`true` 时走两层 reward——给出答案即判定"可解"+0.5，与 `answer` 归一化精确匹配再对 +0.5；`\boxed{SOLVABLE}` 只拿判断层 +0.5 |
+| `two_layer` | 同上 | ⚠️ **UMWP-answerable 专用（D24）**：`true` 时走两层 reward（AND 门控）——给出答案即判定"可解"，答案也对才 +1，否则 0 |
+| `solvable_answer` | 同上 | ⚠️ **FalseQA-answerable 专用（D27）**：`true` 时走两层 reward（AND 门控）——给出答案即判定"可解"，与 `answer` 归一化精确匹配也对才 +1；`\boxed{SOLVABLE}` → 0 |
 | `pair_task` + `answerable_id` | 同上 | ⚠️ **SUM 专用（D23）**：`pair_task=true`，`answerable_id ∈ {"A","B"}` 标记哪个问题可解；A/B 顺序由 adapter 行级随机 |
 | `options` | `extra_info.options` + prompt 渲染 | 选项文本（FalseQA 为替换对），reward 侧只比 `correct_option_id` |
 | `perturbation_type` | `extra_info.perturbation_type` | `missing_condition / contradictory_condition / distracting_condition / null` |
@@ -282,11 +282,11 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 
 - **label=1 侧（不可解·四档）**：沿用 D21 替换对选项契约（下述），`has_diagnosis_label=true`，
   `\boxed{UNSOLVABLE: <ID>}` 命中 gold 才 +1。
-- **label=0 侧（answerable·两层，gt 键 `solvable_answer`）**：`\boxed{答案}` → 判可解 +0.5、
-  与 gold（label=0 `answer`）`norm_match` 再 +0.5；`\boxed{SOLVABLE}` → 判可解对但未解答
-  +0.5；误拒（`UNSOLVABLE` 任意形态）→ 0。`answer` 67.8% 为自由文本短答 → 答案层用
-  **归一化精确匹配**（小写/去标点/去冠词/strip），同义 paraphrase 只会损失答案层 0.5、
-  不会误判判断层；匹配噪声人工抽检 N=50（§12 Q17）。
+- **label=0 侧（answerable·两层，gt 键 `solvable_answer`，AND 门控）**：`\boxed{答案}`
+  与 gold（label=0 `answer`）`norm_match` 通过才 +1（判对答错 → 0）；`\boxed{SOLVABLE}`
+  → 0；误拒（`UNSOLVABLE` 任意形态）→ 0。`answer` 67.8% 为自由文本短答 → 答案层用
+  **归一化精确匹配**（小写/去标点/去冠词/strip）；AND 门控下同义 paraphrase 会损失整分，
+  匹配噪声人工抽检 N=50（§12 Q17）。
 - **answerable 侧同样带占位替换对选项块**（左项 = 题面内内容短语、右项 = 题面外同类等长词，
   k=3 无正确项）——与不可解侧模板 A 外观同构，防"无选项块 ⇒ SOLVABLE"格式记忆（D18）。
 
@@ -305,7 +305,7 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 **reward（两侧各两层）**：不可解侧选对替换对才得分——走 §6 四档分支
 （`has_diagnosis_label=true`：`\boxed{UNSOLVABLE: <ID>}` 且 ID 命中 gold → +1；
 编造答案 → −1；bare `\boxed{UNSOLVABLE}` → 0）；answerable 侧走 §6 `solvable_answer`
-分支（判断层 +0.5 / 答案层 +0.5，见上）。
+分支（AND 门控：两层都对 +1，否则 0，见上）。
 
 **交付约束（`falseqa_adapter.py`）**：
 
@@ -361,18 +361,18 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 - 模型任务：**先判断哪个问题可解，再解答该问题**，输出 `\boxed{<ID>: <答案>}`（如 `\boxed{A: 42}`）。
 - gold：`pair_task=true`、`answerable_id ∈ {"A","B"}`、`answer` = 该行 `ground_truth`。
 
-**两层 reward**：
+**两层 reward（AND 门控）**：
 
 | 情形 | 得分 |
 |---|---|
 | 判断对（ID = `answerable_id`）且答案对（`math_match` vs `ground_truth`） | **+1.0** |
-| 判断对、答案错 | **+0.5** |
+| 判断对、答案错 | **0** |
 | 判断错（答的是不可解题，答案层不给分、也不额外扣分——任务强制二选一） | **0** |
 | 无法解析（无 `\boxed{}` / 不是 `ID: 答案` 形态） | **0** |
 
-设计依据：判断层随机下限 50%，+0.5 给的是**早期学习信号**；要拿答案层的 +0.5 必须先判断对
-且真的解出——解出本身就要求识别出可解题，所以答案层严格难于判断层，完整解出的期望
-（1.0）远高于瞎猜（0.25）。判断层准确率须对照 50% 基线监控（§10）。
+设计依据：判断层随机下限 50%，原 0.5+0.5 部分分给瞎猜留了 0.25 的期望（§11 风险 8）；
+AND 门控下判断层单独不值分，只有完整解出（+1）有奖励，瞎猜期望降为 0——解出本身就
+要求识别出可解题，答案层严格难于判断层。判断层准确率仍须对照 50% 基线监控（§10）。
 
 **adapter（`sum_adapter.py`）**：断言两问均非空、`ground_truth` 可解析；A/B 打乱用行级 seed
 （可复现）；`verify_sum.py` 断言成品中 `answerable_id` 的 A/B 分布为 50:50 ±2pt。
@@ -395,9 +395,9 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 
 各源要点：
 
-- **UMWP**（D24 两层化）：只消费 `question / answer / answerable` 三字段，统一两层 reward——
-  **answerable 侧**进模板 A 的可解行（承担 D18"模板 A 必须含可解"的硬约束），输出 `\boxed{答案}`，
-  给出答案即判定"可解"+0.5、答案再对 +0.5（拒答则判断层失败 0 分）；**unanswerable 侧**全部
+- **UMWP**（D24 两层化）：只消费 `question / answer / answerable` 三字段，统一两层 reward
+  （AND 门控）——**answerable 侧**进模板 A 的可解行（承担 D18"模板 A 必须含可解"的硬约束），
+  输出 `\boxed{答案}`，给出答案即判定"可解"，答案也对才 +1（判对答错 / 拒答均 0 分）；**unanswerable 侧**全部
   三档 bare（`\boxed{UNSOLVABLE}` 即 +1，prompt 不附选项块）。可见缺陷类的同题等长跨度选项
   **整体废弃**；不可解类别（Key Information Missing 32% / Ambiguous 49% / Unrealistic 11% /
   Unrelated Object 4% / Question Missing 5%）仅用于缺陷类型统计，不再决定契约分支。
@@ -565,7 +565,7 @@ TreeCut 负 4,907**（D24 后 UMWP 可见缺陷类退化为三档、D26 后 Tree
 | 可解（数值/表达式：GSM-IC、合成干扰、主池数学题） | 最后一行 `\boxed{<数值/表达式>}` |
 | 可解（K&K：逐人角色判定，D19） | `\boxed{<人名>: <角色词>, <人名>: <角色词>, …}`（如 `\boxed{Oliver: angel, Ethan: devil}`）；**顺序不限**；人名与角色词都用题面原词 |
 | 可解·**判断+解答**（`two_layer`：UMWP-answerable，D24） | `\boxed{<数值答案>}`——给出答案即判定"可解" |
-| 可解·**判断+解答**（`solvable_answer`：FalseQA-answerable，D27） | `\boxed{<答案>}`（自由文本，与 gold 归一化精确匹配；`\boxed{SOLVABLE}` 只拿判断层 +0.5） |
+| 可解·**判断+解答**（`solvable_answer`：FalseQA-answerable，D27） | `\boxed{<答案>}`（自由文本，与 gold 归一化精确匹配；AND 门控，`\boxed{SOLVABLE}` → 0） |
 | 可解但**只判可答性**（`judgment_only`：CREPE-normal） | `\boxed{SOLVABLE}` |
 | 配对判断（SUM，D23） | `\boxed{<A或B>: <数值答案>}`（如 `\boxed{A: 42}`） |
 | 不可解且有诊断标签（FalseQA-fake 替换对 / TreeCut 负·缺失条件，D26） | `\boxed{UNSOLVABLE: <选项ID>}`（如 `\boxed{UNSOLVABLE: B}`） |
@@ -642,8 +642,7 @@ C. man -> teacher
   > 另：`schema.question_of(row)` 按模板指令块的前缀把**题面**切出来，供 §7.2 去重使用。
 - UMWP-answerable（D24）/ FalseQA-answerable（D27）行：复用模板 A 外观——选项块由 adapter
   用题面外同类等长替换对**占位**（无正确项），仅为满足 D18；可解时输出 `\boxed{答案}`，
-  两层 reward 见 §6（输出选项 ID / `UNSOLVABLE` → 判断层 0 分；FalseQA-answerable 额外接受
-  `\boxed{SOLVABLE}` 拿判断层 +0.5）。
+  两层 reward 见 §6（AND 门控：输出选项 ID / `UNSOLVABLE` / `SOLVABLE` / 答错 → 0）。
 - TreeCut 行（D26）：**负样本**选项块为候选缺失条件（全部题面外，gold = 被剪的边）；
   **正样本**选项块为题面条件换变量名/变量值的**占位**项（无正确项），可解时输出
   `\boxed{答案}`，误拒（`UNSOLVABLE` 任意形态）→ 0（与普通可解行一致）。正负两侧外观同构。
@@ -706,16 +705,15 @@ compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs
         sid, sans = parse_pair(answer)        # 正则 ^([AB])\s*[:：]\s*(.+)$，作用于 boxed 内容
         if sid is None or sid != gt["answerable_id"]:
             return 0.0                        # 判断层失败 → 答案层不给分
-        return 0.5 + 0.5 * math_match(sans, gt["answer"])
+        return 1.0 if math_match(sans, gt["answer"]) else 0.0   # AND 门控：判断层单独不值分
 
     if gt.solvable:
         if gt.get("two_layer"):           # UMWP-answerable 两层（D24）：与 SUM pair_task 对称
             if status != "answer":                         return 0.0   # 拒答 → 判断层失败
-            return 0.5 + 0.5 * math_match(answer, gt.answer)            # 判可解 +0.5，答案对再 +0.5
+            return 1.0 if math_match(answer, gt.answer) else 0.0        # AND 门控：判对答对才 +1
         if gt.get("solvable_answer"):     # FalseQA-answerable 两层（D27）：自由文本答案
-            if status == "solvable_marker":                  return 0.5   # 判可解对，未解答
-            if status != "answer":                           return 0.0   # 拒答/误拒 → 判断层失败
-            return 0.5 + 0.5 * norm_match(answer, gt.answer)              # 判可解 +0.5，答案对再 +0.5
+            if status != "answer":                           return 0.0   # 拒答/误拒/SOLVABLE → 0
+            return 1.0 if norm_match(answer, gt.answer) else 0.0        # AND 门控：判对答对才 +1
         if gt.get("judgment_only"):       # 判断型可解（CREPE-normal）
             if status == "solvable_marker":                      return 1.0
             if status in {"unsolvable_bare", "unsolvable_option"}: return -1.0   # 误拒
@@ -732,8 +730,8 @@ compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs
 
 要点：
 
-- **主 reward 取值 `{+1, 0, -1}`**（SUM 配对 / UMWP-answerable / FalseQA-answerable 两层任务为
-  `{+1, +0.5, 0}`），与 spec §3.1 一致。
+- **主 reward 取值 `{+1, 0, -1}`**（SUM 配对 / UMWP-answerable / FalseQA-answerable 两层任务
+  经 AND 门控后同为 `{+1, 0}`——判断层单独不值分，判断与答案都对才 +1），与 spec §3.1 一致。
   ⚠️ 量纲风险：现有其它域是 `{0,1}`，`-1` 在组内 std 归一化下可能被放大；退化组由 DAPO
   `filter_groups` 屏蔽（D5）。上线时按 §10 观察负 advantage 分布。
 - `math_match` 复用现有数学匹配路径（`_math_score` / math_verify + math_dapo fallback），
@@ -751,16 +749,16 @@ compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs
 - `parse_pair`（SUM 专用，D23）：作用于 boxed 内容，正则 `^([AB])\s*[:：]\s*(.+)$`；
   答案部分交给 `math_match`（gold 是数值）。判定依据是 `pair_task` 键。
 - 抽取全部集中在 `extract_final`，只取最后一个 `\boxed{}`；无 `\boxed{}` → `status="none"` → 0。
-- **`two_layer` 分支**（UMWP-answerable，D24）：两层 reward，结构上与 SUM 的 `pair_task` 对称——
-  先判"可解性"（`status=="answer"` 即给出 `\boxed{答案}` → **+0.5**；输出 `SOLVABLE` /
-  `UNSOLVABLE` / 选项 ID / 无 box → 0，判断层失败），再解答案（`math_match` 对 → 再 **+0.5**，
-  错 → 停在 +0.5 不罚）。判定依据是 `two_layer` 键。
+- **`two_layer` 分支**（UMWP-answerable，D24）：两层 reward 经 AND 门控，结构上与 SUM 的
+  `pair_task` 对称——先判"可解性"（`status=="answer"` 即给出 `\boxed{答案}`；输出 `SOLVABLE` /
+  `UNSOLVABLE` / 选项 ID / 无 box → 0），再解答案（`math_match` 对 → **+1**，错 → **0**；
+  判断层单独不值分）。判定依据是 `two_layer` 键。
 - **`solvable_answer` 分支**（FalseQA-answerable，D27）：与 `two_layer` 同构，但答案层是
   **自由文本**——`norm_match`（小写/去标点/去冠词/strip 后精确匹配；复用 gsm8k 系的归一化
-  helper，不新写）对 → 再 **+0.5**。`\boxed{SOLVABLE}` → **+0.5**（判可解对、未解答，不罚）；
-  误拒（`UNSOLVABLE` 任意形态）→ **0**（与普通可解行一致，不引入 −1 误拒）。判定依据是
-  `solvable_answer` 键。答案层匹配噪声：同义 paraphrase 会丢 0.5（判断层不受影响）→ 入池前
-  人工抽检 N=50，误判率 >10% 只保留短答子集（§12 Q17）。
+  helper，不新写）对 → **+1**，错 → **0**（AND 门控）。`\boxed{SOLVABLE}` → **0**（只判断未
+  解答不给分）；误拒（`UNSOLVABLE` 任意形态）→ **0**（与普通可解行一致，不引入 −1 误拒）。
+  判定依据是 `solvable_answer` 键。答案层匹配噪声：AND 门控下同义 paraphrase 会丢整分 →
+  入池前人工抽检 N=50，误判率 >10% 只保留短答子集（§12 Q17）。
 - **三档 bare 分支**（`has_diagnosis_label=false`）：`status ∈ {"unsolvable_bare","unsolvable_option"}`
   即 +1——MiP/UMWP-unanswerable/CREPE 的 prompt 里没有选项，选项 ID 无意义，
   spec §3.1「识别出不可解即满分」。
@@ -911,11 +909,11 @@ examples/reasoning_rl/
   |---|---|---|---|
   | 可解·数值+干扰（B） | `\boxed{42}`（= gold）→ **+1** | `\boxed{UNSOLVABLE}` → 0；`\boxed{43}` → 0 | 无 `\boxed{}` → 0 |
   | 可解·人名-角色对（K&K，D19） | `\boxed{Ava: angel, Jack: devil}`（归一化后 = gold）→ **+1**（人名顺序打乱仍 +1） | 角色判错 / 缺人 / 多人 / 人名不在 gold 集合 → 0；`\boxed{UNSOLVABLE}` → 0 | `\boxed{angel devil}`（旧纯序列，无人名）→ **0** |
-  | 可解·两层（UMWP-answerable，D24） | `\boxed{42}`（= gold）→ **+1** | `\boxed{43}`（判对答错）→ **+0.5**；`\boxed{SOLVABLE}` / `\boxed{UNSOLVABLE}` → **0** | 无 `\boxed{}` → 0 |
-  | 可解·两层（FalseQA-answerable，D27） | `\boxed{Paris}`（norm = gold）→ **+1**；`\boxed{paris,}`（归一化后 = gold）→ **+1** | `\boxed{Lyon}`（判对答错）→ **+0.5**；`\boxed{SOLVABLE}` → **+0.5**；`\boxed{UNSOLVABLE}`（误拒）→ **0** | 无 `\boxed{}` → 0 |
+  | 可解·两层（UMWP-answerable，D24，AND 门控） | `\boxed{42}`（= gold）→ **+1** | `\boxed{43}`（判对答错）→ **0**；`\boxed{SOLVABLE}` / `\boxed{UNSOLVABLE}` → **0** | 无 `\boxed{}` → 0 |
+  | 可解·两层（FalseQA-answerable，D27，AND 门控） | `\boxed{Paris}`（norm = gold）→ **+1**；`\boxed{paris,}`（归一化后 = gold）→ **+1** | `\boxed{Lyon}`（判对答错）→ **0**；`\boxed{SOLVABLE}` → **0**；`\boxed{UNSOLVABLE}`（误拒）→ **0** | 无 `\boxed{}` → 0 |
   | 可解·判断型（CREPE-normal，B） | `\boxed{SOLVABLE}` → **+1** | `\boxed{UNSOLVABLE}` / `\boxed{UNSOLVABLE: B}` → **−1（误拒）** | 普通答案 / 无 `\boxed{}` → 0 |
   | 可解·数值+占位选项块（TreeCut 正，A，D26） | `\boxed{42}`（= gold）→ **+1** | `\boxed{UNSOLVABLE}` / `\boxed{UNSOLVABLE: B}`（误拒）→ **0**；`\boxed{B}`（选占位选项）→ 0 | 无 `\boxed{}` → 0 |
-  | 配对判断（SUM，D23） | `\boxed{A: 42}`（ID 对 + 答案对）→ **+1** | `\boxed{B: …}`（判断错）→ **0** | `\boxed{A: 43}`（判断对答案错）→ **+0.5**；无 `\boxed{}` → 0 |
+  | 配对判断（SUM，D23，AND 门控） | `\boxed{A: 42}`（ID 对 + 答案对）→ **+1** | `\boxed{B: …}`（判断错）→ **0** | `\boxed{A: 43}`（判断对答案错）→ **0**；无 `\boxed{}` → 0 |
   | 不可解·四档（A） | `\boxed{UNSOLVABLE: B}`（= `correct_option_id`）→ **+1** | `\boxed{答案}` → **−1（编造）** | `\boxed{UNSOLVABLE}` → **0（裸的不给分）**；选错 → 0 |
   | 不可解·三档（B） | `\boxed{UNSOLVABLE}` → **+1**（`\boxed{UNSOLVABLE: B}` 也 +1） | `\boxed{答案}` → **−1（编造）** | 无 `\boxed{}` → 0 |
 
@@ -981,8 +979,8 @@ examples/reasoning_rl/
   - 判断型可解（CREPE-normal）：**`\boxed{SOLVABLE}` 正确率 / 误拒率**。
 - **两层任务（D24/D27）拆开画**：UMWP-answerable 与 FalseQA-answerable 各自画——判断层
   （非拒答率）与答案层准确率（非拒答前提下），以及误拒率（输出 `UNSOLVABLE` 的比例）；
-  FalseQA-answerable 额外画 `\boxed{SOLVABLE}` 占比（只拿判断层 +0.5 的"偷懒"比例，
-  长期升高说明答案层匹配过苛，回去查 `norm_match` 噪声）。
+  FalseQA-answerable 额外画 `\boxed{SOLVABLE}` 占比（只判断未解答、得 0 的"偷懒"比例，
+  长期升高说明模型在规避答案层或 `norm_match` 过苛，回去查匹配噪声）。
 - **SUM 配对（D23）三个指标分开画**：判断层准确率（**对照 50% 随机基线**——长期 ≈50% 说明
   判断层没学到东西、只有答案层在工作）、答案层准确率（判断对的前提下）、`answerable_id`
   的预测位置偏置（模型猜 A 的比例应 ≈50%，gold 分布本身 50:50）。
@@ -1030,8 +1028,9 @@ examples/reasoning_rl/
    防线：① 按对 split（§4.3，同对不进异侧）；② 双侧占位选项块同构（防"无选项块 ⇒ SOLVABLE"
    格式记忆）；③ §10 配对双侧对照监控。评估时仍须把"识别假前提"（label=1 四档命中）、
    "不误拒真前提"（label=0 判断层）与"答对答案"（label=0 答案层）三个指标分开看。
-8. **SUM 判断层的猜测下限（D23）**：判断层随机 50%，+0.5 部分分可能奖励瞎猜（瞎猜期望 0.25
-   vs 认真解 1.0，梯度方向仍正确）；§10 对照 50% 基线监控判断层准确率。
+8. **SUM 判断层的猜测下限（D23）**：判断层随机 50%，原 +0.5 部分分会奖励瞎猜（瞎猜期望
+   0.25 vs 认真解 1.0）——**已改为 AND 门控**：判断层单独不值分，瞎猜期望降为 0；§10 对照
+   50% 基线监控判断层准确率。
 9. **License**：K&K（clean + perturbed）**cc-by-nc-sa-4.0 禁商用**；UMWP CC-BY-SA-4.0（论文
    禁商用）；AbstentionBench cc-by-nc-4.0；SUM MIT、TreeCut Apache-2.0、CREPE BSD；
    FalseQA / GSM-IC / MiP 尚未逐个确认。若有商用诉求，K&K 必须整体替换或删除。
@@ -1067,7 +1066,7 @@ examples/reasoning_rl/
 | Q12 | 各来源配额（§4.8 表 B）是否要独立旋钮？ | 默认**不加**，写成 adapter 常量；要调就改常量并重跑 `mix_stats.json` |
 | Q13 | **20,000 重配平确认（D23/D24/D25/D26 后果）**：TreeCut 占不可解侧 40.9%（四档的 84.1%）、缺前提类占不可解 50.2%、四档 = FalseQA 928 + TreeCut 负 4,907——接受该分布，还是下调总量 / 上调 SUM 配对补位？ | 默认**接受表 B 现状**；TreeCut L3 修复失败时改用 SUM 配对补位（P→8,000，两侧配额按 §4.8 公式重算） |
 | Q14 | ~~UMWP 是否也改成 SUM 式配对任务~~ | **已关闭（D24）**：UMWP 不做配对化，改为单层任务两层 reward（answerable 侧 `\boxed{答案}` / unanswerable 侧三档 bare），可见缺陷类四档整体废弃 |
-| Q15 | **SUM 两层 reward 的权重**（判断 0.5 / 答案 0.5）是否调整？ | 默认对半；上线后按 §10 判断层准确率（vs 50% 基线）与答案层准确率再调（如 0.25/0.75） |
+| Q15 | **SUM 两层 reward 的权重**（判断 0.5 / 答案 0.5）是否调整？ | **已定：改为 AND 门控**（判断与答案都对 +1，否则 0）——原对半部分分奖励瞎猜（§11 风险 8）；上线后按 §10 判断层准确率（vs 50% 基线）与答案层准确率复核 |
 | Q16 | TreeCut 正样本占位选项的干扰强度？（换变量名 / 换变量值比例；换上后是否要求语义合理） | 默认**变量名 / 变量值各 50% 随机**，只要求题面外、不要求语义合理（占位即可）；上线后按 §10 TreeCut 正样本准确率观察是否过易 |
 | Q17 | FalseQA-answerable 答案层匹配噪声与配额让渡确认（D27） | 默认：① 答案层用 `norm_match`（大小写/标点/冠词归一化精确匹配），入池前人工抽检 N=50，误判率 >10% 则只保留短答子集；② 让渡方案默认 **TreeCut 正 1,000→500、GSM-IC 1,200→772**，可改 |
 | Q18 | §10 的分域监控是否要一个交付物（离线统计/绘图脚本）？ | 默认**暂不新增**：数据侧桶列（`branch` / `data_source` / `template` / `perturbation_family` / `answerable_id` / `pair_id`）已备齐，§10 的指标可在 rollout 落盘后离线算；需要固化时再补一个 `scripts/hallucination/monitor_halluc.py`（读 rollout dump → 按 §10 分桶出表） |

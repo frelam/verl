@@ -291,8 +291,9 @@ class TestSolvableTwoLayerNumeric:
     def test_answer_scores_full(self):
         assert score(self.SOURCE, "\\boxed{42}", self.GT) == 1.0
 
-    def test_judged_but_wrong_scores_half(self):
-        assert score(self.SOURCE, "\\boxed{43}", self.GT) == 0.5
+    def test_judged_but_wrong_scores_zero(self):
+        # AND-gated: the judgement layer alone earns nothing.
+        assert score(self.SOURCE, "\\boxed{43}", self.GT) == 0.0
 
     def test_refusal_fails_the_judgement_layer(self):
         for refusal in ("\\boxed{UNSOLVABLE}", "\\boxed{UNSOLVABLE: B}", "\\boxed{SOLVABLE}"):
@@ -317,11 +318,13 @@ class TestSolvableTwoLayerFreeText:
         for answer in ("\\boxed{Teacher!}", "\\boxed{the teacher.}", "\\boxed{  TEACHER  }"):
             assert score(self.SOURCE, answer, self.GT) == 1.0, answer
 
-    def test_judged_but_wrong_scores_half(self):
-        assert score(self.SOURCE, "\\boxed{a student}", self.GT) == 0.5
+    def test_judged_but_wrong_scores_zero(self):
+        # AND-gated: the judgement layer alone earns nothing.
+        assert score(self.SOURCE, "\\boxed{a student}", self.GT) == 0.0
 
-    def test_solvable_marker_takes_the_judgement_layer_only(self):
-        assert score(self.SOURCE, "\\boxed{SOLVABLE}", self.GT) == 0.5
+    def test_solvable_marker_alone_scores_zero(self):
+        # AND-gated: judging "solvable" without an answer earns nothing.
+        assert score(self.SOURCE, "\\boxed{SOLVABLE}", self.GT) == 0.0
 
     def test_misrefusal_scores_zero(self):
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 0.0
@@ -359,8 +362,9 @@ class TestSumPairTask:
         assert score(self.SOURCE, "\\boxed{b：42}", self.GT) == 1.0
         assert score(self.SOURCE, "\\boxed{B : 42}", self.GT) == 1.0
 
-    def test_judged_but_wrong_scores_half(self):
-        assert score(self.SOURCE, "\\boxed{B: 43}", self.GT) == 0.5
+    def test_judged_but_wrong_scores_zero(self):
+        # AND-gated: the right pick with a wrong answer earns nothing.
+        assert score(self.SOURCE, "\\boxed{B: 43}", self.GT) == 0.0
 
     def test_wrong_judgement_scores_zero_even_with_the_right_answer(self):
         assert score(self.SOURCE, "\\boxed{A: 42}", self.GT) == 0.0
@@ -616,19 +620,19 @@ class TestDecisionTable:
             ({"solvable": True, "answer": "72"}, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
             ({"solvable": True, "answer": "72"}, STATUS_UNSOLVABLE_OPTION, None, "B", 0.0),
             ({"solvable": True, "answer": "72"}, STATUS_NONE, None, None, 0.0),
-            # solvable two-layer numeric (D24)
+            # solvable two-layer numeric (D24) -- AND-gated: judgement alone is 0
             ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_ANSWER, "42", None, 1.0),
-            ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_ANSWER, "43", None, 0.5),
+            ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_ANSWER, "43", None, 0.0),
             ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
             ({"solvable": True, "two_layer": True, "answer": "42"}, STATUS_SOLVABLE_MARKER, None, None, 0.0),
-            # solvable two-layer free text (D27)
+            # solvable two-layer free text (D27) -- AND-gated
             (FREE_TEXT_GT, STATUS_ANSWER, "Teacher!", None, 1.0),
-            (FREE_TEXT_GT, STATUS_ANSWER, "a student", None, 0.5),
-            (FREE_TEXT_GT, STATUS_SOLVABLE_MARKER, None, None, 0.5),
+            (FREE_TEXT_GT, STATUS_ANSWER, "a student", None, 0.0),
+            (FREE_TEXT_GT, STATUS_SOLVABLE_MARKER, None, None, 0.0),
             (FREE_TEXT_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
-            # SUM pair task (D23)
+            # SUM pair task (D23) -- AND-gated
             (PAIR_GT, STATUS_ANSWER, "B: 42", None, 1.0),
-            (PAIR_GT, STATUS_ANSWER, "B: 43", None, 0.5),
+            (PAIR_GT, STATUS_ANSWER, "B: 43", None, 0.0),
             (PAIR_GT, STATUS_ANSWER, "A: 42", None, 0.0),
             (PAIR_GT, STATUS_ANSWER, "42", None, 0.0),
             (PAIR_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
