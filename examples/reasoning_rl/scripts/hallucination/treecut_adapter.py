@@ -25,12 +25,12 @@ vendored) and records the seam the design doc asks for.
 Contract produced by this adapter (design doc D26; sections 4.6, 4.8 table B rows
 5 and 7, 5.1, 5.2, 9):
 
-=================  ====================  ========  ============================================
+=================  ====================  ========  ==========================================================
 side               branch                template  gold
-=================  ====================  ========  ============================================
-negative (4,907)   ``unsolvable_diag``   A         ``\\boxed{UNSOLVABLE: <选项ID>}`` (four-tier)
+=================  ====================  ========  ==========================================================
+negative (4,907)   ``unsolvable_diag``   A         ``\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`` (D28)
 positive (500)     ``solvable_numeric``  A         ``\\boxed{<答案>}`` (numeric match)
-=================  ====================  ========  ============================================
+=================  ====================  ========  ==========================================================
 
 Table B row 5 (TreeCut positives) shares ``solvable_numeric`` with row 1 (GSM-IC
 and the synthesised distractors); the mix tells the two apart by ``data_source``
@@ -122,6 +122,15 @@ Certificates (fail closed; each is re-derived by ``verify_treecut.py``)
   number proved, the certificate runs on the pairs that can reach the positive
   quota; a pair that fails it keeps its four-tier negative and loses only the
   positive.
+* **Repaired answer (D28)** -- every four-tier negative also ships
+  ``repaired_answer``: the solution of the scenario once the gold option (the
+  cut sentence) is restored.  ``certify_repaired_answer`` rebuilds the full
+  scenario text (negative body + its recorded deleted sentence) and runs the
+  same chain certificate on it, at **pair level**: a pair whose restored text
+  cannot prove the generator's number loses its negative *and* the positive's
+  candidacy, counted in the funnel's ``certificate_drops`` like every other
+  pair-level failure.  Unlike the positive-side gate this one guards all
+  4,907 negatives, because every negative ships the number.
 
 A row whose certificate cannot be re-derived from its own two texts is dropped
 and counted in the funnel; nothing is invented, no counterpart text is reused
@@ -1042,6 +1051,26 @@ def certify_answer(positive: dict, config: dict) -> list:
     return []
 
 
+def certify_repaired_answer(negative: dict, positive: dict, config: dict) -> list:
+    """Re-derive the negative's D28 repaired answer; ``[]`` == certified.
+
+    Restoring the negative's own ``deleted_sentence`` into its body rebuilds the
+    full scenario (the pairing certificate already fixes the two members'
+    sentence multisets to a one-sentence symmetric difference), so the chain
+    certificate of :func:`certify_answer` can run on the restored text verbatim:
+    the value it derives must equal the generator's answer for the shared
+    render -- the number the row ships as ``repaired_answer``.  Fail closed: an
+    unreachable or ambiguously decoded chain drops the whole pair (the negative
+    and the positive's candidacy), and the drop is counted in the funnel like
+    every other certificate failure.
+    """
+    body, question = split_body(negative["problem"])
+    restored = f"{body} {negative['deleted_sentence']} {question}".strip()
+    restored_member = {"problem": restored, "answer": positive.get("answer", "")}
+    problems = certify_answer(restored_member, config)
+    return [f"repaired answer: {problem}" for problem in problems]
+
+
 # ---------------------------------------------------------------------------
 # options (D26): candidate missing conditions (negative) + placeholders (positive)
 # ---------------------------------------------------------------------------
@@ -1173,7 +1202,15 @@ def _shared_extra_info(config: dict, seed: int, task_id: str) -> dict:
 
 def row_for_negative(negative: dict, positive: dict, config: dict, options: list,
                      correct: str, seed: int) -> dict:
-    """One four-tier negative row (table B row 7, D26): refusal + diagnosis."""
+    """One four-tier negative row (table B row 7, D26): refusal + diagnosis.
+
+    D28 adds the third reward layer: ``repaired_answer`` is the shared render's
+    answer (an integer string), which restoring the gold option's cut sentence
+    provably re-enables -- :func:`certify_repaired_answer` re-derives it from
+    the restored text at pair level, and a pair that cannot prove it is dropped
+    whole.  The reward compares it with ``math_match``, the same matcher as the
+    solvable positive.
+    """
     extra_info = _shared_extra_info(config, seed, task_id_for(config))
     extra_info.update(
         {
@@ -1198,6 +1235,10 @@ def row_for_negative(negative: dict, positive: dict, config: dict, options: list
             correct_option_id=correct,
             has_diagnosis_label=True,
             perturbation_type=PERTURBATION_TYPE,
+            # D28 third layer: restoring the gold option (the cut sentence)
+            # rebuilds the full scenario, whose solution is the shared render's
+            # answer -- certified by certify_repaired_answer at pair level.
+            repaired_answer=str(positive["answer"]),
         ),
         template=TEMPLATE_A,
         branch=BRANCH_DIAG,
@@ -1311,6 +1352,14 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple:
                 "formula": source["formula"],
             }
             problems = certify_pair(negative, positive, config, matcher)
+            if problems:
+                certificate_drops[f"{theme}-nv{num_vars}-ad{ans_depth}: {problems[0]}"] += 1
+                continue
+            # D28: the four-tier negative ships the post-repair solution as its
+            # third reward layer, so the repaired answer is certified at pair
+            # level -- a pair whose restored text cannot prove the number loses
+            # its negative (and the positive's candidacy) entirely.
+            problems = certify_repaired_answer(negative, positive, config)
             if problems:
                 certificate_drops[f"{theme}-nv{num_vars}-ad{ans_depth}: {problems[0]}"] += 1
                 continue

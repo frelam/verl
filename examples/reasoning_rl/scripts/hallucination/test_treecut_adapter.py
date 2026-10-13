@@ -811,7 +811,9 @@ def test_full_build_ships_both_sides_of_the_contract(full_rows):
         assert truth["correct_option_id"] in [opt["id"] for opt in info["options"]]
         passage = row["prompt"][0]["content"].split("\n\n")[0]
         assert info["deleted_condition_text"] not in passage
-        assert "\\boxed{UNSOLVABLE: <选项ID>}" in row["prompt"][0]["content"]
+        assert "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" in row["prompt"][0]["content"]
+        # D28: the chain-certified post-repair solution rides in the gold
+        assert truth["repaired_answer"] is not None and str(truth["repaired_answer"]).strip() != ""
         for opt in info["options"]:
             assert opt["text"] not in passage
 

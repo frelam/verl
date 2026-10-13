@@ -238,8 +238,8 @@ _TEMPLATE_A = """{question}
 请判断该问题是否可解，并在最后一行给出结论：
 
 - 若前提成立、题目可以作答，最后一行输出：\\boxed{{<答案>}}
-- 若前提不成立 / 条件相互矛盾，最后一行输出：\\boxed{{UNSOLVABLE: <选项ID>}}
-  其中 <选项ID> 是下面候选中，能让该问题变为可解的那一项。
+- 若前提不成立 / 条件相互矛盾，最后一行输出：\\boxed{{UNSOLVABLE: <选项ID>: <修复后的答案>}}
+  其中 <选项ID> 是下面候选中，能让该问题变为可解的那一项；<修复后的答案> 是补上该条件后，该问题的正确解。
 
 选项：
 {options}"""
@@ -347,6 +347,8 @@ def ground_truth_payload(
     solvable_answer: bool = False,
     pair_task: bool = False,
     answerable_id: str | None = None,
+    repaired_answer: str | None = None,
+    repaired_free_text: bool = False,
 ) -> dict:
     """Build the ``reward_model.ground_truth`` payload (design doc section 3).
 
@@ -370,6 +372,13 @@ def ground_truth_payload(
 
     ``judgment_only`` is the CREPE-normal branch: the row asks "is this
     answerable?" and ``answer`` is audit-only, never compared.
+
+    ``repaired_answer`` (D28) is the four-tier unsolvable row's third layer: the
+    correct solution once the gold option's condition is restored.  It is
+    written only when provided, so an old artifact without the key keeps the
+    legacy two-layer scoring; ``repaired_free_text`` selects the matcher
+    (``norm_match`` for FalseQA's free text, ``math_match`` for TreeCut's
+    integers).
     """
     payload: dict[str, Any] = {
         "solvable": bool(solvable),
@@ -389,6 +398,10 @@ def ground_truth_payload(
     if pair_task:
         payload["pair_task"] = True
         payload["answerable_id"] = answerable_id
+    if repaired_answer is not None:
+        payload["repaired_answer"] = repaired_answer
+        if repaired_free_text:
+            payload["repaired_free_text"] = True
     return payload
 
 
@@ -574,6 +587,11 @@ def validate_row(row: dict) -> list[str]:
     else:
         if gt.get("answer") is not None:
             problem("unsolvable row must not carry an answer")
+        if not gt.get("has_diagnosis_label") and gt.get("repaired_answer") is not None:
+            # D28: the repaired answer is the four-tier diagnosis row's third
+            # layer; a three-tier row has no option to restore, so the key is
+            # meaningless there.
+            problem("a three-tier unsolvable row must not carry repaired_answer")
         if correct is not None and correct not in ids:
             # Catches the adapter's option-shuffle / index off-by-one bug that
             # design doc section 9 calls out explicitly.
@@ -591,6 +609,14 @@ def validate_row(row: dict) -> list[str]:
             problem("has_diagnosis_label row needs a perturbation_type")
     if solvable and correct is not None:
         problem("correct_option_id set on a solvable row")
+    if solvable and gt.get("repaired_answer") is not None:
+        problem("a solvable row must not carry repaired_answer (D28 is four-tier only)")
+    if gt.get("has_diagnosis_label") and not gt.get("repaired_answer"):
+        # D28: the four-tier contract is three-layer -- the refusal, the option
+        # pointer, and the solution once the gold option's condition is restored.
+        problem("has_diagnosis_label row needs a non-empty repaired_answer (D28)")
+    if gt.get("repaired_free_text") and gt.get("repaired_answer") is None:
+        problem("repaired_free_text without repaired_answer")
     if sum((role_words is not None, two_layer, solvable_answer, pair_task, bool(gt.get("judgment_only")))) > 1:
         problem("a row must not combine two answer-contract flags")
 

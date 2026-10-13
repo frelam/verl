@@ -80,6 +80,14 @@ pair's two questions -- and the option block is a set of **replacement pairs**::
   ever padded and no option text ever comes from another *question's* passage
   position: distractors are whole word windows of the corpus, which is what the
   section 4.3 argument requires.
+* **D28 third layer.**  Applying the gold pair to the fake question reproduces
+  the real question verbatim, so the paired real row's own ``answer`` is by
+  construction the correct solution after the repair.  It is stored as
+  ``repaired_answer`` (with ``repaired_free_text``, since 67.8% of the answers
+  are free text) and the reward's four-tier branch AND-gates on it: refusal +
+  correct pointer + correct post-repair solution, all three or nothing.  A pair
+  whose real answer is empty therefore loses the diagnosis row as well (counted
+  once in ``answer_empty``; never observed).
 
 The answerable side: a two-layer reward with an isomorphic placeholder block (D27)
 ----------------------------------------------------------------------------------
@@ -685,7 +693,16 @@ def _build_diag(
     correct: str,
     deleted: str,
     inserted: str,
+    repaired_answer: str,
 ) -> dict:
+    """One ``unsolvable_diag`` row (D21): refusal + replacement-pair pointer.
+
+    ``repaired_answer`` is the D28 third layer: applying the gold pair
+    (``left -> right``) to the presented question reproduces the paired real
+    question verbatim, so the real side's own answer is by construction the
+    correct solution after the repair.  It is free text, so the reward compares
+    it with ``norm_match`` (the D27 matcher).
+    """
     extra = _base_extra_info(split, index, seed, partner_question)
     extra.update(
         {
@@ -708,6 +725,8 @@ def _build_diag(
             correct_option_id=correct,
             has_diagnosis_label=True,
             perturbation_type=PERTURBATION_TYPE,
+            repaired_answer=repaired_answer,
+            repaired_free_text=True,
         ),
         template=schema.TEMPLATE_A,
         branch=BRANCH_DIAG,
@@ -950,6 +969,12 @@ def build_rows(
             # The pair still has a region certificate, so the answerable side can
             # be built; only the diagnosis side loses its pointer gold.
             drops[problem] += 1
+        elif not real_answer:
+            # D28: the diagnosis row's third layer *is* the real side's answer,
+            # so without it the diagnosis side cannot be built either.  The pair
+            # is counted once, in ``answer_empty`` below (never observed: the
+            # eligible pairs all carry a non-empty source answer).
+            pass
         else:
             pool = out_of_passage_right_pool(
                 bank,
@@ -979,6 +1004,7 @@ def build_rows(
                             correct=correct,
                             deleted=deleted,
                             inserted=inserted,
+                            repaired_answer=real_answer,
                         )
                     )
 

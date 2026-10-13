@@ -146,7 +146,7 @@ _FIELDS = ("question", "answer", "label")
 PAIR_ARROW = " -> "
 MARKER_ANSWER = "\\boxed{<答案>}"
 MARKER_UNSOLVABLE = "\\boxed{UNSOLVABLE"
-MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>}"
+MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
 
 #: The frozen reward dispatcher, imported end to end so the section 9 reward cells
 #: are pinned against the real scorer rather than a restatement of it.
@@ -256,6 +256,8 @@ def test_diag_row_carries_the_region_as_a_replacement_pair(tmp_path):
         "correct_option_id": info["correct_option_id"],
         "has_diagnosis_label": True,
         "perturbation_type": "contradictory_condition",
+        "repaired_answer": COLD_REAL[1],
+        "repaired_free_text": True,
         "solvable": False,
     }
     assert info["solvable"] is False
@@ -545,10 +547,16 @@ def test_a_short_distractor_pool_drops_the_row_instead_of_padding_it(tmp_path):
     assert not any(row["extra_info"]["branch"] == adapter.BRANCH_DIAG for row in rows)
 
 
-def test_an_empty_source_answer_drops_the_answerable_row(tmp_path):
+def test_an_empty_source_answer_drops_both_rows(tmp_path):
+    """D28: an empty real answer takes the diag row down with the answerable one.
+
+    The diag row's ``repaired_answer`` is the paired real row's own answer, so a
+    pair whose real answer is empty cannot field either side.  Both drops are
+    counted once in ``answer_empty``.
+    """
     rows, report = _build(tmp_path, EMPTY_ANSWER)
     assert report["drops"]["answer_empty"] == 1
-    assert [row["extra_info"]["branch"] for row in rows] == [adapter.BRANCH_DIAG]
+    assert rows == []
 
 
 def test_a_passage_without_a_content_span_drops_the_placeholder_row(tmp_path):
@@ -728,14 +736,23 @@ def test_main_fails_closed_on_an_empty_artifact(tmp_path, monkeypatch, capsys):
 
 
 def test_four_tier_reward_cells_for_a_diag_row(tmp_path):
-    """Four-tier (D21/§6): the pointer earns +1, a bare refusal 0, an answer -1."""
+    """Four-tier three-layer AND-gate (D28/§6): refusal + pointer + post-repair solution."""
     rows, _ = _build(tmp_path, COLD)
     diag = _by_id(rows)["falseqa-fake-train-0"]
     gold_id = diag["extra_info"]["correct_option_id"]
     wrong_id = next(letter for letter in "ABC" if letter != gold_id)
-    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == 1.0
+    repaired = json.loads(diag["reward_model"]["ground_truth"])["repaired_answer"]
+    # all three layers correct
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: {repaired}}}") == 1.0
+    # norm_match: case/punctuation/articles are not part of the answer
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: {repaired.upper()}}}") == 1.0
+    # missing or wrong post-repair solution
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == 0.0
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: something else}}") == 0.0
+    # wrong pointer, right solution
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {wrong_id}: {repaired}}}") == 0.0
+    # bare refusal / answer / no box
     assert _reward(diag, "\\boxed{UNSOLVABLE}") == 0.0
-    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {wrong_id}}}") == 0.0
     assert _reward(diag, "\\boxed{42}") == -1.0
     assert _reward(diag, "no box at all") == 0.0
 
@@ -752,6 +769,7 @@ def test_two_layer_reward_cells_for_an_answerable_row(tmp_path):
     assert _reward(answerable, "\\boxed{something else}") == 0.0
     assert _reward(answerable, "\\boxed{UNSOLVABLE}") == 0.0
     assert _reward(answerable, "\\boxed{UNSOLVABLE: A}") == 0.0
+    assert _reward(answerable, f"\\boxed{{UNSOLVABLE: A: {answer}}}") == 0.0
     assert _reward(answerable, "no box at all") == 0.0
 
 
@@ -760,7 +778,8 @@ def test_shuffling_the_option_block_does_not_change_the_score(tmp_path):
     rows, _ = _build(tmp_path, COLD, BIRDS)
     diag = _by_id(rows)["falseqa-fake-train-0"]
     gold_id = diag["extra_info"]["correct_option_id"]
-    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == 1.0
+    repaired = json.loads(diag["reward_model"]["ground_truth"])["repaired_answer"]
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: {repaired}}}") == 1.0
 
     shuffled = json.loads(json.dumps(diag))
     info = shuffled["extra_info"]
@@ -776,9 +795,11 @@ def test_shuffling_the_option_block_does_not_change_the_score(tmp_path):
     shuffled["reward_model"]["ground_truth"] = json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     assert schema.validate_row(shuffled) == []
-    assert _reward(shuffled, f"\\boxed{{UNSOLVABLE: {info['correct_option_id']}}}") == 1.0
+    assert _reward(shuffled, f"\\boxed{{UNSOLVABLE: {info['correct_option_id']}: {repaired}}}") == 1.0
     # the *old* id is now a distractor, so it must not score
-    assert _reward(shuffled, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == (1.0 if gold_id == info["correct_option_id"] else 0.0)
+    assert _reward(shuffled, f"\\boxed{{UNSOLVABLE: {gold_id}: {repaired}}}") == (
+        1.0 if gold_id == info["correct_option_id"] else 0.0
+    )
 
 
 def test_the_gold_option_id_is_the_shuffled_position_of_the_gold_pair(tmp_path):

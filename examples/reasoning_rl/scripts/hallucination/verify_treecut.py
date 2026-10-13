@@ -2030,7 +2030,7 @@ def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
             if "\\boxed{<答案>}" not in content:
                 failures.append(f"{task_id}: the solvable prompt does not ask for an answer")
         else:
-            if "\\boxed{UNSOLVABLE: <选项ID>}" not in content:
+            if "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" not in content:
                 failures.append(f"{task_id}: the four-tier prompt does not ask for the diagnosis")
     reporter.check(
         "prompt: template A is isomorphic across the two sides (same preamble, k=3 block) "

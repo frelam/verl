@@ -144,7 +144,7 @@ PAIR_ARROW = " -> "
 #: for it, and a prompt that offered it would be a different scaffold.
 MARKER_ANSWER = "\\boxed{<答案>}"
 MARKER_UNSOLVABLE = "\\boxed{UNSOLVABLE"
-MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>}"
+MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
 MARKER_VERDICTS = (MARKER_ANSWER, MARKER_UNSOLVABLE_ID)
 #: The whole wording of template A that is *not* the row's own text: the verdict
 #: instruction between the question and the block, and the header that opens the

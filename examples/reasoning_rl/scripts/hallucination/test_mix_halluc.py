@@ -126,6 +126,8 @@ def make_cell_rows(branch, data_source, template, solvable, n, seed=0):
                 gt_kwargs["correct_option_id"] = rng.choice("ABC")
                 gt_kwargs["has_diagnosis_label"] = True
                 gt_kwargs["perturbation_type"] = "missing_condition"
+                # D28: a four-tier row carries the chain-certified post-repair solution.
+                gt_kwargs["repaired_answer"] = "42"
                 if data_source == SOURCE_FALSEQA:
                     extra["pair_id"] = f"falseqa:train:{i}"
         rows.append(

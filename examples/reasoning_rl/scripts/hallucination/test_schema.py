@@ -122,7 +122,7 @@ class TestBranchShapesAreAccepted:
     def test_unsolvable_diag(self):
         schema.validate_rows(
             [row({"solvable": False, "answer": None, "correct_option_id": "B", "has_diagnosis_label": True,
-                  "perturbation_type": "missing_condition"},
+                  "perturbation_type": "missing_condition", "repaired_answer": "42"},
                  template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG,
                  data_source=schema.SOURCE_TREECUT, options=OPTIONS)]
         )
@@ -163,15 +163,21 @@ class TestViolationsAreRejected:
 
     def test_four_tier_without_a_correct_option(self):
         bad = row({"solvable": False, "correct_option_id": None, "has_diagnosis_label": True,
-                   "perturbation_type": "missing_condition"},
+                   "perturbation_type": "missing_condition", "repaired_answer": "42"},
                   template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
         assert any("correct_option_id" in p for p in schema.validate_row(bad))
 
     def test_four_tier_option_id_must_exist(self):
         bad = row({"solvable": False, "correct_option_id": "D", "has_diagnosis_label": True,
-                   "perturbation_type": "missing_condition"},
+                   "perturbation_type": "missing_condition", "repaired_answer": "42"},
                   template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
         assert any("not among the row's options" in p for p in schema.validate_row(bad))
+
+    def test_four_tier_without_a_repaired_answer(self):
+        bad = row({"solvable": False, "correct_option_id": "B", "has_diagnosis_label": True,
+                   "perturbation_type": "missing_condition"},
+                  template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
+        assert any("repaired_answer" in p for p in schema.validate_row(bad))
 
     def test_three_tier_must_not_carry_an_option_block(self):
         bad = row({"solvable": False, "perturbation_type": "missing_condition"},
@@ -234,7 +240,7 @@ class TestTemplates:
         prompt = schema.render_prompt("Q?", schema.TEMPLATE_A, options=OPTIONS)
         assert "A. man -> child" in prompt
         assert "\\boxed{<答案>}" in prompt
-        assert "\\boxed{UNSOLVABLE: <选项ID>}" in prompt
+        assert "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" in prompt
 
     def test_template_a_requires_options(self):
         with pytest.raises(ValueError, match="options block"):
@@ -288,7 +294,7 @@ class TestGroundTruthAndOptions:
 
     def test_json_round_trip_is_stable(self):
         payload = schema.ground_truth_payload(False, has_diagnosis_label=True, correct_option_id="B",
-                                              perturbation_type="missing_condition")
+                                              perturbation_type="missing_condition", repaired_answer="42")
         encoded = schema.ground_truth_json(payload)
         assert json.loads(encoded) == payload
         assert encoded == schema.ground_truth_json(payload)
@@ -352,7 +358,7 @@ class TestParquetRoundTrip:
             row({"solvable": True, "answer": "42", "perturbation_type": "distracting_condition"},
                 template=schema.TEMPLATE_B, branch=schema.BRANCH_SOLVABLE_NUMERIC),
             row({"solvable": False, "answer": None, "correct_option_id": "B", "has_diagnosis_label": True,
-                 "perturbation_type": "missing_condition"},
+                 "perturbation_type": "missing_condition", "repaired_answer": "42"},
                 template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG,
                 data_source=schema.SOURCE_FALSEQA, options=OPTIONS),
             row({"solvable": True, "pair_task": True, "answerable_id": "A", "answer": 7},
@@ -404,6 +410,7 @@ class TestTemplateIsomorphism:
                     gt["has_diagnosis_label"] = template == schema.TEMPLATE_A
                     if template == schema.TEMPLATE_A:
                         gt["correct_option_id"] = "B"
+                        gt["repaired_answer"] = "42"
                 rows.append(
                     row(gt, template=template, branch=branch, data_source=data_source,
                         options=options, role_words=gt.get("role_words"))
