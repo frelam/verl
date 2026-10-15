@@ -811,9 +811,9 @@ def test_full_build_ships_both_sides_of_the_contract(full_rows):
         assert truth["correct_option_id"] in [opt["id"] for opt in info["options"]]
         passage = row["prompt"][0]["content"].split("\n\n")[0]
         assert info["deleted_condition_text"] not in passage
-        assert "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" in row["prompt"][0]["content"]
-        # D28: the chain-certified post-repair solution rides in the gold
-        assert truth["repaired_answer"] is not None and str(truth["repaired_answer"]).strip() != ""
+        # Stage 2 (D29): the two-layer pointer contract -- no repair keys.
+        assert "\\boxed{UNSOLVABLE: <选项ID>}" in row["prompt"][0]["content"]
+        assert "repair_task" not in truth and "repaired_answer" not in truth
         for opt in info["options"]:
             assert opt["text"] not in passage
 
@@ -833,6 +833,29 @@ def test_full_build_ships_both_sides_of_the_contract(full_rows):
         assert "\\boxed{<答案>}" in row["prompt"][0]["content"]
         for opt in info["options"]:
             assert opt["text"] not in row["prompt"][0]["content"].split("\n\n")[0]
+
+
+@requires_raw
+def test_repair_build_negatives_carry_the_third_layer():
+    """Stage 3 (D28/D29): ``repair=True`` ships the chain-certified post-repair
+    solution on template A_repair; positives keep the stage-2 shape."""
+    rows, _ = adapter.build_rows(RAW_DIR, limit=24, seed=0, repair=True)
+    negatives = [row for row in rows if not row["extra_info"]["solvable"]]
+    positives = [row for row in rows if row["extra_info"]["solvable"]]
+    assert negatives and positives
+    schema.validate_rows(rows)
+    for row in negatives:
+        info = row["extra_info"]
+        truth = json.loads(row["reward_model"]["ground_truth"])
+        assert info["template"] == schema.TEMPLATE_A_REPAIR
+        assert truth["repair_task"] is True
+        assert "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" in row["prompt"][0]["content"]
+        # D28: the chain-certified post-repair solution rides in the gold
+        assert truth["repaired_answer"] is not None and str(truth["repaired_answer"]).strip() != ""
+    for row in positives:
+        truth = json.loads(row["reward_model"]["ground_truth"])
+        assert row["extra_info"]["template"] == schema.TEMPLATE_A
+        assert "repair_task" not in truth and "repaired_answer" not in truth
 
 
 @requires_raw

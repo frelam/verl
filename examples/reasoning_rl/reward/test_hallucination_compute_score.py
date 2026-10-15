@@ -541,6 +541,94 @@ class TestUnsolvableFourTier:
         assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE: A}", gt) == 1.0
         assert score("halluc_math_treecut", "\\boxed{UNSOLVABLE}", gt) == 0.0
 
+    def test_a_third_segment_is_ignored_on_a_stage2_row(self):
+        """D29: a stage-2 row scores on the pointer alone, so a model emitting the
+        stage-3 three-segment shape is neither rewarded nor punished for the extra
+        text -- it is parsed out and never looked at."""
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: man -> women makes it false}", self.GT) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# branch 7 stage 3: repair_task rows add a third AND-gate layer (D28/D29)
+# ---------------------------------------------------------------------------
+
+
+class TestUnsolvableFourTierRepair:
+    """Stage-3 repair rows keep the four-tier verdict+pointer layers and add a
+    third: the answer after restoring the gold option's condition.  The router
+    keys on the ground truth, not the data source: ``repair_task`` rows take the
+    three-layer gate, and a pre-D29 artifact (``repaired_answer`` without
+    ``repair_task``) lands on the same gate via the legacy fallback."""
+
+    SOURCE = "halluc_math_treecut"
+    GT = gt_json(
+        solvable=False,
+        answer=None,
+        correct_option_id="B",
+        has_diagnosis_label=True,
+        perturbation_type="missing_condition",
+        repair_task=True,
+        repaired_answer="42",
+    )
+
+    def test_full_three_segment_output_scores(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 42}", self.GT) == 1.0
+
+    def test_wrong_repaired_answer_scores_zero(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 43}", self.GT) == 0.0
+
+    def test_two_segment_output_scores_zero(self):
+        # Verdict and pointer pass, but the third layer has nothing to match:
+        # a stage-2 answer on a stage-3 row earns 0.
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", self.GT) == 0.0
+
+    def test_wrong_option_scores_zero_even_with_the_right_answer(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: A: 42}", self.GT) == 0.0
+
+    def test_bare_refusal_scores_zero(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 0.0
+
+    def test_fabrication_is_penalised(self):
+        assert score(self.SOURCE, "\\boxed{42}", self.GT) == -1.0
+
+    def test_repair_task_without_repaired_answer_fails_closed(self):
+        # An adapter that ships the flag without the gold must not silently
+        # demote the row to the two-layer contract.
+        gt = gt_json(
+            solvable=False,
+            has_diagnosis_label=True,
+            correct_option_id="B",
+            repair_task=True,
+        )
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 42}", gt) == 0.0
+
+    def test_free_text_repair_uses_norm_match(self):
+        # FalseQA's repaired answer is free text (D27's matcher); TreeCut's is an
+        # integer (math_match).  ``repaired_free_text`` picks between them.
+        gt = gt_json(
+            solvable=False,
+            has_diagnosis_label=True,
+            correct_option_id="B",
+            repair_task=True,
+            repaired_answer="a teacher",
+            repaired_free_text=True,
+        )
+        assert score("halluc_commonsense_falseqa", "\\boxed{UNSOLVABLE: B: Teacher!}", gt) == 1.0
+        assert score("halluc_commonsense_falseqa", "\\boxed{UNSOLVABLE: B: a student}", gt) == 0.0
+
+    def test_legacy_repaired_answer_without_repair_task_keeps_the_three_layer_gate(self):
+        """Pre-D29 artifacts carry ``repaired_answer`` but no ``repair_task``; the
+        router must not demote them to the stage-2 two-layer contract."""
+        gt = gt_json(
+            solvable=False,
+            has_diagnosis_label=True,
+            correct_option_id="B",
+            repaired_answer="42",
+        )
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 42}", gt) == 1.0
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", gt) == 0.0
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 43}", gt) == 0.0
+
 
 # ---------------------------------------------------------------------------
 # the bare-marker branch correlation (doc section 9)
@@ -608,6 +696,13 @@ class TestFormatGateAndMalformedInputs:
 FREE_TEXT_GT = {"solvable": True, "solvable_answer": True, "answer": "a teacher"}
 PAIR_GT = {"solvable": True, "pair_task": True, "answerable_id": "B", "answer": 42}
 FOUR_TIER_GT = {"solvable": False, "has_diagnosis_label": True, "correct_option_id": "B"}
+REPAIR_GT = {
+    "solvable": False,
+    "has_diagnosis_label": True,
+    "correct_option_id": "B",
+    "repair_task": True,
+    "repaired_answer": "42",
+}
 
 
 class TestDecisionTable:
@@ -648,12 +743,21 @@ class TestDecisionTable:
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_ANSWER, "5", None, -1.0),
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_NONE, None, None, 0.0),
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_SOLVABLE_MARKER, None, None, 0.0),
-            # unsolvable four-tier
+            # unsolvable four-tier (stage 2, D29: the pointer alone earns +1 --
+            # a third segment is parsed but ignored)
             (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, None, "B", 1.0),
+            (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, "ignored text", "B", 1.0),
             (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, None, "A", 0.0),
             (FOUR_TIER_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
             (FOUR_TIER_GT, STATUS_ANSWER, "1", None, -1.0),
             (FOUR_TIER_GT, STATUS_NONE, None, None, 0.0),
+            # unsolvable four-tier repair (stage 3, D28/D29: three-layer AND-gate)
+            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "42", "B", 1.0),
+            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "43", "B", 0.0),
+            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, None, "B", 0.0),
+            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "42", "A", 0.0),
+            (REPAIR_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
+            (REPAIR_GT, STATUS_ANSWER, "42", None, -1.0),
         ],
     )
     def test_cell(self, ground_truth, status, answer, option, expected):

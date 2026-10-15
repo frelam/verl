@@ -146,7 +146,11 @@ _FIELDS = ("question", "answer", "label")
 PAIR_ARROW = " -> "
 MARKER_ANSWER = "\\boxed{<答案>}"
 MARKER_UNSOLVABLE = "\\boxed{UNSOLVABLE"
-MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
+#: The two contract stages (D29): the default build ships stage 2's two-segment
+#: pointer on template A; ``repair=True`` ships stage 3's three-segment contract
+#: on template A_repair.
+MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>}"
+MARKER_UNSOLVABLE_ID_REPAIR = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
 
 #: The frozen reward dispatcher, imported end to end so the section 9 reward cells
 #: are pinned against the real scorer rather than a restatement of it.
@@ -256,15 +260,38 @@ def test_diag_row_carries_the_region_as_a_replacement_pair(tmp_path):
         "correct_option_id": info["correct_option_id"],
         "has_diagnosis_label": True,
         "perturbation_type": "contradictory_condition",
-        "repaired_answer": COLD_REAL[1],
-        "repaired_free_text": True,
         "solvable": False,
     }
     assert info["solvable"] is False
     assert info["error_type"] == "false_premise_pointable"
     assert info["perturbation_type"] == "contradictory_condition"
     assert info["pair_id"] == "train:0"
+    assert info["template"] == schema.TEMPLATE_A
     assert MARKER_UNSOLVABLE_ID in diag["prompt"][0]["content"]
+
+
+def test_diag_row_in_repair_mode_carries_the_third_layer(tmp_path):
+    """Stage 3 (D28/D29): ``repair=True`` adds the post-repair solution gold."""
+    rows, _ = _build(tmp_path, COLD, repair=True)
+    diag = _by_id(rows)["falseqa-fake-train-0"]
+    info = diag["extra_info"]
+    assert info["template"] == schema.TEMPLATE_A_REPAIR
+    assert json.loads(diag["reward_model"]["ground_truth"]) == {
+        "answer": None,
+        "correct_option_id": info["correct_option_id"],
+        "has_diagnosis_label": True,
+        "perturbation_type": "contradictory_condition",
+        "repair_task": True,
+        "repaired_answer": COLD_REAL[1],
+        "repaired_free_text": True,
+        "solvable": False,
+    }
+    assert MARKER_UNSOLVABLE_ID_REPAIR in diag["prompt"][0]["content"]
+    # the answerable twin keeps the stage-2 shape: template A, no repair keys
+    answerable = _by_id(rows)["falseqa-real-train-0"]
+    payload = json.loads(answerable["reward_model"]["ground_truth"])
+    assert answerable["extra_info"]["template"] == schema.TEMPLATE_A
+    assert "repair_task" not in payload and "repaired_answer" not in payload
 
 
 def test_answerable_row_is_a_placeholder_two_layer_row(tmp_path):
@@ -547,14 +574,23 @@ def test_a_short_distractor_pool_drops_the_row_instead_of_padding_it(tmp_path):
     assert not any(row["extra_info"]["branch"] == adapter.BRANCH_DIAG for row in rows)
 
 
-def test_an_empty_source_answer_drops_both_rows(tmp_path):
-    """D28: an empty real answer takes the diag row down with the answerable one.
+def test_an_empty_source_answer_drops_only_the_answerable_row(tmp_path):
+    """Stage 2 (D29): an empty real answer no longer takes the diag row down.
 
-    The diag row's ``repaired_answer`` is the paired real row's own answer, so a
-    pair whose real answer is empty cannot field either side.  Both drops are
-    counted once in ``answer_empty``.
+    The pointer contract never reads the real side's answer, so only the
+    answerable side is unbuildable; ``answer_empty`` is still counted once.
     """
     rows, report = _build(tmp_path, EMPTY_ANSWER)
+    assert report["drops"]["answer_empty"] == 1
+    assert [row["extra_info"]["branch"] for row in rows] == [adapter.BRANCH_DIAG]
+
+
+def test_an_empty_source_answer_drops_both_rows_in_repair_mode(tmp_path):
+    """D28: in repair mode the diag row's third layer *is* the real side's own
+    answer, so a pair whose real answer is empty cannot field either side.  Both
+    drops are counted once in ``answer_empty``.
+    """
+    rows, report = _build(tmp_path, EMPTY_ANSWER, repair=True)
     assert report["drops"]["answer_empty"] == 1
     assert rows == []
 
@@ -736,8 +772,25 @@ def test_main_fails_closed_on_an_empty_artifact(tmp_path, monkeypatch, capsys):
 
 
 def test_four_tier_reward_cells_for_a_diag_row(tmp_path):
-    """Four-tier three-layer AND-gate (D28/§6): refusal + pointer + post-repair solution."""
+    """Stage 2 (D29) two-layer cells: the refusal + the pointer earn +1."""
     rows, _ = _build(tmp_path, COLD)
+    diag = _by_id(rows)["falseqa-fake-train-0"]
+    gold_id = diag["extra_info"]["correct_option_id"]
+    wrong_id = next(letter for letter in "ABC" if letter != gold_id)
+    # the pointer alone earns +1
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == 1.0
+    # a third segment the stage-2 prompt never asked for is ignored, not punished
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: anything at all}}") == 1.0
+    # wrong pointer / bare refusal / answer / no box
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {wrong_id}}}") == 0.0
+    assert _reward(diag, "\\boxed{UNSOLVABLE}") == 0.0
+    assert _reward(diag, "\\boxed{42}") == -1.0
+    assert _reward(diag, "no box at all") == 0.0
+
+
+def test_four_tier_reward_cells_for_a_repair_row(tmp_path):
+    """Stage 3 three-layer AND-gate (D28/D29, §6): refusal + pointer + post-repair solution."""
+    rows, _ = _build(tmp_path, COLD, repair=True)
     diag = _by_id(rows)["falseqa-fake-train-0"]
     gold_id = diag["extra_info"]["correct_option_id"]
     wrong_id = next(letter for letter in "ABC" if letter != gold_id)
@@ -775,7 +828,7 @@ def test_two_layer_reward_cells_for_an_answerable_row(tmp_path):
 
 def test_shuffling_the_option_block_does_not_change_the_score(tmp_path):
     """§9 option-shuffle invariance: the reward compares ids, and the ids follow."""
-    rows, _ = _build(tmp_path, COLD, BIRDS)
+    rows, _ = _build(tmp_path, COLD, BIRDS, repair=True)
     diag = _by_id(rows)["falseqa-fake-train-0"]
     gold_id = diag["extra_info"]["correct_option_id"]
     repaired = json.loads(diag["reward_model"]["ground_truth"])["repaired_answer"]

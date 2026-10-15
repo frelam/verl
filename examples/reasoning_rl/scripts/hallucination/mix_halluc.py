@@ -71,6 +71,19 @@ cell is its own group and never absorbs a deficit), so the 60/40 unsolvable spli
 and the four-tier/three-tier composition survive a shortfall; the total is only
 allowed to come out below ``--halluc_total`` when the pools genuinely cannot fill
 it.
+
+Stage 3: ``--repair_mode`` (D29)
+--------------------------------
+
+With ``--repair_mode`` the mixer builds the stage-3 repair-task mix instead:
+``--halluc_dir`` must point at the adapters' ``--repair-contract`` output and
+the quota is :data:`REPAIR_QUOTA` -- only the two four-tier diagnosis cells, in
+their table-B ratio.  Every halluc row is then a three-layer repair row
+(``repair_task=True``), so ``--halluc_unsolvable_ratio`` is unused, the
+pair-atomicity rule is skipped (the answerable twins are never quota'd, so val
+cannot leak them), and template ``A_repair`` is exempt from the both-sides
+balance check.  The stage-1 old-domain replay (``--stage1_path`` /
+``--old_domain_ratio``) and both dedup passes run unchanged.
 """
 
 from __future__ import annotations
@@ -168,6 +181,17 @@ DEFAULT_QUOTA: dict[tuple[str, str], int] = {
 #: accounting).
 QUOTA_GROUPS = ("solvable", "four_tier", "three_tier", "pair")
 
+#: Stage 3 (D29, ``--repair_mode``): the repair task's halluc side.  Only the
+#: four-tier diagnosis cells participate, at their table-B ratio (928:4907).
+#: Every row is a three-layer repair row, so there is no side-weight arithmetic
+#: -- the solvable/unsolvable balancing of table B belongs to stage 2, and the
+#: FalseQA answerable / TreeCut positive rows that share the repair parquets
+#: are simply not quota'd here.
+REPAIR_QUOTA: dict[tuple[str, str], int] = {
+    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_FALSEQA): 928,
+    (BRANCH_UNSOLVABLE_DIAG, schema.SOURCE_TREECUT): 4907,
+}
+
 
 def _largest_remainder(shares: dict, total: int) -> dict:
     """Apportion ``total`` proportionally to ``shares``, summing to exactly ``total``."""
@@ -233,6 +257,17 @@ def _four_tier_share() -> float:
     four = sum(q for (branch, _), q in DEFAULT_QUOTA.items() if branch == BRANCH_UNSOLVABLE_DIAG)
     bare = sum(q for (branch, _), q in DEFAULT_QUOTA.items() if branch == BRANCH_UNSOLVABLE_BARE)
     return four / (four + bare)
+
+
+def repair_quota(total: int) -> dict[tuple[str, str], int]:
+    """Rescale :data:`REPAIR_QUOTA` to the requested total (largest-remainder).
+
+    Stage 3 (D29) has no side ratio knob: every repair row is four-tier
+    unsolvable, so the only apportionment is the table-B 928:4907 source split.
+    """
+    if total <= 0:
+        raise ValueError(f"--halluc_total must be positive in repair mode, got {total}")
+    return _largest_remainder({cell: q for cell, q in REPAIR_QUOTA.items()}, total)
 
 
 def index_pool(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
@@ -417,7 +452,7 @@ def check_template_balance(rows: list[dict]) -> dict:
     label leak, and the fix belongs in the adapters (route some rows of the other
     side through it), not in a tolerance here.
 
-    Two exemptions, both structural rather than tolerances:
+    Three exemptions, all structural rather than tolerances:
 
     * template C is SUM's pair task: every row is ``solvable=true`` *and* carries
       an unanswerable question, so it covers both sides by construction
@@ -425,7 +460,11 @@ def check_template_balance(rows: list[dict]) -> dict:
     * template ``B_judge`` is template B's verdict-only variant, used by the
       CREPE-normal judgement rows; it is counted inside the B family, which must
       still carry both classes (B has the numeric/K&K solvable rows and the
-      three-tier unsolvable rows).
+      three-tier unsolvable rows);
+    * template ``A_repair`` is stage 3's repair contract (D29): ``validate_row``
+      ties it to ``repair_task`` 1:1, so it can only ever carry four-tier
+      unsolvable rows -- there is no solvable side the template could leak, and
+      the solvability judgement it skips is the skill stage 2 already owns.
     """
     counts: dict[str, Counter] = defaultdict(Counter)
     for row in rows:
@@ -434,8 +473,9 @@ def check_template_balance(rows: list[dict]) -> dict:
         solvable = json.loads(row["reward_model"]["ground_truth"]).get("solvable")
         counts[family]["solvable" if solvable else "unsolvable"] += 1
 
+    exempt = (schema.TEMPLATE_C, schema.TEMPLATE_A_REPAIR)
     unbalanced = [
-        t for t, c in counts.items() if t != schema.TEMPLATE_C and not (c["solvable"] and c["unsolvable"])
+        t for t, c in counts.items() if t not in exempt and not (c["solvable"] and c["unsolvable"])
     ]
     if unbalanced:
         detail = {t: dict(counts[t]) for t in unbalanced}
@@ -560,6 +600,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output_dir", default="~/data/reasoning_rl/final_halluc")
     parser.add_argument("--halluc_total", type=int, default=20000)
     parser.add_argument("--halluc_unsolvable_ratio", type=float, default=0.6)
+    parser.add_argument(
+        "--repair_mode",
+        action="store_true",
+        help="Stage 3 (D29): mix only the repair-task cells (REPAIR_QUOTA) out of "
+        "--halluc_dir, which must hold the adapters' --repair-contract output. "
+        "--halluc_unsolvable_ratio is unused: every repair row is four-tier "
+        "unsolvable.",
+    )
     parser.add_argument("--old_domain_ratio", type=float, default=0.7, help="stage-1 share of the stage-2 mix")
     parser.add_argument(
         "--spill_across_tiers",
@@ -594,7 +642,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"no hallucination rows found under {halluc_dir}")
     print(f"[mix_halluc] {len(halluc_rows)} rows from {len(files)} adapter parquet(s)")
 
-    quota = scaled_quota(args.halluc_total, args.halluc_unsolvable_ratio)
+    quota = repair_quota(args.halluc_total) if args.repair_mode else scaled_quota(args.halluc_total, args.halluc_unsolvable_ratio)
     pool = index_pool(halluc_rows)
     missing = [cell for cell in quota if cell not in pool]
     if missing:
@@ -602,7 +650,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Carve val out of the pools first, then fill the train quota (mix.py's order).
     val_rows, pool = carve_val(pool, quota, args.val_size, rng)
-    val_rows, returned = enforce_pair_atomicity(val_rows, pool)
+    if args.repair_mode:
+        # The answerable twins are never quota'd in repair mode, so a paired
+        # diag row in val cannot leak its twin into train -- the atomicity rule
+        # would only bounce every FalseQA repair row out of val.
+        returned = []
+    else:
+        val_rows, returned = enforce_pair_atomicity(val_rows, pool)
     if returned:
         print(f"[mix_halluc] val: returned {len(returned)} row(s) whose pair twin was not in val")
     rows, cell_report = fill_cells(pool, quota, rng, spill_across_tiers=args.spill_across_tiers)
@@ -713,6 +767,7 @@ def main(argv: list[str] | None = None) -> int:
         "config": {
             "halluc_total": args.halluc_total,
             "halluc_unsolvable_ratio": args.halluc_unsolvable_ratio,
+            "repair_mode": args.repair_mode,
             "old_domain_ratio": args.old_domain_ratio,
             "val_size": args.val_size,
             "seed": args.seed,
@@ -725,7 +780,8 @@ def main(argv: list[str] | None = None) -> int:
         "requested_ratios": {
             # Side weights, so the SUM pairs count 0.5/0.5 the way section 4.8
             # accounts for them; the four-tier composition is fixed by table B.
-            "unsolvable_share": args.halluc_unsolvable_ratio,
+            # Repair mode (stage 3, D29) is unsolvable-only by construction.
+            "unsolvable_share": 1.0 if args.repair_mode else args.halluc_unsolvable_ratio,
         },
         "row_kinds": {
             "solvable_rows": n_solvable_rows,

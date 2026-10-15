@@ -136,16 +136,31 @@ MAX_CHAR_RATIO = 2.0
 #: The D21 replacement-pair arrow (``man -> women``).  Re-declared, for the same
 #: reason as ``K_OPTIONS``.
 PAIR_ARROW = " -> "
-#: The two verdicts template A offers (design doc section 5.2, the wording every
-#: option-block row shares).  The *marker* strings are what the reward parses, so
-#: the audit checks that the prompt offers both bullets instead of trusting the
-#: option block to imply them.  ``\boxed{SOLVABLE}`` is deliberately absent: the
-#: reward accepts it on the ``solvable_answer`` branch, but template A never asks
-#: for it, and a prompt that offered it would be a different scaffold.
+#: The two verdicts a template-A-family prompt offers (design doc section 5.2).
+#: The *marker* strings are what the reward parses, so the audit checks that the
+#: prompt offers both bullets instead of trusting the option block to imply them.
+#: ``\boxed{SOLVABLE}`` is deliberately absent: the reward accepts it on the
+#: ``solvable_answer`` branch, but template A never asks for it, and a prompt
+#: that offered it would be a different scaffold.  The UNSOLVABLE marker comes in
+#: two contract stages (D29): stage 2's two-segment pointer on template A, and
+#: stage 3's three-segment repair contract on template A_repair.  Which one a row
+#: must offer is a property of its *template*, not of the artifact's file name.
 MARKER_ANSWER = "\\boxed{<答案>}"
 MARKER_UNSOLVABLE = "\\boxed{UNSOLVABLE"
-MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
-MARKER_VERDICTS = (MARKER_ANSWER, MARKER_UNSOLVABLE_ID)
+MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>}"
+MARKER_UNSOLVABLE_ID_REPAIR = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
+
+
+def marker_verdicts(template: str) -> tuple[str, str]:
+    """The (answer, unsolvable) marker pair a template-A-family prompt must offer."""
+    unsolvable = (
+        MARKER_UNSOLVABLE_ID_REPAIR
+        if template == schema.TEMPLATE_A_REPAIR
+        else MARKER_UNSOLVABLE_ID
+    )
+    return (MARKER_ANSWER, unsolvable)
+
+
 #: The whole wording of template A that is *not* the row's own text: the verdict
 #: instruction between the question and the block, and the header that opens the
 #: block.
@@ -1535,16 +1550,17 @@ def check_contract(rows: list[dict], reporter: Reporter) -> None:
                 )
             if not ground_truth.get("perturbation_type"):
                 failures.append(f"{task_id}: diag row without a perturbation_type")
-            if MARKER_UNSOLVABLE_ID not in row["prompt"][0]["content"]:
+            if marker_verdicts(info["template"])[1] not in row["prompt"][0]["content"]:
                 failures.append(f"{task_id}: prompt does not ask for the UNSOLVABLE:<id> marker")
         # The reward reads the *status the model emits*, so the expected marker is
-        # a property of the prompt, not of a stored gold string: every template A
-        # row must offer both verdicts, because the two sides share one wording.
+        # a property of the prompt, not of a stored gold string: every row of the
+        # template-A family must offer both verdicts of *its* contract stage,
+        # because the two sides share one wording per template.
         prompt = row["prompt"][0]["content"]
-        if info["template"] == schema.TEMPLATE_A and not all(
-            marker in prompt for marker in MARKER_VERDICTS
+        if info["template"] in (schema.TEMPLATE_A, schema.TEMPLATE_A_REPAIR) and not all(
+            marker in prompt for marker in marker_verdicts(info["template"])
         ):
-            failures.append(f"{task_id}: template A prompt does not offer both verdict markers")
+            failures.append(f"{task_id}: template {info['template']} prompt does not offer both verdict markers")
         if not info.get("paired_original_text") or info["paired_original_text"] == question_of(row):
             failures.append(f"{task_id}: missing or identical paired original")
     reporter.check(
@@ -1581,7 +1597,7 @@ def prompt_scaffold(prompt: str) -> tuple[str, str] | None:
 
 
 def check_template_isomorphism(rows: list[dict], reporter: Reporter) -> None:
-    """The D18 defence, asserted on the artifact: one scaffold for both sides.
+    """The D18 defence, asserted on the artifact: one scaffold per template.
 
     Sections 5.1/5.2 and 9 make this the hard constraint of the source: the two
     sides must differ *only* in their own question and option texts, because any
@@ -1592,6 +1608,11 @@ def check_template_isomorphism(rows: list[dict], reporter: Reporter) -> None:
     ``\\boxed{UNSOLVABLE: <id>}`` bullet, or renamed the option header, passes every
     other check in this file.  This check exists to catch exactly those two
     mutations.
+
+    The gate is **per template** (D29): a stage-3 artifact puts the diag branch on
+    A_repair and the answerable branch on A, whose instructions differ by exactly
+    the repair segment -- that difference is the contract, not a leak.  What must
+    not vary is the scaffold *within* one template across the two branches.
     """
     scaffolds: dict[str, set[tuple[str, str]]] = collections.defaultdict(set)
     unparsable: list[str] = []
@@ -1602,15 +1623,20 @@ def check_template_isomorphism(rows: list[dict], reporter: Reporter) -> None:
         if scaffold is None:
             unparsable.append(row["extra_info"]["task_id"])
             continue
-        scaffolds[row["extra_info"]["branch"]].add(scaffold)
-        if not all(marker in prompt for marker in MARKER_VERDICTS):
+        template = row["extra_info"]["template"]
+        scaffolds[template].add(scaffold)
+        if not all(marker in prompt for marker in marker_verdicts(template)):
             unmarked.append(row["extra_info"]["task_id"])
-    distinct = {scaffold for branch in scaffolds.values() for scaffold in branch}
-    per_branch = ", ".join(f"{branch}:{len(found)}" for branch, found in sorted(scaffolds.items()))
+    per_template = ", ".join(
+        f"{template}:{len(found)}" for template, found in sorted(scaffolds.items())
+    )
     reporter.check(
-        "D18 template isomorphism: one scaffold for both sides",
-        bool(scaffolds) and len(distinct) == 1 and not unparsable and not unmarked,
-        f"scaffolds per branch {{{per_branch}}}: {len(distinct)} distinct, "
+        "D18 template isomorphism: one scaffold per template across both sides",
+        bool(scaffolds)
+        and all(len(found) == 1 for found in scaffolds.values())
+        and not unparsable
+        and not unmarked,
+        f"scaffolds per template {{{per_template}}}, "
         f"{len(unparsable)} prompt(s) without a template boundary/option header, "
         f"{len(unmarked)} without both verdict markers"
         + (f"; first: {(unparsable + unmarked)[:3]}" if (unparsable or unmarked) else ""),

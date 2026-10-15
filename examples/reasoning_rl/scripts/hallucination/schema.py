@@ -51,6 +51,13 @@ branch                 example source                                  template
 Row 5 of table B (TreeCut positives) shares ``solvable_numeric`` with row 1 --
 both are template-A numeric rows whose only difference is the *placeholder*
 option block, which the reward ignores.
+
+Stage 3 (D29) adds a ninth shape: the same ``unsolvable_diag`` branch on
+template ``A_repair`` with ``repair_task=True`` in the payload -- the D28
+three-layer contract (``\boxed{UNSOLVABLE: <id>: <repaired answer>}``), built
+by the FalseQA/TreeCut adapters' ``--repair-contract`` mode and mixed by
+``mix_halluc.py --repair_mode``.  Stage-2 four-tier rows stay on template A
+with the two-layer contract.
 """
 
 from __future__ import annotations
@@ -150,7 +157,7 @@ STAGE1_EXTRA_INFO_KEYS = (
 # Stage-2 additions (design doc sections 3 and 4).
 STAGE2_EXTRA_INFO_KEYS = (
     "branch",  # table B branch, for quota bookkeeping and per-branch monitoring
-    "template",  # A / B / B_judge -- see below
+    "template",  # A / A_repair / B / B_judge / C -- see below
     "perturbation_type",
     "perturbation_family",  # K&K: clean / perturbed_statement / ...
     "options",  # [{"id": "A", "text": ...}], empty for option-less rows
@@ -215,11 +222,12 @@ EXTRA_INFO_DEFAULTS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 TEMPLATE_A = "A"  # options block + explicit verdict  (judgment + diagnosis)
+TEMPLATE_A_REPAIR = "A_repair"  # stage 3 (D29): A + the post-repair solution segment
 TEMPLATE_B = "B"  # no options block, answer or refuse
 TEMPLATE_B_JUDGE = "B_judge"  # no options block, verdict only
 TEMPLATE_C = "C"  # two questions labelled A/B, judge-then-solve (SUM, D23)
 
-TEMPLATES = (TEMPLATE_A, TEMPLATE_B, TEMPLATE_B_JUDGE, TEMPLATE_C)
+TEMPLATES = (TEMPLATE_A, TEMPLATE_A_REPAIR, TEMPLATE_B, TEMPLATE_B_JUDGE, TEMPLATE_C)
 
 #: D15 pins k = 3 (1 correct + 2 distractors, ids A/B/C) and requires the same k
 #: across the subsets of one template.  ``validate_row`` enforces it on the
@@ -233,7 +241,28 @@ OPTION_COUNT = 3
 # (UMWP-answerable D24, FalseQA-answerable D27, TreeCut positives D26).  One
 # wording for both sides is the point: any difference in the option-block
 # sentence would itself become the label.
+#
+# Stage 2's four-tier contract is two-layer (D29): the refusal and the option
+# pointer.  The D28 three-layer contract (the post-repair solution as a third
+# segment) lives in stage 3 on template A_repair, so the stage-2 mix no longer
+# pays for -- or is confounded by -- the repair-solution skill.
 _TEMPLATE_A = """{question}
+
+请判断该问题是否可解，并在最后一行给出结论：
+
+- 若前提成立、题目可以作答，最后一行输出：\\boxed{{<答案>}}
+- 若前提不成立 / 条件相互矛盾，最后一行输出：\\boxed{{UNSOLVABLE: <选项ID>}}
+  其中 <选项ID> 是下面候选中，能让该问题变为可解的那一项。
+
+选项：
+{options}"""
+
+# Stage 3 (D29): the D28 three-layer four-tier contract, on its own template so
+# a stage-2 artifact never asks for the repair solution.  The option-block
+# sentence is byte-identical to template A's -- the isomorphism argument of D18
+# must hold within one template family, and the only wording difference between
+# the two stages is the extra output segment the row's own contract requires.
+_TEMPLATE_A_REPAIR = """{question}
 
 请判断该问题是否可解，并在最后一行给出结论：
 
@@ -311,10 +340,11 @@ def render_prompt(
     given exactly when the template is C.
     """
     question = question.strip()
-    if template == TEMPLATE_A:
+    if template in (TEMPLATE_A, TEMPLATE_A_REPAIR):
         if not options:
-            raise ValueError("template A requires an options block")
-        return _TEMPLATE_A.format(question=question, options=render_options_block(options))
+            raise ValueError(f"template {template} requires an options block")
+        text = _TEMPLATE_A if template == TEMPLATE_A else _TEMPLATE_A_REPAIR
+        return text.format(question=question, options=render_options_block(options))
     if template == TEMPLATE_B:
         prompt = _TEMPLATE_B.format(question=question)
         if role_words:
@@ -347,6 +377,7 @@ def ground_truth_payload(
     solvable_answer: bool = False,
     pair_task: bool = False,
     answerable_id: str | None = None,
+    repair_task: bool = False,
     repaired_answer: str | None = None,
     repaired_free_text: bool = False,
 ) -> dict:
@@ -373,12 +404,14 @@ def ground_truth_payload(
     ``judgment_only`` is the CREPE-normal branch: the row asks "is this
     answerable?" and ``answer`` is audit-only, never compared.
 
-    ``repaired_answer`` (D28) is the four-tier unsolvable row's third layer: the
-    correct solution once the gold option's condition is restored.  It is
-    written only when provided, so an old artifact without the key keeps the
-    legacy two-layer scoring; ``repaired_free_text`` selects the matcher
-    (``norm_match`` for FalseQA's free text, ``math_match`` for TreeCut's
-    integers).
+    ``repaired_answer`` is the stage-3 repair task's third layer (D28, moved to
+    stage 3 by D29): the correct solution once the gold option's condition is
+    restored.  It is written only on ``repair_task`` rows -- stage-2 four-tier
+    rows keep the two-layer contract and carry neither key -- and
+    ``repaired_free_text`` selects the matcher (``norm_match`` for FalseQA's
+    free text, ``math_match`` for TreeCut's integers).  The reward also AND-gates
+    on a bare ``repaired_answer`` without ``repair_task`` so a legacy D28
+    artifact keeps its three-layer scoring.
     """
     payload: dict[str, Any] = {
         "solvable": bool(solvable),
@@ -398,6 +431,8 @@ def ground_truth_payload(
     if pair_task:
         payload["pair_task"] = True
         payload["answerable_id"] = answerable_id
+    if repair_task:
+        payload["repair_task"] = True
     if repaired_answer is not None:
         payload["repaired_answer"] = repaired_answer
         if repaired_free_text:
@@ -568,6 +603,7 @@ def validate_row(row: dict) -> list[str]:
     two_layer = bool(gt.get("two_layer"))
     solvable_answer = bool(gt.get("solvable_answer"))
     pair_task = bool(gt.get("pair_task"))
+    repair_task = bool(gt.get("repair_task"))
     if solvable:
         if gt.get("judgment_only"):
             pass  # answer is audit-only here
@@ -584,14 +620,18 @@ def validate_row(row: dict) -> list[str]:
             problem(f"pair_task row needs answerable_id in A/B, got {gt.get('answerable_id')!r}")
         if gt.get("has_diagnosis_label"):
             problem("a solvable row must not carry has_diagnosis_label")
+        if repair_task:
+            problem("a solvable row must not carry repair_task (stage-3 four-tier only)")
     else:
         if gt.get("answer") is not None:
             problem("unsolvable row must not carry an answer")
         if not gt.get("has_diagnosis_label") and gt.get("repaired_answer") is not None:
-            # D28: the repaired answer is the four-tier diagnosis row's third
+            # The repaired answer is the four-tier diagnosis row's stage-3 third
             # layer; a three-tier row has no option to restore, so the key is
             # meaningless there.
             problem("a three-tier unsolvable row must not carry repaired_answer")
+        if repair_task and not gt.get("has_diagnosis_label"):
+            problem("repair_task without has_diagnosis_label (the repair contract is four-tier)")
         if correct is not None and correct not in ids:
             # Catches the adapter's option-shuffle / index off-by-one bug that
             # design doc section 9 calls out explicitly.
@@ -610,11 +650,16 @@ def validate_row(row: dict) -> list[str]:
     if solvable and correct is not None:
         problem("correct_option_id set on a solvable row")
     if solvable and gt.get("repaired_answer") is not None:
-        problem("a solvable row must not carry repaired_answer (D28 is four-tier only)")
-    if gt.get("has_diagnosis_label") and not gt.get("repaired_answer"):
-        # D28: the four-tier contract is three-layer -- the refusal, the option
-        # pointer, and the solution once the gold option's condition is restored.
-        problem("has_diagnosis_label row needs a non-empty repaired_answer (D28)")
+        problem("a solvable row must not carry repaired_answer (stage-3 four-tier only)")
+    if repair_task and not gt.get("repaired_answer"):
+        # D29: the stage-3 four-tier contract is three-layer -- the refusal, the
+        # option pointer, and the solution once the gold option's condition is
+        # restored.
+        problem("repair_task row needs a non-empty repaired_answer (D28/D29)")
+    if not repair_task and gt.get("repaired_answer") is not None:
+        # D29 moved the third layer to stage 3: a stage-2 four-tier row scores
+        # the pointer alone and must not ship the repair gold.
+        problem("repaired_answer without repair_task (stage-2 rows use the two-layer contract)")
     if gt.get("repaired_free_text") and gt.get("repaired_answer") is None:
         problem("repaired_free_text without repaired_answer")
     if sum((role_words is not None, two_layer, solvable_answer, pair_task, bool(gt.get("judgment_only")))) > 1:
@@ -625,14 +670,20 @@ def validate_row(row: dict) -> list[str]:
     # *placeholder* block to satisfy the D18 isomorphism constraint (UMWP /
     # FalseQA answerable, TreeCut positives); what ties them together is that A
     # always has an options block and that a solvable A row never carries a
-    # correct option.  Template C carries both sides of SUM's pair task by
+    # correct option.  Template A_repair is the stage-3 (D29) four-tier contract
+    # -- three-layer rows only, so it pins repair_task 1:1 the way template C
+    # pins pair_task.  Template C carries both sides of SUM's pair task by
     # construction (design doc section 4.8).
     judgment_only = bool(gt.get("judgment_only"))
     has_options_block = bool(options)
-    if template == TEMPLATE_A and not has_options_block:
-        problem("template A without an options block")
+    if template in (TEMPLATE_A, TEMPLATE_A_REPAIR) and not has_options_block:
+        problem(f"template {template} without an options block")
     if template in (TEMPLATE_B, TEMPLATE_B_JUDGE, TEMPLATE_C) and has_options_block:
         problem(f"template {template} must not carry an options block")
+    if repair_task != (template == TEMPLATE_A_REPAIR):
+        problem(f"repair_task={repair_task} but template={template!r} (template A_repair is the stage-3 repair task)")
+    if template == TEMPLATE_A_REPAIR and not gt.get("has_diagnosis_label"):
+        problem(f"template {TEMPLATE_A_REPAIR} is four-tier only (a solvable row never asks for a repair)")
     if judgment_only and template != TEMPLATE_B_JUDGE:
         problem(f"judgment_only row must use template {TEMPLATE_B_JUDGE}, got {template!r}")
     if isinstance(solvable, bool) and judgment_only and not solvable:

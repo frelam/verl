@@ -28,9 +28,15 @@ Contract produced by this adapter (design doc D26; sections 4.6, 4.8 table B row
 =================  ====================  ========  ==========================================================
 side               branch                template  gold
 =================  ====================  ========  ==========================================================
-negative (4,907)   ``unsolvable_diag``   A         ``\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`` (D28)
+negative (4,907)   ``unsolvable_diag``   A         ``\\boxed{UNSOLVABLE: <选项ID>}`` (stage 2, D29)
+negative (4,907)   ``unsolvable_diag``   A_repair  ``\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`` (stage 3, D28/D29)
 positive (500)     ``solvable_numeric``  A         ``\\boxed{<答案>}`` (numeric match)
 =================  ====================  ========  ==========================================================
+
+The two negative rows are the *same* underlying pairs under two contracts:
+``--repair-contract`` writes the stage-3 repair task (and gates every pair on
+``certify_repaired_answer``); the default stage-2 build writes the two-layer
+pointer contract and never runs that certificate.
 
 Table B row 5 (TreeCut positives) shares ``solvable_numeric`` with row 1 (GSM-IC
 and the synthesised distractors); the mix tells the two apart by ``data_source``
@@ -122,15 +128,18 @@ Certificates (fail closed; each is re-derived by ``verify_treecut.py``)
   number proved, the certificate runs on the pairs that can reach the positive
   quota; a pair that fails it keeps its four-tier negative and loses only the
   positive.
-* **Repaired answer (D28)** -- every four-tier negative also ships
-  ``repaired_answer``: the solution of the scenario once the gold option (the
-  cut sentence) is restored.  ``certify_repaired_answer`` rebuilds the full
-  scenario text (negative body + its recorded deleted sentence) and runs the
-  same chain certificate on it, at **pair level**: a pair whose restored text
-  cannot prove the generator's number loses its negative *and* the positive's
-  candidacy, counted in the funnel's ``certificate_drops`` like every other
-  pair-level failure.  Unlike the positive-side gate this one guards all
-  4,907 negatives, because every negative ships the number.
+* **Repaired answer (D28/D29, stage 3 only)** -- with ``--repair-contract``
+  every four-tier negative also ships ``repaired_answer``: the solution of the
+  scenario once the gold option (the cut sentence) is restored.
+  ``certify_repaired_answer`` rebuilds the full scenario text (negative body +
+  its recorded deleted sentence) and runs the same chain certificate on it, at
+  **pair level**: a pair whose restored text cannot prove the generator's
+  number loses its negative *and* the positive's candidacy, counted in the
+  funnel's ``certificate_drops`` like every other pair-level failure.  Unlike
+  the positive-side gate this one guards all 4,907 negatives, because every
+  repair row ships the number.  The default stage-2 build skips it: the
+  two-layer pointer contract never reads the number, so a pair that would fail
+  the restored-text proof keeps both sides.
 
 A row whose certificate cannot be re-derived from its own two texts is dropped
 and counted in the funnel; nothing is invented, no counterpart text is reused
@@ -314,6 +323,7 @@ ENTITIES_FILE = "entities_items.py"
 BRANCH_DIAG = schema.BRANCH_UNSOLVABLE_DIAG
 BRANCH_POSITIVE = schema.BRANCH_SOLVABLE_NUMERIC
 TEMPLATE_A = schema.TEMPLATE_A
+TEMPLATE_A_REPAIR = schema.TEMPLATE_A_REPAIR
 
 #: Table B rows 5 and 7 (D26/D27): the four-tier negative quota and the solvable
 #: positive quota.  The source is a generator, so these are generation targets,
@@ -1201,13 +1211,15 @@ def _shared_extra_info(config: dict, seed: int, task_id: str) -> dict:
 
 
 def row_for_negative(negative: dict, positive: dict, config: dict, options: list,
-                     correct: str, seed: int) -> dict:
+                     correct: str, seed: int, repair: bool = False) -> dict:
     """One four-tier negative row (table B row 7, D26): refusal + diagnosis.
 
-    D28 adds the third reward layer: ``repaired_answer`` is the shared render's
-    answer (an integer string), which restoring the gold option's cut sentence
-    provably re-enables -- :func:`certify_repaired_answer` re-derives it from
-    the restored text at pair level, and a pair that cannot prove it is dropped
+    Stage 2 (D29) ships the two-layer contract on template A -- no repair gold.
+    ``repair=True`` builds the stage-3 repair task (template A_repair,
+    ``repair_task=True``): ``repaired_answer`` is the shared render's answer (an
+    integer string), which restoring the gold option's cut sentence provably
+    re-enables -- :func:`certify_repaired_answer` re-derives it from the
+    restored text at pair level, and a pair that cannot prove it is dropped
     whole.  The reward compares it with ``math_match``, the same matcher as the
     solvable positive.
     """
@@ -1235,12 +1247,13 @@ def row_for_negative(negative: dict, positive: dict, config: dict, options: list
             correct_option_id=correct,
             has_diagnosis_label=True,
             perturbation_type=PERTURBATION_TYPE,
-            # D28 third layer: restoring the gold option (the cut sentence)
+            # Stage-3 third layer: restoring the gold option (the cut sentence)
             # rebuilds the full scenario, whose solution is the shared render's
             # answer -- certified by certify_repaired_answer at pair level.
-            repaired_answer=str(positive["answer"]),
+            repair_task=repair,
+            repaired_answer=str(positive["answer"]) if repair else None,
         ),
-        template=TEMPLATE_A,
+        template=TEMPLATE_A_REPAIR if repair else TEMPLATE_A,
         branch=BRANCH_DIAG,
         extra_info=extra_info,
         options=options,
@@ -1292,7 +1305,7 @@ def row_for_positive(negative: dict, positive: dict, config: dict, options: list
     )
 
 
-def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple:
+def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0, repair: bool = False) -> tuple:
     """Build the TreeCut parquet rows and the funnel that produced them.
 
     Returns ``(rows, funnel)``: ``rows`` are ready for
@@ -1310,6 +1323,13 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple:
     be built (see the module docstring): a pair that fails either gate loses only
     its positive, never its negative, and its slot is taken by the next pair so the
     quota is met.
+
+    ``repair=True`` builds the stage-3 repair contract (D29): the four-tier
+    negative asks for the post-repair solution and the pair-level
+    :func:`certify_repaired_answer` gate runs.  The default stage-2 build keeps
+    the two-layer pointer contract and never runs that certificate, so a pair
+    the restored text cannot prove keeps its negative (and its positive's
+    candidacy).
     """
     source = load_source(raw_dir)
     grid = cells()
@@ -1355,14 +1375,17 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple:
             if problems:
                 certificate_drops[f"{theme}-nv{num_vars}-ad{ans_depth}: {problems[0]}"] += 1
                 continue
-            # D28: the four-tier negative ships the post-repair solution as its
-            # third reward layer, so the repaired answer is certified at pair
-            # level -- a pair whose restored text cannot prove the number loses
-            # its negative (and the positive's candidacy) entirely.
-            problems = certify_repaired_answer(negative, positive, config)
-            if problems:
-                certificate_drops[f"{theme}-nv{num_vars}-ad{ans_depth}: {problems[0]}"] += 1
-                continue
+            if repair:
+                # Stage 3 (D29): the repair row ships the post-repair solution as
+                # its third reward layer, so the repaired answer is certified at
+                # pair level -- a pair whose restored text cannot prove the
+                # number loses its negative (and the positive's candidacy)
+                # entirely.  Stage 2 skips this gate: the pointer contract does
+                # not read the number.
+                problems = certify_repaired_answer(negative, positive, config)
+                if problems:
+                    certificate_drops[f"{theme}-nv{num_vars}-ad{ans_depth}: {problems[0]}"] += 1
+                    continue
             funnel["after_certificate_drop"] += 1
             planned.append((cell_index, ordinal, negative, positive, config))
 
@@ -1386,7 +1409,8 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple:
             continue
         options, correct = built
         shipped_negatives.append((negative, positive, config,
-                                  row_for_negative(negative, positive, config, options, correct, seed)))
+                                  row_for_negative(negative, positive, config, options, correct, seed,
+                                                   repair=repair)))
     funnel["after_option_drop"] = len(shipped_negatives)
 
     positive_drops = 0
@@ -1580,10 +1604,19 @@ def main() -> None:
     parser.add_argument("--report", default=None, help="JSON funnel/cell plan (default: alongside --out)")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--repair-contract",
+        action="store_true",
+        help="build the stage-3 repair task (D29): negatives ask for "
+        "\\boxed{UNSOLVABLE: <id>: <repaired answer>}, ship the shared render's "
+        "answer as the third reward layer, and gate every pair on "
+        "certify_repaired_answer. Default (stage 2) is the two-layer pointer "
+        "contract without that certificate.",
+    )
     args = parser.parse_args()
     report_path = args.report or report_path_for(args.out)
 
-    rows, funnel = build_rows(args.raw_dir, limit=args.limit, seed=args.seed)
+    rows, funnel = build_rows(args.raw_dir, limit=args.limit, seed=args.seed, repair=args.repair_contract)
     schema.normalise_extra_info(rows)
     schema.validate_rows(rows)
     schema.write_rows_parquet(rows, args.out)

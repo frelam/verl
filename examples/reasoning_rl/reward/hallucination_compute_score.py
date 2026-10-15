@@ -34,7 +34,8 @@ solvable, name -> role pairs (K&K, D19)       ``\\boxed{<name>: <role>, …}``
 solvable, judgement + answer (D24/D27)        ``\\boxed{<answer>}``  (both layers required)
 solvable, "is this answerable?" (CREPE)       ``\\boxed{SOLVABLE}``
 paired judge-then-solve (SUM, D23)            ``\\boxed{<A|B>: <answer>}``
-unsolvable, with diagnosis label (D28)        ``\\boxed{UNSOLVABLE: <option id>: <repaired answer>}``
+unsolvable, with diagnosis label (stage 2)    ``\\boxed{UNSOLVABLE: <option id>}``
+unsolvable, repair task (stage 3, D28/D29)    ``\\boxed{UNSOLVABLE: <option id>: <repaired answer>}``
 unsolvable, without diagnosis label           ``\\boxed{UNSOLVABLE}``
 ===========================================  =====================================
 
@@ -47,10 +48,12 @@ The main reward is ``{+1, 0, -1}``.  The two-layer tasks (``pair_task`` /
 ``two_layer`` / ``solvable_answer``) are AND-gated: the solvability judgement
 earns nothing on its own, only a correct judgement *and* a correct answer score
 ``+1`` -- a ``+0.5`` judgement-only credit would reward guessing "solvable".
-The four-tier unsolvable branch is AND-gated the same way (D28): when the
-ground truth carries ``repaired_answer``, the refusal and the option pointer
-alone earn nothing -- the model must also produce the correct solution after
-restoring the gold option's condition.
+Stage 2's four-tier unsolvable branch is two-layer (D29): the refusal plus the
+correct option pointer earns ``+1``.  The D28 three-layer AND-gate lives in
+stage 3 on ``repair_task`` rows: the refusal and the pointer alone earn nothing
+-- the model must also produce the correct solution after restoring the gold
+option's condition.  (A pre-D29 artifact carries ``repaired_answer`` without
+``repair_task`` and keeps its D28 three-layer scoring.)
 ``-1`` is symmetric by construction and applies in
 exactly two places: fabricating an answer on an unsolvable row, and refusing on a
 ``judgment_only`` row (CREPE-normal).  Every *other* solvable branch scores a
@@ -128,11 +131,12 @@ _UNSOLVABLE_RE = re.compile(r"^UNSOLVABLE\s*(?:[:\-—]\s*(.*))?$", re.IGNORECAS
 # longer "id" such as ``UNSOLVABLE: missing the number of sprints`` is prose, not
 # an option, and is treated as a bare refusal instead of silently scoring 0.
 _OPTION_ID_RE = re.compile(r"^([A-Za-z])$")
-# D28 three-layer four-tier form: ``UNSOLVABLE: B: 42`` -- the option id, then
-# the solution once that option's condition is restored.  The id is upper-cased
-# and the colon may be full-width (section 9 pins both variants for the SUM pair
-# answer; the same tolerance applies here).  An empty answer (``UNSOLVABLE: B:``)
-# does not match and falls through to the single-letter / bare logic below.
+# Stage-3 (D28/D29) three-layer four-tier form: ``UNSOLVABLE: B: 42`` -- the
+# option id, then the solution once that option's condition is restored.  The
+# id is upper-cased and the colon may be full-width (section 9 pins both
+# variants for the SUM pair answer; the same tolerance applies here).  An empty
+# answer (``UNSOLVABLE: B:``) does not match and falls through to the
+# single-letter / bare logic below.
 _OPTION_ANSWER_RE = re.compile(r"^([A-Za-z])\s*[:：]\s*(.+)$", re.DOTALL)
 # A response may decorate the marker with a short preamble inside the box
 # ("The premise is false: UNSOLVABLE"). Keep the strict forms above for the
@@ -175,7 +179,7 @@ def extract_final(solution_str: str) -> tuple[str, str | None, str | None]:
 
     Returns ``(status, answer, option)`` where ``status`` is one of the five
     constants above.  ``answer`` is the boxed text for ``STATUS_ANSWER`` and
-    ``None`` otherwise, except for the D28 three-layer form
+    ``None`` otherwise, except for the stage-3 (D28/D29) three-layer form
     ``UNSOLVABLE: <id>: <repaired answer>``, which returns it alongside the
     option.  ``option`` is the upper-cased single-letter id for
     ``STATUS_UNSOLVABLE_OPTION`` and ``None`` otherwise.
@@ -200,8 +204,8 @@ def extract_final(solution_str: str) -> tuple[str, str | None, str | None]:
         tail = (match.group(1) or "").strip()
         pair = _OPTION_ANSWER_RE.match(tail)
         if pair is not None:
-            # D28: ``UNSOLVABLE: B: 42`` -- the diagnosis pointer *and* the
-            # solution after restoring that option's condition.
+            # Stage 3 (D28/D29): ``UNSOLVABLE: B: 42`` -- the diagnosis pointer
+            # *and* the solution after restoring that option's condition.
             return STATUS_UNSOLVABLE_OPTION, pair.group(2).strip(), pair.group(1).upper()
         option = tail.upper() if _OPTION_ID_RE.match(tail) else None
         if option is not None:
@@ -554,15 +558,20 @@ def score_from_status(ground_truth: dict, status: str, answer: str | None, optio
     if status != STATUS_UNSOLVABLE_OPTION or option != str(correct).upper():
         return 0.0
     repaired = ground_truth.get("repaired_answer")
-    if repaired is None:
-        # Legacy artifact without the D28 key: the two-layer contract (pointer
-        # only) still applies, so a correct pointer earns +1.
+    if not ground_truth.get("repair_task") and repaired is None:
+        # Stage 2 (D29): the two-layer contract -- the pointer alone earns +1.
         return 1.0
-    # D28 three-layer AND-gate: the refusal and the pointer have passed; the
-    # model must also have solved the question after restoring the gold
-    # option's condition.  FalseQA's repaired answer is free text (norm_match,
-    # the D27 matcher); TreeCut's is an integer (math_match, the same matcher
-    # as its solvable positive).
+    if repaired is None:
+        # A repair_task row without its gold is an adapter bug; fail closed.
+        logger.warning("[halluc] repair_task row without repaired_answer; scoring 0")
+        return 0.0
+    # Stage 3 (D28/D29) three-layer AND-gate: the refusal and the pointer have
+    # passed; the model must also have solved the question after restoring the
+    # gold option's condition.  FalseQA's repaired answer is free text
+    # (norm_match, the D27 matcher); TreeCut's is an integer (math_match, the
+    # same matcher as its solvable positive).  A pre-D29 artifact carries
+    # ``repaired_answer`` without ``repair_task`` and lands here too, keeping
+    # its D28 three-layer scoring.
     matcher = norm_match if ground_truth.get("repaired_free_text") else math_match
     return 1.0 if matcher(answer, repaired) else 0.0
 

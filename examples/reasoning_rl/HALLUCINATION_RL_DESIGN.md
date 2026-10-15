@@ -1,6 +1,6 @@
 # 幻觉抵制 Reasoning RL —— 实施设计
 
-> 状态：**实施口径已定稿（D1–D28）**。本文档是这份方案的唯一事实来源与施工图。
+> 状态：**实施口径已定稿（D1–D29）**。本文档是这份方案的唯一事实来源与施工图。
 > 与已有的 `DESIGN.md`（Qwen3-4B reasoning RL 主方案）**并行存在、互不覆盖**：本方案只在训练后程
 > 以「换数据 mix + 换 reward 文件」的方式接入，不修改阶段一任何行为。
 
@@ -15,7 +15,7 @@
 |---|---|---|
 | D1 | 接入方式 | 两段式：阶段 1 完全不动；阶段 2 从 ckpt `RESUME_MODE=resume_path` 续训，换新 mix parquet + 新 reward 文件 |
 | D2 | 数据源 | 垂直切片四源：K&K（logic）+ MiP（math）+ FalseQA（commonsense）+ GSM-IC（可解-干扰对照）；后经 D16 扩充 SUM / UMWP / KUQ / TreeCut / CREPE（KUQ 后被 D25 移出） |
-| D3 | 答案契约 | 可解 `\boxed{答案}`；不可解 `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`（有诊断标签，D28）或 `\boxed{UNSOLVABLE}`（无诊断标签）；判断型可解 `\boxed{SOLVABLE}`；SUM 配对 `\boxed{<A或B>: <答案>}`（D23）；UMWP-answerable / FalseQA-answerable 两层 `\boxed{答案}`（D24/D27） |
+| D3 | 答案契约 | 可解 `\boxed{答案}`；不可解 `\boxed{UNSOLVABLE}`（无诊断标签）或 `\boxed{UNSOLVABLE: <选项ID>}`（有诊断标签，**stage 2**，D29）；**stage 3** 修复行 `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`（D28，经 D29 迁至独立阶段）；判断型可解 `\boxed{SOLVABLE}`；SUM 配对 `\boxed{<A或B>: <答案>}`（D23）；UMWP-answerable / FalseQA-answerable 两层 `\boxed{答案}`（D24/D27） |
 | D4 | 一致性辅助项（spec §3.2） | **不做**。reward 只保留 spec §3.1 主 reward |
 | D5 | 归一化（spec §3.3） | 随 D4 失效；退化组屏蔽沿用现有 DAPO `filter_groups` |
 | D6 | 冷启动 SFT（spec §4） | **不在范围**。只交付数据 + reward |
@@ -40,7 +40,8 @@
 | D25 | KUQ 移出 | **KUQ 整体不入池**：无可验证答案、只能判断是否 unknown，判断信号缺答案层约束、模型容易瞎猜 |
 | D26 | TreeCut 正负双侧入池 + 负样本四档化 | TreeCut **正样本（可解）入池**：输出 `\boxed{答案}`，prompt 带**占位选项块**（题面条件中随机抽 k=3 条换变量名/变量值生成，无正确项），误拒 → 0（与普通可解行一致）；**负样本升四档诊断**：gold = 生成器剪掉的边（`cut` 已知），选项 = 生成器顺带产出的候选缺失条件（k=3，全部题面外），`\boxed{UNSOLVABLE: <ID>}` 命中才 +1。**正负 prompt 同带选项块**（模板 A 外观同构，同 k=3，D15），消除"有选项块 ⇒ UNSOLVABLE"捷径；负样本选项集须过 MiP 同款泄题测试（§9）。配额：正 1,000（GSM-IC 合成干扰让渡 1,400→400；**D27 后再让渡至 500**）/ 负 4,907（三档→四档，不可解侧不变） |
 | D27 | FalseQA 双侧入池（label=0 复活） | **作废 D22 的"label=0 不入池"**：answerable 侧 928 条入池，与 label=1 索引对齐配对、**按对划分 split**（同对不进异侧）；走**两层 reward（AND 门控**，gt 键 `solvable_answer`）：`\boxed{答案}` 与 gold（label=0 answer）`norm_match` 通过才 +1（判对答错 → 0）；`\boxed{SOLVABLE}` → 0；误拒（`UNSOLVABLE` 任意形态）→ 0。label=0 answer 67.8% 为自由文本短答 → 答案层用归一化精确匹配（大小写/标点/冠词），噪声抽检见 Q17。**answerable 侧同样带占位替换对选项块**（题面内左项 + 题面外同类等长右项，k=3 无正确项），模板 A 外观与不可解侧同构，防"无选项块 ⇒ SOLVABLE"格式记忆。配额：行 3 扩为 UMWP 550 + FalseQA-ans 928 = 1,478；让渡 TreeCut 正 1,000→500、GSM-IC 1,200→772（§4.8） |
-| D28 | 四档不可解行三层 AND-gate | 四档不可解行（FalseQA-fake / TreeCut 负）的输出契约由 `\boxed{UNSOLVABLE: <选项ID>}` 扩为 `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`；reward 在原「拒答 + 指针命中」两层之上**加第三层「补条件后的正确解」**：三层全对 +1，否则 0。gold 侧新增 `repaired_answer`（必有）与 `repaired_free_text`（FalseQA 置 true 走 `norm_match`；TreeCut 数值走 `math_match`）。来源：FalseQA 用配对真题的 source answer（构造即证书——应用 gold 替换对恰好重放真题题面）；TreeCut 用 `certify_repaired_answer`（恢复 `deleted_sentence` 重跑 `certify_answer`，失败丢整对）。兼容性：旧 parquet 缺 `repaired_answer` 时回退旧两层口径，新构建的 parquet 必填（schema `validate_row` 强校验） |
+| D28 | 四档不可解行三层 AND-gate | **（D29 后：仅 stage 3；stage 2 已由 D29 回退为两段式，见下）** 四档不可解行（FalseQA-fake / TreeCut 负）的输出契约由 `\boxed{UNSOLVABLE: <选项ID>}` 扩为 `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`；reward 在原「拒答 + 指针命中」两层之上**加第三层「补条件后的正确解」**：三层全对 +1，否则 0。gold 侧新增 `repaired_answer`（必有）与 `repaired_free_text`（FalseQA 置 true 走 `norm_match`；TreeCut 数值走 `math_match`）。来源：FalseQA 用配对真题的 source answer（构造即证书——应用 gold 替换对恰好重放真题题面）；TreeCut 用 `certify_repaired_answer`（恢复 `deleted_sentence` 重跑 `certify_answer`，失败丢整对）。兼容性：缺 `repaired_answer` 的旧 parquet 回退旧两层口径 |
+| D29 | 三层修复契约拆为独立 stage 3 | **动机**：D28 把"判不可解 + 指对选项 + 解出修复后的题"绑进 stage 2 同一个 reward，四档行第三层长期 ≈0 时整行零方差被 `filter_groups` 屏蔽，反而污染 stage 2 的"拒答 + 诊断"信号。**拆分**：① stage 2 四档行回退两段式 `\boxed{UNSOLVABLE: <选项ID>}`（拒答 + 指针命中即 +1；收到三段式输出时第三段被解析但忽略，不奖不罚）；② stage 3 原样保留 D28 三段式契约与三层 AND-gate，由 gt 键 `repair_task=true` 路由（`repair_task` 与模板 `A_repair` 1:1 绑定，schema 强校验；带 `repaired_answer` 无 `repair_task` 的 pre-D29 artifact 走 legacy 回退仍按三层门评分）；③ stage 3 数据 = 纯修复行（FalseQA-repair 928 + TreeCut-repair 4,907，`REPAIR_QUOTA`）+ 旧域回放（`--old_domain_ratio 0.7`），由 `mix_halluc.py --repair_mode` 构建（跳过 `enforce_pair_atomicity`，`A_repair` 模板平衡结构性豁免）；④ adapter 侧 `--repair-contract` 旗标控制是否产出 `repair_task`/`repaired_answer`（stage 2 默认不产出，TreeCut 顺带跳过 `certify_repaired_answer` 的整对丢弃）；⑤ stage 3 训练从 stage-2 ckpt 续训（`run_qwen3_4b_hallucination_stage3_fully_async.sh`），reward 文件与 stage 2 共用 `hallucination_compute_score.py`（路由依据是 ground_truth 的键，不是 data_source） |
 
 ---
 
@@ -117,8 +118,9 @@ SUM 配对任务（D23）把"识别可解"与"解出答案"绑定在同一行里
 | `difficulty_tag` | `extra_info.difficulty` | 来源原生难度，供分桶监控 |
 | `metadata.paired_original_text` | `extra_info.paired_original_text` | 审计用（可裁掉以控体积） |
 | `pair_id` | `extra_info.pair_id` | ⚠️ **FalseQA 专用（D27）**：同一索引配对（label=1 / label=0）两条共用的稳定键；mix 用它保证同对不跨 train/val 两侧（两侧行落在不同 `(branch, source)` cell，按 cell 切分会裂开），reward 不读 |
-| `repaired_answer` | `reward_model.ground_truth` JSON | ⚠️ **四档专用（D28）**：补上 gold 条件后题面的正确解。`has_diagnosis_label=true` 必填；`solvable=true` 或三档不可解行**不得携带**。FalseQA 来自配对真题的 source answer（自由文本）；TreeCut 来自 `certify_repaired_answer` 恢复 `deleted_sentence` 后重跑 `certify_answer`（整数） |
-| `repaired_free_text` | 同上 | ⚠️ **四档专用（D28）**：`true` 时 `repaired_answer` 走 `norm_match`（FalseQA，67.8% 自由文本）；缺省 / `false` 走 `math_match`（TreeCut 数值） |
+| `repaired_answer` | `reward_model.ground_truth` JSON | ⚠️ **stage-3 修复行专用（D28/D29）**：补上 gold 条件后题面的正确解。`repair_task=true` 时必填（schema 强校验）；**stage-2 四档行不得携带**（两段式契约，D29）。FalseQA 来自配对真题的 source answer（自由文本）；TreeCut 来自 `certify_repaired_answer` 恢复 `deleted_sentence` 后重跑 `certify_answer`（整数） |
+| `repaired_free_text` | 同上 | ⚠️ **stage-3 修复行专用（D28/D29）**：`true` 时 `repaired_answer` 走 `norm_match`（FalseQA，67.8% 自由文本）；缺省 / `false` 走 `math_match`（TreeCut 数值） |
+| `repair_task` | 同上 | ⚠️ **stage-3 路由键（D29）**：`true` 时该四档行走三层 AND-gate（D28），且必须使用模板 `A_repair`（1:1 绑定，schema 强校验）；缺省 / `false` 时四档行走 stage-2 两段式（指针命中即 +1）。reward 的判定依据是 ground_truth 的键而非 data_source：带 `repaired_answer` 而无 `repair_task` 的 pre-D29 artifact 按 legacy 回退仍走三层门 |
 
 `reward_model` 通用示例：
 
@@ -165,21 +167,30 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 }
 ```
 
-四档不可解行示例（三层 reward，D28；FalseQA-fake 侧，`repaired_free_text=true`）：
+四档不可解行示例（**stage 2** 两段式，D29；FalseQA-fake 侧，拒答 + 指针命中即 +1）：
 
 ```json
 {
   "style": "rule",
-  "ground_truth": "{\"solvable\": false, \"answer\": null, \"correct_option_id\": \"B\", \"has_diagnosis_label\": true, \"perturbation_type\": \"contradictory_condition\", \"repaired_answer\": \"Because a child needs food.\", \"repaired_free_text\": true}"
+  "ground_truth": "{\"solvable\": false, \"answer\": null, \"correct_option_id\": \"B\", \"has_diagnosis_label\": true, \"perturbation_type\": \"contradictory_condition\"}"
 }
 ```
 
-四档不可解行示例（三层 reward，D28；TreeCut 负样本侧，`repaired_answer` 为链式证书认证的整数）：
+四档不可解行示例（**stage 3** 三层，D28/D29；FalseQA-repair 侧，`repair_task=true` + `repaired_free_text=true`）：
 
 ```json
 {
   "style": "rule",
-  "ground_truth": "{\"solvable\": false, \"answer\": null, \"correct_option_id\": \"A\", \"has_diagnosis_label\": true, \"perturbation_type\": \"missing_condition\", \"repaired_answer\": \"42\"}"
+  "ground_truth": "{\"solvable\": false, \"answer\": null, \"correct_option_id\": \"B\", \"has_diagnosis_label\": true, \"perturbation_type\": \"contradictory_condition\", \"repair_task\": true, \"repaired_answer\": \"Because a child needs food.\", \"repaired_free_text\": true}"
+}
+```
+
+四档不可解行示例（**stage 3** 三层，D28/D29；TreeCut-repair 负样本侧，`repaired_answer` 为链式证书认证的整数）：
+
+```json
+{
+  "style": "rule",
+  "ground_truth": "{\"solvable\": false, \"answer\": null, \"correct_option_id\": \"A\", \"has_diagnosis_label\": true, \"perturbation_type\": \"missing_condition\", \"repair_task\": true, \"repaired_answer\": \"42\"}"
 }
 ```
 
@@ -210,9 +221,12 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 >
 > **实现口径（2026-09-20 复核）**：`validate_row(s)` 除本表字段外还硬校验四件事，任一不过即拒绝
 > 落盘（fail closed）：① `extra_info.branch` ∈ §4.8 表 B 的 7 个契约分支键；② `extra_info.template`
-> ∈ {A, B, B_judge, C}；③ `ability == extra_info.domain`（本表 `domain` 同时落两处的映射）；
+> ∈ {A, A_repair, B, B_judge, C}（A_repair 随 D29 加入，与 `repair_task` 1:1 绑定）；
+> ③ `ability == extra_info.domain`（本表 `domain` 同时落两处的映射）；
 > ④ `task_id` **全局唯一**（本表「hard replay 的 dedup key」），冲突按批报出。带选项块的行
-> 选项数必须 = k = 3（D15）。
+> 选项数必须 = k = 3（D15）。D29 追加：repair 字段的一致性校验——`repaired_answer` 无
+> `repair_task` 拒绝（stage-2 行不得携带）、`repair_task` 无 `repaired_answer` 拒绝、
+> `repair_task` ⟺ 模板 `A_repair` 双向绑定、`repair_task` 仅限四档行。
 
 ---
 
@@ -301,11 +315,14 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
 **使用方式（D27 双侧入池；作废 D22）**：**label=1（不可解）928 + label=0（answerable）928
 均入池**，索引对齐配对、**按对划分 split**（同对不进异侧，防"题面几乎相同"跨侧泄漏）。
 
-- **label=1 侧（不可解·四档·三层，D28）**：沿用 D21 替换对选项契约（下述），`has_diagnosis_label=true`，
+- **label=1 侧（不可解·四档；stage 2 两段式 D29 / stage 3 三层 D28）**：沿用 D21 替换对选项契约
+  （下述），`has_diagnosis_label=true`。**stage 2（默认构建）**：`\boxed{UNSOLVABLE: <ID>}`——
+  拒答 + 指针命中即 +1。**stage 3（`--repair-contract` 构建）**：gt 加 `repair_task=true`、
   `\boxed{UNSOLVABLE: <ID>: <修复后的答案>}`——拒答 + 指针命中 + 修复后的正确解三层都对才 +1。
   `repaired_answer` = 配对真题的 source `answer`（构造即证书：应用 gold 替换对恰好重放真题题面），
   `repaired_free_text=true` → 第三层走 `norm_match`（67.8% 自由文本短答，同 answerable 侧的匹配
-  口径）。配对真题 answer 为空 → 整对丢（`answer_empty` 计 1；未观测到）。
+  口径）。配对真题 answer 为空 → stage 3 整对丢（`answer_empty` 计 1；未观测到）；stage 2 不需要
+  `repaired_answer`，answerable 侧（label=0）此时仍存活、diag 行单独保留。
 - **label=0 侧（answerable·两层，gt 键 `solvable_answer`，AND 门控）**：`\boxed{答案}`
   与 gold（label=0 `answer`）`norm_match` 通过才 +1（判对答错 → 0）；`\boxed{SOLVABLE}`
   → 0；误拒（`UNSOLVABLE` 任意形态）→ 0。`answer` 67.8% 为自由文本短答 → 答案层用
@@ -326,11 +343,13 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
   这是必须避免的镜像捷径）。剩下的区分只能靠"哪个替换真的让前提成立"，即任务本身。
 - **残余风险**：规则生成的干扰右项可能语义上也能修复前提（"也对"）→ §9 抽检 + §12 Q9 人工复核。
 
-**reward（两侧各两层 → 不可解侧 D28 三层）**：不可解侧走 §6 四档分支（D28 三层 AND-gate：
-`has_diagnosis_label=true` 且 gt 带 `repaired_answer` 时，`\boxed{UNSOLVABLE: <ID>: <修复后的答案>}`
-须 ID 命中 gold **且** 修复解与 `repaired_answer` `norm_match`（`repaired_free_text=true`）→ +1；
-编造答案 → −1；bare `\boxed{UNSOLVABLE}` / 只命中 ID 未给修复解 / 修复解错 → 0）；answerable 侧走
-§6 `solvable_answer` 分支（AND 门控：两层都对 +1，否则 0，见上）。
+**reward（answerable 侧两层 / 不可解侧按 stage 分）**：不可解侧走 §6 四档分支——**stage 2（D29
+两段式）**：`\boxed{UNSOLVABLE: <ID>}` 命中 gold → +1；编造答案 → −1；bare `\boxed{UNSOLVABLE}` /
+指针错 → 0（收到三段式输出时第三段被解析但忽略，指针命中仍 +1）。**stage 3（D28 三层 AND-gate，
+gt 键 `repair_task` 路由）**：`\boxed{UNSOLVABLE: <ID>: <修复后的答案>}` 须 ID 命中 gold **且**
+修复解与 `repaired_answer` `norm_match`（`repaired_free_text=true`）→ +1；编造 → −1；bare /
+只命中 ID 未给修复解 / 修复解错 → 0。answerable 侧走 §6 `solvable_answer` 分支（AND 门控：
+两层都对 +1，否则 0，见上）。
 
 **交付约束（`falseqa_adapter.py`）**：
 
@@ -341,6 +360,11 @@ FalseQA-answerable 行示例（两层 reward，D27；`answer` 为自由文本，
   = label=0 `answer` 字段（原样保留，reward 侧做归一化）；选项块为**占位替换对**（左项题面内、
   右项题面外同类等长，k=3 无正确项，`correct_option_id=null`）；与 label=1 侧**按对分 split**。
 - 差异区域不唯一 / 无法构造合格干扰右项 → 该条丢弃，禁止兜底。
+- **stage 3 修复契约（D29）**：`--repair-contract` 时 diag 行 gt 加 `repair_task=true` +
+  `repaired_answer`（= 配对真题 source answer）+ `repaired_free_text=true`、模板改用 `A_repair`
+  （三段式 marker）；默认（stage 2）不带任何 repair 键、模板 A（两段式 marker）。answerable 侧
+  两种模式恒为 stage-2 形态。配对真题 answer 为空时：stage 2 只丢 answerable 行、diag 行存活；
+  repair 模式整对丢。
 - 交付前必须跑 `verify_falseqa.py`（§9）并留报告。
 
 > **实现口径（2026-09-20 复核）**：真实三 split 的产出为 train 1,757（**829 四档 + 928 两层**）、
@@ -439,12 +463,14 @@ AND 门控下判断层单独不值分，只有完整解出（+1）有奖励，�
 - **TreeCut**（D26 正负双侧入池）：`cut = ans_upstream[cutDepth-1]` → 剪掉的边必在根→答案
   路径上，**不可解性构造即证明**（`proof` 自带"N variables but M formulas"凭证）——这正是
   MiP 缺的东西；且**被剪的边已知** → 负样本可做四档诊断（gold 选项 = 被剪条件）。
-  - **负样本（4,907，四档·三层，D28）**：选项 = 生成器顺带产出的候选缺失条件（k=3，D15）——同一
-    参数族内候选 `cut` 集合，**全部题面外**（每条都是"题面里缺失的条件"形态）；
-    `has_diagnosis_label=true`，`\boxed{UNSOLVABLE: <ID>: <修复后的答案>}`——拒答 + 指针命中 +
-    修复后的正确解三层都对才 +1。`repaired_answer` 为整数字符串：在 adapter 内由
-    `certify_repaired_answer`（恢复 `deleted_sentence` 重跑 `certify_answer`）认证，失败丢整对；
-    `repaired_free_text` 缺省 → 第三层走 `math_match`。
+  - **负样本（4,907，四档；stage 2 两段式 D29 / stage 3 三层 D28）**：选项 = 生成器顺带产出的
+    候选缺失条件（k=3，D15）——同一参数族内候选 `cut` 集合，**全部题面外**（每条都是"题面里
+    缺失的条件"形态）；`has_diagnosis_label=true`。**stage 2（默认构建）**：
+    `\boxed{UNSOLVABLE: <ID>}`——拒答 + 指针命中即 +1，**不跑 `certify_repaired_answer`**
+    （其失败不再丢整对）。**stage 3（`--repair-contract` 构建）**：gt 加 `repair_task=true`、
+    `\boxed{UNSOLVABLE: <ID>: <修复后的答案>}`——拒答 + 指针命中 + 修复后的正确解三层都对才 +1；
+    `repaired_answer` 为整数字符串，由 `certify_repaired_answer`（恢复 `deleted_sentence` 重跑
+    `certify_answer`）认证，失败丢整对；`repaired_free_text` 缺省 → 第三层走 `math_match`。
   - **正样本（500，D27 让渡后；模板 A 可解行）**：输出 `\boxed{答案}` 走 `_math_score`；prompt 带
     **占位选项块**（从题面条件中随机抽 k=3 条，换变量名或变量值生成，无正确项）——
     正负两侧选项块外观同构，模型无法靠"有选项块 ⇒ UNSOLVABLE"蒙（D18 硬约束）；
@@ -509,7 +535,7 @@ GSM-IC 的 242 个 `sentence_template` 全部只由 `{role}`（272 个取值）/
 | 4 | 可解·判断（`judgment_only`） | B | `\boxed{SOLVABLE}` | CREPE-normal 250 | **250** |
 | 5 | 可解·数值 + 占位选项块（D26） | A | `\boxed{答案}` | TreeCut 正样本 500（D27 让渡后） | **500** |
 | 6 | 配对判断 + 解答（两层 reward，D23） | C | `\boxed{<ID>: 答案}` | SUM 6,000 | **6,000** |
-| 7 | **不可解·四档诊断（三层，D28）** | A | `\boxed{UNSOLVABLE: <ID>: <修复后的答案>}` | FalseQA-fake 928 + TreeCut 负 4,907（D26） | **5,835** |
+| 7 | **不可解·四档诊断（stage 2 两段式，D29）** | A | `\boxed{UNSOLVABLE: <ID>}` | FalseQA-fake 928 + TreeCut 负 4,907（D26） | **5,835** |
 | 8 | **不可解·三档 bare** | B | `\boxed{UNSOLVABLE}` | UMWP-unanswerable 2,489 + CREPE-FP 400 + MiP 276 | **3,165** |
 | | | | | **合计** | **20,000** |
 
@@ -520,6 +546,16 @@ GSM-IC 的 242 个 `sentence_template` 全部只由 `{role}`（272 个取值）/
 
 **硬约束检查（D18）**：模板 A 含可解（行 3/5）与不可解（行 7）✅；模板 B 含可解（行 1/2/4）与
 不可解（行 8）✅；模板 C 自带两侧 ✅。
+
+**stage 3 构成（D29；与表 B 不同的另一份 artifact）**：stage 3 的幻觉侧**只有表 B 行 7 的两个
+cell**，且按修复契约重建——FalseQA-repair 928 + TreeCut-repair 4,907 = **5,835**（`REPAIR_QUOTA`，
+largest-remainder 按 `--halluc_total` 缩放），幻觉侧不可解占比 100%（`--repair_mode` 强制
+`unsolvable_share == 1.0`）；旧域回放比例不变（`--old_domain_ratio 0.7`）。模板为 `A_repair`
+（三段式 marker），属 stage-3 结构性"只有不可解"——D18 的模板平衡硬约束对 `A_repair` 结构性豁免
+（它是 stage 3 的唯一模板，没有可解对照可配；防泄漏靠 stage 2 已建立的"选项块 ⟺ 任务类型"外观
+先验，见 §11 风险 10）。repair 混合跳过 `enforce_pair_atomicity`：FalseQA 的 answerable 孪生
+不进 stage 3，diag 行无需按对绑定。构建入口 `build_hallucination_stage3_data.sh`（两 adapter
+带 `--repair-contract` → `mix_halluc.py --repair_mode`），默认输出 `final_halluc_repair/`。
 
 > **实现口径（§4.8 行 1 的 400 条合成干扰行）**：D17 的三段施加对象（UMWP-answerable 200 / K&K 100 /
 > 主池数学题 100）全部保留，但 K&K 底题产出的行**答案契约是 D19 的「人名: 角色词」**，无法落在行 1
@@ -586,7 +622,7 @@ TreeCut 负 4,907**（D24 后 UMWP 可见缺陷类退化为三档、D26 后 Tree
 
 ## 5. 统一答案契约与 Prompt 模板
 
-### 5.1 契约（D3 / D19 / D21 / D23 / D24 / D27 / D28）
+### 5.1 契约（D3 / D19 / D21 / D23 / D24 / D27 / D28 / D29）
 
 | 情形 | 模型应输出 |
 |---|---|
@@ -596,14 +632,18 @@ TreeCut 负 4,907**（D24 后 UMWP 可见缺陷类退化为三档、D26 后 Tree
 | 可解·**判断+解答**（`solvable_answer`：FalseQA-answerable，D27） | `\boxed{<答案>}`（自由文本，与 gold 归一化精确匹配；AND 门控，`\boxed{SOLVABLE}` → 0） |
 | 可解但**只判可答性**（`judgment_only`：CREPE-normal） | `\boxed{SOLVABLE}` |
 | 配对判断（SUM，D23） | `\boxed{<A或B>: <数值答案>}`（如 `\boxed{A: 42}`） |
-| 不可解且有诊断标签（FalseQA-fake 替换对 / TreeCut 负·缺失条件，D26/D28） | `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`（如 `\boxed{UNSOLVABLE: B: 42}`；修复解须与 gt `repaired_answer` 匹配——FalseQA 走 `norm_match`，TreeCut 走 `math_match`） |
+| 不可解且有诊断标签（FalseQA-fake 替换对 / TreeCut 负·缺失条件，D26）——**stage 2**（D29） | `\boxed{UNSOLVABLE: <选项ID>}`（如 `\boxed{UNSOLVABLE: B}`；指针命中即 +1，收到三段式输出时第三段被解析但忽略） |
+| 不可解且有诊断标签——**stage 3 修复行**（FalseQA-repair / TreeCut-repair，D28/D29） | `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`（如 `\boxed{UNSOLVABLE: B: 42}`；修复解须与 gt `repaired_answer` 匹配——FalseQA 走 `norm_match`，TreeCut 走 `math_match`） |
 | 不可解且无诊断标签（MiP / UMWP-unanswerable / CREPE-FP） | `\boxed{UNSOLVABLE}` |
 
 - **只约束最终落点，不约束推理过程/位置**：reward 只在"最后一个 `\boxed{}`"上判。
 - **bare `\boxed{UNSOLVABLE}` 的得分是分支相关的**（§6 最易写错的一处）：三档源上 +1，
   四档源上 0（识别对了但没给诊断）。
-- **四档源只给 ID 不给修复解也得 0**（D28）：`\boxed{UNSOLVABLE: <ID>}` 缺少第三段修复解，
-  或修复解与 `repaired_answer` 不匹配，均计 0——必须三段全对。
+- **stage-2 四档行指针命中即满分**（D29）：`\boxed{UNSOLVABLE: <ID>}` 命中 gold → +1；
+  模型若输出 stage-3 的三段式形态，第三段被 `extract_final` 解析但**不参与判分**（不奖不罚）。
+- **stage-3 修复行只给 ID 不给修复解也得 0**（D28）：`\boxed{UNSOLVABLE: <ID>}` 缺少第三段修复解，
+  或修复解与 `repaired_answer` 不匹配，均计 0——必须三段全对。stage 2 与 stage 3 的四档行由
+  gt 键 `repair_task` 区分（不是 data_source），reward 据此路由（§6）。
 
 **⚠️ K&K 角色词归一化（强制；漏掉则 reward 反向）**
 
@@ -663,7 +703,9 @@ C. man -> teacher
 ```
 
 - 模板 A 内**可解与不可解子集必须共用同一套外观**（都先问是否可解、都附选项块、选项个数同为
-  k=3），否则"看到选项块 ⇒ 输出 UNSOLVABLE"是 100% 捷径（D18 硬约束）。
+  k=3），否则"看到选项块 ⇒ 输出 UNSOLVABLE"是 100% 捷径（D18 硬约束）。模板 A 的不可解 marker
+  是**两段式** `\boxed{UNSOLVABLE: <选项ID>}`（D29：stage 2 回退后的契约；三段式形态只属于
+  `A_repair`，见下）。
   > **实现口径（2026-09-20 复核）**：为满足这条「共用同一套外观」，落盘文案把上面那行
   > `其中 <选项ID> 是下列"前提替换"候选中…` 统一写成 `其中 <选项ID> 是下面候选中，能让该问题变为可解的那一项。`
   > ——「前提替换」是 FalseQA-fake 专用的措辞，写在 UMWP/FalseQA-answerable/TreeCut 的**占位**选项块
@@ -677,6 +719,34 @@ C. man -> teacher
   **正样本**选项块为题面条件换变量名/变量值的**占位**项（无正确项），可解时输出
   `\boxed{答案}`，误拒（`UNSOLVABLE` 任意形态）→ 0（与普通可解行一致）。正负两侧外观同构。
 - 选项位置按 seed 打乱；reward 只比选项 ID，不比文本。
+
+**模板 A_repair（stage 3 专用，D29）—— FalseQA-repair / TreeCut-repair 四档修复行：**
+
+与模板 A 同构（同问"是否可解"、同附 k=3 选项块），唯一差异在不可解 marker 是**三段式**：
+
+```
+<题面…>
+
+请判断该问题是否可解，并在最后一行给出结论：
+
+- 若前提成立、题目可以作答，最后一行输出：\boxed{<答案>}
+- 若前提不成立 / 条件相互矛盾，最后一行输出：\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}
+  其中 <选项ID> 是下面候选中，能让该问题变为可解的那一项；<修复后的答案> 是按该项
+  补足条件后，该问题的正确答案。
+
+选项：
+A. man -> women
+B. man -> child
+C. man -> teacher
+```
+
+- `A_repair` 与 gt 键 `repair_task=true` **1:1 绑定**（schema `validate_row` 双向强校验：
+  `repair_task` 行必须用 `A_repair`，`A_repair` 行必须带 `repair_task`），且仅限四档不可解行。
+- 两个 marker 互为非子串（两段式在 `>` 后即 `}`，三段式中间有 `: <修复后的答案>`），
+  `verify_falseqa.py` / `verify_treecut.py` 按行模板推导预期 marker，同一脚本可审计两种
+  artifact，无需新增旗标。
+- stage 3 的幻觉侧只有 `A_repair` 一个模板、只有不可解行——D18 的模板平衡硬约束对它结构性
+  豁免（§4.8 stage 3 构成）。
 
 **模板 B（不附选项块）—— 所有三档不可解源 + 可解数值/角色词/判断型：**
 
@@ -756,14 +826,19 @@ compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs
     else:
         if status == "answer":            return -1.0   # 应该拒答却编造
         if not gt.has_diagnosis_label:    return 1.0 if status in {"unsolvable_bare","unsolvable_option"} else 0.0
-        # D28 三层 AND-gate：gt 带 repaired_answer 时进入新契约
-        if gt.get("repaired_answer"):
-            if status != "unsolvable_option":              return 0.0   # 未给出"拒答 + 指针 + 修复解"形态
-            if option != gt.correct_option_id:             return 0.0   # 指针错
-            matcher = norm_match if gt.get("repaired_free_text") else math_match
-            return 1.0 if matcher(answer, gt["repaired_answer"]) else 0.0   # 修复解错 → 0
-        # 兼容旧 parquet（无 repaired_answer）：两层口径
-        return 1.0 if (status == "unsolvable_option" and option == gt.correct_option_id) else 0.0
+        # 四档分支：先过「拒答 + 指针」两层，再按 D29 的 repair_task 键路由
+        if status != "unsolvable_option":              return 0.0   # bare / 无 box → 0
+        if option != gt.correct_option_id:             return 0.0   # 指针错 → 0
+        repaired = gt.get("repaired_answer")
+        if not gt.get("repair_task") and repaired is None:
+            return 1.0                        # stage 2（D29 两段式）：指针命中即 +1
+                                              # （三段式输出的第三段已被 extract_final 解析，此处忽略）
+        if repaired is None:
+            return 0.0                        # repair_task 行缺 gold：adapter bug，fail closed + log
+        # stage 3（D28/D29 三层 AND-gate；pre-D29 artifact 带 repaired_answer 无
+        # repair_task 时经 legacy 回退也落这里）：
+        matcher = norm_match if gt.get("repaired_free_text") else math_match
+        return 1.0 if matcher(answer, repaired) else 0.0   # 修复解错 / 缺第三段 → 0
         # 识别出不可解但诊断错误/未给诊断 → 0
 ```
 
@@ -801,15 +876,18 @@ compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs
 - **三档 bare 分支**（`has_diagnosis_label=false`）：`status ∈ {"unsolvable_bare","unsolvable_option"}`
   即 +1——MiP/UMWP-unanswerable/CREPE 的 prompt 里没有选项，选项 ID 无意义，
   spec §3.1「识别出不可解即满分」。
-- **四档分支**（`has_diagnosis_label=true`：FalseQA-fake / TreeCut 负，D26/D28）：D28 后该分支是
-  **三层 AND-gate**——gt 携带 `repaired_answer` 时，只有 `status == "unsolvable_option"` **且**
-  `option == gt.correct_option_id` **且** 解析出的修复解（boxed 内容 `UNSOLVABLE: B: 42` 的第三段，
-  由 `extract_final` 按 `^([A-Za-z])\s*[:：]\s*(.+)$` 拆出）与 `gt["repaired_answer"]` 匹配才 +1；
-  匹配器按 `repaired_free_text` 路由（FalseQA `true` → `norm_match`；TreeCut 缺省 → `math_match`）。
-  bare `\boxed{UNSOLVABLE}` → **0**（识别对了但没给诊断）；只给 ID 不给修复解 / 修复解错 → **0**。
-  reward 侧只比选项 ID 与修复解，不比选项文本。**兼容**：旧 parquet 无 `repaired_answer` 字段时
-  回退到 D26 的两层口径（`status == "unsolvable_option"` 且 ID 命中 → +1）——该回退只服务于历史
-  artifact；新构建 parquet 由 schema `validate_row` 强制 `repaired_answer` 非空。
+- **四档分支**（`has_diagnosis_label=true`：FalseQA-fake / TreeCut 负，D26；stage 拆分见 D29）：
+  先过「拒答 + 指针」两层——`status == "unsolvable_option"` **且** `option == gt.correct_option_id`，
+  否则 0（bare `\boxed{UNSOLVABLE}` → **0**，识别对了但没给诊断）。指针过后按 gt 键路由：
+  **stage 2（D29 两段式，默认）**：无 `repair_task` 且无 `repaired_answer` → 指针命中即 **+1**
+  （模型输出三段式时第三段由 `extract_final` 按 `^([A-Za-z])\s*[:：]\s*(.+)$` 解析，但不参与判分）。
+  **stage 3（D28 三层 AND-gate）**：`repair_task=true` 时还要求解析出的修复解与
+  `gt["repaired_answer"]` 匹配——匹配器按 `repaired_free_text` 路由（FalseQA `true` →
+  `norm_match`；TreeCut 缺省 → `math_match`）；只给 ID 不给修复解 / 修复解错 → **0**；
+  `repair_task` 行缺 `repaired_answer` 是 adapter bug，fail closed 记 0 + log。**legacy 回退**：
+  带 `repaired_answer` 而无 `repair_task` 的 pre-D29 artifact 仍按三层门评分，与 D28 原口径一致。
+  reward 侧只比选项 ID 与修复解，不比选项文本；判定依据是 ground_truth 的键（`repair_task` /
+  `repaired_answer`），不是 `data_source`——stage 2 与 stage 3 共用同一个 reward 文件。
 - **TreeCut 正样本**走可解主分支（`status == "answer"` 且 `math_match` → +1；误拒 → 0，
   与普通可解行一致），prompt 的占位选项块不进 reward 判定（D26）。
 - **`judgment_only` 分支**（CREPE-normal）：只认 `\boxed{SOLVABLE}`；**误拒给 −1**——`-1` 因此
@@ -853,6 +931,11 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 - `--halluc_total`：幻觉域总量，默认 **20000**（D18）。
 - `--halluc_unsolvable_ratio`：幻觉域内不可解占比，默认 **0.6**（SUM 配对行按 0.5/0.5 计入两侧，
   §4.8）。
+- `--repair_mode`（D29，stage 3）：幻觉侧只采 `REPAIR_QUOTA` 的两个 cell（FalseQA-repair 928 /
+  TreeCut-repair 4,907，按 `--halluc_total` 用 largest-remainder 缩放），不可解占比强制 1.0；
+  读 `built_repair/` 下的 `--repair-contract` 构建产物；跳过 `enforce_pair_atomicity`（diag 行的
+  answerable 孪生不进 stage 3）；模板平衡检查对 `A_repair` 结构性豁免（§4.8 stage 3 构成）。
+  `mix_stats.json` 记 `config.repair_mode` 与 `requested_ratios.unsolvable_share`。
 - 各来源配额（K&K 1,600 / SUM 6,000 / FalseQA 928×2 / …）按 §4.8 表 B 写成 adapter 常量（§12 Q12），
   不做旋钮；K&K 组内去重在 adapter 完成（§4.1），mix 只按比例抽。
 
@@ -894,6 +977,17 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 - reward：现有 run 脚本把 `reward.custom_reward_function.path` 硬编码为 `compute_score.py`，
   切换需要额外一小步——默认方案：给现有脚本加一个默认值不变的 `REWARD_PATH` env 开关（§12 Q3）。
 
+### 7.4 阶段三启动方式（D29）
+
+- 数据：`build_hallucination_stage3_data.sh` 一键构建（两 adapter 带 `--repair-contract` 输出到
+  `halluc/built_repair/` → `mix_halluc.py --repair_mode --halluc_total 5835
+  --old_domain_ratio 0.7 --val_size 256 --seed 42`），默认产出 `final_halluc_repair/`；
+  训练脚本 `run_qwen3_4b_hallucination_stage3_fully_async.sh` 的 `DATA_DIR` 默认指向它。
+- 续训：`RESUME_PATH=<阶段二 ckpt 目录>`（stage 3 不从头训：拒答 + 指针行为由 stage 2 建立，
+  本阶段只学第三层"补条件后解题"）。
+- reward：**与 stage 2 共用** `reward/hallucination_compute_score.py`——四档行按 gt 键
+  `repair_task` 路由（§6），同一文件服务两个 stage，无需切换。
+
 ---
 
 ## 8. 文件清单（全部新增，零覆盖）
@@ -901,8 +995,10 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 ```
 examples/reasoning_rl/
 ├── HALLUCINATION_RL_DESIGN.md                     # 本文档
+├── build_hallucination_stage3_data.sh             # D29 stage 3 数据一键构建（--repair-contract × 2 + mix --repair_mode）
+├── run_qwen3_4b_hallucination_stage3_fully_async.sh  # D29 stage 3 训练 recipe（RESUME_PATH=<stage-2 ckpt>）
 ├── reward/
-│   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托）
+│   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托；stage 2/3 共用，按 gt 键路由）
 │   └── test_hallucination_compute_score.py
 └── scripts/hallucination/
     ├── schema.py                                  # pydantic schema + parquet 序列化/校验
@@ -947,8 +1043,8 @@ examples/reasoning_rl/
 
 ## 9. 测试策略
 
-- **reward 单测**（`test_hallucination_compute_score.py`）——**九分支 × 三类用例矩阵**
-  （分支取自 §4.8 表 B；每格给出应得分）：
+- **reward 单测**（`test_hallucination_compute_score.py`）——**分支 × 三类用例矩阵**
+  （分支取自 §4.8 表 B + D29 的 stage-3 修复行；每格给出应得分）：
 
   | 分支 | 正确 | 错向 | 不可解析 / 其它 |
   |---|---|---|---|
@@ -959,7 +1055,8 @@ examples/reasoning_rl/
   | 可解·判断型（CREPE-normal，B） | `\boxed{SOLVABLE}` → **+1** | `\boxed{UNSOLVABLE}` / `\boxed{UNSOLVABLE: B}` → **−1（误拒）** | 普通答案 / 无 `\boxed{}` → 0 |
   | 可解·数值+占位选项块（TreeCut 正，A，D26） | `\boxed{42}`（= gold）→ **+1** | `\boxed{UNSOLVABLE}` / `\boxed{UNSOLVABLE: B}`（误拒）→ **0**；`\boxed{B}`（选占位选项）→ 0 | 无 `\boxed{}` → 0 |
   | 配对判断（SUM，D23，AND 门控） | `\boxed{A: 42}`（ID 对 + 答案对）→ **+1** | `\boxed{B: …}`（判断错）→ **0** | `\boxed{A: 43}`（判断对答案错）→ **0**；无 `\boxed{}` → 0 |
-  | 不可解·四档（A，D28 三层） | `\boxed{UNSOLVABLE: B: 42}`（ID 命中 + 修复解命中 `repaired_answer`）→ **+1**；`\boxed{UNSOLVABLE: B: forty-two}`（TreeCut `math_match` 数值等价）→ **+1** | `\boxed{答案}` → **−1（编造）**；`\boxed{UNSOLVABLE: B: 43}`（ID 对修复解错）→ **0** | `\boxed{UNSOLVABLE}` → **0（裸的不给分）**；`\boxed{UNSOLVABLE: B}`（缺第三段）→ **0**；选错 ID → 0 |
+  | 不可解·四档（A，stage 2 两段式，D29） | `\boxed{UNSOLVABLE: B}`（ID 命中）→ **+1**；`\boxed{UNSOLVABLE: B: 任意文本}`（三段式第三段被忽略）→ **+1** | `\boxed{答案}` → **−1（编造）**；`\boxed{UNSOLVABLE: A}`（指针错）→ **0** | `\boxed{UNSOLVABLE}` → **0（裸的不给分）**；无 `\boxed{}` → 0 |
+  | 不可解·四档修复（A_repair，stage 3 三层，D28/D29） | `\boxed{UNSOLVABLE: B: 42}`（ID 命中 + 修复解命中 `repaired_answer`）→ **+1**；`\boxed{UNSOLVABLE: B: forty-two}`（TreeCut `math_match` 数值等价）→ **+1** | `\boxed{答案}` → **−1（编造）**；`\boxed{UNSOLVABLE: B: 43}`（ID 对修复解错）→ **0**；`\boxed{UNSOLVABLE: A: 42}`（指针错，修复解对也 0）→ **0** | `\boxed{UNSOLVABLE}` → **0**；`\boxed{UNSOLVABLE: B}`（缺第三段）→ **0**；`repair_task` 缺 `repaired_answer` → **0（fail closed）** |
   | 不可解·三档（B） | `\boxed{UNSOLVABLE}` → **+1**（`\boxed{UNSOLVABLE: B}` 也 +1） | `\boxed{答案}` → **−1（编造）** | 无 `\boxed{}` → 0 |
 
 - **K&K 角色词防反向**：`flip_role`（`role_words=['knave','knight']`）与 `random_pair`
@@ -985,6 +1082,8 @@ examples/reasoning_rl/
   > 落地的断言改为**分模板两侧都存在且都不少于该模板的 10%**（模板 A 实测可解侧 25.3%），
   > 与 §11 风险 10 的表述一致（"要防的是同模板内『选项块 ⟺ 不可解』的关联"）；模板 A 两侧
   > **共用同一套文案**才是真正的防线。`B_judge` 作为 B 的"只判不答"变体并入 B 族计平衡。
+  > D29 追加：`A_repair` 对该断言**结构性豁免**——stage 3 的幻觉侧只有不可解修复行（§4.8
+  > stage 3 构成），同构检查按**模板**分组（verify 脚本对 A 与 A_repair 各查一脚手架）。
 - **选项乱序不变性**：同一条数据、同一次输出，只打乱选项块顺序 + 同步改 `correct_option_id`，
   reward 必须不变。
 - **reward 与 adapter 字段契约**：`ground_truth` 必须是 JSON 字符串；四档源的
@@ -1020,8 +1119,9 @@ examples/reasoning_rl/
 - 可解题准确率（按 source 分开）。
 - 不可解侧**按契约分支分开看**：
   - 三档 bare（MiP / UMWP-unanswerable / CREPE）：**编造率 / 正确拒答率**；
-  - 四档（FalseQA-fake / TreeCut 负，D26/D28）：**编造率 / 拒答但诊断错 / 诊断正确但修复解错 /
-    三层全对**（四者分开画；D28 后"诊断正确但修复解错"是单独一条曲线，用来观察模型是否
+  - 四档（FalseQA-fake / TreeCut 负，D26）：**stage 2（D29 两段式）**画**编造率 / 拒答但诊断错 /
+    诊断正确**（三者）；**stage 3（D28 三层）**画**编造率 / 拒答但诊断错 / 诊断正确但修复解错 /
+    三层全对**（四者分开画；"诊断正确但修复解错"是 stage 3 的单独一条曲线，用来观察模型是否
     只学了指针没学解题）；
   - 判断型可解（CREPE-normal）：**`\boxed{SOLVABLE}` 正确率 / 误拒率**。
 - **两层任务（D24/D27）拆开画**：UMWP-answerable 与 FalseQA-answerable 各自画——判断层
@@ -1090,12 +1190,15 @@ examples/reasoning_rl/
     21.8%（多差异区域）+ 干扰构造失败条。三档/四档能力可能只在对应形态上生效，§10 覆盖检查
     就是盯这个。
 12. **阶段二 reward 路径切换**是小改动但触及现有 run 脚本（§7.3 / §12 Q3）。
-13. **D28 修复解层的获取难度**：四档第三层要求模型在选对替换对的同时**真的解出补条件后的题**。
-    冷启动早期可能出现"指针命中率高、修复解命中率 ≈0"的平台期——此时四档行 reward 全 0，
-    组内零方差被 `filter_groups` 屏蔽的风险比两层口径更高（与 §10 退化组监控同一处看）。
+13. **D28 修复解层的获取难度（D29 后：stage 3 专属）**：stage 3 第三层要求模型在选对替换对的
+    同时**真的解出补条件后的题**。该风险曾作用于 stage 2（D28 原口径下四档行 reward 全 0、
+    组内零方差被 `filter_groups` 屏蔽），D29 拆分后只影响 stage 3——stage 2 的「拒答 + 诊断」
+    信号不再被第三层污染。stage 3 从 stage-2 ckpt 续训，指针行为已建立，冷启动平台期应短于
+    D28 原口径；但"修复解命中率 ≈0"的平台期仍可能出现（此时 stage 3 修复行 reward 全 0，
+    与 §10 退化组监控同一处看）。
     缓解：FalseQA 侧 67.8% 自由文本短答，答案层与 D27 的 answerable 侧共享 `norm_match`
-    口径，可由 answerable 侧的学习信号迁移；TreeCut 侧修复解就是正样本同款 `_math_score`
-    数值，可由 TreeCut 正样本的 500 条迁移。若长期 ≈0，回查 `certify_repaired_answer` 的
+    口径，可由 stage 2 answerable 侧的学习信号迁移；TreeCut 侧修复解就是正样本同款 `_math_score`
+    数值，可由 stage 2 TreeCut 正样本的 500 条迁移。若长期 ≈0，回查 `certify_repaired_answer` 的
     认证通过率与 `norm_match` 噪声（§12 Q17）。
 
 ---
@@ -1125,3 +1228,4 @@ examples/reasoning_rl/
 | Q17 | FalseQA-answerable 答案层匹配噪声与配额让渡确认（D27） | 默认：① 答案层用 `norm_match`（大小写/标点/冠词归一化精确匹配），入池前人工抽检 N=50，误判率 >10% 则只保留短答子集；② 让渡方案默认 **TreeCut 正 1,000→500、GSM-IC 1,200→772**，可改 |
 | Q18 | §10 的分域监控是否要一个交付物（离线统计/绘图脚本）？ | 默认**暂不新增**：数据侧桶列（`branch` / `data_source` / `template` / `perturbation_family` / `answerable_id` / `pair_id`）已备齐，§10 的指标可在 rollout 落盘后离线算；需要固化时再补一个 `scripts/hallucination/monitor_halluc.py`（读 rollout dump → 按 §10 分桶出表） |
 | Q19 | Q9/Q10/Q17 的人工抽检结论由谁出、什么时候出？ | 代码侧已就绪：`verify_falseqa.py --spot-check-out`（L1 旁证 N=50 + 干扰右项 N=50）、`verify_sum.py --spot-check N=100`（含 `--label-file` 人工判读入口）都能导出可复现的抽样清单，但**判定本身是人工步骤**，不自动判罚。上线前需人工过一遍并把结论写进构建报告 |
+| Q20 | stage 3 的数据组成与规模（D29）？ | 默认：① 幻觉侧**纯修复行**——FalseQA-repair 928 + TreeCut-repair 4,907（`REPAIR_QUOTA`，`--halluc_total 5835`），不加 stage-2 其他分支（SUM/K&K/三档等）；② 旧域回放 `--old_domain_ratio 0.7` 不变；③ `--val_size 256`、`--seed 42` 沿用 stage 2；④ stage 3 从 stage-2 ckpt 续训。可改：是否在幻觉侧掺少量 stage-2 两段式四档行作"指针行为防遗忘"对照（默认不掺——stage 3 行的前两层与 stage 2 同构，本身即是复习） |

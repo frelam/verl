@@ -80,14 +80,16 @@ pair's two questions -- and the option block is a set of **replacement pairs**::
   ever padded and no option text ever comes from another *question's* passage
   position: distractors are whole word windows of the corpus, which is what the
   section 4.3 argument requires.
-* **D28 third layer.**  Applying the gold pair to the fake question reproduces
-  the real question verbatim, so the paired real row's own ``answer`` is by
-  construction the correct solution after the repair.  It is stored as
-  ``repaired_answer`` (with ``repaired_free_text``, since 67.8% of the answers
-  are free text) and the reward's four-tier branch AND-gates on it: refusal +
+* **Stage-3 repair layer (D28/D29, ``--repair-contract``).**  Applying the gold
+  pair to the fake question reproduces the real question verbatim, so the paired
+  real row's own ``answer`` is by construction the correct solution after the
+  repair.  In repair mode the diagnosis row ships it as ``repaired_answer``
+  (with ``repaired_free_text``, since 67.8% of the answers are free text) on
+  template A_repair, and the reward's repair branch AND-gates on it: refusal +
   correct pointer + correct post-repair solution, all three or nothing.  A pair
-  whose real answer is empty therefore loses the diagnosis row as well (counted
-  once in ``answer_empty``; never observed).
+  whose real answer is empty then loses the diagnosis row as well (counted once
+  in ``answer_empty``; never observed).  The default stage-2 build keeps the
+  two-layer pointer contract on template A and never gates on the real answer.
 
 The answerable side: a two-layer reward with an isomorphic placeholder block (D27)
 ----------------------------------------------------------------------------------
@@ -693,15 +695,17 @@ def _build_diag(
     correct: str,
     deleted: str,
     inserted: str,
-    repaired_answer: str,
+    repaired_answer: str | None = None,
 ) -> dict:
     """One ``unsolvable_diag`` row (D21): refusal + replacement-pair pointer.
 
-    ``repaired_answer`` is the D28 third layer: applying the gold pair
-    (``left -> right``) to the presented question reproduces the paired real
-    question verbatim, so the real side's own answer is by construction the
-    correct solution after the repair.  It is free text, so the reward compares
-    it with ``norm_match`` (the D27 matcher).
+    Stage 2 (D29) ships the two-layer contract on template A -- no repair gold.
+    ``repaired_answer`` turns the row into the stage-3 repair task (template
+    A_repair, ``repair_task=True``): applying the gold pair (``left -> right``)
+    to the presented question reproduces the paired real question verbatim, so
+    the real side's own answer is by construction the correct solution after
+    the repair.  It is free text, so the reward compares it with ``norm_match``
+    (the D27 matcher).
     """
     extra = _base_extra_info(split, index, seed, partner_question)
     extra.update(
@@ -725,10 +729,11 @@ def _build_diag(
             correct_option_id=correct,
             has_diagnosis_label=True,
             perturbation_type=PERTURBATION_TYPE,
+            repair_task=repaired_answer is not None,
             repaired_answer=repaired_answer,
-            repaired_free_text=True,
+            repaired_free_text=repaired_answer is not None,
         ),
-        template=schema.TEMPLATE_A,
+        template=schema.TEMPLATE_A_REPAIR if repaired_answer is not None else schema.TEMPLATE_A,
         branch=BRANCH_DIAG,
         extra_info=extra,
         options=options,
@@ -887,6 +892,7 @@ def build_rows(
     limit: int | None = None,
     seed: int = 0,
     split: str = DEFAULT_SPLIT,
+    repair: bool = False,
 ) -> tuple[list[dict], dict]:
     """Build the FalseQA rows and the report that produced them.
 
@@ -902,6 +908,10 @@ def build_rows(
             admitted *set* is fixed by the certificates, so the same seed always
             yields byte-identical rows.
         split: which of the source's own splits to read (``train`` by default).
+        repair: build the stage-3 repair contract (D29) for the diagnosis rows --
+            template A_repair plus the real side's answer as the third reward
+            layer.  ``False`` (stage 2) keeps the two-layer pointer contract and
+            never gates the diagnosis side on the real answer's availability.
 
     Returns:
         ``(rows, report)``.  ``rows`` are ready for
@@ -969,11 +979,13 @@ def build_rows(
             # The pair still has a region certificate, so the answerable side can
             # be built; only the diagnosis side loses its pointer gold.
             drops[problem] += 1
-        elif not real_answer:
-            # D28: the diagnosis row's third layer *is* the real side's answer,
-            # so without it the diagnosis side cannot be built either.  The pair
-            # is counted once, in ``answer_empty`` below (never observed: the
-            # eligible pairs all carry a non-empty source answer).
+        elif repair and not real_answer:
+            # Stage 3 (D29): the repair row's third layer *is* the real side's
+            # answer, so without it the diagnosis side cannot be built either.
+            # The pair is counted once, in ``answer_empty`` below (never
+            # observed: the eligible pairs all carry a non-empty source answer).
+            # Stage 2 keeps the diagnosis row -- the pointer contract does not
+            # read the real answer.
             pass
         else:
             pool = out_of_passage_right_pool(
@@ -1004,7 +1016,7 @@ def build_rows(
                             correct=correct,
                             deleted=deleted,
                             inserted=inserted,
-                            repaired_answer=real_answer,
+                            repaired_answer=real_answer if repair else None,
                         )
                     )
 
@@ -1097,10 +1109,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=DEFAULT_OUT, help="output parquet path")
     parser.add_argument("--report", default=None, help="JSON funnel report (default: alongside --out)")
     parser.add_argument("--seed", type=int, default=0, help="option-sampling seed")
+    parser.add_argument(
+        "--repair-contract",
+        action="store_true",
+        help="build the stage-3 repair task (D29): diagnosis rows ask for "
+        "\\boxed{UNSOLVABLE: <id>: <repaired answer>} and ship the real side's "
+        "answer as the third reward layer. Default (stage 2) is the two-layer "
+        "pointer contract.",
+    )
     args = parser.parse_args(argv)
     report_path = args.report or report_path_for(args.out)
 
-    rows, report = build_rows(args.raw_dir, limit=args.limit, seed=args.seed, split=args.split)
+    rows, report = build_rows(
+        args.raw_dir, limit=args.limit, seed=args.seed, split=args.split, repair=args.repair_contract
+    )
     if not rows:
         print("no rows survived the certificates; nothing written", file=sys.stderr)
         return 1

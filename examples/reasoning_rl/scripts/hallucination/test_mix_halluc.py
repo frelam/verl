@@ -56,6 +56,7 @@ from schema import (
     SOURCE_TREECUT,
     SOURCE_UMWP,
     TEMPLATE_A,
+    TEMPLATE_A_REPAIR,
     TEMPLATE_B,
     TEMPLATE_B_JUDGE,
     TEMPLATE_C,
@@ -126,8 +127,6 @@ def make_cell_rows(branch, data_source, template, solvable, n, seed=0):
                 gt_kwargs["correct_option_id"] = rng.choice("ABC")
                 gt_kwargs["has_diagnosis_label"] = True
                 gt_kwargs["perturbation_type"] = "missing_condition"
-                # D28: a four-tier row carries the chain-certified post-repair solution.
-                gt_kwargs["repaired_answer"] = "42"
                 if data_source == SOURCE_FALSEQA:
                     extra["pair_id"] = f"falseqa:train:{i}"
         rows.append(
@@ -684,3 +683,108 @@ class TestNearDedup:
         )
         assert kept == []
         assert (dropped, twins) == (2, 1)
+
+
+class TestRepairMode:
+    """Stage 3 (D29): ``--repair_mode`` mixes only the two four-tier repair cells.
+
+    The repair rows sit on template A_repair with ``repair_task`` + the certified
+    ``repaired_answer``; everything about the quota, the balance gate and the val
+    carve must treat that shape as first-class rather than as a stage-2 row with
+    extra keys.
+    """
+
+    @staticmethod
+    def make_repair_rows(data_source, n, seed=0):
+        """A_repair diag rows in the shape the ``--repair-contract`` adapters emit."""
+        rows = make_cell_rows(BRANCH_UNSOLVABLE_DIAG, data_source, TEMPLATE_A, False, n, seed=seed)
+        for row in rows:
+            info = row["extra_info"]
+            info["template"] = TEMPLATE_A_REPAIR
+            gt = json.loads(row["reward_model"]["ground_truth"])
+            gt["repair_task"] = True
+            gt["repaired_answer"] = "42"
+            row["reward_model"]["ground_truth"] = json.dumps(gt, ensure_ascii=False, sort_keys=True)
+            # Re-render the prompt so the stored text is the A_repair scaffold.
+            row["prompt"] = [
+                {"role": "user", "content": schema.render_prompt(
+                    f"Question {data_source} {BRANCH_UNSOLVABLE_DIAG} {info['index']}?",
+                    TEMPLATE_A_REPAIR, options=info["options"])}
+            ]
+            assert schema.validate_row(row) == []
+        return rows
+
+    def test_default_knobs_reproduce_the_repair_composition(self):
+        quota = mix_halluc.repair_quota(5835)
+        assert quota == mix_halluc.REPAIR_QUOTA
+        assert sum(quota.values()) == 5835
+        assert quota[(BRANCH_UNSOLVABLE_DIAG, SOURCE_FALSEQA)] == 928
+        assert quota[(BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT)] == 4907
+
+    @pytest.mark.parametrize("total", [5835, 1000, 333, 77])
+    def test_repair_quota_sums_exactly(self, total):
+        quota = mix_halluc.repair_quota(total)
+        assert sum(quota.values()) == total
+        # Largest-remainder rescaling keeps the 928:4907 split within a row.
+        falseqa = quota[(BRANCH_UNSOLVABLE_DIAG, SOURCE_FALSEQA)]
+        assert falseqa == pytest.approx(total * 928 / 5835, abs=1)
+
+    def test_template_a_repair_is_balance_exempt(self):
+        # validate_row binds A_repair to repair_task, so the template can only
+        # ever carry four-tier unsolvable rows -- the both-sides rule has no
+        # purchase, exactly like template C (section 4.8).
+        rows = self.make_repair_rows(SOURCE_TREECUT, 3)
+        assert mix_halluc.check_template_balance(rows) == {TEMPLATE_A_REPAIR: {"unsolvable": 3}}
+
+    def test_end_to_end_repair_mix(self, tmp_path):
+        build = tmp_path / "built_repair"
+        build.mkdir()
+        rows = self.make_repair_rows(SOURCE_FALSEQA, 40) + self.make_repair_rows(SOURCE_TREECUT, 200)
+        schema.write_rows_parquet(rows, str(build / "repair.parquet"))
+        out = tmp_path / "stage3"
+        assert mix_halluc.main([
+            "--repair_mode",
+            "--halluc_dir", str(build),
+            "--output_dir", str(out),
+            "--halluc_total", "120",
+            "--val_size", "10",
+            "--seed", "7",
+        ]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
+        assert len(train) == 120
+        assert len(val) == 10
+        schema.validate_rows(train + val)
+        # The halluc side is repair rows only: no stage-2 branches leak in.
+        assert {r["extra_info"]["template"] for r in train + val} == {TEMPLATE_A_REPAIR}
+        assert {r["extra_info"]["branch"] for r in train + val} == {BRANCH_UNSOLVABLE_DIAG}
+        for row in train + val:
+            gt = json.loads(row["reward_model"]["ground_truth"])
+            assert gt["repair_task"] is True and gt["repaired_answer"] == "42"
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+        assert stats["config"]["repair_mode"] is True
+        assert stats["requested_ratios"]["unsolvable_share"] == 1.0
+        assert stats["achieved_ratios"]["unsolvable_share"] == pytest.approx(1.0)
+
+    def test_repair_mix_keeps_falseqa_diag_rows_in_val(self, tmp_path):
+        """Regression: pair atomicity must not bounce repair rows out of val.
+
+        The answerable twin is never quota'd in repair mode, so a FalseQA diag
+        row in val has no twin to leak into train; running the stage-2 atomicity
+        rule here would empty val of every FalseQA repair row.
+        """
+        build = tmp_path / "built_repair"
+        build.mkdir()
+        rows = self.make_repair_rows(SOURCE_FALSEQA, 40) + self.make_repair_rows(SOURCE_TREECUT, 60)
+        schema.write_rows_parquet(rows, str(build / "repair.parquet"))
+        out = tmp_path / "stage3"
+        assert mix_halluc.main([
+            "--repair_mode",
+            "--halluc_dir", str(build),
+            "--output_dir", str(out),
+            "--halluc_total", "50",
+            "--val_size", "40",
+            "--seed", "3",
+        ]) == 0
+        val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
+        assert any(r["data_source"] == SOURCE_FALSEQA for r in val)

@@ -26,9 +26,10 @@ exits non-zero if any check fails.
 A TreeCut row is one side of a *pair* (D26 ships both sides, table B rows 5 and 7):
 
 * the **negative** (branch ``unsolvable_diag``) is the member whose cut took an
-  edge the answer's derivation needs -- nothing grounds the answer, so its gold is
-  ``\\boxed{UNSOLVABLE: <选项ID>}`` and the option block holds candidate missing
-  conditions;
+  edge the answer's derivation needs -- nothing grounds the answer, so its gold
+  is ``\\boxed{UNSOLVABLE: <选项ID>}`` in the stage-2 contract (template A) and
+  ``\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`` in the stage-3 one (template
+  A_repair, D29), and the option block holds candidate missing conditions;
 * the **positive** (branch ``solvable_numeric``) is the counterpart, whose cut took
   an edge the derivation does not use, so it stays solvable and ships the
   generator's answer as a numeric gold with a *placeholder* option block.
@@ -45,8 +46,9 @@ output for the row's own question under the row's recorded ``template`` and
 can be re-derived from the row.  This is what ties the gold to the question: a
 prompt rewritten to another template while the gold stayed the four-tier refusal
 is a row that never asks for its own answer, and it fails here.  Both sides must
-render template A with exactly k=3 option lines and the same instruction preamble
-(the D18 isomorphism D26 re-states).
+render their recorded template with exactly k=3 option lines, and all rows of one
+template share the same instruction preamble (the D18 isomorphism D26 re-states;
+A and A_repair differ by exactly the repair segment, so the gate is per template).
 
 **Source anchor.**  The row's texts are proved against the source itself, and the
 anchor fails closed: if ``<raw_dir>/repo/treecut/entities_items.py`` cannot be
@@ -215,6 +217,14 @@ except ImportError:  # pragma: no cover - running as a plain script
 BRANCH_DIAG = schema.BRANCH_UNSOLVABLE_DIAG
 BRANCH_POSITIVE = schema.BRANCH_SOLVABLE_NUMERIC
 TEMPLATE_A = schema.TEMPLATE_A
+TEMPLATE_A_REPAIR = schema.TEMPLATE_A_REPAIR
+
+#: The four-tier refusal marker, per contract stage (D29): stage 2 asks for the
+#: two-segment pointer, stage 3 (template A_repair) adds the post-repair
+#: solution as a third segment.  Re-declared here rather than imported: a check
+#: that reads its expectations out of the code under test is not a check.
+MARKER_UNSOLVABLE_ID = "\\boxed{UNSOLVABLE: <选项ID>}"
+MARKER_UNSOLVABLE_ID_REPAIR = "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}"
 
 DEFAULT_RAW_DIR = "/home/charles/data/reasoning_rl/halluc/raw/treecut"
 REPO_SUBDIR = os.path.join("repo", "treecut")
@@ -1385,8 +1395,12 @@ def option_shuffle_failures(row: dict, reward, rng: random.Random) -> list:
     moved = dict(gt)
     moved["correct_option_id"] = next(ids[index] for index, text in enumerate(texts)
                                       if text == gold_text)
-    before = reward.score_from_status(gt, reward.STATUS_UNSOLVABLE_OPTION, None, correct)
-    after = reward.score_from_status(moved, reward.STATUS_UNSOLVABLE_OPTION, None,
+    # The +1 reply is contract-dependent (D29): on a stage-3 repair_task row the
+    # pointer alone earns nothing, so the certified post-repair solution rides
+    # along; on a stage-2 row the pointer is the whole task.
+    solution = gt.get("repaired_answer") if gt.get("repair_task") else None
+    before = reward.score_from_status(gt, reward.STATUS_UNSOLVABLE_OPTION, solution, correct)
+    after = reward.score_from_status(moved, reward.STATUS_UNSOLVABLE_OPTION, solution,
                                      moved["correct_option_id"])
     if before != 1.0:
         problems.append(f"{task_id}: the recorded gold scores {before}, expected +1")
@@ -1452,13 +1466,28 @@ def check_bare_unsolvable(rows: list, reporter: Reporter, reward) -> None:
                         f"payload scored {three_score}, expected +1")
     correctness: list = []
     sample = negatives[0]
-    gold = ground_truth_of(sample).get("correct_option_id")
-    option_reply = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
-                    f"\\boxed{{UNSOLVABLE: {gold}}}")
+    sample_truth = ground_truth_of(sample)
+    gold = sample_truth.get("correct_option_id")
+    if sample_truth.get("repair_task"):
+        # Stage 3 (D28/D29): the pointer alone earns 0; only the three-segment
+        # form -- pointer plus the certified post-repair solution -- earns +1.
+        repaired = sample_truth.get("repaired_answer")
+        pointer_only = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
+                        f"\\boxed{{UNSOLVABLE: {gold}}}")
+        pointer_score = reward.score_halluc_row(sample["data_source"], pointer_only,
+                                                sample["reward_model"]["ground_truth"])
+        if pointer_score != 0.0:
+            correctness.append(f"{sample['data_source']}: pointer-only refusal on a repair_task row "
+                               f"scored {pointer_score}, expected 0")
+        option_reply = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
+                        f"\\boxed{{UNSOLVABLE: {gold}: {repaired}}}")
+    else:
+        option_reply = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
+                        f"\\boxed{{UNSOLVABLE: {gold}}}")
     option_score = reward.score_halluc_row(sample["data_source"], option_reply,
                                            sample["reward_model"]["ground_truth"])
     if option_score != 1.0:
-        correctness.append(f"{sample['data_source']}: \\boxed{{UNSOLVABLE: {gold}}} scored "
+        correctness.append(f"{sample['data_source']}: the contract-correct refusal scored "
                            f"{option_score}, expected +1")
     answer_score = reward.score_halluc_row(
         sample["data_source"], "<think>\nForty-two.\n</think>\n\\boxed{42}",
@@ -1853,8 +1882,11 @@ def check_contract(rows: list, reporter: Reporter) -> None:
         positive = is_positive(row)
         if row.get("data_source") != schema.SOURCE_TREECUT:
             failures.append(f"{task_id}: data_source {row.get('data_source')!r}")
-        if info.get("template") != TEMPLATE_A:
-            failures.append(f"{task_id}: template {info.get('template')!r}, expected A")
+        # Positives are always template A; negatives are A in the stage-2
+        # contract and A_repair in the stage-3 one (D29).
+        if info.get("template") not in ((TEMPLATE_A,) if positive else (TEMPLATE_A, TEMPLATE_A_REPAIR)):
+            failures.append(f"{task_id}: template {info.get('template')!r} on a "
+                            f"{'positive' if positive else 'negative'} row")
         if info.get("options") is None or len(info.get("options") or []) != K_OPTIONS:
             failures.append(f"{task_id}: {len(info.get('options') or [])} options, expected "
                             f"k={K_OPTIONS}")
@@ -1998,10 +2030,13 @@ def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
     )
 
     # Per-branch wording: the four-tier negative's prompt must ask for the diagnosis
-    # and the solvable row's for an answer, while the two sides share one instruction
-    # preamble and one k=3 block shape (the D18/D26 isomorphism).
+    # and the solvable row's for an answer, while rows of one template share one
+    # instruction preamble and one k=3 block shape (the D18/D26 isomorphism).  In a
+    # stage-3 (repair-contract) artifact the negatives sit on template A_repair,
+    # whose preamble differs from A's by exactly the third output segment -- so the
+    # isomorphism gate is one preamble *per template*, not one across the file.
     failures = []
-    preamble = None
+    preambles: dict[str, str] = {}
     for row in rows:
         info = row["extra_info"]
         task_id = info.get("task_id", "<missing>")
@@ -2017,10 +2052,11 @@ def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
             failures.append(f"{task_id}: the prompt has no 选项： block")
             continue
         head = "\n".join(lines[: block_start + 1])
-        if preamble is None:
-            preamble = head
-        elif head != preamble:
-            failures.append(f"{task_id}: the template-A preamble differs from the first row's")
+        template = info.get("template")
+        if template not in preambles:
+            preambles[template] = head
+        elif head != preambles[template]:
+            failures.append(f"{task_id}: the template-{template} preamble differs from the first row's")
         block = lines[block_start + 1:]
         if len(block) != K_OPTIONS or any(
                 not line.startswith(f"{opt['id']}. ") for line, opt in zip(block, options, strict=False)):
@@ -2030,11 +2066,13 @@ def check_prompt_coherence(rows: list, reporter: Reporter) -> None:
             if "\\boxed{<答案>}" not in content:
                 failures.append(f"{task_id}: the solvable prompt does not ask for an answer")
         else:
-            if "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" not in content:
+            marker = (MARKER_UNSOLVABLE_ID_REPAIR if template == TEMPLATE_A_REPAIR
+                      else MARKER_UNSOLVABLE_ID)
+            if marker not in content:
                 failures.append(f"{task_id}: the four-tier prompt does not ask for the diagnosis")
     reporter.check(
-        "prompt: template A is isomorphic across the two sides (same preamble, k=3 block) "
-        "and asks each side for its own gold",
+        "prompt: one preamble per template across the two sides (k=3 block), "
+        "each side asked for its own gold",
         not failures,
         f"{len(rows)} prompts checked, {len(failures)} failures"
         + (f"; first: {failures[:3]}" if failures else ""),

@@ -120,10 +120,21 @@ class TestBranchShapesAreAccepted:
         )
 
     def test_unsolvable_diag(self):
+        # Stage 2 (D29): the two-layer pointer contract, template A, no repair keys.
         schema.validate_rows(
             [row({"solvable": False, "answer": None, "correct_option_id": "B", "has_diagnosis_label": True,
-                  "perturbation_type": "missing_condition", "repaired_answer": "42"},
+                  "perturbation_type": "missing_condition"},
                  template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG,
+                 data_source=schema.SOURCE_TREECUT, options=OPTIONS)]
+        )
+
+    def test_unsolvable_diag_repair(self):
+        # Stage 3 (D28/D29): the three-layer contract on template A_repair.
+        schema.validate_rows(
+            [row({"solvable": False, "answer": None, "correct_option_id": "B", "has_diagnosis_label": True,
+                  "perturbation_type": "missing_condition", "repair_task": True,
+                  "repaired_answer": "42"},
+                 template=schema.TEMPLATE_A_REPAIR, branch=schema.BRANCH_UNSOLVABLE_DIAG,
                  data_source=schema.SOURCE_TREECUT, options=OPTIONS)]
         )
 
@@ -163,21 +174,48 @@ class TestViolationsAreRejected:
 
     def test_four_tier_without_a_correct_option(self):
         bad = row({"solvable": False, "correct_option_id": None, "has_diagnosis_label": True,
-                   "perturbation_type": "missing_condition", "repaired_answer": "42"},
+                   "perturbation_type": "missing_condition"},
                   template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
         assert any("correct_option_id" in p for p in schema.validate_row(bad))
 
     def test_four_tier_option_id_must_exist(self):
         bad = row({"solvable": False, "correct_option_id": "D", "has_diagnosis_label": True,
-                   "perturbation_type": "missing_condition", "repaired_answer": "42"},
+                   "perturbation_type": "missing_condition"},
                   template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
         assert any("not among the row's options" in p for p in schema.validate_row(bad))
 
-    def test_four_tier_without_a_repaired_answer(self):
+    def test_repair_task_without_a_repaired_answer(self):
+        bad = row({"solvable": False, "correct_option_id": "B", "has_diagnosis_label": True,
+                   "perturbation_type": "missing_condition", "repair_task": True},
+                  template=schema.TEMPLATE_A_REPAIR, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
+        assert any("repaired_answer" in p for p in schema.validate_row(bad))
+
+    def test_stage2_diag_row_must_not_carry_a_repaired_answer(self):
+        bad = row({"solvable": False, "correct_option_id": "B", "has_diagnosis_label": True,
+                   "perturbation_type": "missing_condition", "repaired_answer": "42"},
+                  template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
+        assert any("repaired_answer without repair_task" in p for p in schema.validate_row(bad))
+
+    def test_repair_task_requires_template_a_repair(self):
+        # The 1:1 binding, modelled on pair_task <-> template C: a repair_task
+        # row on plain A never asked for the answer its gold repairs.
+        bad = row({"solvable": False, "correct_option_id": "B", "has_diagnosis_label": True,
+                   "perturbation_type": "missing_condition", "repair_task": True,
+                   "repaired_answer": "42"},
+                  template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
+        assert any("repair_task" in p for p in schema.validate_row(bad))
+
+    def test_template_a_repair_requires_repair_task(self):
         bad = row({"solvable": False, "correct_option_id": "B", "has_diagnosis_label": True,
                    "perturbation_type": "missing_condition"},
-                  template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
-        assert any("repaired_answer" in p for p in schema.validate_row(bad))
+                  template=schema.TEMPLATE_A_REPAIR, branch=schema.BRANCH_UNSOLVABLE_DIAG, options=OPTIONS)
+        assert any("repair_task" in p for p in schema.validate_row(bad))
+
+    def test_repair_task_is_four_tier_only(self):
+        bad = row({"solvable": True, "answer": "42", "repair_task": True,
+                   "repaired_answer": "42"},
+                  template=schema.TEMPLATE_A_REPAIR, branch=schema.BRANCH_SOLVABLE_NUMERIC, options=OPTIONS)
+        assert any("four-tier" in p for p in schema.validate_row(bad))
 
     def test_three_tier_must_not_carry_an_option_block(self):
         bad = row({"solvable": False, "perturbation_type": "missing_condition"},
@@ -240,7 +278,26 @@ class TestTemplates:
         prompt = schema.render_prompt("Q?", schema.TEMPLATE_A, options=OPTIONS)
         assert "A. man -> child" in prompt
         assert "\\boxed{<答案>}" in prompt
+        assert "\\boxed{UNSOLVABLE: <选项ID>}" in prompt
+
+    def test_template_a_repair_asks_for_the_third_segment(self):
+        # Stage 3 (D29): the D28 three-layer contract lives on its own template,
+        # whose option-block sentence is byte-identical to A's apart from the
+        # added repair segment.
+        prompt = schema.render_prompt("Q?", schema.TEMPLATE_A_REPAIR, options=OPTIONS)
+        assert "A. man -> child" in prompt
+        assert "\\boxed{<答案>}" in prompt
         assert "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" in prompt
+        plain = schema.render_prompt("Q?", schema.TEMPLATE_A, options=OPTIONS)
+        # The two-stage markers are mutually exclusive substrings: the two-part
+        # one ends right after <选项ID>, so it never matches inside an A_repair
+        # prompt, and the three-part one never appears on plain A.
+        assert "\\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}" not in plain
+        assert "\\boxed{UNSOLVABLE: <选项ID>}" not in prompt
+
+    def test_template_a_repair_requires_options(self):
+        with pytest.raises(ValueError, match="options block"):
+            schema.render_prompt("Q?", schema.TEMPLATE_A_REPAIR)
 
     def test_template_a_requires_options(self):
         with pytest.raises(ValueError, match="options block"):
@@ -358,8 +415,8 @@ class TestParquetRoundTrip:
             row({"solvable": True, "answer": "42", "perturbation_type": "distracting_condition"},
                 template=schema.TEMPLATE_B, branch=schema.BRANCH_SOLVABLE_NUMERIC),
             row({"solvable": False, "answer": None, "correct_option_id": "B", "has_diagnosis_label": True,
-                 "perturbation_type": "missing_condition", "repaired_answer": "42"},
-                template=schema.TEMPLATE_A, branch=schema.BRANCH_UNSOLVABLE_DIAG,
+                 "perturbation_type": "missing_condition", "repair_task": True, "repaired_answer": "42"},
+                template=schema.TEMPLATE_A_REPAIR, branch=schema.BRANCH_UNSOLVABLE_DIAG,
                 data_source=schema.SOURCE_FALSEQA, options=OPTIONS),
             row({"solvable": True, "pair_task": True, "answerable_id": "A", "answer": 7},
                 template=schema.TEMPLATE_C, branch=schema.BRANCH_SOLVABLE_PAIR,
@@ -410,7 +467,6 @@ class TestTemplateIsomorphism:
                     gt["has_diagnosis_label"] = template == schema.TEMPLATE_A
                     if template == schema.TEMPLATE_A:
                         gt["correct_option_id"] = "B"
-                        gt["repaired_answer"] = "42"
                 rows.append(
                     row(gt, template=template, branch=branch, data_source=data_source,
                         options=options, role_words=gt.get("role_words"))
