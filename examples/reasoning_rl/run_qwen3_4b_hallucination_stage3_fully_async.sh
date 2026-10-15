@@ -3,14 +3,16 @@
 #
 #   FULLY ASYNC variant — STANDALONE recipe. This is a full copy of
 #   run_qwen3_4b_reasoning_rl_fully_async.sh with the stage-3 defaults baked in:
-#     * data  -> $DATA_ROOT/final_halluc_repair/{train,val}.parquet (the stage-3
-#       repair mix: ONLY the four-tier unsolvable rows under the D28 three-layer
-#       contract + stage-1 old-domain replay; build it first with
+#     * data  -> $DATA_ROOT/final_halluc_stage3/{train,val}.parquet (the D30
+#       domain-balanced mix: logic 15% / commonsense 20% / math 65% by rows,
+#       40/60 solvable/unsolvable per domain by edge weight, + stage-1
+#       old-domain replay; build it first with
 #       build_hallucination_stage3_data.sh)
 #     * reward -> hallucination_compute_score.py (halluc_* rows scored by the
-#       abstention dispatcher; ``repair_task`` rows route through the three-layer
-#       AND-gate while stage-2 rows keep the two-layer contract, so one reward
-#       file serves both stages; every other row delegates to compute_score.py)
+#       abstention dispatcher; the D28 repair layer is retired (D29) -- every
+#       four-tier unsolvable row scores on the stage-2 pointer contract alone,
+#       so one reward file serves both stages; every other row delegates to
+#       compute_score.py)
 #     * resume -> RESUME_MODE=resume_path + RESUME_PATH=<stage-2 ckpt> REQUIRED
 #       (the mid-training hand-off; RESUME_MODE=disable starts fresh but then
 #       stage-2 training never happened)
@@ -124,10 +126,10 @@ NNODES_ROLLOUT=${NNODES_ROLLOUT:-1}
 NGPUS_TRAIN=${NGPUS_TRAIN:-8}
 NGPUS_ROLLOUT=${NGPUS_ROLLOUT:-8}
 
-# Stage-3 repair mix produced by build_hallucination_stage3_data.sh.
+# Stage-3 domain-balanced mix produced by build_hallucination_stage3_data.sh.
 # TRAIN_FILES / VAL_FILES remain an explicit override seam (same semantics as
 # the stage-1 recipe).
-DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final_halluc_repair}
+DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final_halluc_stage3}
 train_files=${TRAIN_FILES:-"['$DATA_DIR/train.parquet']"}
 val_files=${VAL_FILES:-"['$DATA_DIR/val.parquet']"}
 
@@ -267,9 +269,10 @@ PROJECT_NAME=${PROJECT_NAME:-verl_reasoning_rl}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_hallucination_stage3_$(date +%Y%m%d_%H%M)}
 
 # Stage-3 reward: the abstention dispatcher, shared with stage 2. `halluc_*`
-# rows are scored by the hallucination logic — ``repair_task`` rows through the
-# D28 three-layer AND-gate, stage-2 two-layer rows through the pointer gate;
-# every other row is delegated back to compute_score.py
+# rows are scored by the hallucination logic — the D28 repair layer is retired
+# (D29), so four-tier unsolvable rows (including legacy ``repair_task`` rows)
+# score on the stage-2 pointer contract alone; every other row is delegated
+# back to compute_score.py
 # (HALLUCINATION_RL_DESIGN.md section 7.3 / Q3). REWARD_PATH stays an override.
 reward_path=${REWARD_PATH:-"$REPO_ROOT/examples/reasoning_rl/reward/hallucination_compute_score.py"}
 ########################### end user-adjustable ###########################
@@ -281,9 +284,9 @@ if [ "$RESUME_MODE" = "resume_path" ] && [ -z "$RESUME_PATH" ]; then
     echo "ERROR: stage 3 resumes from a stage-2 checkpoint; set RESUME_PATH=<ckpt_dir>" >&2
     exit 1
 fi
-# The stage-3 repair mix must exist (build_hallucination_stage3_data.sh). Only
-# check the default paths — explicit TRAIN_FILES/VAL_FILES overrides are the
-# user's responsibility.
+# The stage-3 domain-balanced mix must exist (build_hallucination_stage3_data.sh).
+# Only check the default paths — explicit TRAIN_FILES/VAL_FILES overrides are
+# the user's responsibility.
 if [ -z "${TRAIN_FILES:-}" ] && [ ! -f "$DATA_DIR/train.parquet" ]; then
     echo "ERROR: $DATA_DIR/train.parquet missing; run build_hallucination_stage3_data.sh first" >&2
     exit 1
@@ -496,7 +499,7 @@ ASYNC=(
 )
 
 # Mid-training resume: continue from the stage-2 checkpoint with the stage-3
-# repair mix.
+# domain-balanced mix.
 if [ -n "$RESUME_MODE" ]; then
     TRAINER+=(
         trainer.resume_mode=${RESUME_MODE}

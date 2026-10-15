@@ -30,6 +30,7 @@ import json
 import os
 import random
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import pytest
@@ -56,7 +57,6 @@ from schema import (
     SOURCE_TREECUT,
     SOURCE_UMWP,
     TEMPLATE_A,
-    TEMPLATE_A_REPAIR,
     TEMPLATE_B,
     TEMPLATE_B_JUDGE,
     TEMPLATE_C,
@@ -685,106 +685,115 @@ class TestNearDedup:
         assert (dropped, twins) == (2, 1)
 
 
-class TestRepairMode:
-    """Stage 3 (D29): ``--repair_mode`` mixes only the two four-tier repair cells.
+class TestStage3Mix:
+    """Stage 3 (D30): ``--stage3_mix`` builds the domain-balanced table.
 
-    The repair rows sit on template A_repair with ``repair_task`` + the certified
-    ``repaired_answer``; everything about the quota, the balance gate and the val
-    carve must treat that shape as first-class rather than as a stage-2 row with
-    extra keys.
+    The table rebalances every stage-2 source so each domain splits 40/60 and
+    the domain weights move to logic 15% / commonsense 20% / math 65%; the new
+    logic unsolvable side is the kkcut synthesis cell.  The old ``--repair_mode``
+    (D29) is retired from scoring, so there is no repair quota to test anymore.
     """
 
-    @staticmethod
-    def make_repair_rows(data_source, n, seed=0):
-        """A_repair diag rows in the shape the ``--repair-contract`` adapters emit."""
-        rows = make_cell_rows(BRANCH_UNSOLVABLE_DIAG, data_source, TEMPLATE_A, False, n, seed=seed)
-        for row in rows:
-            info = row["extra_info"]
-            info["template"] = TEMPLATE_A_REPAIR
-            gt = json.loads(row["reward_model"]["ground_truth"])
-            gt["repair_task"] = True
-            gt["repaired_answer"] = "42"
-            row["reward_model"]["ground_truth"] = json.dumps(gt, ensure_ascii=False, sort_keys=True)
-            # Re-render the prompt so the stored text is the A_repair scaffold.
-            row["prompt"] = [
-                {"role": "user", "content": schema.render_prompt(
-                    f"Question {data_source} {BRANCH_UNSOLVABLE_DIAG} {info['index']}?",
-                    TEMPLATE_A_REPAIR, options=info["options"])}
-            ]
-            assert schema.validate_row(row) == []
-        return rows
+    # Pools shaped like the stage-3 adapter outputs: every cell comfortably
+    # above its STAGE3_QUOTA target so the test exercises the quota arithmetic,
+    # not shortfall redistribution.
+    STAGE3_CELL_SHAPES = [
+        (BRANCH_SOLVABLE_ROLES, SOURCE_KK, TEMPLATE_B, True, 1400),
+        (BRANCH_UNSOLVABLE_BARE, SOURCE_KK, TEMPLATE_B, False, 2100),
+        (BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, 900),
+        (BRANCH_SOLVABLE_NUMERIC, SOURCE_UMWP, TEMPLATE_B, True, 300),
+        (BRANCH_SOLVABLE_NUMERIC, SOURCE_MAIN, TEMPLATE_B, True, 200),
+        (BRANCH_SOLVABLE_NUMERIC, SOURCE_TREECUT, TEMPLATE_A, True, 650),
+        (BRANCH_SOLVABLE_TWO_LAYER, SOURCE_UMWP, TEMPLATE_A, True, 700),
+        (BRANCH_SOLVABLE_PAIR, SOURCE_SUM, TEMPLATE_C, True, 7000),
+        (BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT, TEMPLATE_A, False, 3600),
+        (BRANCH_UNSOLVABLE_BARE, SOURCE_UMWP, TEMPLATE_B, False, 1500),
+        (BRANCH_UNSOLVABLE_BARE, SOURCE_MIP, TEMPLATE_B, False, 350),
+        (BRANCH_SOLVABLE_TWO_LAYER, SOURCE_FALSEQA, TEMPLATE_A, True, 1100),
+        (BRANCH_SOLVABLE_JUDGE, SOURCE_CREPE, TEMPLATE_B_JUDGE, True, 800),
+        (BRANCH_UNSOLVABLE_DIAG, SOURCE_FALSEQA, TEMPLATE_A, False, 1100),
+        (BRANCH_UNSOLVABLE_BARE, SOURCE_CREPE, TEMPLATE_B, False, 1700),
+    ]
 
-    def test_default_knobs_reproduce_the_repair_composition(self):
-        quota = mix_halluc.repair_quota(5835)
-        assert quota == mix_halluc.REPAIR_QUOTA
-        assert sum(quota.values()) == 5835
-        assert quota[(BRANCH_UNSOLVABLE_DIAG, SOURCE_FALSEQA)] == 928
-        assert quota[(BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT)] == 4907
+    def test_stage3_table_sums_to_the_total(self):
+        quota = mix_halluc.STAGE3_QUOTA
+        assert sum(quota.values()) == 20000
+        assert set(quota) == set(mix_halluc.scaled_quota(20000, 0.6, base=quota))
 
-    @pytest.mark.parametrize("total", [5835, 1000, 333, 77])
-    def test_repair_quota_sums_exactly(self, total):
-        quota = mix_halluc.repair_quota(total)
-        assert sum(quota.values()) == total
-        # Largest-remainder rescaling keeps the 928:4907 split within a row.
-        falseqa = quota[(BRANCH_UNSOLVABLE_DIAG, SOURCE_FALSEQA)]
-        assert falseqa == pytest.approx(total * 928 / 5835, abs=1)
+    def test_stage3_table_domain_arithmetic(self):
+        """logic 15% / commonsense 20% / math 65%, each 40/60 inside."""
+        solvable = defaultdict(int)
+        unsolvable = defaultdict(int)
+        for (branch, data_source), rows in mix_halluc.STAGE3_QUOTA.items():
+            domain = schema.SOURCES[data_source][0]
+            if branch in mix_halluc.PAIR_BRANCHES:
+                solvable[domain] += rows / 2
+                unsolvable[domain] += rows / 2
+            elif branch in mix_halluc.SOLVABLE_BRANCHES:
+                solvable[domain] += rows
+            else:
+                unsolvable[domain] += rows
+        assert solvable == {"logic": 1200, "commonsense": 1600, "math": 5200}
+        assert unsolvable == {"logic": 1800, "commonsense": 2400, "math": 7800}
 
-    def test_template_a_repair_is_balance_exempt(self):
-        # validate_row binds A_repair to repair_task, so the template can only
-        # ever carry four-tier unsolvable rows -- the both-sides rule has no
-        # purchase, exactly like template C (section 4.8).
-        rows = self.make_repair_rows(SOURCE_TREECUT, 3)
-        assert mix_halluc.check_template_balance(rows) == {TEMPLATE_A_REPAIR: {"unsolvable": 3}}
+    def test_stage3_table_has_the_kkcut_cell(self):
+        # The synthesised logic unsolvable side (D30): kk_adapter --emit-unsolvable.
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_BARE, SOURCE_KK)] == 1800
+        # Supply-capped cells: MiP at its strict-certification ceiling, TreeCut
+        # negatives shrunk so math's 7,800 stays exact.
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_BARE, SOURCE_MIP)] == 270
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT)] == 3230
 
-    def test_end_to_end_repair_mix(self, tmp_path):
-        build = tmp_path / "built_repair"
+    def test_stage3_mix_end_to_end(self, tmp_path):
+        build = tmp_path / "built_stage3"
         build.mkdir()
-        rows = self.make_repair_rows(SOURCE_FALSEQA, 40) + self.make_repair_rows(SOURCE_TREECUT, 200)
-        schema.write_rows_parquet(rows, str(build / "repair.parquet"))
+        rows = []
+        for branch, data_source, template, solvable, n in self.STAGE3_CELL_SHAPES:
+            rows.extend(make_cell_rows(branch, data_source, template, solvable, n))
+        schema.write_rows_parquet(rows, str(build / "halluc.parquet"))
         out = tmp_path / "stage3"
         assert mix_halluc.main([
-            "--repair_mode",
+            "--stage3_mix",
             "--halluc_dir", str(build),
             "--output_dir", str(out),
-            "--halluc_total", "120",
-            "--val_size", "10",
-            "--seed", "7",
+            "--halluc_total", "2000",
+            "--val_size", "60",
+            "--seed", "11",
         ]) == 0
         train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
         val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
-        assert len(train) == 120
-        assert len(val) == 10
+        assert len(train) == 2000
+        # Pair atomicity may return a few split twins to train, so val can come
+        # in under the requested carve (the D27 rule, exercised for real here).
+        assert 0 < len(val) <= 60
         schema.validate_rows(train + val)
-        # The halluc side is repair rows only: no stage-2 branches leak in.
-        assert {r["extra_info"]["template"] for r in train + val} == {TEMPLATE_A_REPAIR}
-        assert {r["extra_info"]["branch"] for r in train + val} == {BRANCH_UNSOLVABLE_DIAG}
-        for row in train + val:
-            gt = json.loads(row["reward_model"]["ground_truth"])
-            assert gt["repair_task"] is True and gt["repaired_answer"] == "42"
         stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
-        assert stats["config"]["repair_mode"] is True
-        assert stats["requested_ratios"]["unsolvable_share"] == 1.0
-        assert stats["achieved_ratios"]["unsolvable_share"] == pytest.approx(1.0)
+        assert stats["config"]["stage3_mix"] is True
+        assert stats["achieved_ratios"]["unsolvable_share"] == pytest.approx(0.6)
+        # At total=2000 the rescaled table keeps the domain row counts exactly
+        # at 15/20/65 (the SUM pairs are full rows of the math domain here).
+        assert stats["halluc_by_domain"] == {"logic": 300, "commonsense": 400, "math": 1300}
 
-    def test_repair_mix_keeps_falseqa_diag_rows_in_val(self, tmp_path):
-        """Regression: pair atomicity must not bounce repair rows out of val.
-
-        The answerable twin is never quota'd in repair mode, so a FalseQA diag
-        row in val has no twin to leak into train; running the stage-2 atomicity
-        rule here would empty val of every FalseQA repair row.
-        """
-        build = tmp_path / "built_repair"
+    def test_stage3_mix_runs_pair_atomicity(self, tmp_path):
+        """Stage 3 uses the stage-2 FalseQA twins, so the val atomicity rule applies."""
+        build = tmp_path / "built_stage3"
         build.mkdir()
-        rows = self.make_repair_rows(SOURCE_FALSEQA, 40) + self.make_repair_rows(SOURCE_TREECUT, 60)
-        schema.write_rows_parquet(rows, str(build / "repair.parquet"))
+        rows = []
+        for branch, data_source, template, solvable, n in self.STAGE3_CELL_SHAPES:
+            rows.extend(make_cell_rows(branch, data_source, template, solvable, n))
+        schema.write_rows_parquet(rows, str(build / "halluc.parquet"))
         out = tmp_path / "stage3"
         assert mix_halluc.main([
-            "--repair_mode",
+            "--stage3_mix",
             "--halluc_dir", str(build),
             "--output_dir", str(out),
-            "--halluc_total", "50",
-            "--val_size", "40",
-            "--seed", "3",
+            "--halluc_total", "2000",
+            "--val_size", "200",
+            "--seed", "5",
         ]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
         val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
-        assert any(r["data_source"] == SOURCE_FALSEQA for r in val)
+        # No pair_id may straddle the boundary (D27), on either side.
+        val_ids = {r["extra_info"].get("pair_id") for r in val if r["extra_info"].get("pair_id")}
+        train_ids = {r["extra_info"].get("pair_id") for r in train if r["extra_info"].get("pair_id")}
+        assert not val_ids & train_ids

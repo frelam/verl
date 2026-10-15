@@ -22,9 +22,10 @@ the ``Test*`` classes below.  Every branch gets a correct-output cell, a
 wrong-direction cell and an unparseable cell, and the two cross-cutting rules are
 pinned down explicitly:
 
-* ``-1`` applies in exactly two places -- fabricating an answer on an unsolvable
-  row and refusing on a ``judgment_only`` row; every other solvable branch scores
-  a misrefusal 0 (section 6's pseudocode, section 9's matrix, D24/D26);
+* ``-1`` applies in exactly one place -- refusing on a ``judgment_only`` row;
+  every unsolvable branch is ``{+1, 0}`` (fabrication and vague abstention are
+  plain 0) and every other solvable branch scores a misrefusal 0 (section 6's
+  pseudocode, section 9's matrix, D24/D26);
 * the bare ``\\boxed{UNSOLVABLE}`` string is branch-dependent: +1 on a three-tier
   source, 0 on a four-tier one (section 5.1's "最容易写错的一处").
 """
@@ -442,8 +443,10 @@ class TestUnsolvableThreeTier:
         # is meaningless and the verdict earns full credit.
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: A}", self.GT) == 1.0
 
-    def test_fabrication_is_penalised(self):
-        assert score(self.SOURCE, "\\boxed{540}", self.GT) == -1.0
+    def test_fabrication_scores_zero(self):
+        # The unsolvable branch never goes negative: a fabricated number is a
+        # wasted rollout, not a penalised one.
+        assert score(self.SOURCE, "\\boxed{540}", self.GT) == 0.0
 
     def test_no_boxed_scores_zero(self):
         assert score(self.SOURCE, "The problem is missing information.", self.GT) == 0.0
@@ -461,7 +464,7 @@ class TestUnsolvableThreeTier:
             "halluc_commonsense_crepe",
         ):
             assert score(source, "\\boxed{UNSOLVABLE}", self.GT) == 1.0, source
-            assert score(source, "\\boxed{42}", self.GT) == -1.0, source
+            assert score(source, "\\boxed{42}", self.GT) == 0.0, source
 
 
 # ---------------------------------------------------------------------------
@@ -499,8 +502,8 @@ class TestUnsolvableFourTier:
         pointer the row asks for is missing (doc section 5.1, "最容易写错的一处")."""
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 0.0
 
-    def test_fabrication_is_penalised(self):
-        assert score(self.SOURCE, "\\boxed{42}", self.GT) == -1.0
+    def test_fabrication_scores_zero(self):
+        assert score(self.SOURCE, "\\boxed{42}", self.GT) == 0.0
 
     def test_no_boxed_scores_zero(self):
         assert score(self.SOURCE, "选项 B 让前提为假。", self.GT) == 0.0
@@ -549,16 +552,17 @@ class TestUnsolvableFourTier:
 
 
 # ---------------------------------------------------------------------------
-# branch 7 stage 3: repair_task rows add a third AND-gate layer (D28/D29)
+# branch 7 stage 3: repair rows score the stage-2 pointer contract (2026-10-15)
 # ---------------------------------------------------------------------------
 
 
 class TestUnsolvableFourTierRepair:
-    """Stage-3 repair rows keep the four-tier verdict+pointer layers and add a
-    third: the answer after restoring the gold option's condition.  The router
-    keys on the ground truth, not the data source: ``repair_task`` rows take the
-    three-layer gate, and a pre-D29 artifact (``repaired_answer`` without
-    ``repair_task``) lands on the same gate via the legacy fallback."""
+    """Repair rows score the stage-2 pointer contract only (2026-10-15 decision):
+    the post-repair solution segment is parsed but ignored -- ``repaired_answer``
+    stays in the artifact for audit, and no matcher reads it.  The router keys on
+    the ground truth, not the data source; ``repair_task`` no longer changes the
+    behaviour, and a pre-D29 artifact (``repaired_answer`` without
+    ``repair_task``) is equally pointer-only."""
 
     SOURCE = "halluc_math_treecut"
     GT = gt_json(
@@ -571,16 +575,16 @@ class TestUnsolvableFourTierRepair:
         repaired_answer="42",
     )
 
+    def test_pointer_alone_scores_even_on_a_repair_row(self):
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", self.GT) == 1.0
+
     def test_full_three_segment_output_scores(self):
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 42}", self.GT) == 1.0
 
-    def test_wrong_repaired_answer_scores_zero(self):
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 43}", self.GT) == 0.0
-
-    def test_two_segment_output_scores_zero(self):
-        # Verdict and pointer pass, but the third layer has nothing to match:
-        # a stage-2 answer on a stage-3 row earns 0.
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", self.GT) == 0.0
+    def test_wrong_repaired_answer_is_ignored(self):
+        # The third segment carries no score weight: a wrong number after a
+        # correct pointer earns the same +1.
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 43}", self.GT) == 1.0
 
     def test_wrong_option_scores_zero_even_with_the_right_answer(self):
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: A: 42}", self.GT) == 0.0
@@ -588,23 +592,23 @@ class TestUnsolvableFourTierRepair:
     def test_bare_refusal_scores_zero(self):
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE}", self.GT) == 0.0
 
-    def test_fabrication_is_penalised(self):
-        assert score(self.SOURCE, "\\boxed{42}", self.GT) == -1.0
+    def test_fabrication_scores_zero(self):
+        assert score(self.SOURCE, "\\boxed{42}", self.GT) == 0.0
 
-    def test_repair_task_without_repaired_answer_fails_closed(self):
-        # An adapter that ships the flag without the gold must not silently
-        # demote the row to the two-layer contract.
+    def test_repair_task_without_repaired_answer_still_scores_the_pointer(self):
+        # The layer that read ``repaired_answer`` is gone, so the old fail-closed
+        # demotion no longer applies: the artifact's gold is audit-only.
         gt = gt_json(
             solvable=False,
             has_diagnosis_label=True,
             correct_option_id="B",
             repair_task=True,
         )
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 42}", gt) == 0.0
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", gt) == 1.0
 
-    def test_free_text_repair_uses_norm_match(self):
-        # FalseQA's repaired answer is free text (D27's matcher); TreeCut's is an
-        # integer (math_match).  ``repaired_free_text`` picks between them.
+    def test_free_text_repair_row_is_pointer_only_too(self):
+        # FalseQA's repaired answer used to go through norm_match; the repair
+        # layer is retired, so the free-text matcher no longer gates anything.
         gt = gt_json(
             solvable=False,
             has_diagnosis_label=True,
@@ -613,12 +617,12 @@ class TestUnsolvableFourTierRepair:
             repaired_answer="a teacher",
             repaired_free_text=True,
         )
-        assert score("halluc_commonsense_falseqa", "\\boxed{UNSOLVABLE: B: Teacher!}", gt) == 1.0
-        assert score("halluc_commonsense_falseqa", "\\boxed{UNSOLVABLE: B: a student}", gt) == 0.0
+        assert score("halluc_commonsense_falseqa", "\\boxed{UNSOLVABLE: B}", gt) == 1.0
+        assert score("halluc_commonsense_falseqa", "\\boxed{UNSOLVABLE: B: anything at all}", gt) == 1.0
 
-    def test_legacy_repaired_answer_without_repair_task_keeps_the_three_layer_gate(self):
-        """Pre-D29 artifacts carry ``repaired_answer`` but no ``repair_task``; the
-        router must not demote them to the stage-2 two-layer contract."""
+    def test_legacy_repaired_answer_without_repair_task_is_pointer_only(self):
+        """Pre-D29 artifacts carry ``repaired_answer`` but no ``repair_task``;
+        they score the same pointer-only contract as every other four-tier row."""
         gt = gt_json(
             solvable=False,
             has_diagnosis_label=True,
@@ -626,8 +630,8 @@ class TestUnsolvableFourTierRepair:
             repaired_answer="42",
         )
         assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 42}", gt) == 1.0
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", gt) == 0.0
-        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 43}", gt) == 0.0
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B}", gt) == 1.0
+        assert score(self.SOURCE, "\\boxed{UNSOLVABLE: B: 43}", gt) == 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +744,7 @@ class TestDecisionTable:
             # unsolvable three-tier
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_UNSOLVABLE_BARE, None, None, 1.0),
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_UNSOLVABLE_OPTION, None, "A", 1.0),
-            ({"solvable": False, "has_diagnosis_label": False}, STATUS_ANSWER, "5", None, -1.0),
+            ({"solvable": False, "has_diagnosis_label": False}, STATUS_ANSWER, "5", None, 0.0),
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_NONE, None, None, 0.0),
             ({"solvable": False, "has_diagnosis_label": False}, STATUS_SOLVABLE_MARKER, None, None, 0.0),
             # unsolvable four-tier (stage 2, D29: the pointer alone earns +1 --
@@ -749,15 +753,16 @@ class TestDecisionTable:
             (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, "ignored text", "B", 1.0),
             (FOUR_TIER_GT, STATUS_UNSOLVABLE_OPTION, None, "A", 0.0),
             (FOUR_TIER_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
-            (FOUR_TIER_GT, STATUS_ANSWER, "1", None, -1.0),
+            (FOUR_TIER_GT, STATUS_ANSWER, "1", None, 0.0),
             (FOUR_TIER_GT, STATUS_NONE, None, None, 0.0),
-            # unsolvable four-tier repair (stage 3, D28/D29: three-layer AND-gate)
+            # unsolvable four-tier repair (stage 3 rows score the stage-2
+            # pointer contract; the third segment is parsed but ignored)
             (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "42", "B", 1.0),
-            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "43", "B", 0.0),
-            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, None, "B", 0.0),
+            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "43", "B", 1.0),
+            (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, None, "B", 1.0),
             (REPAIR_GT, STATUS_UNSOLVABLE_OPTION, "42", "A", 0.0),
             (REPAIR_GT, STATUS_UNSOLVABLE_BARE, None, None, 0.0),
-            (REPAIR_GT, STATUS_ANSWER, "42", None, -1.0),
+            (REPAIR_GT, STATUS_ANSWER, "42", None, 0.0),
         ],
     )
     def test_cell(self, ground_truth, status, answer, option, expected):
@@ -929,9 +934,9 @@ class TestRepetitionPenalty:
         )
         assert res["score"] == pytest.approx(0.5)
 
-    def test_death_loop_hits_floor_even_on_fabrication(self):
-        # Fabricating on an unsolvable row is already -1; the penalty keeps a
-        # heavily looped *correct* refusal from scoring above a clean one.
+    def test_death_loop_hits_floor_even_when_correct(self):
+        # A heavily looped *correct* refusal must not score above a clean one:
+        # the n-gram penalty alone drags the score to the -1 floor.
         res = compute_score(
             "halluc_math_gsmic",
             think_wrap("\\boxed{540}", think=f" {_loop(65)} "),

@@ -1217,6 +1217,151 @@ def test_verify_sentence_oracles_catch_a_reordered_roster(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# the kkcut channel (stage 3 / D30: synthesised unsolvable rows)
+# ---------------------------------------------------------------------------
+
+
+def _kkcut_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if row["extra_info"]["task_id"].startswith(adapter.KKCUT_PREFIX + ":")]
+
+
+def test_emit_unsolvable_ships_a_bare_refusal_next_to_the_parent(tmp_path):
+    """The synthesised row is a three-tier bare refusal; the parent is untouched."""
+    rows, report = _build(tmp_path, emit_unsolvable=True, seed=0)
+    cuts = _kkcut_rows(rows)
+    assert len(cuts) == 1
+    assert report["kkcut"]["emitted"] == 1
+    assert report["kkcut"]["groups_attempted"] == 1
+    parent = _by_task_id(rows)[adapter.task_id_of("perturbed_statement", 4, 100)]
+
+    cut = cuts[0]
+    info = cut["extra_info"]
+    payload = _payload(cut)
+    assert info["task_id"] == "kkcut:perturbed_statement:4ppl:100"
+    assert info["branch"] == schema.BRANCH_UNSOLVABLE_BARE
+    assert info["template"] == schema.TEMPLATE_B
+    assert info["solvable"] is False
+    assert info["role_words"] == []  # no answer-with-roles hint on a bare refusal
+    assert info["difficulty"] == "4ppl"
+    assert info["perturbation_type"] == adapter.KKCUT_PERTURBATION
+    assert 0 <= info["kkcut_deleted_index"] < 4
+    assert payload["solvable"] is False
+    assert payload["answer"] is None
+    assert payload["perturbation_type"] == adapter.KKCUT_PERTURBATION
+
+    # The parent keeps its solvable contract, and the cut is the parent's quiz
+    # minus exactly one statement sentence, roster intact.
+    assert parent["extra_info"]["branch"] == schema.BRANCH_SOLVABLE_ROLES
+    assert len(rows) == 2
+    cut_head = cut["prompt"][0]["content"].partition("\n\n")[0]
+    parent_head = parent["prompt"][0]["content"].partition("\n\n")[0]
+    assert len(verify_kk.split_sentences(cut_head)) == len(verify_kk.split_sentences(parent_head)) - 1
+    assert verify_kk.names_in_question(cut_head) == verify_kk.names_in_question(parent_head)
+    speaker = PERTURBED_STATEMENT["names"][info["kkcut_deleted_index"]]
+    # The speaker keeps their roster entry and may be named inside other
+    # statements -- what disappears is their own statement *sentence*.
+    deleted_sentence = next(
+        sentence
+        for sentence in verify_kk.split_sentences(parent_head)
+        if sentence.startswith(speaker + " ")
+    )
+    assert deleted_sentence not in cut_head
+    assert verify_kk.normalise(info["paired_original_text"]) == verify_kk.normalise(PERTURBED_STATEMENT["quiz"])
+
+
+def test_emit_unsolvable_without_the_flag_is_the_plain_build(tmp_path):
+    rows, report = _build(tmp_path)
+    assert _kkcut_rows(rows) == []
+    assert report["kkcut"] == {
+        "emitted": 0,
+        "groups_attempted": 0,
+        "skipped": {},
+        "per_tier": {},
+        "per_family": {},
+    }
+
+
+def test_emit_unsolvable_is_deterministic_in_the_seed(tmp_path):
+    """The same seed reproduces the same cut; the deletion order is seeded."""
+    first = adapter._kkcut_deletion_order("perturbed_statement", 4, 100, 43)
+    assert first == adapter._kkcut_deletion_order("perturbed_statement", 4, 100, 43)
+    rows_a, _ = _build(tmp_path, emit_unsolvable=True, seed=43)
+    rows_b, _ = _build(tmp_path / "b", emit_unsolvable=True, seed=43)
+    assert [row["extra_info"]["task_id"] for row in rows_a] == [row["extra_info"]["task_id"] for row in rows_b]
+    assert [row["extra_info"]["kkcut_deleted_index"] for row in _kkcut_rows(rows_a)] == [
+        row["extra_info"]["kkcut_deleted_index"] for row in _kkcut_rows(rows_b)
+    ]
+
+
+def test_kkcut_rows_pass_the_dedicated_audit_channel(tmp_path):
+    """check_kkcut re-derives parent uniqueness, certificate and surgery -- and passes."""
+    rows, _ = _build(tmp_path, emit_unsolvable=True, seed=0)
+    raw_dir = _write_raw(tmp_path / "raw", GROUP_FILES)
+    index = verify_kk.load_raw_index(raw_dir)
+
+    kkcut = _kkcut_rows(rows)
+    kk_rows = [row for row in rows if row not in kkcut]
+    reporter = verify_kk.Reporter()
+    verify_kk.check_kkcut(kkcut, index, raw_dir, reporter)
+    assert reporter.failed == []
+    # The routing the audit's main() does: the solvable channel runs on the
+    # kk: rows alone -- a mixed artifact must not trip the L2 group rule.
+    verify_kk.check_contract(kk_rows, reporter)
+    verify_kk.check_prompt_contract(kk_rows, reporter)
+    assert reporter.failed == []
+    assert verify_kk.parse_kkcut_task_id("kkcut:perturbed_statement:4ppl:100") == ("perturbed_statement", 4, 100)
+    assert verify_kk.parse_kkcut_task_id(adapter.task_id_of("perturbed_statement", 4, 100)) is None
+
+
+def test_kkcut_audit_catches_a_relabelled_deletion(tmp_path):
+    """A cut row claiming another speaker's deletion fails the anchor."""
+    rows, _ = _build(tmp_path, emit_unsolvable=True, seed=0)
+    raw_dir = _write_raw(tmp_path / "raw", GROUP_FILES)
+    index = verify_kk.load_raw_index(raw_dir)
+    cut = _kkcut_rows(rows)[0]
+    cut["extra_info"]["kkcut_deleted_index"] = (cut["extra_info"]["kkcut_deleted_index"] + 1) % 4
+    reporter = verify_kk.Reporter()
+    verify_kk.check_kkcut(_kkcut_rows(rows), index, raw_dir, reporter)
+    assert reporter.failed == ["kkcut source anchor (parent unique, certificate re-derived, exactly one sentence cut)"]
+
+
+def test_kkcut_audit_catches_a_forged_solution_count(tmp_path):
+    """The stored solution count may never overclaim what the enumeration finds."""
+    rows, _ = _build(tmp_path, emit_unsolvable=True, seed=0)
+    raw_dir = _write_raw(tmp_path / "raw", GROUP_FILES)
+    index = verify_kk.load_raw_index(raw_dir)
+    cut = _kkcut_rows(rows)[0]
+    cut["extra_info"]["kkcut_solutions_after"] = 99
+    reporter = verify_kk.Reporter()
+    verify_kk.check_kkcut(_kkcut_rows(rows), index, raw_dir, reporter)
+    assert reporter.failed == ["kkcut source anchor (parent unique, certificate re-derived, exactly one sentence cut)"]
+
+
+def test_kkcut_audit_catches_a_broken_prompt(tmp_path):
+    """The bare refusal must render without the role-word instruction."""
+    rows, _ = _build(tmp_path, emit_unsolvable=True, seed=0)
+    raw_dir = _write_raw(tmp_path / "raw", GROUP_FILES)
+    index = verify_kk.load_raw_index(raw_dir)
+    cut = _kkcut_rows(rows)[0]
+    head, _, tail = cut["prompt"][0]["content"].partition("\n\n")
+    cut["prompt"][0]["content"] = head + "\n\n" + tail + " Answer with knight and knave."
+    reporter = verify_kk.Reporter()
+    verify_kk.check_kkcut(_kkcut_rows(rows), index, raw_dir, reporter)
+    assert reporter.failed == ["kkcut prompt contract (full prompt == schema.render_prompt(question, B), no role words)"]
+
+
+def test_kkcut_row_scores_through_the_reward(tmp_path):
+    """Bare-refusal reward: a recognised UNSOLVABLE earns +1, fabrication scores 0."""
+    rows, _ = _build(tmp_path, emit_unsolvable=True, seed=0)
+    cut = _kkcut_rows(rows)[0]
+    assert _reward(cut, "\\boxed{UNSOLVABLE}") == 1.0
+    # Fabricating an answer on an unsolvable row is a plain 0 (the D-rule: only
+    # the refusal is rewarded, nothing is punished below 0).
+    assert _reward(cut, _response(_answer_of(_plain_perturbed_row(rows)).items())) == 0.0
+    assert _reward(cut, "I cannot tell.") == 0.0
+
+
+# ---------------------------------------------------------------------------
 # the real corpus (built once for the module)
 # ---------------------------------------------------------------------------
 

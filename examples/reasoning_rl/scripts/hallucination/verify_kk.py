@@ -96,6 +96,19 @@ person**:
 
 The measured numbers are printed pass or fail, so the report carries the actual
 rate rather than a verdict.
+
+**kkcut -- synthesised unsolvable rows (D30).**  ``--emit-unsolvable`` appends
+``kkcut:``-prefixed rows: a certified-unique parent puzzle minus one speaker's
+statement, shipped as a three-tier bare refusal.  They are routed out of every
+solvable check above (an unsolvable row has no gold mapping, and its ``< 1``
+variant-per-group rule does not apply -- a cut row and its parent *are* allowed
+to share a group) and audited by their own channel, which re-derives the parent's
+uniqueness and the ``>= 2``-solutions-after-the-cut certificate with **its own**
+enumerator, checks the text surgery against the raw quiz -- exactly one sentence
+fewer, a single divergence with an aligned tail, the roster untouched, the deleted
+line inside the statement block and naming the deleted speaker -- and demands the
+bare-refusal contract: template B with no role-word instruction, no options
+block, no answer, ``missing_condition`` on both sides of the row.
 """
 
 from __future__ import annotations
@@ -106,6 +119,7 @@ import collections
 import json
 import os
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -183,6 +197,36 @@ def payload_of(row: dict) -> dict:
 
 def normalise(text: str) -> str:
     return " ".join((text or "").split())
+
+
+def parse_kkcut_task_id(task_id: str) -> tuple[str, int, int] | None:
+    """``kkcut:{family}:{N}ppl:{index}`` -> ``(family, N, index)``, or ``None``.
+
+    The body grammar is the solvable ``kk:`` id's -- the cut row and its parent
+    share ``(family, tier, index)`` and differ only in the prefix -- so the same
+    vocabulary check applies; only the prefix routes the two contracts apart.
+    """
+    parts = task_id.split(":")
+    if len(parts) != 4 or parts[0] != kk_adapter.KKCUT_PREFIX:
+        return None
+    family, tier, raw_index = parts[1], parts[2], parts[3]
+    if family not in kk_adapter.FAMILIES or not tier.endswith("ppl"):
+        return None
+    try:
+        return family, int(tier[:-3]), int(raw_index)
+    except ValueError:
+        return None
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split a quiz into sentences on ``.``/``?`` followed by whitespace.
+
+    The verifier's own surgery oracle: whatever the adapter's private sentence
+    cutter does, this regex is what the audit holds the cut text against, so a
+    cut that removes a partial sentence or merges two shows up as a count or
+    alignment failure rather than passing by construction.
+    """
+    return [sentence for sentence in re.split(r"(?<=[.?])\s+", text.strip()) if sentence]
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +323,28 @@ def solutions_own(statements: tuple, count: int) -> list[tuple[bool, ...]]:
         truth = tuple(bool(mask >> i & 1) for i in range(count))
         if all(evaluate_own(stmt, truth) == truth[i] for i, stmt in enumerate(statements)):
             found.append(truth)
+    return found
+
+
+def solutions_without_own(statements: tuple, count: int, dropped: int) -> int:
+    """How many assignments satisfy the subsystem without speaker ``dropped``.
+
+    The kkcut certificate (D30), re-derived here: person ``dropped`` makes no
+    assertion, so their constraint vanishes while every other speaker's keeps
+    its original index -- the pairs are carried as ``(i, stmt)`` rather than a
+    truncated tuple, which would misalign the remaining indices.  The caller
+    only ever calls this on puzzles :func:`solutions_own` proved to exactly one
+    solution, so the result is >= 1 by construction and ``>= 2`` is precisely
+    the claim "the deleted statement was necessary; the cut puzzle is
+    underdetermined".  Full enumeration, no early stop -- the audit counts, it
+    does not merely threshold.
+    """
+    keep = [(i, stmt) for i, stmt in enumerate(statements) if i != dropped]
+    found = 0
+    for mask in range(1 << count):
+        truth = tuple(bool(mask >> i & 1) for i in range(count))
+        if all(evaluate_own(stmt, truth) == truth[i] for i, stmt in keep):
+            found += 1
     return found
 
 
@@ -968,6 +1034,243 @@ def check_l3(rows: list[dict], index: dict, reporter: Reporter) -> None:
 
 
 # ---------------------------------------------------------------------------
+# the kkcut channel (D30: synthesised unsolvable rows)
+# ---------------------------------------------------------------------------
+
+
+def check_kkcut(rows: list[dict], index: dict, raw_dir: str, reporter: Reporter) -> None:
+    """Audit the ``kkcut:`` bare-refusal rows: contract, certificate, surgery.
+
+    Three independent halves, all re-derived here rather than trusted from the
+    adapter:
+
+    * the **contract** -- a three-tier bare refusal (template B, no role-word
+      instruction, no options block, no answer, no diagnosis label),
+      ``missing_condition`` on both sides of the row, tier and family matching
+      the task_id, and the three audit fields present and well typed;
+    * the **certificate** -- the parent puzzle is re-enumerated to exactly one
+      solution and the cut subsystem to ``>= 2`` with the verifier's own
+      enumerator; the stored deleted statement must be the parent's own formula
+      for that speaker, and the stored solution count must not overclaim;
+    * the **surgery** -- against the raw quiz: exactly one sentence fewer, one
+      divergence with an aligned tail, the roster preserved verbatim, the cut
+      inside the statement block (after the roster sentence, before the closing
+      question) and the deleted sentence naming the deleted speaker.
+
+    Unlike the solvable checks, the L2 "at most one variant per group" rule is
+    *not* applied across channels: a cut row and its parent sharing
+    ``(count, index)`` is the design.  Within the cut rows themselves, one cut
+    per parent group still holds.
+    """
+    if not rows:
+        reporter.note("kkcut channel: no kkcut rows in this artifact -- the D30 channel did not run")
+        return
+
+    # 1. schema + contract invariants.
+    violations: list[str] = []
+    for row in rows:
+        violations.extend(schema.validate_row(row))
+    reporter.check(
+        "kkcut schema.validate_row on every row",
+        not violations,
+        f"{len(rows)} rows, {len(violations)} violations"
+        + (f"; first: {violations[:3]}" if violations else ""),
+    )
+
+    failures: list[str] = []
+    for row in rows:
+        info = row["extra_info"]
+        task_id = info["task_id"]
+        parsed = parse_kkcut_task_id(task_id)
+        if parsed is None:
+            failures.append(f"{task_id}: task_id is not kkcut:{{family}}:{{N}}ppl:{{index}}")
+            continue
+        family, count, raw_index = parsed
+        payload = payload_of(row)
+        if info.get("branch") != schema.BRANCH_UNSOLVABLE_BARE:
+            failures.append(f"{task_id}: branch {info.get('branch')!r} (a cut row is a bare refusal)")
+        if info.get("template") != schema.TEMPLATE_B:
+            failures.append(f"{task_id}: template {info.get('template')!r}")
+        if info.get("solvable") is not False or payload.get("solvable") is not False:
+            failures.append(f"{task_id}: not marked unsolvable on both sides")
+        if info.get("options"):
+            failures.append(f"{task_id}: carries an options block")
+        if info.get("has_diagnosis_label") or payload.get("has_diagnosis_label"):
+            failures.append(f"{task_id}: carries a diagnosis label")
+        if payload.get("correct_option_id") is not None:
+            failures.append(f"{task_id}: carries correct_option_id")
+        if payload.get("answer") is not None:
+            failures.append(f"{task_id}: an unsolvable row has no answer to point at")
+        if payload.get("judgment_only"):
+            failures.append(f"{task_id}: judgment_only on a bare-refusal row")
+        for side, value in (("extra_info", info.get("perturbation_type")), ("ground_truth", payload.get("perturbation_type"))):
+            if value != kk_adapter.KKCUT_PERTURBATION:
+                failures.append(f"{task_id}: {side}.perturbation_type {value!r} != {kk_adapter.KKCUT_PERTURBATION!r}")
+        if info.get("perturbation_family") != family:
+            failures.append(f"{task_id}: perturbation_family {info.get('perturbation_family')!r} != task_id")
+        if family == kk_adapter.FAMILY_CLEAN:
+            failures.append(f"{task_id}: a clean parent is in the pool (D20, and D30 cuts perturbed parents only)")
+        if info.get("difficulty") != f"{count}ppl":
+            failures.append(f"{task_id}: difficulty {info.get('difficulty')!r} != {count}ppl")
+        if count < kk_adapter.MIN_INHABITANTS:
+            failures.append(f"{task_id}: {count} inhabitants < the N >= {kk_adapter.MIN_INHABITANTS} floor")
+        if info.get("role_words"):
+            failures.append(f"{task_id}: role_words {info.get('role_words')!r} on a bare refusal "
+                            "(the answer-with-roles hint fights the UNSOLVABLE contract)")
+        deleted = info.get("kkcut_deleted_index")
+        if isinstance(deleted, bool) or not isinstance(deleted, int):
+            failures.append(f"{task_id}: kkcut_deleted_index {deleted!r} is not an int")
+        elif not 0 <= deleted < count:
+            failures.append(f"{task_id}: kkcut_deleted_index {deleted} outside 0..{count - 1}")
+        statement_text = info.get("kkcut_deleted_statement")
+        if not isinstance(statement_text, str) or not statement_text:
+            failures.append(f"{task_id}: kkcut_deleted_statement {statement_text!r} is not a formula repr")
+        after = info.get("kkcut_solutions_after")
+        if isinstance(after, bool) or not isinstance(after, int) or after < 2:
+            failures.append(f"{task_id}: kkcut_solutions_after {after!r} is not an int >= 2")
+    reporter.check(
+        "kkcut contract invariants (bare refusal, missing_condition, certificate fields)",
+        not failures,
+        f"{len(rows)} rows, {len(failures)} violations" + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+    # 2. prompt contract: the bare render, without the role-word instruction.
+    failures = []
+    for row in rows:
+        task_id = row["extra_info"]["task_id"]
+        try:
+            question = question_of(row)
+        except ValueError as exc:
+            failures.append(str(exc))
+            continue
+        try:
+            expected = schema.render_prompt(question, schema.TEMPLATE_B)
+        except Exception as exc:  # noqa: BLE001 - report any render failure as a failure
+            failures.append(f"{task_id}: schema.render_prompt raised {exc!r}")
+            continue
+        if row["prompt"][0]["content"] != expected:
+            failures.append(f"{task_id}: prompt is not schema.render_prompt(question, B) without role words")
+    reporter.check(
+        "kkcut prompt contract (full prompt == schema.render_prompt(question, B), no role words)",
+        not failures,
+        f"{len(rows)} rows, {len(failures)} violations" + (f"; first: {failures[:3]}" if failures else ""),
+    )
+
+    # 3. at most one cut per parent group (across channels the parent itself may
+    #    share the key -- that is the design, not a leak).
+    groups: dict[tuple[int, int], list[str]] = collections.defaultdict(list)
+    for row in rows:
+        parsed = parse_kkcut_task_id(row["extra_info"]["task_id"])
+        if parsed is not None:
+            groups[(parsed[1], parsed[2])].append(row["extra_info"]["task_id"])
+    duplicated = {key: ids for key, ids in groups.items() if len(ids) > 1}
+    reporter.check(
+        "kkcut uniqueness (<= 1 cut row per parent group)",
+        not duplicated,
+        f"{len(rows)} rows over {len(groups)} parent groups, {len(duplicated)} groups with more than one cut"
+        + (f"; first: {sorted(duplicated.items())[:3]}" if duplicated else ""),
+    )
+
+    # 4. source anchor: parent uniqueness, re-derived certificate, text surgery.
+    if not index:
+        reporter.check(
+            "kkcut source anchor (parent unique, certificate re-derived, exactly one sentence cut)",
+            False,
+            f"cannot read any parquet under {raw_dir} -- the cut cannot be proved without the source",
+        )
+        return
+
+    failures = []
+    anchored = 0
+    for row in rows:
+        info = row["extra_info"]
+        task_id = info["task_id"]
+        parsed = parse_kkcut_task_id(task_id)
+        if parsed is None:
+            failures.append(f"{task_id}: unparseable task_id")
+            continue
+        family, count, raw_index = parsed
+        source = index.get((family, count, raw_index))
+        if source is None:
+            failures.append(f"{task_id}: ({family}, {count}, {raw_index}) is not a source row")
+            continue
+        try:
+            statements = parse_own_statements(source["statements"], count)
+        except BadStatement as exc:
+            failures.append(f"{task_id}: parent statements are not a legal formula: {exc}")
+            continue
+        if len(solutions_own(statements, count)) != 1:
+            failures.append(f"{task_id}: the parent puzzle is not uniquely determined")
+            continue
+        deleted = info["kkcut_deleted_index"]
+        # The audit fields must describe *this* parent: the stored formula is the
+        # parent's own statement for that speaker, and the stored solution count
+        # never overclaims what the re-enumeration finds.
+        try:
+            deleted_stmt = ast.literal_eval(info["kkcut_deleted_statement"])
+        except (ValueError, SyntaxError) as exc:
+            failures.append(f"{task_id}: kkcut_deleted_statement is not a Python literal: {exc}")
+            continue
+        if deleted_stmt != statements[deleted]:
+            failures.append(f"{task_id}: kkcut_deleted_statement is not speaker {deleted}'s formula")
+            continue
+        after = solutions_without_own(statements, count, deleted)
+        if after < 2:
+            failures.append(f"{task_id}: the cut subsystem has {after} solutions, the certificate needs >= 2")
+            continue
+        if info["kkcut_solutions_after"] > after:
+            failures.append(f"{task_id}: kkcut_solutions_after {info['kkcut_solutions_after']} overclaims {after}")
+            continue
+        # Surgery, against the source's own quiz.  Roster first: the cut speaker
+        # keeps their roster entry, so the presented question must still name
+        # exactly the parent's inhabitants.
+        try:
+            question = question_of(row)
+            roster = names_in_question(question)
+        except ValueError as exc:
+            failures.append(f"{task_id}: {exc}")
+            continue
+        if roster != list(source["names"]):
+            failures.append(f"{task_id}: the presented roster {roster} is not the parent's {list(source['names'])}")
+            continue
+        presented_sentences = split_sentences(question)
+        parent_sentences = split_sentences(normalise(source["quiz"]))
+        if len(parent_sentences) - len(presented_sentences) != 1:
+            failures.append(
+                f"{task_id}: {len(parent_sentences)} parent sentences vs {len(presented_sentences)} presented "
+                "(the cut must remove exactly one sentence)"
+            )
+            continue
+        cut_at = 0
+        while cut_at < len(presented_sentences) and presented_sentences[cut_at] == parent_sentences[cut_at]:
+            cut_at += 1
+        if presented_sentences[cut_at:] != parent_sentences[cut_at + 1:]:
+            failures.append(f"{task_id}: the cut is not a single aligned deletion (diverges at sentence {cut_at})")
+            continue
+        # The deleted sentence must be a statement, not the roster line or the
+        # closing question: after the first roster sentence, before the last.
+        roster_positions = [position for position, sentence in enumerate(parent_sentences) if "inhabitants:" in sentence]
+        if not roster_positions or cut_at <= roster_positions[0] or cut_at >= len(parent_sentences) - 1:
+            failures.append(
+                f"{task_id}: the deleted sentence (position {cut_at}) is not inside the statement block"
+            )
+            continue
+        speaker = source["names"][deleted]
+        if speaker not in parent_sentences[cut_at]:
+            failures.append(f"{task_id}: the deleted sentence does not mention the deleted speaker {speaker!r}")
+            continue
+        if normalise(info.get("paired_original_text", "")) != normalise(source["quiz"]):
+            failures.append(f"{task_id}: paired_original_text is not the parent's own quiz")
+            continue
+        anchored += 1
+    detail = (
+        f"{anchored}/{len(rows)} rows anchored, {len(failures)} failures"
+        + (f"; first: {failures[:3]}" if failures else "")
+    )
+    reporter.check("kkcut source anchor (parent unique, certificate re-derived, exactly one sentence cut)", not failures, detail)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1003,25 +1306,35 @@ def main(argv: list[str] | None = None) -> None:
     if not rows:
         print(f"[FAIL] {args.rows} holds no rows")
         raise SystemExit(1)
-    print(f"rows    : {args.rows} ({len(rows)} rows)")
+    # Route the two contracts apart from the artifact alone: a ``kkcut:`` id is
+    # a D30 bare-refusal row, anything else must parse as a solvable ``kk:`` id
+    # (and an id that parses as neither fails loudly in check_contract).
+    kkcut_rows = [row for row in rows if parse_kkcut_task_id(row["extra_info"]["task_id"]) is not None]
+    kk_rows = [row for row in rows if parse_kkcut_task_id(row["extra_info"]["task_id"]) is None]
+    print(f"rows    : {args.rows} ({len(rows)} rows: {len(kk_rows)} solvable kk, {len(kkcut_rows)} kkcut D30)")
     print(f"families: {dict(collections.Counter(r['extra_info']['perturbation_family'] for r in rows))}")
     print(f"tiers   : {dict(collections.Counter(r['extra_info']['difficulty'] for r in rows))}")
 
     index = load_raw_index(args.raw_dir)
 
     reporter = Reporter()
-    check_contract(rows, reporter)
-    check_prompt_contract(rows, reporter)
-    check_source_anchor(rows, index, args.raw_dir, reporter)
-    check_sentence_oracles(rows, index, reporter)
+    if not kk_rows:
+        reporter.note("solvable channel: no kk: rows in this artifact -- the solvable checks did not run")
+    else:
+        check_contract(kk_rows, reporter)
+        check_prompt_contract(kk_rows, reporter)
+        check_source_anchor(kk_rows, index, args.raw_dir, reporter)
+        check_sentence_oracles(kk_rows, index, reporter)
 
-    sampled = sample_rows(rows, size=args.sample, seed=args.seed)
-    reporter.note(f"L1/L2 sample: {len(sampled)} rows of {len(rows)}")
-    if len(sampled) < L1_MIN_SAMPLE:
-        reporter.check("L1/L2 sample size", False, f"only {len(sampled)} rows to audit, need {L1_MIN_SAMPLE}")
-    check_l1(sampled, index, reporter)
-    check_l2(rows, sampled, index, reporter)
-    check_l3(rows, index, reporter)
+        sampled = sample_rows(kk_rows, size=args.sample, seed=args.seed)
+        reporter.note(f"L1/L2 sample: {len(sampled)} rows of {len(kk_rows)}")
+        if len(sampled) < L1_MIN_SAMPLE:
+            reporter.check("L1/L2 sample size", False, f"only {len(sampled)} rows to audit, need {L1_MIN_SAMPLE}")
+        check_l1(sampled, index, reporter)
+        check_l2(kk_rows, sampled, index, reporter)
+        check_l3(kk_rows, index, reporter)
+
+    check_kkcut(kkcut_rows, index, args.raw_dir, reporter)
 
     print()
     if reporter.failed:

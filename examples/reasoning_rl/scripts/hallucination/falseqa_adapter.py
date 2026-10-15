@@ -80,16 +80,18 @@ pair's two questions -- and the option block is a set of **replacement pairs**::
   ever padded and no option text ever comes from another *question's* passage
   position: distractors are whole word windows of the corpus, which is what the
   section 4.3 argument requires.
-* **Stage-3 repair layer (D28/D29, ``--repair-contract``).**  Applying the gold
-  pair to the fake question reproduces the real question verbatim, so the paired
-  real row's own ``answer`` is by construction the correct solution after the
-  repair.  In repair mode the diagnosis row ships it as ``repaired_answer``
-  (with ``repaired_free_text``, since 67.8% of the answers are free text) on
-  template A_repair, and the reward's repair branch AND-gates on it: refusal +
-  correct pointer + correct post-repair solution, all three or nothing.  A pair
-  whose real answer is empty then loses the diagnosis row as well (counted once
-  in ``answer_empty``; never observed).  The default stage-2 build keeps the
-  two-layer pointer contract on template A and never gates on the real answer.
+* **Stage-3 repair layer (D28/D29, ``--repair-contract``; retired from scoring
+  by D30).**  Applying the gold pair to the fake question reproduces the real
+  question verbatim, so the paired real row's own ``answer`` is by construction
+  the correct solution after the repair.  In repair mode the diagnosis row
+  ships it as ``repaired_answer`` (with ``repaired_free_text``, since 67.8% of
+  the answers are free text) on template A_repair.  D30 retired the repair
+  layer from scoring: the reward ignores both repair fields and every
+  four-tier row scores on the stage-2 pointer contract alone, so the fields
+  survive for audit only.  A pair whose real answer is empty then loses the
+  diagnosis row as well (counted once in ``answer_empty``; never observed).
+  The default stage-2 build keeps the two-layer pointer contract on template A
+  and never gates on the real answer.
 
 The answerable side: a two-layer reward with an isomorphic placeholder block (D27)
 ----------------------------------------------------------------------------------

@@ -35,7 +35,7 @@ solvable, judgement + answer (D24/D27)        ``\\boxed{<answer>}``  (both layer
 solvable, "is this answerable?" (CREPE)       ``\\boxed{SOLVABLE}``
 paired judge-then-solve (SUM, D23)            ``\\boxed{<A|B>: <answer>}``
 unsolvable, with diagnosis label (stage 2)    ``\\boxed{UNSOLVABLE: <option id>}``
-unsolvable, repair task (stage 3, D28/D29)    ``\\boxed{UNSOLVABLE: <option id>: <repaired answer>}``
+unsolvable, repair task (stage 3, A_repair)   ``\\boxed{UNSOLVABLE: <option id>: <repaired answer>}``  (third segment parsed, **not scored**)
 unsolvable, without diagnosis label           ``\\boxed{UNSOLVABLE}``
 ===========================================  =====================================
 
@@ -48,18 +48,19 @@ The main reward is ``{+1, 0, -1}``.  The two-layer tasks (``pair_task`` /
 ``two_layer`` / ``solvable_answer``) are AND-gated: the solvability judgement
 earns nothing on its own, only a correct judgement *and* a correct answer score
 ``+1`` -- a ``+0.5`` judgement-only credit would reward guessing "solvable".
-Stage 2's four-tier unsolvable branch is two-layer (D29): the refusal plus the
-correct option pointer earns ``+1``.  The D28 three-layer AND-gate lives in
-stage 3 on ``repair_task`` rows: the refusal and the pointer alone earn nothing
--- the model must also produce the correct solution after restoring the gold
-option's condition.  (A pre-D29 artifact carries ``repaired_answer`` without
-``repair_task`` and keeps its D28 three-layer scoring.)
-``-1`` is symmetric by construction and applies in
-exactly two places: fabricating an answer on an unsolvable row, and refusing on a
+Every four-tier unsolvable branch is the stage-2 two-layer contract (D29): the
+refusal plus the correct option pointer earns ``+1``.  The D28 repair layer is
+retired from scoring (2026-10-15 decision): a ``repair_task`` row -- and a
+pre-D29 artifact carrying ``repaired_answer`` without ``repair_task`` -- scores
+the pointer alone; the post-repair solution segment is parsed out and ignored,
+and ``repaired_answer`` / ``repaired_free_text`` stay in the artifact for audit.
+``-1`` applies in
+exactly one place: refusing on a
 ``judgment_only`` row (CREPE-normal).  Every *other* solvable branch scores a
 misrefusal 0 rather than -1 -- that is what section 6's pseudocode specifies and
 what section 9's matrix pins down for the numeric, K&K, two-layer and TreeCut
-branches ("误拒 → 0（与普通可解行一致）", D24/D26).
+branches ("误拒 → 0（与普通可解行一致）", D24/D26); fabrication on an unsolvable
+row is likewise 0 (2026-10-15 decision -- the branch never goes negative).
 
 Routing
 -------
@@ -486,10 +487,15 @@ def score_from_status(ground_truth: dict, status: str, answer: str | None, optio
     Split out from ``compute_score`` so the whole branch matrix can be exercised
     without building a full ``solution_str``.
 
-    ``-1`` appears exactly twice: fabricating an answer on an unsolvable row, and
-    refusing on a ``judgment_only`` row.  Every other solvable branch is
-    ``{+1, 0}``, with the two-layer branches AND-gated (judgement alone scores
-    0), which is what D24/D26 restate as "误拒 → 0（与普通可解行一致）".
+    ``-1`` appears exactly once: refusing on a ``judgment_only`` row.  Every
+    unsolvable branch is ``{+1, 0}`` -- only a recognised UNSOLVABLE refusal can
+    score, and fabrication / vague abstention are plain 0 -- while the two-layer
+    solvable branches are AND-gated (judgement alone scores 0), which is what
+    D24/D26 restate as "误拒 → 0（与普通可解行一致）".  The four-tier contract is
+    pointer-only on every template: a repair-template row scores the stage-2
+    two-layer reward -- the post-repair solution segment is not scored
+    (2026-10-15 decision: the free-text/numeric repair matchers were the dominant
+    false-negative source; ``repaired_answer`` stays in the artifact for audit).
     """
     if "solvable" not in ground_truth:
         logger.warning("[halluc] ground_truth has no 'solvable' key; scoring 0")
@@ -537,11 +543,9 @@ def score_from_status(ground_truth: dict, status: str, answer: str | None, optio
             return 1.0 if kk_match(answer, role_words, ground_truth.get("answer")) else 0.0
         return 1.0 if math_match(answer, ground_truth.get("answer")) else 0.0
 
-    # Unsolvable: the model must refuse.  Fabricating an answer costs more than
-    # refusing imprecisely, because a fabricated answer is exactly the failure
-    # mode this domain exists to remove.
-    if status == STATUS_ANSWER:
-        return -1.0
+    # Unsolvable: only a recognised UNSOLVABLE refusal can score.  Fabricating an
+    # answer, a vague abstention and every other shape are plain 0 -- the score
+    # never goes negative on this branch.
     if status not in _ABSTAIN_STATUSES:
         return 0.0
     if not ground_truth.get("has_diagnosis_label"):
@@ -557,23 +561,12 @@ def score_from_status(ground_truth: dict, status: str, answer: str | None, optio
         return 0.0
     if status != STATUS_UNSOLVABLE_OPTION or option != str(correct).upper():
         return 0.0
-    repaired = ground_truth.get("repaired_answer")
-    if not ground_truth.get("repair_task") and repaired is None:
-        # Stage 2 (D29): the two-layer contract -- the pointer alone earns +1.
-        return 1.0
-    if repaired is None:
-        # A repair_task row without its gold is an adapter bug; fail closed.
-        logger.warning("[halluc] repair_task row without repaired_answer; scoring 0")
-        return 0.0
-    # Stage 3 (D28/D29) three-layer AND-gate: the refusal and the pointer have
-    # passed; the model must also have solved the question after restoring the
-    # gold option's condition.  FalseQA's repaired answer is free text
-    # (norm_match, the D27 matcher); TreeCut's is an integer (math_match, the
-    # same matcher as its solvable positive).  A pre-D29 artifact carries
-    # ``repaired_answer`` without ``repair_task`` and lands here too, keeping
-    # its D28 three-layer scoring.
-    matcher = norm_match if ground_truth.get("repaired_free_text") else math_match
-    return 1.0 if matcher(answer, repaired) else 0.0
+    # The pointer alone earns +1, on the stage-2 two-layer contract and on the
+    # stage-3 repair template alike: the post-repair solution segment is no
+    # longer scored (2026-10-15 decision).  ``repaired_answer`` /
+    # ``repaired_free_text`` stay in the artifact for audit only, and the
+    # stage-2 template-A rows reach the same return below.
+    return 1.0
 
 
 def score_halluc_row(data_source: str, solution_str: str, ground_truth, extra_info=None) -> float:

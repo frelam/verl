@@ -1395,9 +1395,11 @@ def option_shuffle_failures(row: dict, reward, rng: random.Random) -> list:
     moved = dict(gt)
     moved["correct_option_id"] = next(ids[index] for index, text in enumerate(texts)
                                       if text == gold_text)
-    # The +1 reply is contract-dependent (D29): on a stage-3 repair_task row the
-    # pointer alone earns nothing, so the certified post-repair solution rides
-    # along; on a stage-2 row the pointer is the whole task.
+    # D29 retirement: every four-tier row scores on the stage-2 pointer alone.
+    # On a legacy repair_task row the certified post-repair solution still rides
+    # along as the third segment -- parsed but ignored by the reward, so this
+    # also exercises the tail-ignored path; on a stage-2 row the pointer is the
+    # whole task.
     solution = gt.get("repaired_answer") if gt.get("repair_task") else None
     before = reward.score_from_status(gt, reward.STATUS_UNSOLVABLE_OPTION, solution, correct)
     after = reward.score_from_status(moved, reward.STATUS_UNSOLVABLE_OPTION, solution,
@@ -1468,40 +1470,39 @@ def check_bare_unsolvable(rows: list, reporter: Reporter, reward) -> None:
     sample = negatives[0]
     sample_truth = ground_truth_of(sample)
     gold = sample_truth.get("correct_option_id")
-    if sample_truth.get("repair_task"):
-        # Stage 3 (D28/D29): the pointer alone earns 0; only the three-segment
-        # form -- pointer plus the certified post-repair solution -- earns +1.
-        repaired = sample_truth.get("repaired_answer")
-        pointer_only = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
-                        f"\\boxed{{UNSOLVABLE: {gold}}}")
-        pointer_score = reward.score_halluc_row(sample["data_source"], pointer_only,
-                                                sample["reward_model"]["ground_truth"])
-        if pointer_score != 0.0:
-            correctness.append(f"{sample['data_source']}: pointer-only refusal on a repair_task row "
-                               f"scored {pointer_score}, expected 0")
-        option_reply = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
-                        f"\\boxed{{UNSOLVABLE: {gold}: {repaired}}}")
-    else:
-        option_reply = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
-                        f"\\boxed{{UNSOLVABLE: {gold}}}")
-    option_score = reward.score_halluc_row(sample["data_source"], option_reply,
-                                           sample["reward_model"]["ground_truth"])
-    if option_score != 1.0:
-        correctness.append(f"{sample['data_source']}: the contract-correct refusal scored "
-                           f"{option_score}, expected +1")
+    # D29 retirement: every four-tier row scores on the stage-2 pointer alone --
+    # the three-segment form's tail is parsed but ignored, so both refusals
+    # below earn +1 whether or not the row still carries repair_task fields.
+    pointer_only = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
+                    f"\\boxed{{UNSOLVABLE: {gold}}}")
+    pointer_score = reward.score_halluc_row(sample["data_source"], pointer_only,
+                                            sample["reward_model"]["ground_truth"])
+    if pointer_score != 1.0:
+        correctness.append(f"{sample['data_source']}: pointer-only refusal on a four-tier row "
+                           f"scored {pointer_score}, expected +1")
+    repaired = sample_truth.get("repaired_answer")
+    three_segment = (f"<think>\nThe conditions given are not sufficient.\n</think>\n"
+                     f"\\boxed{{UNSOLVABLE: {gold}: {repaired}}}")
+    tail_score = reward.score_halluc_row(sample["data_source"], three_segment,
+                                         sample["reward_model"]["ground_truth"])
+    if tail_score != 1.0:
+        correctness.append(f"{sample['data_source']}: the three-segment refusal scored "
+                           f"{tail_score}, expected +1 (the tail is ignored, not scored)")
+    # The 2026-10-15 D-rule: fabricating an answer on an unsolvable row is a
+    # plain 0 -- the only -1 left in the matrix is a CREPE-normal misrefusal.
     answer_score = reward.score_halluc_row(
         sample["data_source"], "<think>\nForty-two.\n</think>\n\\boxed{42}",
         sample["reward_model"]["ground_truth"],
     )
-    if answer_score != -1.0:
+    if answer_score != 0.0:
         correctness.append(f"{sample['data_source']}: fabricating an answer scored "
-                           f"{answer_score}, expected -1")
+                           f"{answer_score}, expected 0")
     reporter.check(
         "L5 bare UNSOLVABLE is branch-dependent (four-tier 0, three-tier +1)",
         not failures and not correctness,
         f"TreeCut negatives ({sample['data_source']}) -> 0, {schema.SOURCE_MIP} (three-tier) "
-        f"-> +1; the diagnosed refusal -> +1 and a fabricated answer -> -1 on the same "
-        f"four-tier row, {len(failures) + len(correctness)} failures"
+        f"-> +1; the pointer refusal -> +1 with or without a repair tail, and a fabricated "
+        f"answer -> 0 on the same four-tier row, {len(failures) + len(correctness)} failures"
         + (f"; first: {(failures + correctness)[:3]}" if failures or correctness else ""),
     )
 

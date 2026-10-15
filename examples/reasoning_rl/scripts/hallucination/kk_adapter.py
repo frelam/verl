@@ -36,6 +36,29 @@ branch                    template  gold
                                     ``\\boxed{人名: 角色词, …}``, order free
 ========================  ========  ===============================================
 
+Optional unsolvable synthesis (``--emit-unsolvable``, stage 3 / D30)
+--------------------------------------------------------------------
+
+K&K has no native unsolvable rows, so the stage-3 domain-balanced mix synthesises
+them instead of importing a second logic source: take a certified-unique-solution
+puzzle, delete one inhabitant's statement (from the ``statements`` tuple *and*
+from the ``quiz`` text), and keep the result only when the remaining subsystem
+enumerates to **>= 2 solutions**.  Dropping a constraint can only add solutions,
+so the full puzzle's unique solution survives in the subsystem and the only way
+the deletion yields an unsolvable puzzle is *underdetermination* -- the deleted
+statement was necessary.  That enumeration is the row's certificate, the same
+2^N oracle the solvable side uses, re-derived by ``verify_kk.py``'s ``kkcut:``
+channel.
+
+The deleted speaker keeps their place in the ``inhabitants:`` roster (every row
+carries the full roster, so nothing leaks), and the row ships its audit fields --
+``kkcut_deleted_index`` / ``kkcut_deleted_statement`` / ``kkcut_solutions_after``
+-- in ``extra_info``.  One kkcut row per abstract group at most, from the first
+admissible deletion in a seeded order (``--seed`` only matters under this flag;
+the solvable build stays seed-free).  The contract is the three-tier bare
+refusal (template B, ``\\boxed{UNSOLVABLE}``), MiP-style: no options block to
+mine, the deficiency itself is unpointable by construction.
+
 The gold is a **mapping**, never a bare role-word sequence: section 5.1 (D19)
 fixes the contract as per-inhabitant ``name: role`` pairs and the reward requires
 the model's name set to equal the gold's exactly, so a sequence carries no name to
@@ -165,6 +188,8 @@ import ast
 import collections
 import json
 import os
+import random
+import re
 import sys
 from pathlib import Path
 
@@ -225,6 +250,16 @@ MAX_ENUMERATED = 16
 
 #: Statement-tree depth bound (the corpus max is a handful).
 MAX_STATEMENT_DEPTH = 64
+
+#: task_id prefix of the synthesised unsolvable rows (stage 3 / D30).  Distinct
+#: from the solvable ``kk:`` prefix so ``verify_kk.py`` and ``mix_halluc`` can
+#: route the two contracts apart from the artifact alone.
+KKCUT_PREFIX = "kkcut"
+
+#: ``extra_info.perturbation_type`` of a kkcut row: one speaker's statement is
+#: gone, so the puzzle lacks a necessary condition (a schema.PERTURBATION_TYPES
+#: member -- validate_row rejects anything outside that tuple).
+KKCUT_PERTURBATION = "missing_condition"
 
 _FILE_PARTS = ("clean", "perturbed")
 _FILE_SPLITS = ("train", "test")
@@ -353,6 +388,32 @@ def unique_solution(statements: tuple, count: int) -> tuple[bool, ...] | None:
     return found
 
 
+def solutions_without(statements: tuple, count: int, dropped: int) -> int:
+    """How many assignments satisfy the subsystem that drops speaker ``dropped``.
+
+    The kkcut certificate (stage 3 / D30).  Person ``dropped`` makes no assertion,
+    so the constraint ``truth[dropped] == evaluate(...)`` vanishes while every
+    other speaker's constraint keeps its original index -- which is why the
+    constraint pairs are carried as ``(i, stmt)`` instead of truncating the tuple
+    (a truncated tuple would misalign the remaining indices).
+
+    Dropping a constraint can only add solutions, and the caller only ever calls
+    this on puzzles :func:`unique_solution` certified to exactly one -- so the
+    result is >= 1 by construction, and ``>= 2`` is precisely the claim "the
+    deleted statement was necessary; the truncated puzzle is underdetermined".
+    The count stops at 2: that is the only threshold the certificate reads.
+    """
+    keep = [(i, stmt) for i, stmt in enumerate(statements) if i != dropped]
+    found = 0
+    for mask in range(1 << count):
+        truth = tuple(bool(mask >> i & 1) for i in range(count))
+        if all(evaluate(stmt, truth) == truth[i] for i, stmt in keep):
+            found += 1
+            if found >= 2:
+                return found
+    return found
+
+
 # ---------------------------------------------------------------------------
 # text plumbing
 # ---------------------------------------------------------------------------
@@ -385,6 +446,108 @@ def answer_mapping(names: list[str], solution: list[bool], role_words: list[str]
     """
     truth_word, lie_word = role_words
     return {name: (truth_word if flag else lie_word) for name, flag in zip(names, solution, strict=False)}
+
+
+# ---------------------------------------------------------------------------
+# kkcut text surgery (stage 3 / D30): delete one speaker's sentence, fail closed
+# ---------------------------------------------------------------------------
+
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?])\s+")
+
+#: Speaker-position patterns.  The corpus's statement sentences all attribute the
+#: claim in one of three positions, so a sentence whose speaker cannot be placed
+#: by one of these is a structural surprise and the whole candidate is dropped
+#: (fail closed) rather than guessed at.  Content mentions ("According to Noah,
+#: 'Aria is a knave'") never sit in these positions -- the mention is inside the
+#: quote, the attribution outside it.
+_TAIL_ATTRIBUTION_RE = re.compile(r"(?:^|\s)-\s*(.+?)\.\s*$")
+_COMMA_ATTRIBUTION_RE = re.compile(r",\s*(.+?)\s+(?:declared|mentioned|said)\.\s*$")
+_MID_ATTRIBUTION_RES = (
+    re.compile(r"^According to\s+(.+?),\s"),
+    re.compile(r"^In a statement by\s+(.+?):\s"),
+)
+
+
+def split_quiz_sentences(quiz: str) -> list[str]:
+    """Split a ``quiz`` into its sentences.
+
+    The corpus is synthetic and measured clean (no newlines, no non-ASCII, and no
+    periods inside the quoted formulas), so a lookbehind split on ``.``/``?`` plus
+    whitespace recovers one sentence per fragment -- preamble, roster, statements,
+    the closing ``So who is ...?`` question.  The fragments keep their terminal
+    punctuation, so ``" ".join(...)`` reassembles the original text byte for byte
+    modulo whitespace, which :func:`normalise_text` collapses anyway.
+    """
+    return [part for part in _SENTENCE_SPLIT_RE.split(quiz.strip()) if part]
+
+
+def speaker_index(sentence: str, names: list[str]) -> int | None:
+    """Which name this statement sentence attributes its claim to, or ``None``.
+
+    Three attribution positions are recognised: the sentence *starts* with the
+    speaker (``Ethan asserted: "..."``, ``Ethan told you that ...``), the speaker
+    sits in a tail (``"..." - David.``, ``"..." , Lucas declared.``), or the
+    speaker is named mid-sentence by the two fixed frames (``According to X,``,
+    ``In a statement by X:``).  A sentence matching none (or matching with a name
+    that is not in ``names``) returns ``None`` -- the caller drops the candidate.
+    """
+    match = _TAIL_ATTRIBUTION_RE.search(sentence)
+    if match is None:
+        match = _COMMA_ATTRIBUTION_RE.search(sentence)
+    if match is not None:
+        attribution = match.group(1).strip()
+        return names.index(attribution) if attribution in names else None
+    for pattern in _MID_ATTRIBUTION_RES:
+        match = pattern.match(sentence)
+        if match is not None:
+            attribution = match.group(1).strip()
+            return names.index(attribution) if attribution in names else None
+    for index, name in enumerate(names):
+        if sentence.startswith(f"{name} "):
+            return index
+    return None
+
+
+def remove_statement_sentence(quiz: str, names: list[str], dropped: int) -> str | None:
+    """The quiz text with speaker ``dropped``'s statement sentence deleted.
+
+    Fail closed on every structural assumption: the sentences must segment into a
+    preamble, exactly ``len(names)`` statement sentences each attributed to a
+    distinct inhabitant, and a closing ``So who ...?`` question; the statement
+    block must be contiguous.  Anything else returns ``None`` and the candidate is
+    dropped -- a mis-cut prompt is worse than a missing row.  The roster sentence
+    (``You meet N inhabitants: ...``) stays verbatim: every row, cut or not,
+    carries the full roster, so nothing about which statement was deleted leaks
+    through it.
+    """
+    sentences = split_quiz_sentences(quiz)
+    if len(sentences) < len(names) + 2:
+        return None
+    closing = sentences[-1]
+    if not closing.endswith("?") or "who is" not in closing:
+        return None
+
+    speakers: dict[int, int] = {}
+    statement_span: list[int] = []
+    for position, sentence in enumerate(sentences[1:-1], start=1):
+        who = speaker_index(sentence, names)
+        if who is None:
+            continue
+        if who in speakers:
+            return None  # two sentences attributed to the same speaker
+        speakers[who] = position
+        statement_span.append(position)
+    if len(speakers) != len(names):
+        return None
+    # Contiguity: every sentence between the first and last statement sentence is
+    # itself a statement sentence (the preamble never contains an attribution).
+    if statement_span != list(range(statement_span[0], statement_span[-1] + 1)):
+        return None
+
+    cut_position = speakers[dropped]
+    remaining = sentences[:cut_position] + sentences[cut_position + 1 :]
+    return " ".join(remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -667,32 +830,39 @@ def select_group_members(groups: dict[tuple[int, int], list[dict]]) -> tuple[lis
     return chosen, dict(stats)
 
 
+def _round_robin(items: list, key) -> list:
+    """Round-robin ``items`` across the buckets ``key`` defines, order preserved.
+
+    A plain slice of a bucket-ordered list is *bucket-ordered*, not merely
+    bucket-sorted: measured, ``--limit 400`` over the ``(len(names), index)``
+    order returned 400 rows all at ``4ppl``, so every length-sensitive statistic
+    was measured on the easiest tier only.  The same defect, with the same fix,
+    is guarded in the ``sum`` (by branch) and ``treecut`` (by cell) adapters.
+    """
+    buckets: dict = collections.OrderedDict()
+    for item in items:
+        buckets.setdefault(key(item), []).append(item)
+    out: list = []
+    index = 0
+    while True:
+        progressed = False
+        for bucket in buckets.values():
+            if index < len(bucket):
+                out.append(bucket[index])
+                progressed = True
+        if not progressed:
+            return out
+        index += 1
+
+
 def _interleave_by_tier(chosen: list[dict]) -> list[dict]:
     """Round-robin the size tiers so a ``limit`` keeps every tier represented.
 
     :func:`select_group_members` returns its members in ``(len(names), index)``
     order, so a plain ``chosen[:limit]`` is *tier-ordered*, not merely
-    tier-sorted: measured, ``--limit 400`` returned 400 rows all at ``4ppl``,
-    whose answer strings are the shortest in the corpus.  The slice then reads
-    as a corpus with one difficulty, and every length-sensitive statistic
-    (answer form, prompt size, the L3 floors) is measured on the easiest tier
-    only.  The same defect, with the same fix, is guarded in the ``sum``
-    (by branch) and ``treecut`` (by cell) adapters.
+    tier-sorted -- see :func:`_round_robin` for the failure it prevents.
     """
-    tiers: dict[int, list[dict]] = collections.OrderedDict()
-    for member in chosen:
-        tiers.setdefault(len(member["names"]), []).append(member)
-    out: list[dict] = []
-    index = 0
-    while True:
-        progressed = False
-        for tier in tiers.values():
-            if index < len(tier):
-                out.append(tier[index])
-                progressed = True
-        if not progressed:
-            return out
-        index += 1
+    return _round_robin(chosen, lambda member: len(member["names"]))
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +913,78 @@ def _build_row(member: dict, clean_sibling: dict | None, seed: int) -> dict:
     )
 
 
-def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[list[dict], dict]:
+def _kkcut_task_id(family: str, count: int, index: int) -> str:
+    """Stable hard-replay key of one synthesised unsolvable row (stage 3 / D30).
+
+    Same ``(family, tier, index)`` body as :func:`task_id_of` under the
+    ``kkcut:`` prefix, so a kkcut row and its solvable parent never collide and
+    ``verify_kk.py`` can route the two contracts apart from the artifact alone.
+    """
+    return f"{KKCUT_PREFIX}:{family}:{count}ppl:{index}"
+
+
+def _kkcut_deletion_order(family: str, count: int, index: int, seed: int) -> list[int]:
+    """The seeded order the candidate deletions are tried in.
+
+    ``random.Random(str)`` seeds deterministically from the string, so the same
+    ``(seed, group)`` always yields the same order.  ``seed`` is only read on
+    the ``--emit-unsolvable`` path; the solvable build stays seed-free.
+    """
+    rng = random.Random(f"{seed}:kkcut:{family}:{count}:{index}")
+    order = list(range(count))
+    rng.shuffle(order)
+    return order
+
+
+def _build_kkcut_row(member: dict, cut_quiz: str, deleted: int, statements: tuple, seed: int) -> dict:
+    """One synthesised unsolvable row: the quiz minus speaker ``deleted``'s line.
+
+    The enumeration certificate has already run (``solutions_without(...) >= 2``
+    on the parent's certified-unique statement system), so the row only renders
+    the MiP-shaped three-tier bare refusal: template B with no options block and
+    no role-word instruction (an ``answer with name: role`` hint would fight the
+    UNSOLVABLE contract), gold ``solvable=False`` with no answer to point at.
+    The deleted speaker keeps their roster entry -- nothing leaks which line is
+    gone -- and the audit fields carry the certificate for ``verify_kk.py`` to
+    re-derive.  ``kkcut_solutions_after`` is capped at the certificate threshold
+    (the count stops at 2), so an emitted row always reads exactly ``2``.
+    """
+    count = len(member["names"])
+    index = int(member["index"])
+    family = member["_family"]
+    extra_info = {
+        "split": "train",
+        "index": index,
+        "task_id": _kkcut_task_id(family, count, index),
+        "seed": seed,
+        "difficulty": f"{count}ppl",
+        "perturbation_type": KKCUT_PERTURBATION,
+        "perturbation_family": family,
+        "solvable": False,
+        "paired_original_text": normalise_text(member["quiz"]),
+        "kkcut_deleted_index": deleted,
+        "kkcut_deleted_statement": repr(statements[deleted]),
+        "kkcut_solutions_after": 2,
+    }
+    return schema.make_row(
+        data_source=DATA_SOURCE,
+        question=normalise_text(cut_quiz),
+        ground_truth=schema.build_ground_truth(
+            solvable=False,
+            answer=None,
+            correct_option_id=None,
+            has_diagnosis_label=False,
+            perturbation_type=KKCUT_PERTURBATION,
+        ),
+        template=TEMPLATE,
+        branch=schema.BRANCH_UNSOLVABLE_BARE,
+        extra_info=extra_info,
+    )
+
+
+def build_rows(
+    raw_dir: str, limit: int | None = None, seed: int = 0, emit_unsolvable: bool = False
+) -> tuple[list[dict], dict]:
     """Build the K&K parquet rows and the report that produced them.
 
     Returns ``(rows, report)``: ``rows`` are ready for
@@ -755,6 +996,15 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[l
     were read and excluded.  Selection is deterministic -- ``seed`` is recorded but
     never chooses a row -- so the same ``raw_dir`` and ``limit`` always produce
     byte-identical rows.
+
+    With ``emit_unsolvable`` (stage 3 / D30) every selected group also tries one
+    statement deletion; the first candidate that survives both certificates
+    (enumeration ``>= 2`` solutions after the drop, and the fail-closed text
+    surgery) ships as a ``kkcut:`` bare-refusal row appended after the solvable
+    pool.  A group whose every candidate fails is counted in
+    ``report["kkcut"]["skipped"]`` (the funnel keeps its "rows remaining" meaning)
+    and contributes nothing -- the solvable side is never weakened to balance the
+    synthesis.
     """
     raw = load_source(raw_dir)
     funnel: dict[str, int] = collections.OrderedDict()
@@ -820,10 +1070,48 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[l
     # same list in a different order.
     selected = _interleave_by_tier(selected)
 
+    parents = selected
     rows = [_build_row(member, _clean_sibling(groups, member), seed) for member in selected]
     if limit is not None:
+        parents = parents[: max(limit, 0)]
         rows = rows[: max(limit, 0)]
     funnel["after_limit"] = len(rows)
+
+    # Stage 3 / D30: one synthesised unsolvable row per group whose first
+    # admissible deletion survives both certificates.  Synthesis runs over the
+    # post-limit parents, so ``--limit`` caps both sides; a group that yields no
+    # kkcut row never weakens the solvable side.
+    kkcut_rows: list[dict] = []
+    kkcut_skipped: collections.Counter = collections.Counter()
+    if emit_unsolvable:
+        pairs: list[tuple[dict, dict]] = []
+        for member in parents:
+            count = len(member["names"])
+            index = int(member["index"])
+            family = member["_family"]
+            try:
+                statements = parse_statements(member["statements"], count)
+            except StatementError:  # pragma: no cover - selection only admits parsed rows
+                kkcut_skipped["unparseable_statements"] += 1
+                continue
+            made = False
+            for deleted in _kkcut_deletion_order(family, count, index, seed):
+                if solutions_without(statements, count, deleted) < 2:
+                    continue
+                cut_quiz = remove_statement_sentence(member["quiz"], list(member["names"]), deleted)
+                if cut_quiz is None:
+                    kkcut_skipped["text_surgery_dropped"] += 1
+                    continue
+                pairs.append((member, _build_kkcut_row(member, cut_quiz, deleted, statements, seed)))
+                made = True
+                break
+            if not made:
+                kkcut_skipped["no_admissible_deletion"] += 1
+        # Tier-interleave the kkcut rows themselves, so a downstream cap on the
+        # cell cannot reduce it to one difficulty tier.
+        kkcut_rows = [row for _, row in _round_robin(pairs, lambda pair: len(pair[0]["names"]))]
+    solvable_rows = rows
+    rows = rows + kkcut_rows
 
     report = {
         "raw_dir": str(raw_dir),
@@ -846,14 +1134,27 @@ def build_rows(raw_dir: str, limit: int | None = None, seed: int = 0) -> tuple[l
             "skipped": selection_stats,
         },
         "selected": {
-            "per_tier": _breakdown(rows, lambda row: row["extra_info"]["difficulty"]),
-            "per_family": _breakdown(rows, lambda row: row["extra_info"]["perturbation_family"]),
-            "clean": sum(1 for row in rows if row["extra_info"]["perturbation_family"] == FAMILY_CLEAN),
-            "perturbed": sum(1 for row in rows if row["extra_info"]["perturbation_family"] != FAMILY_CLEAN),
-            "non_canonical_role_words": sum(
-                1 for row in rows if tuple(row["extra_info"]["role_words"]) != CANONICAL_ROLE_WORDS
+            "per_tier": _breakdown(solvable_rows, lambda row: row["extra_info"]["difficulty"]),
+            "per_family": _breakdown(solvable_rows, lambda row: row["extra_info"]["perturbation_family"]),
+            "clean": sum(1 for row in solvable_rows if row["extra_info"]["perturbation_family"] == FAMILY_CLEAN),
+            "perturbed": sum(
+                1 for row in solvable_rows if row["extra_info"]["perturbation_family"] != FAMILY_CLEAN
             ),
-            "distinct_role_word_pairs": len({tuple(row["extra_info"]["role_words"]) for row in rows}),
+            "non_canonical_role_words": sum(
+                1 for row in solvable_rows if tuple(row["extra_info"]["role_words"]) != CANONICAL_ROLE_WORDS
+            ),
+            "distinct_role_word_pairs": len({tuple(row["extra_info"]["role_words"]) for row in solvable_rows}),
+        },
+        "kkcut": {
+            # Stage 3 / D30 synthesis.  Always present (zeroed when the flag is
+            # off) so the artifact's own report shows whether the cell was even
+            # attempted.  ``skipped`` names why each failed group failed; the
+            # solvable funnel above is untouched by any of it.
+            "emitted": len(kkcut_rows),
+            "groups_attempted": len(parents) if emit_unsolvable else 0,
+            "skipped": dict(kkcut_skipped),
+            "per_tier": _breakdown(kkcut_rows, lambda row: row["extra_info"]["difficulty"]),
+            "per_family": _breakdown(kkcut_rows, lambda row: row["extra_info"]["perturbation_family"]),
         },
         "enumerator": {
             "checked": enumerator["checked"],
@@ -922,10 +1223,16 @@ def main() -> None:
     parser.add_argument("--report", default=None, help="JSON report path (default: alongside --out)")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--emit-unsolvable",
+        action="store_true",
+        help="also synthesise one kkcut unsolvable row per group (stage 3 / D30); "
+        "--seed only matters under this flag",
+    )
     args = parser.parse_args()
     report_path = args.report or report_path_for(args.out)
 
-    rows, report = build_rows(args.raw_dir, limit=args.limit, seed=args.seed)
+    rows, report = build_rows(args.raw_dir, limit=args.limit, seed=args.seed, emit_unsolvable=args.emit_unsolvable)
     schema.normalise_extra_info(rows)
     schema.validate_rows(rows)
     schema.write_rows_parquet(rows, args.out)
@@ -958,6 +1265,10 @@ def main() -> None:
         print(f"  {tier:22s} {count}")
     print("\nenumerator (over the pre-N>=4 pool):")
     for key, count in report["enumerator"].items():
+        print(f"  {key:30s} {count}")
+    print("\nkkcut synthesis (stage 3 / D30):")
+    print(f"  emitted {report['kkcut']['emitted']} of {report['kkcut']['groups_attempted']} groups attempted")
+    for key, count in report["kkcut"]["skipped"].items():
         print(f"  {key:30s} {count}")
 
     os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)

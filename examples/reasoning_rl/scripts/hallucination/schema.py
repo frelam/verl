@@ -52,12 +52,15 @@ Row 5 of table B (TreeCut positives) shares ``solvable_numeric`` with row 1 --
 both are template-A numeric rows whose only difference is the *placeholder*
 option block, which the reward ignores.
 
-Stage 3 (D29) adds a ninth shape: the same ``unsolvable_diag`` branch on
-template ``A_repair`` with ``repair_task=True`` in the payload -- the D28
-three-layer contract (``\boxed{UNSOLVABLE: <id>: <repaired answer>}``), built
-by the FalseQA/TreeCut adapters' ``--repair-contract`` mode and mixed by
-``mix_halluc.py --repair_mode``.  Stage-2 four-tier rows stay on template A
-with the two-layer contract.
+Stage 3 (D29, historical) added a ninth shape: the same ``unsolvable_diag``
+branch on template ``A_repair`` with ``repair_task=True`` in the payload --
+the D28 three-layer contract (``\boxed{UNSOLVABLE: <id>: <repaired answer>}``),
+built by the FalseQA/TreeCut adapters' ``--repair-contract`` mode.  D30
+retired that layer: the stage-3 build (``mix_halluc.py --stage3_mix``) now
+mixes the domain-balanced table in the plain stage-2 contracts and the reward
+no longer reads the repair fields, so the shape stays in the schema only so
+pre-D29 artifacts still validate and audit.  Stage-2 four-tier rows stay on
+template A with the two-layer contract.
 """
 
 from __future__ import annotations
@@ -404,14 +407,15 @@ def ground_truth_payload(
     ``judgment_only`` is the CREPE-normal branch: the row asks "is this
     answerable?" and ``answer`` is audit-only, never compared.
 
-    ``repaired_answer`` is the stage-3 repair task's third layer (D28, moved to
+    ``repaired_answer`` was the stage-3 repair task's third layer (D28, moved to
     stage 3 by D29): the correct solution once the gold option's condition is
     restored.  It is written only on ``repair_task`` rows -- stage-2 four-tier
     rows keep the two-layer contract and carry neither key -- and
     ``repaired_free_text`` selects the matcher (``norm_match`` for FalseQA's
-    free text, ``math_match`` for TreeCut's integers).  The reward also AND-gates
-    on a bare ``repaired_answer`` without ``repair_task`` so a legacy D28
-    artifact keeps its three-layer scoring.
+    free text, ``math_match`` for TreeCut's integers).  D30 retired the repair
+    layer from scoring: the reward no longer reads either key (a three-segment
+    reply's tail is parsed but ignored), and they survive in the schema only so
+    pre-D29 artifacts still validate and audit.
     """
     payload: dict[str, Any] = {
         "solvable": bool(solvable),

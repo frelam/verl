@@ -576,7 +576,7 @@ def test_section9_reward_cells_two_layer_and_three_tier(tmp_path):
     bare_gt = bare["reward_model"]["ground_truth"]
     assert score(bare, bare_gt, r"\boxed{UNSOLVABLE}") == 1.0
     assert score(bare, bare_gt, r"\boxed{UNSOLVABLE: B}") == 1.0  # option id is meaningless here
-    assert score(bare, bare_gt, r"\boxed{42}") == -1.0  # fabricated answer
+    assert score(bare, bare_gt, r"\boxed{42}") == 0.0  # fabricated answer: plain 0 (2026-10-15 D-rule)
     assert score(bare, bare_gt, "the question cannot be answered") == 0.0
 
     # the branch-dependent cell of section 5.1: same marker, four-tier ground truth

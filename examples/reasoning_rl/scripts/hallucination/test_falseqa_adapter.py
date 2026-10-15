@@ -784,29 +784,33 @@ def test_four_tier_reward_cells_for_a_diag_row(tmp_path):
     # wrong pointer / bare refusal / answer / no box
     assert _reward(diag, f"\\boxed{{UNSOLVABLE: {wrong_id}}}") == 0.0
     assert _reward(diag, "\\boxed{UNSOLVABLE}") == 0.0
-    assert _reward(diag, "\\boxed{42}") == -1.0
+    # fabrication is a plain 0 (the 2026-10-15 D-rule: nothing scores below 0 here)
+    assert _reward(diag, "\\boxed{42}") == 0.0
     assert _reward(diag, "no box at all") == 0.0
 
 
 def test_four_tier_reward_cells_for_a_repair_row(tmp_path):
-    """Stage 3 three-layer AND-gate (D28/D29, §6): refusal + pointer + post-repair solution."""
+    """D29 retirement: the repair layer no longer gates the score.
+
+    Stage-3 repair rows keep the three-segment prompt and the ``repaired_answer``
+    fields in the artifact, but the reward reads the stage-2 pointer alone: every
+    recognised ``UNSOLVABLE: <id>`` with the right option earns +1 whatever the
+    third segment says -- or whether there is one at all.
+    """
     rows, _ = _build(tmp_path, COLD, repair=True)
     diag = _by_id(rows)["falseqa-fake-train-0"]
     gold_id = diag["extra_info"]["correct_option_id"]
     wrong_id = next(letter for letter in "ABC" if letter != gold_id)
     repaired = json.loads(diag["reward_model"]["ground_truth"])["repaired_answer"]
-    # all three layers correct
+    # the pointer alone earns +1, tail or no tail
     assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: {repaired}}}") == 1.0
-    # norm_match: case/punctuation/articles are not part of the answer
     assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: {repaired.upper()}}}") == 1.0
-    # missing or wrong post-repair solution
-    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == 0.0
-    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: something else}}") == 0.0
-    # wrong pointer, right solution
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}: something else}}") == 1.0
+    assert _reward(diag, f"\\boxed{{UNSOLVABLE: {gold_id}}}") == 1.0
+    # wrong pointer / bare refusal / answer / no box
     assert _reward(diag, f"\\boxed{{UNSOLVABLE: {wrong_id}: {repaired}}}") == 0.0
-    # bare refusal / answer / no box
     assert _reward(diag, "\\boxed{UNSOLVABLE}") == 0.0
-    assert _reward(diag, "\\boxed{42}") == -1.0
+    assert _reward(diag, "\\boxed{42}") == 0.0
     assert _reward(diag, "no box at all") == 0.0
 
 

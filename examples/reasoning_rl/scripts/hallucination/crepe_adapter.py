@@ -372,6 +372,7 @@ def build_rows(
     limit: int | None = None,
     seed: int = 0,
     sources: tuple[str, ...] = SOURCE_NAMES,
+    quota_overrides: dict[tuple[str, str], int] | None = None,
 ) -> tuple[list[dict], OrderedDict[str, int]]:
     """Build the rows and the filter funnel (design doc sections 4.6 and 4.8).
 
@@ -382,6 +383,13 @@ def build_rows(
         seed: seed of the quota subsampling; ``(raw_dir, limit, seed)`` is
             reproducible byte for byte.
         sources: which sources to build (``SOURCE_NAMES`` by default).
+        quota_overrides: per-group quota replacements for the stage-3
+            domain-balanced mix (D30 raises this source to 672 judgment rows +
+            1,472 bare-refusal rows).  Keys must be :data:`QUOTAS` keys and
+            values positive; an unknown key is a hard error, not a silent add --
+            the two-group structure is fixed by the design doc.  A quota larger
+            than the surviving group simply emits the whole group (the funnel's
+            ``after_quota`` shows what actually shipped).
 
     Returns:
         ``(rows, funnel)``.  ``funnel`` maps each filter stage to the number of
@@ -396,6 +404,13 @@ def build_rows(
         raise ValueError(f"unknown source(s) {unknown_sources}; expected {SOURCE_NAMES}")
     if limit is not None and limit < 0:
         raise ValueError(f"limit must be non-negative, got {limit}")
+    quotas = dict(QUOTAS)
+    for key, value in (quota_overrides or {}).items():
+        if key not in quotas:
+            raise ValueError(f"unknown quota group {key!r}; expected one of {sorted(quotas)}")
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"quota for {key!r} must be a positive int, got {value!r}")
+        quotas[key] = value
 
     funnel: OrderedDict[str, int] = OrderedDict()
 
@@ -441,10 +456,10 @@ def build_rows(
 
     filled: list[list[Candidate]] = []
     for group_index, group_key in enumerate(GROUP_ORDER):
-        if group_key not in QUOTAS:
+        if group_key not in quotas:
             raise ValueError(f"no quota declared for group {group_key!r}")
         members = grouped.get(group_key, [])
-        quota = QUOTAS[group_key]
+        quota = quotas[group_key]
         if len(members) > quota:
             members = _group_rng(seed, group_index).sample(members, quota)
         members = _round_robin_by_split(members)
@@ -491,6 +506,35 @@ def _print_breakdown(rows: list[dict]) -> None:
     print(f"rows with an options block: {optioned}; with a diagnosis label: {diagnosis}")
 
 
+def parse_quota_overrides(text: str) -> dict[tuple[str, str], int]:
+    """``"solvable_judge=672,unsolvable_bare=1472"`` -> a quota_overrides dict.
+
+    The source element of every key is :data:`SOURCE_CREPE` -- this adapter
+    builds CREPE only, so the flag carries the branch name alone.  Unknown
+    branches, missing values and non-positive counts raise ``ValueError`` here,
+    before any raw file is read.
+    """
+    overrides: dict[tuple[str, str], int] = {}
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        branch, sep, raw_value = part.partition("=")
+        branch, raw_value = branch.strip(), raw_value.strip()
+        key = (schema.SOURCE_CREPE, branch)
+        if key not in QUOTAS:
+            raise ValueError(
+                f"unknown branch {branch!r}; expected one of {sorted(b for _, b in QUOTAS)}"
+            )
+        if not sep or not raw_value:
+            raise ValueError(f"quota override {part!r} must be <branch>=<count>")
+        try:
+            overrides[key] = int(raw_value)
+        except ValueError as exc:
+            raise ValueError(f"quota override {part!r} is not an int") from exc
+    return overrides
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--raw-dir", default=RAW_DIR_DEFAULT, help="raw CREPE bundle")
@@ -503,13 +547,27 @@ def main() -> None:
         default=SOURCE_CHOICES[0],
         help="which source to build; this adapter builds CREPE only",
     )
+    parser.add_argument(
+        "--quota-overrides",
+        default=None,
+        help="comma list of <branch>=<count>, e.g. "
+        "'solvable_judge=672,unsolvable_bare=1472' (stage 3 / D30); "
+        "a group larger than its surviving pool emits the whole pool",
+    )
     args = parser.parse_args()
 
     # Single-source file: argparse's ``choices`` is what rejects anything but
     # CREPE, and the flag itself is kept for symmetry with the other adapters.
     sources = SOURCE_NAMES
+    quota_overrides = parse_quota_overrides(args.quota_overrides) if args.quota_overrides else None
 
-    rows, funnel = build_rows(args.raw_dir, limit=args.limit, seed=args.seed, sources=sources)
+    rows, funnel = build_rows(
+        args.raw_dir,
+        limit=args.limit,
+        seed=args.seed,
+        sources=sources,
+        quota_overrides=quota_overrides,
+    )
     if not rows:
         raise SystemExit("no rows survived the funnel; refusing to write an empty parquet")
     schema.normalise_extra_info(rows)
@@ -525,8 +583,11 @@ def main() -> None:
     print()
     _print_breakdown(rows)
     print()
-    quotas = ", ".join(f"{src}/{branch}={quota}" for (src, branch), quota in QUOTAS.items())
-    print(f"D18 table B quotas: {quotas}")
+    effective = dict(QUOTAS)
+    if quota_overrides:
+        effective.update(quota_overrides)
+    quotas = ", ".join(f"{src}/{branch}={quota}" for (src, branch), quota in effective.items())
+    print(f"quotas (D18 table B; --quota-overrides applied where given): {quotas}")
 
 
 if __name__ == "__main__":

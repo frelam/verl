@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# Hallucination-resistance stage 3 (HALLUCINATION_RL_DESIGN.md D29): DATA BUILD ONLY.
+# Hallucination-resistance stage 3 (HALLUCINATION_RL_DESIGN.md D30): DATA BUILD ONLY.
 #
-# Stage 3 owns the D28 three-layer repair contract that used to live in stage 2:
-# the four-tier diagnosis rows ask for \boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}
-# and the reward AND-gates refusal + correct pointer + correct post-repair
-# solution.  Stage 2 keeps the two-layer pointer contract (see
-# build_hallucination_stage2_data.sh); this script builds the repair variant.
+# Stage 3 resumes from a stage-2 checkpoint and trains the domain-balanced
+# unsolvable mix: every domain ships 40% solvable / 60% unsolvable by edge
+# weight (logic 15% / commonsense 20% / math 65% by row count), which needs the
+# D30 synthesised K&K unsolvable rows (kk_adapter --emit-unsolvable) to fill
+# logic's unsolvable side.  The D28 repair layer is retired: stage-3 rows are
+# the plain stage-2 contracts, and the four-tier unsolvable rows score on the
+# stage-2 pointer alone -- so the adapters run WITHOUT --repair-contract and
+# mix_halluc runs --stage3_mix instead of the retired --repair_mode (see
+# build_hallucination_stage2_data.sh for the stage-2 build).
 #
 # Idempotent build pipeline (completed artifacts are cached / re-used):
-#   fetch_raw.py                    -> $DATA_ROOT/halluc/raw/<source>/   (falseqa + treecut inputs)
+#   fetch_raw.py                    -> $DATA_ROOT/halluc/raw/<source>/   (per-source raw files)
 #   treecut-math clone              -> $DATA_ROOT/halluc/raw/treecut/repo (generator repo, not on HF)
-#   falseqa_adapter.py  --repair-contract -> $REPAIR_BUILT_DIR/falseqa.parquet
-#   treecut_adapter.py  --repair-contract -> $REPAIR_BUILT_DIR/treecut.parquet
-#   mix_halluc.py --repair_mode     -> $STAGE3_DIR/{train,val}.parquet + mix_stats.json
+#   <source>_adapter.py  x 8        -> $DATA_ROOT/halluc/built_stage3/<source>.parquet
+#                                      (kk with --emit-unsolvable, crepe with
+#                                      --quota-overrides, the rest at their defaults)
+#   distractor_synth.py (D17)       -> $DATA_ROOT/halluc/built_stage3/d17.parquet
+#   mix_halluc.py --stage3_mix      -> $STAGE3_DIR/{train,val}.parquet + mix_stats.json
 #
 # Training is a separate step: run_qwen3_4b_hallucination_stage3_fully_async.sh.
 #
@@ -24,13 +30,18 @@
 #   PYTHON_BIN=python3    interpreter used by the build scripts
 #   DATA_ROOT             default ~/data/reasoning_rl
 #   STAGE1_DATA_DIR       stage-1 mix dir with train.parquet / val.parquet
-#                         (default $DATA_ROOT/final); used by mix_halluc for
-#                         old-domain mixing + near-dedup anchors
-#   STAGE3_DIR            stage-3 output dir (default $DATA_ROOT/final_halluc_repair)
-#   REPAIR_TOTAL=5835     repair-domain row quota (mix_halluc --halluc_total)
+#                         (default $DATA_ROOT/final); used by distractor_synth and
+#                         mix_halluc for old-domain mixing + near-dedup anchors
+#   STAGE3_DIR            stage-3 output dir (default $DATA_ROOT/final_halluc_stage3)
+#   HALLUC_TOTAL=20000    hallucination-domain row quota (mix_halluc --halluc_total;
+#                         --stage3_mix rescales the D30 table on this total)
 #   OLD_DOMAIN_RATIO=0.7  stage-1 share of the stage-3 mix
-#   VAL_SIZE=256          repair-domain val rows
-#   SEED=42
+#   VAL_SIZE=1000         hallucination-domain val rows (raised from 256: the
+#                         per-cell val carve needs the larger sample to matter)
+#   SEED=43               mix seed, the kkcut deletion-order seed (only read
+#                         on the --emit-unsolvable path) AND crepe's quota
+#                         subsampling seed (43 != stage 2's default 0, so the
+#                         stage-3 crepe rows do not re-draw the stage-2 rows)
 
 set -xeuo pipefail
 
@@ -38,14 +49,14 @@ set -xeuo pipefail
 PYTHON_BIN=${PYTHON_BIN:-python3}
 DATA_ROOT=${DATA_ROOT:-$HOME/data/reasoning_rl}
 STAGE1_DATA_DIR=${STAGE1_DATA_DIR:-$DATA_ROOT/final}
-STAGE3_DIR=${STAGE3_DIR:-$DATA_ROOT/final_halluc_repair}
+STAGE3_DIR=${STAGE3_DIR:-$DATA_ROOT/final_halluc_stage3}
 RAW_ROOT=$DATA_ROOT/halluc/raw
-REPAIR_BUILT_DIR=$DATA_ROOT/halluc/built_repair
+BUILT_DIR=$DATA_ROOT/halluc/built_stage3
 
-REPAIR_TOTAL=${REPAIR_TOTAL:-5835}
+HALLUC_TOTAL=${HALLUC_TOTAL:-20000}
 OLD_DOMAIN_RATIO=${OLD_DOMAIN_RATIO:-0.7}
-VAL_SIZE=${VAL_SIZE:-256}
-SEED=${SEED:-42}
+VAL_SIZE=${VAL_SIZE:-1000}
+SEED=${SEED:-43}
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HALLUC_SCRIPTS=$REPO_ROOT/examples/reasoning_rl/scripts/hallucination
@@ -60,22 +71,50 @@ if [ ! -d "$RAW_ROOT/treecut/repo/treecut" ]; then
     git clone https://github.com/j-bagel/treecut-math "$RAW_ROOT/treecut/repo"
 fi
 
-# 1c. The two four-tier sources, in the stage-3 repair contract.  Only these two
-#     carry the third reward layer; the other sources have no repair variant.
-mkdir -p "$REPAIR_BUILT_DIR"
-$PYTHON_BIN "$HALLUC_SCRIPTS/falseqa_adapter.py"   --raw-dir "$RAW_ROOT/falseqa" --out "$REPAIR_BUILT_DIR/falseqa.parquet" --repair-contract
-$PYTHON_BIN "$HALLUC_SCRIPTS/treecut_adapter.py"   --raw-dir "$RAW_ROOT/treecut" --out "$REPAIR_BUILT_DIR/treecut.parquet" --repair-contract
+# 1c. Per-source adapters, in the plain stage-2 contracts.  Two differences
+#     from the stage-2 build:
+#     * kk_adapter gets --emit-unsolvable (D30): every certified-unique parent
+#       group also tries one statement deletion; the survivors ship as
+#       kkcut:<family>:<N>ppl:<index> bare-refusal rows in the same parquet.
+#       $SEED fixes the deletion order, so the build stays reproducible.
+#     * crepe_adapter gets --quota-overrides (D18 table B, stage-3 rescale):
+#       672 solvable-judge / 1472 unsolvable-bare instead of the 250/400 the
+#       stage-2 table fixes, because commonsense now owns 20% of the pool.
+#       --seed "$SEED" re-keys its quota subsampling away from the stage-2
+#       default, so the larger stage-3 sample is not a superset of the
+#       stage-2 rows (the plan's low-overlap intent).
+mkdir -p "$BUILT_DIR"
+$PYTHON_BIN "$HALLUC_SCRIPTS/kk_adapter.py"        --raw-dir "$RAW_ROOT/kk"     --out "$BUILT_DIR/kk.parquet"     --emit-unsolvable --seed "$SEED"
+$PYTHON_BIN "$HALLUC_SCRIPTS/mip_adapter.py"       --raw-dir "$RAW_ROOT/mip"    --out "$BUILT_DIR/mip.parquet"
+$PYTHON_BIN "$HALLUC_SCRIPTS/falseqa_adapter.py"   --raw-dir "$RAW_ROOT/falseqa" --out "$BUILT_DIR/falseqa.parquet"
+$PYTHON_BIN "$HALLUC_SCRIPTS/gsm_ic_adapter.py"    --raw-dir "$RAW_ROOT/gsmic"  --out "$BUILT_DIR/gsmic.parquet"
+$PYTHON_BIN "$HALLUC_SCRIPTS/sum_adapter.py"       --raw-dir "$RAW_ROOT/sum"    --out "$BUILT_DIR/sum.parquet"
+$PYTHON_BIN "$HALLUC_SCRIPTS/umwp_adapter.py"      --raw-dir "$RAW_ROOT/umwp"   --out "$BUILT_DIR/umwp.parquet"
+$PYTHON_BIN "$HALLUC_SCRIPTS/treecut_adapter.py"   --raw-dir "$RAW_ROOT/treecut" --out "$BUILT_DIR/treecut.parquet"
+$PYTHON_BIN "$HALLUC_SCRIPTS/crepe_adapter.py"     --raw-dir "$RAW_ROOT/crepe"  --out "$BUILT_DIR/crepe.parquet" --quota-overrides solvable_judge=672,unsolvable_bare=1472 --seed "$SEED"
 
-# 1d. Stage-3 mix.  --repair_mode quotas only the two four-tier repair cells
-#     (928:4907, rescaled to REPAIR_TOTAL); the solvable rows sharing the repair
-#     parquets are not quota'd.  --stage1_path adds the old-domain replay and
-#     the near-dedup anchors exactly like the stage-2 mix.
+# 1d. D17 synthesised distractors (the main-pool slice of the stage-3 table).
+#     Same fallback as the stage-2 build: without a stage-1 math parquet the
+#     cell is left to mix_halluc's shortfall redistribution.
+DISTRACTOR_ARGS=(--raw-dir "$RAW_ROOT" --out "$BUILT_DIR/d17.parquet")
+if [ -f "$STAGE1_DATA_DIR/train.parquet" ]; then
+    DISTRACTOR_ARGS+=(--stage1-path "$STAGE1_DATA_DIR/train.parquet")
+else
+    echo "WARNING: $STAGE1_DATA_DIR/train.parquet not found; building distractors without the stage-1 main pool" >&2
+    DISTRACTOR_ARGS+=(--main-quota 0)
+fi
+$PYTHON_BIN "$HALLUC_SCRIPTS/distractor_synth.py" "${DISTRACTOR_ARGS[@]}"
+
+# 1e. Stage-3 mix. --stage3_mix swaps the quota base to the D30 table (logic
+#     15% / commonsense 20% / math 65% by rows, 40/60 solvable/unsolvable by
+#     edge weight inside every domain); the other knobs are shared with the
+#     stage-2 mixer (old-domain replay, near-dedup anchors, val carve first).
 $PYTHON_BIN "$HALLUC_SCRIPTS/mix_halluc.py" \
-    --repair_mode \
-    --halluc_dir "$REPAIR_BUILT_DIR" \
+    --stage3_mix \
+    --halluc_dir "$BUILT_DIR" \
     --stage1_path "$STAGE1_DATA_DIR" \
     --output_dir "$STAGE3_DIR" \
-    --halluc_total "$REPAIR_TOTAL" \
+    --halluc_total "$HALLUC_TOTAL" \
     --old_domain_ratio "$OLD_DOMAIN_RATIO" \
     --val_size "$VAL_SIZE" \
     --seed "$SEED"
@@ -87,6 +126,12 @@ for f in "$STAGE3_DIR/train.parquet" "$STAGE3_DIR/val.parquet"; do
         exit 1
     fi
 done
+
+# The D30 rows are audited against the raw files: parent uniqueness, the
+# >= 2-solutions certificate and the one-sentence surgery are re-derived by
+# verify_kk's own enumerator -- a build that mints a bad cut row fails here,
+# not in training.
+$PYTHON_BIN "$HALLUC_SCRIPTS/verify_kk.py" --rows "$BUILT_DIR/kk.parquet" --raw-dir "$RAW_ROOT/kk"
 
 if [ "${RUN_TESTS:-0}" = "1" ]; then
     $PYTHON_BIN -m pytest "$HALLUC_SCRIPTS" "$REPO_ROOT/examples/reasoning_rl/reward/test_hallucination_compute_score.py"

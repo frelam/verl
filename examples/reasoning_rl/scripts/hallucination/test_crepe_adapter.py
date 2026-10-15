@@ -432,11 +432,14 @@ class TestRewardCells:
         # an option id is meaningless on a three-tier source, so it still scores
         assert _score(schema.SOURCE_CREPE, "\\boxed{UNSOLVABLE: B}", payload) == 1.0
 
-    def test_false_presupposition_row_fabrication_is_minus_one(self):
+    def test_false_presupposition_row_fabrication_scores_zero(self):
+        # D-rule (2026-10-15): fabrication on the unsolvable branch is no longer
+        # penalised -- every non-refusal shape scores plain 0; only CREPE-normal
+        # misrefusal keeps the -1.
         payload = {"solvable": False, "judgment_only": False, "answer": None,
                    "has_diagnosis_label": False, "correct_option_id": None,
                    "perturbation_type": "contradictory_condition"}
-        assert _score(schema.SOURCE_CREPE, "\\boxed{42}", payload) == -1.0
+        assert _score(schema.SOURCE_CREPE, "\\boxed{42}", payload) == 0.0
         assert _score(schema.SOURCE_CREPE, None, payload) == 0.0
 
     def test_bare_unsolvable_is_branch_dependent(self):
@@ -467,7 +470,8 @@ class TestRewardCells:
         assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{SOLVABLE}"), normal_gt) == 1.0
         assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{UNSOLVABLE}"), normal_gt) == -1.0
         assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{UNSOLVABLE}"), bare_gt) == 1.0
-        assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{42}"), bare_gt) == -1.0
+        # fabrication scores plain 0 on the unsolvable branch (D-rule 2026-10-15)
+        assert reward.score_halluc_row(schema.SOURCE_CREPE, _solution("\\boxed{42}"), bare_gt) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +830,10 @@ class TestMain:
         assert "rows by branch: solvable_judge=2, unsolvable_bare=3" in printed
         assert "rows by template: B_judge=5" in printed
         assert "rows with an options block: 0; with a diagnosis label: 0" in printed
-        assert f"D18 table B quotas: {schema.SOURCE_CREPE}/{schema.BRANCH_SOLVABLE_JUDGE}=250" in printed
+        assert (
+            f"quotas (D18 table B; --quota-overrides applied where given): "
+            f"{schema.SOURCE_CREPE}/{schema.BRANCH_SOLVABLE_JUDGE}=250" in printed
+        )
         assert out.exists()
         rows = schema.read_parquet_rows(str(out))
         assert len(rows) == 5
