@@ -59,6 +59,7 @@ INSTRUCTION_SUFFIXES = [
     "Please reason step by step, and put your final answer within \\boxed{}.",
     "Write a complete Python program that reads the input from standard input",
     "Implement the required function(s).",
+    "Implement the function named",
 ]
 
 _DIGIT_MAP = str.maketrans("0123456789", "1234567890")

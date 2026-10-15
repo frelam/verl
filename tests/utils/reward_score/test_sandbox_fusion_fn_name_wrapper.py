@@ -19,6 +19,7 @@ locally so its callable-resolution rules can be tested on CPU.  ``outputs_match`
 is the stdout comparison applied to every test case.
 """
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -32,10 +33,21 @@ from verl.utils.reward_score.sandbox_fusion.utils import (
 
 def run_wrapper(generation: str, fn_name: str, stdin: str) -> str:
     wrapper = build_fn_name_wrapper(generation, fn_name)
-    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as fh:
         fh.write(wrapper)
         path = fh.name
-    proc = subprocess.run([sys.executable, path], input=stdin, capture_output=True, text=True, timeout=30)
+    # The production sandbox runs Linux/UTF-8; pin the child to UTF-8 so the
+    # local run compares bytes the same way instead of depending on the host
+    # locale (this Windows box would otherwise decode stdout as GBK).
+    proc = subprocess.run(
+        [sys.executable, path],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+    )
     return proc.stdout
 
 
@@ -82,6 +94,77 @@ def test_container_and_string_results_are_serialized_like_the_sandbox():
 
 def test_missing_callable_prints_nothing():
     assert run_wrapper("x = 1\n", "not_defined", "1") == ""
+
+
+_SNAIL = """def snail(column, day, night):
+    current = 0
+    days = 0
+    while True:
+        days += 1
+        current += day
+        if current >= column:
+            return days
+        current -= night
+"""
+
+
+class TestDriverCodeIsolation:
+    """A driver program appended to a correct function must not zero it.
+
+    The judge owns stdin (JSON args) and stdout (the serialised return), and
+    the submission runs with ``__name__ != "__main__"``: stdin reads, demo
+    prints and ``sys.exit()`` in module-level driver code used to crash the
+    wrapper or pollute the compared stdout, scoring correct functions 0.
+    """
+
+    def test_unguarded_stdin_driver_is_ignored(self):
+        generation = (
+            _SNAIL + "\ncolumn, day, night = map(int, input().split())\nprint(snail(column, day, night))\n"
+        )
+        assert run_wrapper(generation, "snail", "3\n2\n1") == "2\n"
+
+    def test_main_guarded_driver_never_fires(self):
+        generation = (
+            _SNAIL
+            + '\nif __name__ == "__main__":\n'
+            + "    column, day, night = map(int, input().split())\n"
+            + "    print(snail(column, day, night))\n"
+        )
+        assert run_wrapper(generation, "snail", "3\n2\n1") == "2\n"
+
+    def test_demo_print_does_not_pollute_stdout(self):
+        assert run_wrapper(_SNAIL + "\nprint(snail(10, 3, 1))\n", "snail", "3\n2\n1") == "2\n"
+
+    def test_sys_exit_driver_does_not_abort(self):
+        assert run_wrapper(_SNAIL + "\nimport sys\nsys.exit(0)\n", "snail", "3\n2\n1") == "2\n"
+
+    def test_driver_crashing_after_definition_still_scores(self):
+        generation = _SNAIL + '\nwith open("/nonexistent") as fh:\n    fh.read()\n'
+        assert run_wrapper(generation, "snail", "3\n2\n1") == "2\n"
+
+    def test_driver_crashing_before_definition_fails_closed(self):
+        generation = "column, day, night = map(int, input().split())\n" + _SNAIL
+        assert run_wrapper(generation, "snail", "3\n2\n1") == ""
+
+    def test_print_inside_function_does_not_pollute_stdout(self):
+        generation = "def snail(column, day, night):\n    print('debug', column)\n    return 2\n"
+        assert run_wrapper(generation, "snail", "3\n2\n1") == "2\n"
+
+    def test_syntax_error_fails_closed(self):
+        assert run_wrapper("def snail(:\n", "snail", "3\n2\n1") == ""
+
+    def test_module_level_name_clash_does_not_break_wrapper(self):
+        """The submission redefining a wrapper module global (``json``) must not
+        corrupt the judge's own serialisation."""
+        assert run_wrapper("json = 5\n" + _SNAIL, "snail", "3\n2\n1") == "2\n"
+
+    def test_solution_text_with_quotes_and_backslashes_round_trips(self):
+        """ascii()-embedding must carry regexes, docstrings and non-ASCII verbatim."""
+        generation = (
+            'def greet(name):\n    """Greet -- naïve café style."""\n'
+            "    return 'héllo ' + name + r'\\!'\n"
+        )
+        assert run_wrapper(generation, "greet", '"wörld"') == "héllo wörld\\!\n"
 
 
 class TestOutputsMatch:

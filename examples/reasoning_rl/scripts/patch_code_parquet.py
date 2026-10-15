@@ -23,10 +23,13 @@ requires an explicit config.  When you already have the previous
 ``train_code.parquet``, its rows are exactly the ones you trained on, so the two
 data-side fixes can be applied in place instead of re-downloading anything:
 
-1. **name the function in the prompt** -- ``fn_name`` was already stored in
-   ``reward_model.ground_truth``; the old prompt only said "Implement the
-   required function(s)", so the model could not know the exact name the
-   verifier looks up.
+1. **name the function in the prompt and forbid driver code** -- ``fn_name``
+   was already stored in ``reward_model.ground_truth``; the old prompt only
+   said "Implement the required function(s)", so the model could not know the
+   exact name the verifier looks up.  The current instruction additionally
+   tells the model the judge calls the function directly, since an appended
+   stdin-reading main program or demo print broke the sandbox wrapper's
+   stdin/stdout contract and zeroed otherwise-correct solutions.
 2. **unquote string returns** -- the old canonicaliser stored a list-wrapped
    string return as ``json.dumps("hi") == '"hi"'``, but sandbox_fusion prints
    ``str(result) == "hi"`` and compares stdout as text, so every test failed.
@@ -71,8 +74,16 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from to_parquet_code import FUNCTION_INSTRUCTION  # noqa: E402  (new template, single source of truth)
 
-# The instruction string written by every pre-fix line of to_parquet_code.py.
+# Instruction strings written by earlier lines of to_parquet_code.py, oldest
+# first.  Entries containing ``{fn_name}`` are rendered with the row's fn_name
+# before matching, exactly like the current template.
 OLD_FUNCTION_INSTRUCTION = "Implement the required function(s). Wrap your code in ```python and ```."
+_PREV_FUNCTION_INSTRUCTIONS = [
+    OLD_FUNCTION_INSTRUCTION,
+    # v2: named the function but did not forbid stdin drivers / demo prints,
+    # which the sandbox wrapper then scored 0 on (see sandbox_fusion/utils.py).
+    "Implement the function named `{fn_name}` exactly (do not rename it). Wrap your code in ```python and ```.",
+]
 
 
 def _unquote_string_return(value):
@@ -115,8 +126,11 @@ def patch_row(row: dict) -> tuple[bool, int]:
     ):
         content = prompt[0]["content"]
         if new_instruction not in content:
-            if OLD_FUNCTION_INSTRUCTION in content:
-                content = content.replace(OLD_FUNCTION_INSTRUCTION, new_instruction)
+            for prev in _PREV_FUNCTION_INSTRUCTIONS:
+                prev_rendered = prev.replace("{fn_name}", str(fn_name))
+                if prev_rendered in content:
+                    content = content.replace(prev_rendered, new_instruction)
+                    break
             else:
                 content = content.rstrip() + "\n\n" + new_instruction
             prompt[0]["content"] = content

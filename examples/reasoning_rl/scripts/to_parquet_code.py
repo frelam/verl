@@ -59,7 +59,10 @@ STDIO_INSTRUCTION = (
     "the answer to standard output. Wrap your code in ```python and ```."
 )
 FUNCTION_INSTRUCTION = (
-    "Implement the function named `{fn_name}` exactly (do not rename it). Wrap your code in ```python and ```."
+    "Implement the function named `{fn_name}` exactly (do not rename it). The judge calls "
+    "`{fn_name}` directly with the test inputs as arguments and checks the return value, so do "
+    "not read from standard input, do not print anything, and do not include a main program or "
+    "test code. Wrap your code in ```python and ```."
 )
 
 DEEPCODER_REPO = "agentica-org/DeepCoder-Preview-Dataset"

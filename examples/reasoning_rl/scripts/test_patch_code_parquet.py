@@ -109,6 +109,19 @@ class TestPatchRow:
         assert changed is True
         assert row["prompt"][0]["content"].endswith(FUNCTION_INSTRUCTION.replace("{fn_name}", "f"))
 
+    def test_v2_instruction_is_upgraded_not_duplicated(self):
+        """A row already carrying the fn_name-naming (v2) instruction gets it
+        replaced by the current one -- not a second, contradictory block."""
+        v2 = "Implement the function named `f` exactly (do not rename it). Wrap your code in ```python and ```."
+        row = _old_row(fn_name="f")
+        row["prompt"][0]["content"] = "Solve it.\n\n" + v2
+        changed, _ = patch_row(row)
+        assert changed is True
+        content = row["prompt"][0]["content"]
+        assert v2 not in content
+        assert content.endswith(FUNCTION_INSTRUCTION.replace("{fn_name}", "f"))
+        assert content.count("Wrap your code in") == 1
+
     def test_non_call_based_payload_with_missing_fn_name(self):
         row = _old_row()
         row["reward_model"]["ground_truth"] = "not json"

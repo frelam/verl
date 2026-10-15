@@ -346,8 +346,15 @@ NeMo-Gym 的官方环境（`NVIDIA-NeMo/Gym` 的 `resources_servers/instruction_
   module globals 塞 400+ 个标准库名字（`search`、`copy`、`prod`、`comb`…）。原实现用
   `if fn_name in globals()` 解析可调用对象，于是 `class Solution: def search(...)` 这种解会调用
   `re.search`、每个测试都失败（实测 APPS 的 2,616 个 call-based fn_name 里有 26 个重名 / 42 行）。
-  现在先 `_PREEXISTING_GLOBALS = set(globals())` 快照，**优先用户代码自己定义的名字**，其次
-  `Solution` 方法，最后才回退到导入名；`tests/utils/reward_score/test_sandbox_fusion_fn_name_wrapper.py`
+  现在提交代码在**独立命名空间**里 exec（`_USER_GLOBALS` 快照 prelude 名字 + `_USER_PREEXEC_KEYS`
+  记录 prelude 拥有者），**优先用户代码自己定义的名字**，其次 `Solution` 方法，最后才回退到导入名。
+- **驱动代码隔离（已修）**：原实现把模型代码**内联粘贴**进 wrapper 脚本顶层，函数之外的任何
+  驱动代码都会毁掉判分——无守护的 `input()` 主程序直接崩溃、`if __name__ == "__main__":` 守护
+  在沙箱里依然成立（脚本本身就是 main）、顶层 demo `print` 污染被比较的 stdout——函数写对也判 0
+  （bad case 分析中 A_programming 类的主要形态）。现在提交代码以 `__name__ != "__main__"` exec，
+  期间 stdin 换为空流、stdout 丢弃、异常（含 `SystemExit`）被吞掉：驱动程序吃不掉 JSON 参数、
+  污染不了 stdout、中止不了判题，函数定义之后的驱动崩溃也不影响评分；函数体内的 print 同样
+  被隔离（判题 stdout 只含序列化返回值）。`tests/utils/reward_score/test_sandbox_fusion_fn_name_wrapper.py`
   在本地直接跑渲染出的 wrapper 做回归。
 - **资源**：max_concurrent=256 对应 64–128 核 CPU 起步，无 GPU 需求。
 - **退路**：不配 URL 自动 fallback 到 prime_code 本地执行，仅供 smoke run。

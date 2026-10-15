@@ -30,19 +30,35 @@ API_TIMEOUT = 10
 
 logger = logging.getLogger(__name__)
 
-# Wrapper used to execute a call-based ("fn_name") Python solution: it appends the
-# model's code to a fixed prelude, reads the JSON-per-line arguments from stdin,
-# calls the requested callable and prints the result the same way the expected
-# output was serialised (json.dumps for containers/bool/None, str otherwise).
+# Wrapper used to execute a call-based ("fn_name") Python solution: it runs the
+# model's code in an isolated namespace, reads the JSON-per-line arguments from
+# stdin, calls the requested callable and prints the result the same way the
+# expected output was serialised (json.dumps for containers/bool/None, str
+# otherwise).
 #
-# The wildcard imports below put hundreds of stdlib names into the module globals
-# (re.search, copy.copy, math.prod, ...).  `_PREEXISTING_GLOBALS` snapshots the
-# globals *before* the user's code runs so the wrapper can prefer a callable the
-# user actually defined: without it, `class Solution: def search(...)` resolves
-# `search` to `re.search` and every test fails, which scored a correct solution 0.
-# Kept as a plain template (placeholder `.replace`, not an f-string) so the
-# rendered wrapper can be unit-tested without a sandbox.
+# The wildcard imports below put hundreds of stdlib names into the module
+# globals; ``_USER_GLOBALS`` snapshots them *before* the submission runs so the
+# solution sees the same prelude the inline-paste layout used to provide.
+# ``_USER_PREEXEC_KEYS`` records which names the prelude owns, so the resolver
+# can prefer a callable the submission actually defined: without it,
+# `class Solution: def search(...)` resolves `search` to `re.search` and every
+# test fails, which scored a correct solution 0.
+#
+# The submission runs via ``exec`` with ``__name__ != "__main__"``, an empty
+# stdin and a discarded stdout, and any exception (including SystemExit) is
+# swallowed: a driver program the model appended -- stdin reads, demo prints,
+# ``sys.exit()`` -- can no longer consume the JSON arguments, pollute the
+# stdout the judge compares, or abort the run, and a driver crashing *after*
+# defining the callable leaves the callable scoreable.  Previously any such
+# driver zeroed an otherwise-correct solution.
+#
+# The generation travels as an ``ascii()`` string literal (``@@GENERATION_REPR@@``)
+# so arbitrary solution text -- quotes, backslashes, non-ASCII -- cannot break
+# out of the embedding script, and the literal is pure ASCII, surviving any
+# transport encoding.  Kept as a plain template (placeholder `.replace`, not an
+# f-string) so the rendered wrapper can be unit-tested without a sandbox.
 _FN_NAME_WRAPPER_TEMPLATE = """
+import io as _io
 import traceback
 from string import *
 from re import *
@@ -79,10 +95,22 @@ import io
 import sys
 import json
 
-_PREEXISTING_GLOBALS = set(globals())
+_USER_GLOBALS = dict(globals())
+_USER_GLOBALS["__name__"] = "__user_solution__"
+_USER_PREEXEC_KEYS = set(_USER_GLOBALS)
+_USER_CODE = @@GENERATION_REPR@@
 
-# === User's Original Code START ===
-@@GENERATION@@
+# === User's Original Code START (isolated exec) ===
+_real_stdin, _real_stdout = sys.stdin, sys.stdout
+sys.stdin, sys.stdout = _io.StringIO(""), _io.StringIO()
+try:
+    exec(compile(_USER_CODE, "<user_solution>", "exec"), _USER_GLOBALS)
+except SystemExit:
+    pass
+except Exception:
+    traceback.print_exc()
+finally:
+    sys.stdin, sys.stdout = _real_stdin, _real_stdout
 # === User's Original Code END ===
 
 _SANDBOX_FN_NAME = "@@FN_NAME@@"
@@ -102,29 +130,35 @@ def _execute_user_function():
     # --- Function Location and Execution ---
     try:
         _target_callable = None
-        # Try global scope first, but only for a name the user's code introduced:
-        # the wildcard imports above already bind names such as `search`.
-        if _SANDBOX_FN_NAME in globals() and _SANDBOX_FN_NAME not in _PREEXISTING_GLOBALS:
-            _target_callable = globals()[_SANDBOX_FN_NAME]
+        # Resolve inside the submission's own namespace.  Names the prelude
+        # owns (`re.search` & co.) only qualify as a last resort: a submission
+        # that defined nothing under that name gets the wildcard import, which
+        # errors out and scores 0 exactly as before.
+        if _SANDBOX_FN_NAME in _USER_GLOBALS and _SANDBOX_FN_NAME not in _USER_PREEXEC_KEYS:
+            _target_callable = _USER_GLOBALS[_SANDBOX_FN_NAME]
         # Else, if 'Solution' class exists, try to get its method
-        elif 'Solution' in globals():
-            _Solution_class = globals()['Solution']
-            # Attempt to instantiate and get method.
-            # Errors (e.g. Solution not a class, instantiation fails, method missing)
-            # will be caught by the broad except block below.
-            _solution_instance = _Solution_class()
+        elif 'Solution' in _USER_GLOBALS and 'Solution' not in _USER_PREEXEC_KEYS:
+            _solution_instance = _USER_GLOBALS['Solution']()
             _target_callable = getattr(_solution_instance, _SANDBOX_FN_NAME)
-        # Last resort: the name only exists because the wrapper imported it.
-        elif _SANDBOX_FN_NAME in globals():
-            _target_callable = globals()[_SANDBOX_FN_NAME]
+        # Last resort: the name only exists because the prelude imported it
+        # (or the submission redefined a prelude name).
+        elif _SANDBOX_FN_NAME in _USER_GLOBALS:
+            _target_callable = _USER_GLOBALS[_SANDBOX_FN_NAME]
 
         if not _target_callable:
             sys.stderr.write(f"WrapperError: Function or method '{_SANDBOX_FN_NAME}' not found.\\n")
             return None, True # result, error_occurred
 
-        _fn_result = _target_callable(*_args)
+        # stdout belongs to the judge: prints inside the called function are
+        # discarded, only the serialised return value reaches real stdout.
+        sys.stdout = _io.StringIO()
+        try:
+            _fn_result = _target_callable(*_args)
+        finally:
+            sys.stdout = _real_stdout
         return _fn_result, False # result, no_error
     except Exception: # Catches errors from Solution instantiation, getattr, or function call
+        sys.stdout = _real_stdout
         sys.stderr.write(f"Error during setup or execution of '{_SANDBOX_FN_NAME}':\\n{traceback.format_exc()}\\n")
         return None, True # result, error_occurred
 
@@ -147,8 +181,16 @@ if __name__ == '__main__':
 
 
 def build_fn_name_wrapper(generation: str, fn_name: str) -> str:
-    """Render the call-based execution wrapper for one solution."""
-    return _FN_NAME_WRAPPER_TEMPLATE.replace("@@GENERATION@@", generation).replace("@@FN_NAME@@", fn_name)
+    """Render the call-based execution wrapper for one solution.
+
+    The generation is embedded as an ``ascii()`` string literal so quotes,
+    backslashes and non-ASCII text in the solution cannot corrupt the wrapper
+    script.  ``ascii`` round-trips any ``str`` exactly and the literal is pure
+    ASCII, so the rendered wrapper survives any transport encoding.
+    """
+    return _FN_NAME_WRAPPER_TEMPLATE.replace("@@GENERATION_REPR@@", ascii(generation)).replace(
+        "@@FN_NAME@@", fn_name
+    )
 
 
 def normalize_stdout(text: Any) -> str:
