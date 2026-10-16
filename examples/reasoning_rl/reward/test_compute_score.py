@@ -590,6 +590,26 @@ class TestEvaluatedGtMatch:
         # Relations are excluded here; they belong to _normalized_text_match.
         assert not _evaluated_gt_match(think_wrap("\\boxed{y_2 < y_1 < y_3}"), "y2 < y1 < y3")
 
+    def test_chained_relation_pred_not_crashing_relabel(self):
+        pytest.importorskip("math_verify")
+        # Production crash (reward worker died, not a mismatch): a chained
+        # equality parses as a patched latex2sympy2_extended ``And``; the
+        # position-aligned relabel ``x -> y`` turned ``Eq(x, y)`` into the
+        # trivially-true ``Eq(y, y)``, sympy collapsed the ``And`` to the bare
+        # ``Eq(y, 1)``, and the patch's ``_unsorted_args`` assignment blew up
+        # on the relation's ``__slots__``.  _numerisable must drop
+        # Boolean-valued expressions before _equiv's subs ever runs.
+        assert not _evaluated_gt_match(
+            think_wrap("The answer is $\\boxed{x = y = 1}$."), "y + z"
+        )
+        assert not _evaluated_gt_match(
+            think_wrap("The answer is $\\boxed{0 < x < 1}$."), "x + y"
+        )
+        # Same crash class via a chained inequality over two variables.
+        assert not _evaluated_gt_match(
+            think_wrap("The answer is $\\boxed{0 < x < y}$."), "y + z"
+        )
+
     def test_unevaluated_sum_excluded_before_evalf(self):
         pytest.importorskip("math_verify")
         # Production SIGSEGV: the Big-Math mixture log-likelihood ground truth

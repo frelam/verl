@@ -878,6 +878,19 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
 
         if isinstance(e, sp.Equality):
             e = e.rhs
+        # Boolean-valued leftovers (a chained relation parses as a patched
+        # latex2sympy2_extended ``And``, e.g. ``x = y = 1`` or ``0 < x < 1``;
+        # bare strict inequalities; ``Ne``) carry no numeric value and can
+        # never match here.  They must be dropped NOW rather than left to
+        # fail ``float()`` in the sampling loop: the position-aligned relabel
+        # in ``_equiv`` rebuilds that patched ``And`` via ``subs``, and when
+        # the relabel makes an argument trivially true (``Eq(x, y)`` with
+        # ``x -> y``) sympy collapses the ``And`` to a bare relation, whose
+        # unsorted-args patch-up then dies on the ``__slots__``
+        # AttributeError -- killing the whole reward worker (observed in
+        # production on a ``\boxed{x = y = 1}`` prediction).
+        if isinstance(e, (sp.core.relational.Relational, sp.logic.boolalg.Boolean)):
+            return None
         # Unevaluated Sum/Product/Integral: sympy's evalf descends into
         # euler_maclaurin for a symbolic-bounds or nested Sum and can recurse
         # until the worker THREAD's C stack overflows -- a SIGSEGV that kills
@@ -933,7 +946,13 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
         # difference worth crediting.  Same guard as _conditional_match.
         if isinstance(g, sp.Symbol):
             return False
-        p = p.subs(dict(zip(p_syms, g_syms)))
+        try:
+            p = p.subs(dict(zip(p_syms, g_syms)))
+        except Exception:
+            # Exotic sympy rebuild inside subs (e.g. latex2sympy2_extended's
+            # patched And collapsing to a bare relation) -- a mismatch, not a
+            # crash of the whole reward worker.
+            return False
         try:
             g_poly = sp.Poly(sp.expand(g), *g_syms) if g_syms else None
             p_poly = sp.Poly(sp.expand(p), *g_syms) if g_syms else None
