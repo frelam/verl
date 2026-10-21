@@ -887,6 +887,11 @@ class TestStage3Mix:
 
         assert val and kkcut_parents(val)
         assert not kkcut_parents(val) & kkcut_parents(train)
+        # Whole sibling groups are drawn into val, so the carve neither falls
+        # short of its target nor skips the kkcut channel (the old row-wise carve
+        # returned almost every group and left val with a single kkcut row).
+        assert len(val) >= 400
+        assert sum(1 for r in val if r["extra_info"]["task_id"].startswith("kkcut:")) >= 40
 
     def test_stage3_pins_the_code_share_in_the_old_domain(self, tmp_path):
         """The hallucination domain has no code, so the replay must oversample it."""

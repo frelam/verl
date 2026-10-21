@@ -463,43 +463,47 @@ def carve_val_from_filled(
     the row; val is then taken proportionally out of each cell, so it keeps the
     train composition.  ``--halluc_total`` therefore counts train + val.
 
-    A D27 pair or a D30 kkcut sibling group that was split by the carve is
-    returned to train whole (see :func:`_split_group_key`), so val can come in
-    slightly under ``n_val``.
+    Sampling is **group-aware**: D27's FalseQA twins and D30's kkcut siblings
+    (several cuts of one parent differ by a single sentence) are drawn as whole
+    groups, so a group can never straddle the boundary.  Drawing rows
+    independently and returning partial groups to train is the alternative, but
+    it starves val of exactly those sources -- measured on the real build: val
+    came out at 571 instead of 700 and held a single kkcut row, which makes the
+    logic-unsolvable val metric meaningless.  The cost here is a small overshoot
+    (a cell stops at or just past its target, never before it).
     """
     if n_val <= 0:
         return [], list(rows)
 
-    buckets: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    for row in rows:
-        buckets[(row["extra_info"]["branch"], row["data_source"])].append(row)
+    cells = [(row["extra_info"]["branch"], row["data_source"]) for row in rows]
+    groups: dict[str, list[int]] = defaultdict(list)
+    home_cell: dict[str, tuple[str, str]] = {}
+    for index, row in enumerate(rows):
+        key = _split_group_key(row) or f"__row:{index}"
+        groups[key].append(index)
+        home_cell.setdefault(key, cells[index])
 
-    weights = {cell: quota.get(cell, len(bucket)) for cell, bucket in buckets.items()}
+    weights = {cell: quota.get(cell, 0) for cell in set(cells)}
     per_cell = _largest_remainder(weights, min(n_val, len(rows)))
 
-    val_rows: list[dict] = []
-    train_rows: list[dict] = []
-    for cell, bucket in buckets.items():
-        take = min(per_cell.get(cell, 0), len(bucket))
-        chosen = rng.sample(bucket, take) if take else []
-        chosen_ids = {id(r) for r in chosen}
-        val_rows.extend(chosen)
-        train_rows.extend([r for r in bucket if id(r) not in chosen_ids])
+    groups_by_cell: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for key, cell in home_cell.items():
+        groups_by_cell[cell].append(key)
 
-    # D27 pair twins, and D30's kkcut siblings (several cuts of one parent puzzle
-    # differ by a single sentence, so they are near-duplicates of each other): a
-    # group that did not land in val *whole* goes back to train rather than
-    # leaking across the boundary.
-    group_sizes = Counter(key for key in (_split_group_key(r) for r in rows) if key)
-    val_counts = Counter(key for key in (_split_group_key(r) for r in val_rows) if key)
-    kept: list[dict] = []
-    for row in val_rows:
-        key = _split_group_key(row)
-        if key and val_counts[key] != group_sizes[key]:
-            train_rows.append(row)
-        else:
-            kept.append(row)
-    return kept, train_rows
+    val_indices: set[int] = set()
+    for cell, keys in groups_by_cell.items():
+        target = min(per_cell.get(cell, 0), sum(len(groups[key]) for key in keys))
+        rng.shuffle(keys)
+        taken = 0
+        for key in keys:
+            if taken >= target:
+                break
+            val_indices.update(groups[key])
+            taken += len(groups[key])
+
+    val_rows = [row for index, row in enumerate(rows) if index in val_indices]
+    train_rows = [row for index, row in enumerate(rows) if index not in val_indices]
+    return val_rows, train_rows
 
 
 def fill_cells(

@@ -593,11 +593,11 @@ stage 3 用标准模板 A/B/C）→ `halluc/built_stage3/`，构建后跑 `verif
 FAIL 而非训练期）→ `mix_halluc.py --stage3_mix --halluc_total 14000 --halluc_unsolvable_ratio 0.75
 --old_domain_ratio 0.6 --val_size 700 --strict_cells --seed 43` → `final_halluc_stage3/`。
 **配对原子性、近重去重与模板平衡检查原样生效**（FalseQA 双侧同在 stage 3 池内；模板 A 含可解
-umwp 150 + treecut 290 + falseqa-ans 300 与不可解 treecut 负 3,030 + falseqa-fake 820，模板 B
+umwp 170 + treecut 320 + falseqa-ans 300 与不可解 treecut 负 3,030 + falseqa-fake 820，模板 B
 两侧亦齐，D18 硬约束天然满足）。
 `--halluc_total` / `--halluc_unsolvable_ratio` 旋钮在 `--stage3_mix` 下按边权对 `STAGE3_QUOTA`
 重缩放，默认值（14,000 / 0.75）逐行复现该表；`--strict_cells` 让短 cell 直接报错而不是跨 cell
-回填，val 在填满后按 cell 比例切出。
+回填，val 在填满后按 cell 比例、以原子组（D27 孪生 / D30 kkcut 兄弟）为单位切出。
 
 > **实现口径（§4.8 行 1 的 400 条合成干扰行）**：D17 的三段施加对象（UMWP-answerable 200 / K&K 100 /
 > 主池数学题 100）全部保留，但 K&K 底题产出的行**答案契约是 D19 的「人名: 角色词」**，无法落在行 1
