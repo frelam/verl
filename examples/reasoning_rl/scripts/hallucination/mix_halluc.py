@@ -678,7 +678,7 @@ def near_dedup_against_stage1(
     from dedup import minhash_near_dedup
 
     texts = [str(text) for text in anchor_texts] + [_question_key(row) for row in rows]
-    kept_indices = set(minhash_near_dedup(texts, threshold=threshold))
+    kept_indices = set(minhash_near_dedup(texts, threshold=threshold, n_anchors=len(anchor_texts)))
     n_anchor = len(anchor_texts)
     dropped_ids = {row["extra_info"]["task_id"] for i, row in enumerate(rows) if n_anchor + i not in kept_indices}
     if not dropped_ids:

@@ -97,12 +97,25 @@ def minhash_near_dedup(
     num_perm: int = 128,
     bands: int = 32,
     shingle_n: int = 5,
+    n_anchors: int | None = None,
 ) -> list[int]:
     """Greedy MinHash-LSH near-dedup. Returns indices of kept rows.
 
     A row is dropped if it shares an LSH band bucket with an earlier kept row AND
     their signature similarity (fraction of equal minima, an unbiased estimate of
     Jaccard) is >= threshold. Empty texts are always kept (they carry no signal).
+
+    ``n_anchors`` switches to reference-set mode: the first ``n_anchors`` texts
+    are trusted, always kept and indexed, and every later text is compared
+    against *them only* (later texts are never indexed, so near-identical query
+    rows all survive). The default ``None`` keeps the all-pairs greedy behaviour.
+
+    Reference-set mode is what ``mix_halluc`` needs: its query set deliberately
+    contains near-identical rows -- D27's FalseQA twins, UMWP's answerable /
+    unanswerable partners, and D30's kkcut siblings (several cuts of one parent
+    differ by a single sentence). All-pairs greedy collapses each of those
+    clusters to its first element; measured on the real stage-3 pools that took
+    UMWP unsolvable from 2,571 to 704 and the kkcut channel from 2,342 to 0.
 
     Performance notes (all decisions are identical to a naive per-candidate loop):
 
@@ -153,6 +166,10 @@ def minhash_near_dedup(
             keep.append(idx)
             continue
 
+        # Reference-set mode: the anchors are trusted (kept and indexed without
+        # being compared to each other), and a query row is never indexed, so it
+        # cannot evict a later, near-identical query row.
+        is_reference = n_anchors is not None and idx < n_anchors
         q8 = sig.astype(np.uint8)
         cand_arrays: list[np.ndarray] = []
         band_keys: list[bytes] = []
@@ -164,7 +181,7 @@ def minhash_near_dedup(
                 cand_arrays.append(cell[0][: cell[1]])
 
         is_dup = False
-        if cand_arrays:
+        if not is_reference and cand_arrays:
             cand = np.unique(np.concatenate(cand_arrays)) if len(cand_arrays) > 1 else cand_arrays[0]
             for s in range(0, cand.shape[0], _CMP_CHUNK):
                 c = cand[s : s + _CMP_CHUNK]
@@ -176,6 +193,9 @@ def minhash_near_dedup(
                     break
 
         if not is_dup:
+            keep.append(idx)
+            if n_anchors is not None and not is_reference:
+                continue  # query rows are not part of the reference index
             kept_buf[n_kept] = sig
             kept_buf8[n_kept] = q8
             n_kept += 1
@@ -195,6 +215,5 @@ def minhash_near_dedup(
                         cell[0] = arr
                     arr[used] = row
                     cell[1] = used + 1
-            keep.append(idx)
 
     return keep

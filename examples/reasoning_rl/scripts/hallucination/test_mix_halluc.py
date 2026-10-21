@@ -673,6 +673,24 @@ class TestNearDedup:
         assert [row["extra_info"]["task_id"] for row in kept] == ["keep"]
         assert (dropped, twins) == (1, 0)
 
+    def test_near_identical_query_rows_both_survive(self):
+        """Query rows are compared with the anchors only, never with each other.
+
+        D27's twins, UMWP's answerable/unanswerable partners and D30's kkcut
+        siblings are deliberately near-identical; an all-pairs greedy pass would
+        collapse each cluster to its first row (measured: the whole kkcut channel
+        went to zero).
+        """
+        rows = [
+            self.make_row(self.long_question(), "query-a"),
+            self.make_row(self.reworded_question(), "query-b"),
+        ]
+        kept, dropped, twins = mix_halluc.near_dedup_against_stage1(
+            rows, [self.UNRELATED], threshold=0.6
+        )
+        assert [row["extra_info"]["task_id"] for row in kept] == ["query-a", "query-b"]
+        assert (dropped, twins) == (0, 0)
+
     def test_a_dropped_twin_takes_its_pair_with_it(self):
         rows = [
             self.make_row(self.reworded_question(), "twin-a", pair_id="falseqa:train:7"),
