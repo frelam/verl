@@ -53,11 +53,13 @@ channel.
 The deleted speaker keeps their place in the ``inhabitants:`` roster (every row
 carries the full roster, so nothing leaks), and the row ships its audit fields --
 ``kkcut_deleted_index`` / ``kkcut_deleted_statement`` / ``kkcut_solutions_after``
--- in ``extra_info``.  One kkcut row per abstract group at most, from the first
-admissible deletion in a seeded order (``--seed`` only matters under this flag;
-the solvable build stays seed-free).  The contract is the three-tier bare
-refusal (template B, ``\\boxed{UNSOLVABLE}``), MiP-style: no options block to
-mine, the deficiency itself is unpointable by construction.
+-- in ``extra_info``.  ``--kkcut-per-group`` caps how many cuts one abstract group
+may contribute (default 1, from the first admissible deletion in a seeded order;
+``0`` emits every admissible deletion, which is what the stage-3 logic quota
+needs).  ``--seed`` only matters under this flag; the solvable build stays
+seed-free.  The contract is the three-tier bare refusal (template B,
+``\\boxed{UNSOLVABLE}``), MiP-style: no options block to mine, the deficiency
+itself is unpointable by construction.
 
 The gold is a **mapping**, never a bare role-word sequence: section 5.1 (D19)
 fixes the contract as per-inhabitant ``name: role`` pairs and the reward requires
@@ -913,14 +915,16 @@ def _build_row(member: dict, clean_sibling: dict | None, seed: int) -> dict:
     )
 
 
-def _kkcut_task_id(family: str, count: int, index: int) -> str:
+def _kkcut_task_id(family: str, count: int, index: int, deleted: int) -> str:
     """Stable hard-replay key of one synthesised unsolvable row (stage 3 / D30).
 
     Same ``(family, tier, index)`` body as :func:`task_id_of` under the
-    ``kkcut:`` prefix, so a kkcut row and its solvable parent never collide and
-    ``verify_kk.py`` can route the two contracts apart from the artifact alone.
+    ``kkcut:`` prefix, plus the deleted speaker's index as a fifth segment, so a
+    kkcut row and its solvable parent never collide, several cuts of the same
+    parent (``--kkcut-per-group``) stay distinct, and ``verify_kk.py`` can route
+    the two contracts apart from the artifact alone.
     """
-    return f"{KKCUT_PREFIX}:{family}:{count}ppl:{index}"
+    return f"{KKCUT_PREFIX}:{family}:{count}ppl:{index}:{deleted}"
 
 
 def _kkcut_deletion_order(family: str, count: int, index: int, seed: int) -> list[int]:
@@ -955,7 +959,7 @@ def _build_kkcut_row(member: dict, cut_quiz: str, deleted: int, statements: tupl
     extra_info = {
         "split": "train",
         "index": index,
-        "task_id": _kkcut_task_id(family, count, index),
+        "task_id": _kkcut_task_id(family, count, index, deleted),
         "seed": seed,
         "difficulty": f"{count}ppl",
         "perturbation_type": KKCUT_PERTURBATION,
@@ -983,7 +987,11 @@ def _build_kkcut_row(member: dict, cut_quiz: str, deleted: int, statements: tupl
 
 
 def build_rows(
-    raw_dir: str, limit: int | None = None, seed: int = 0, emit_unsolvable: bool = False
+    raw_dir: str,
+    limit: int | None = None,
+    seed: int = 0,
+    emit_unsolvable: bool = False,
+    kkcut_per_group: int = 1,
 ) -> tuple[list[dict], dict]:
     """Build the K&K parquet rows and the report that produced them.
 
@@ -997,14 +1005,16 @@ def build_rows(
     never chooses a row -- so the same ``raw_dir`` and ``limit`` always produce
     byte-identical rows.
 
-    With ``emit_unsolvable`` (stage 3 / D30) every selected group also tries one
-    statement deletion; the first candidate that survives both certificates
+    With ``emit_unsolvable`` (stage 3 / D30) every selected group also tries
+    statement deletions; each candidate that survives both certificates
     (enumeration ``>= 2`` solutions after the drop, and the fail-closed text
     surgery) ships as a ``kkcut:`` bare-refusal row appended after the solvable
-    pool.  A group whose every candidate fails is counted in
-    ``report["kkcut"]["skipped"]`` (the funnel keeps its "rows remaining" meaning)
-    and contributes nothing -- the solvable side is never weakened to balance the
-    synthesis.
+    pool.  ``kkcut_per_group`` caps the rows one parent group may contribute
+    (``1`` is the original behaviour; ``0`` means every admissible deletion, which
+    is what the stage-3 quota needs to reach its logic-unsolvable cell).  A group
+    whose every candidate fails is counted in ``report["kkcut"]["skipped"]`` (the
+    funnel keeps its "rows remaining" meaning) and contributes nothing -- the
+    solvable side is never weakened to balance the synthesis.
     """
     raw = load_source(raw_dir)
     funnel: dict[str, int] = collections.OrderedDict()
@@ -1077,10 +1087,9 @@ def build_rows(
         rows = rows[: max(limit, 0)]
     funnel["after_limit"] = len(rows)
 
-    # Stage 3 / D30: one synthesised unsolvable row per group whose first
-    # admissible deletion survives both certificates.  Synthesis runs over the
-    # post-limit parents, so ``--limit`` caps both sides; a group that yields no
-    # kkcut row never weakens the solvable side.
+    # Stage 3 / D30: synthesised unsolvable rows from certified-necessary statement
+    # deletions.  Synthesis runs over the post-limit parents, so ``--limit`` caps
+    # both sides; a group that yields no kkcut row never weakens the solvable side.
     kkcut_rows: list[dict] = []
     kkcut_skipped: collections.Counter = collections.Counter()
     if emit_unsolvable:
@@ -1094,8 +1103,10 @@ def build_rows(
             except StatementError:  # pragma: no cover - selection only admits parsed rows
                 kkcut_skipped["unparseable_statements"] += 1
                 continue
-            made = False
+            made = 0
             for deleted in _kkcut_deletion_order(family, count, index, seed):
+                if kkcut_per_group and made >= kkcut_per_group:
+                    break
                 if solutions_without(statements, count, deleted) < 2:
                     continue
                 cut_quiz = remove_statement_sentence(member["quiz"], list(member["names"]), deleted)
@@ -1103,8 +1114,7 @@ def build_rows(
                     kkcut_skipped["text_surgery_dropped"] += 1
                     continue
                 pairs.append((member, _build_kkcut_row(member, cut_quiz, deleted, statements, seed)))
-                made = True
-                break
+                made += 1
             if not made:
                 kkcut_skipped["no_admissible_deletion"] += 1
         # Tier-interleave the kkcut rows themselves, so a downstream cap on the
@@ -1152,6 +1162,7 @@ def build_rows(
             # solvable funnel above is untouched by any of it.
             "emitted": len(kkcut_rows),
             "groups_attempted": len(parents) if emit_unsolvable else 0,
+            "per_group_cap": kkcut_per_group,
             "skipped": dict(kkcut_skipped),
             "per_tier": _breakdown(kkcut_rows, lambda row: row["extra_info"]["difficulty"]),
             "per_family": _breakdown(kkcut_rows, lambda row: row["extra_info"]["perturbation_family"]),
@@ -1226,13 +1237,25 @@ def main() -> None:
     parser.add_argument(
         "--emit-unsolvable",
         action="store_true",
-        help="also synthesise one kkcut unsolvable row per group (stage 3 / D30); "
-        "--seed only matters under this flag",
+        help="also synthesise kkcut unsolvable rows from certified statement deletions "
+        "(stage 3 / D30); --seed only matters under this flag",
+    )
+    parser.add_argument(
+        "--kkcut-per-group",
+        type=int,
+        default=1,
+        help="max kkcut rows per parent group (default 1; 0 = every admissible deletion)",
     )
     args = parser.parse_args()
     report_path = args.report or report_path_for(args.out)
 
-    rows, report = build_rows(args.raw_dir, limit=args.limit, seed=args.seed, emit_unsolvable=args.emit_unsolvable)
+    rows, report = build_rows(
+        args.raw_dir,
+        limit=args.limit,
+        seed=args.seed,
+        emit_unsolvable=args.emit_unsolvable,
+        kkcut_per_group=args.kkcut_per_group,
+    )
     schema.normalise_extra_info(rows)
     schema.validate_rows(rows)
     schema.write_rows_parquet(rows, args.out)
@@ -1267,7 +1290,11 @@ def main() -> None:
     for key, count in report["enumerator"].items():
         print(f"  {key:30s} {count}")
     print("\nkkcut synthesis (stage 3 / D30):")
-    print(f"  emitted {report['kkcut']['emitted']} of {report['kkcut']['groups_attempted']} groups attempted")
+    cap = report["kkcut"]["per_group_cap"] or "all"
+    print(
+        f"  emitted {report['kkcut']['emitted']} from {report['kkcut']['groups_attempted']} groups "
+        f"attempted (cap {cap} per group)"
+    )
     for key, count in report["kkcut"]["skipped"].items():
         print(f"  {key:30s} {count}")
 

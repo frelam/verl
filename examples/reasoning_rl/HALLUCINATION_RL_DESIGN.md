@@ -42,7 +42,7 @@
 | D27 | FalseQA 双侧入池（label=0 复活） | **作废 D22 的"label=0 不入池"**：answerable 侧 928 条入池，与 label=1 索引对齐配对、**按对划分 split**（同对不进异侧）；走**两层 reward（AND 门控**，gt 键 `solvable_answer`）：`\boxed{答案}` 与 gold（label=0 answer）`norm_match` 通过才 +1（判对答错 → 0）；`\boxed{SOLVABLE}` → 0；误拒（`UNSOLVABLE` 任意形态）→ 0。label=0 answer 67.8% 为自由文本短答 → 答案层用归一化精确匹配（大小写/标点/冠词），噪声抽检见 Q17。**answerable 侧同样带占位替换对选项块**（题面内左项 + 题面外同类等长右项，k=3 无正确项），模板 A 外观与不可解侧同构，防"无选项块 ⇒ SOLVABLE"格式记忆。配额：行 3 扩为 UMWP 550 + FalseQA-ans 928 = 1,478；让渡 TreeCut 正 1,000→500、GSM-IC 1,200→772（§4.8） |
 | D28 | 四档不可解行三层 AND-gate | **（D29 后：仅 stage 3；stage 2 已由 D29 回退为两段式，见下）** 四档不可解行（FalseQA-fake / TreeCut 负）的输出契约由 `\boxed{UNSOLVABLE: <选项ID>}` 扩为 `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`；reward 在原「拒答 + 指针命中」两层之上**加第三层「补条件后的正确解」**：三层全对 +1，否则 0。gold 侧新增 `repaired_answer`（必有）与 `repaired_free_text`（FalseQA 置 true 走 `norm_match`；TreeCut 数值走 `math_match`）。来源：FalseQA 用配对真题的 source answer（构造即证书——应用 gold 替换对恰好重放真题题面）；TreeCut 用 `certify_repaired_answer`（恢复 `deleted_sentence` 重跑 `certify_answer`，失败丢整对）。兼容性：缺 `repaired_answer` 的旧 parquet 回退旧两层口径 |
 | D29 | 三层修复契约拆为独立 stage 3 | **动机**：D28 把"判不可解 + 指对选项 + 解出修复后的题"绑进 stage 2 同一个 reward，四档行第三层长期 ≈0 时整行零方差被 `filter_groups` 屏蔽，反而污染 stage 2 的"拒答 + 诊断"信号。**拆分**：① stage 2 四档行回退两段式 `\boxed{UNSOLVABLE: <选项ID>}`（拒答 + 指针命中即 +1；收到三段式输出时第三段被解析但忽略，不奖不罚）；② stage 3 原样保留 D28 三段式契约与三层 AND-gate，由 gt 键 `repair_task=true` 路由（`repair_task` 与模板 `A_repair` 1:1 绑定，schema 强校验；带 `repaired_answer` 无 `repair_task` 的 pre-D29 artifact 走 legacy 回退仍按三层门评分）；③ stage 3 数据 = 纯修复行（FalseQA-repair 928 + TreeCut-repair 4,907，`REPAIR_QUOTA`）+ 旧域回放（`--old_domain_ratio 0.7`），由 `mix_halluc.py --repair_mode` 构建（跳过 `enforce_pair_atomicity`，`A_repair` 模板平衡结构性豁免）；④ adapter 侧 `--repair-contract` 旗标控制是否产出 `repair_task`/`repaired_answer`（stage 2 默认不产出，TreeCut 顺带跳过 `certify_repaired_answer` 的整对丢弃）；⑤ stage 3 训练从 stage-2 ckpt 续训（`run_qwen3_4b_hallucination_stage3_fully_async.sh`），reward 文件与 stage 2 共用 `hallucination_compute_score.py`（路由依据是 ground_truth 的键，不是 data_source） |
-| D30 | stage 3 域平衡重构（kkcut 合成 + 新配比） | **动机**：用户要求每个域内不可解/可解 ≈ 40/60，并上调 commonsense 与 logic 占比；K&K 无原生不可解 → 合成。**内容**：① `kk_adapter.py --emit-unsolvable` 合成 **kkcut 行**——对已证唯一解的谜题删除一条陈述（`statements` 元组与 `quiz` 文本同步手术），仅当剩余子系统 2^N 全量枚举 **≥2 解** 时保留（删约束只能增解 ⇒ 被删陈述必要，枚举即证书；`verify_kk.py` 新增 `kkcut:` 独立审计通道，独立重推导不复用 adapter 代码）；契约 = 三档裸拒（模板 B、无 `role_words`，MiP 式），审计字段 `kkcut_deleted_index` / `kkcut_deleted_statement` / `kkcut_solutions_after`；② stage 3 幻觉侧换**域平衡表 `STAGE3_QUOTA`**（15 cell，§4.8）：logic 15%（3,000 = kk 1,200 可解 + kkcut 1,800 不可解）/ commonsense 20%（4,000 = FalseQA 928×2 + CREPE 672 判断 + 1,472 裸拒）/ math 65%（13,000 = GSM-IC 800 + UMWP 200/600/1,300 + 主池 100 + TreeCut 500/3,230 + SUM 6,000 + MiP 270），各域按**边权**（SUM 配对 0.5/0.5）精确 40/60；旧 `--repair_mode` 与 `REPAIR_QUOTA` 删除（D29 修复层已退役，stage 3 不再消费 `--repair-contract` 产物，配对原子性/去重/模板平衡检查与 stage 2 同一套原样生效）；③ CREPE 配额经 `--quota-overrides solvable_judge=672,unsolvable_bare=1472` 扩到 2,144；④ 构建入口 `build_hallucination_stage3_data.sh`（kk 带 `--emit-unsolvable`，构建后跑 `verify_kk.py` 把坏 cut 行挡在构建期）→ `halluc/built_stage3/` → `mix_halluc.py --stage3_mix` → `final_halluc_stage3/`；**stage 2 表 B 不变** |
+| D30 | stage 3 域平衡重构（kkcut 合成 + 新配比） | **动机**：用户要求全局可解/不可解 = 70/30、老域/幻觉域 = 60/40（可解含两域），且合并后 math/code/logic 比例贴近老域；K&K 无原生不可解 → 合成。**内容**：① `kk_adapter.py --emit-unsolvable` 合成 **kkcut 行**——对已证唯一解的谜题删除一条陈述（`statements` 元组与 `quiz` 文本同步手术），仅当剩余子系统 2^N 全量枚举 **≥2 解** 时保留（删约束只能增解 ⇒ 被删陈述必要，枚举即证书；`verify_kk.py` 新增 `kkcut:` 独立审计通道，独立重推导不复用 adapter 代码）；契约 = 三档裸拒（模板 B、无 `role_words`，MiP 式），审计字段 `kkcut_deleted_index` / `kkcut_deleted_statement` / `kkcut_solutions_after`；`--kkcut-per-group 0` 允许同一父组枚举多条可删陈述，`kkcut:` task_id 增加第 5 段保证唯一；② stage 3 幻觉侧换**域平衡表 `STAGE3_QUOTA`**（14 cell，合计 14,000，§4.8）：logic 20%（2,800 = kk 700 可解 + kkcut 2,100 不可解）/ commonsense 20%（2,800 = FalseQA 300+820 + CREPE 400 判断 + 1,280 裸拒）/ math 60%（8,400 = GSM-IC 340 + UMWP 155/170/1,925 + 主池 15 + TreeCut 320/3,030 + SUM 2,200 + MiP 245），幻觉域内按**边权**（SUM 配对 0.5/0.5）精确 25/75，老域占 train 60% ⇒ 全局 70/30；老域按 **ability 分层抽样**（`--code_share`，stage-3 默认 0.24）：幻觉域没有 code 源，若均匀回放 code 会被稀释到全量的 ~15%，故先取 0.24×train_total 条 code，其余按池内供给比例分给 math/logic/stem，使合并后 math/code/logic ≈ 老域的 45/25/15；旧 `--repair_mode` 与 `REPAIR_QUOTA` 删除（D29 修复层已退役，stage 3 不再消费 `--repair-contract` 产物，配对原子性/去重/模板平衡检查与 stage 2 同一套原样生效）；③ CREPE 配额经 `--quota-overrides solvable_judge=400,unsolvable_bare=1280` 扩到 1,680；④ 构建入口 `build_hallucination_stage3_data.sh`（`HALLUC_TOTAL=14000`、`OLD_DOMAIN_RATIO=0.6`、`VAL_SIZE=700`，kk 带 `--emit-unsolvable --kkcut-per-group 0`，构建后跑 `verify_kk.py` 把坏 cut 行挡在构建期）→ `halluc/built_stage3/` → `mix_halluc.py --stage3_mix --strict_cells` → `final_halluc_stage3/`；**stage 2 表 B 不变** |
 
 ---
 
@@ -554,44 +554,50 @@ GSM-IC 的 242 个 `sentence_template` 全部只由 `{role}`（272 个取值）/
 不可解（行 8）✅；模板 C 自带两侧 ✅。
 
 **stage 3 构成（D30 域平衡版；与表 B 不同的另一份 artifact）**：stage 3 幻觉侧不再复用表 B，
-改为**域平衡新配比**——logic 15%（3,000）/ commonsense 20%（4,000）/ math 65%（13,000），且
-**每个域内部**按边权（SUM 配对 0.5/0.5 计入两侧）不可解/可解 = 40/60。logic 的不可解侧由
-K&K **合成**（`kk_adapter.py --emit-unsolvable`，D30：删一条陈述 + 2^N 枚举证书，三档裸拒，
-审计字段与 `kkcut:` 审计通道见 §0 D30）。按 `STAGE3_QUOTA` 的 15 个 cell
-（`mix_halluc.py --stage3_mix`）：
+改为**域平衡新配比**——logic 20%（2,800）/ commonsense 20%（2,800）/ math 60%（8,400），且
+**幻觉域内部**按边权（SUM 配对 0.5/0.5 计入两侧）可解/不可解 = 25/75；老域（stage-1，全可解）
+占最终 train 的 60%，于是整份 artifact 为 **70/30**（0.6×1.0 + 0.4×0.25 = 0.70）。logic 的不可解
+侧由 K&K **合成**（`kk_adapter.py --emit-unsolvable --kkcut-per-group 0`，D30：删一条陈述 + 2^N
+枚举证书，三档裸拒，同一父组可产出多条不同删除，审计字段与 `kkcut:` 审计通道见 §0 D30）。
+按 `STAGE3_QUOTA` 的 **14 个 cell**（`mix_halluc.py --stage3_mix`，合计 14,000）：
 
 | 域 | 分支 | 模板 | 来源与配额 | 小计 |
 |---|---|---|---|---|
-| logic | 可解·人名-角色对（D19） | B | K&K（仅 perturbed，D20）1,200 | **1,200** |
-| logic | **不可解·三档 bare（D30 kkcut 合成）** | B | K&K `kkcut:` 1,800 | **1,800** |
-| math | 可解·数值 + 干扰项 | B | GSM-IC 800 + UMWP 200 + 主池 100 | **1,100** |
-| math | 可解·数值 + 占位选项块（D26） | A | TreeCut 正样本 500 | **500** |
-| math | 可解·判断 + 解答（两层，D24） | A | UMWP-answerable 600 | **600** |
-| math | 配对判断 + 解答（D23，0.5/0.5） | C | SUM 6,000 | **6,000** |
-| math | **不可解·四档诊断** | A | TreeCut 负 3,230 | **3,230** |
-| math | **不可解·三档 bare** | B | UMWP-unanswerable 1,300 + MiP 270 | **1,570** |
-| commonsense | 可解·判断 + 解答（两层，D27） | A | FalseQA-answerable 928 | **928** |
-| commonsense | 可解·判断（`judgment_only`） | B | CREPE-normal 672 | **672** |
-| commonsense | **不可解·四档诊断** | A | FalseQA-fake 928 | **928** |
-| commonsense | **不可解·三档 bare** | B | CREPE-FP 1,472 | **1,472** |
-| | | | **合计** | **20,000** |
+| logic | 可解·人名-角色对（D19） | B | K&K（仅 perturbed，D20）700 | **700** |
+| logic | **不可解·三档 bare（D30 kkcut 合成）** | B | K&K `kkcut:` 2,100 | **2,100** |
+| math | 可解·数值 + 干扰项 | B | GSM-IC 340 + UMWP 155 + 主池 15 | **510** |
+| math | 可解·数值 + 占位选项块（D26） | A | TreeCut 正样本 320 | **320** |
+| math | 可解·判断 + 解答（两层，D24） | A | UMWP-answerable 170 | **170** |
+| math | 配对判断 + 解答（D23，0.5/0.5） | C | SUM 2,200 | **2,200** |
+| math | **不可解·四档诊断** | A | TreeCut 负 3,030 | **3,030** |
+| math | **不可解·三档 bare** | B | UMWP-unanswerable 1,925 + MiP 245 | **2,170** |
+| commonsense | 可解·判断 + 解答（两层，D27） | A | FalseQA-answerable 300 | **300** |
+| commonsense | 可解·判断（`judgment_only`） | B | CREPE-normal 400 | **400** |
+| commonsense | **不可解·四档诊断** | A | FalseQA-fake 820 | **820** |
+| commonsense | **不可解·三档 bare** | B | CREPE-FP 1,280 | **1,280** |
+| | | | **合计** | **14,000** |
 
-**各域 40/60 边权核算**：logic 1,200 / 1,800；commonsense 1,600 / 2,400；math 5,200 / 7,800
-（SUM 6,000 行按 3,000/3,000 拆分）。按行数计 math 为 8,200 / 4,800 ≈ 63/37——配平以**边权**
-为准，与 §4.8 开头的 60/40 核算口径一致（`scaled_quota` 同样按边权重缩放）。
+**幻觉域 25/75 边权核算**：可解 2,400 + SUM 2,200 的半侧 1,100 = 3,500（25%）；不可解 9,400 +
+1,100 = 10,500（75%）。分域：math 2,100 / 6,300、logic 700 / 2,100、commonsense 700 / 2,100
+（行数 20/20/60）。`scaled_quota(14000, 0.75, base=STAGE3_QUOTA)` 逐行复现该表。
 
-**供给侧说明**：MiP 全部严格证书供给 270（实测上限）；TreeCut 负样本从 4,907 缩到 3,230 以保
-math 不可解边权 7,800 精确；CREPE 需 adapter `--quota-overrides`（672 + 1,472，超出 stage-2 的
-650 常量）。构建入口 `build_hallucination_stage3_data.sh`：8 个 adapter 全量重建（kk 带
-`--emit-unsolvable --seed`、crepe 带 `--quota-overrides`、其余默认契约——D29 的
-`--repair-contract` 已废除，无 `A_repair` 专用模板，stage 3 用标准模板 A/B/C）→
-`halluc/built_stage3/`，构建后跑 `verify_kk.py`（坏 cut 行在构建期 FAIL 而非训练期）→
-`mix_halluc.py --stage3_mix --halluc_total 20000 --old_domain_ratio 0.7 --val_size 1000
---seed 43` → `final_halluc_stage3/`。**配对原子性、近重去重与模板平衡检查原样生效**
-（FalseQA 双侧同在 stage 3 池内；模板 A 含可解 umwp 200/600 + treecut 500 + falseqa-ans 928
-与不可解 treecut 负 3,230 + falseqa-fake 928，模板 B 两侧亦齐，D18 硬约束天然满足）。
+**整份 artifact 核算**：`HALLUC_TOTAL=14,000`（train 13,300 + val 700）、`OLD_DOMAIN_RATIO=0.6`
+⇒ 老域 19,950 行，train 合计 33,250：老域 60% / 幻觉 40%，可解 23,275（70%）/ 不可解 9,975（30%）。
+
+**供给侧说明**：MiP 全部严格证书供给 270（实测上限）；kkcut 需 `--kkcut-per-group 0`（旧默认每
+父组 1 条只能产 490，2,100 需多删除放量）；CREPE 需 adapter `--quota-overrides`
+（`solvable_judge=400,unsolvable_bare=1280`）。构建入口 `build_hallucination_stage3_data.sh`：
+8 个 adapter 全量重建（kk 带 `--emit-unsolvable --kkcut-per-group 0 --seed`、crepe 带
+`--quota-overrides`、其余默认契约——D29 的 `--repair-contract` 已废除，无 `A_repair` 专用模板，
+stage 3 用标准模板 A/B/C）→ `halluc/built_stage3/`，构建后跑 `verify_kk.py`（坏 cut 行在构建期
+FAIL 而非训练期）→ `mix_halluc.py --stage3_mix --halluc_total 14000 --halluc_unsolvable_ratio 0.75
+--old_domain_ratio 0.6 --val_size 700 --strict_cells --seed 43` → `final_halluc_stage3/`。
+**配对原子性、近重去重与模板平衡检查原样生效**（FalseQA 双侧同在 stage 3 池内；模板 A 含可解
+umwp 150 + treecut 290 + falseqa-ans 300 与不可解 treecut 负 3,030 + falseqa-fake 820，模板 B
+两侧亦齐，D18 硬约束天然满足）。
 `--halluc_total` / `--halluc_unsolvable_ratio` 旋钮在 `--stage3_mix` 下按边权对 `STAGE3_QUOTA`
-重缩放，默认值（20,000 / 0.6）逐行复现该表。
+重缩放，默认值（14,000 / 0.75）逐行复现该表；`--strict_cells` 让短 cell 直接报错而不是跨 cell
+回填，val 在填满后按 cell 比例切出。
 
 > **实现口径（§4.8 行 1 的 400 条合成干扰行）**：D17 的三段施加对象（UMWP-answerable 200 / K&K 100 /
 > 主池数学题 100）全部保留，但 K&K 底题产出的行**答案契约是 D19 的「人名: 角色词」**，无法落在行 1
@@ -963,12 +969,16 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 - `--halluc_total`：幻觉域总量，默认 **20000**（D18）。
 - `--halluc_unsolvable_ratio`：幻觉域内不可解占比，默认 **0.6**（SUM 配对行按 0.5/0.5 计入两侧，
   §4.8）。
-- `--stage3_mix`（D30，stage 3）：幻觉侧配额基表换成 **`STAGE3_QUOTA`**（域平衡 15 cell，
-  §4.8 stage 3 构成）——logic 15% / commonsense 20% / math 65%，各域边权 40/60；基表含
-  `kkcut:` 合成 cell（消费 `kk_adapter.py --emit-unsolvable` 的产物）。旧 `--repair_mode`
+- `--stage3_mix`（D30，stage 3）：幻觉侧配额基表换成 **`STAGE3_QUOTA`**（域平衡 14 cell，
+  §4.8 stage 3 构成）——logic 20% / commonsense 20% / math 60%，幻觉域内边权 25/75，老域占
+  train 60% ⇒ 全局 70/30；该模式下 `--halluc_total` 默认 **14000**、`--halluc_unsolvable_ratio`
+  默认 **0.75**、`--old_domain_ratio` 默认 **0.6**。基表含 `kkcut:` 合成 cell（消费
+  `kk_adapter.py --emit-unsolvable --kkcut-per-group 0` 的产物）。旧 `--repair_mode`
   （D29）与 `REPAIR_QUOTA` 已**删除**：修复层退役后 stage 3 不再消费 `--repair-contract`
   产物，也不再有"纯不可解"强制与 `A_repair` 模板豁免——配对原子性 / 去重 / 模板平衡检查
-  与 stage 2 同一套原样生效。`mix_stats.json` 记 `config.stage3_mix`。
+  与 stage 2 同一套原样生效。`--strict_cells` 让短 cell 直接报错（不跨 cell 回填），val 在
+  fill 之后按 cell 比例切出（`carve_val_from_filled`），`mix_stats.json` 记
+  `config.stage3_mix` / `config.strict_cells` 与 `achieved_ratios`。
 - 各来源配额（K&K 1,600 / SUM 6,000 / FalseQA 928×2 / …）按 §4.8 表 B 写成 adapter 常量（§12 Q12），
   不做旋钮；K&K 组内去重在 adapter 完成（§4.1），mix 只按比例抽。
 
@@ -1013,14 +1023,15 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 ### 7.4 阶段三启动方式（D30）
 
 - 数据：`build_hallucination_stage3_data.sh` 一键构建——8 个 adapter 全量重建输出
-  `halluc/built_stage3/`（kk 带 `--emit-unsolvable --seed`、crepe 带
-  `--quota-overrides solvable_judge=672,unsolvable_bare=1472 --seed`，其余默认契约；D29 的
+  `halluc/built_stage3/`（kk 带 `--emit-unsolvable --kkcut-per-group 0 --seed`、crepe 带
+  `--quota-overrides solvable_judge=400,unsolvable_bare=1280 --seed`，其余默认契约；D29 的
   `--repair-contract` 已废除），构建后跑 `verify_kk.py` 把坏 cut 行挡在构建期；随后
-  `mix_halluc.py --stage3_mix --halluc_total 20000 --old_domain_ratio 0.7 --val_size 1000
-  --seed 43` 产出 `final_halluc_stage3/`（`SEED` 同时是 mix 种子、kkcut 删除顺序种子与
-  crepe 配额子采样种子——43 ≠ stage-2 的默认 0，stage-3 的 crepe 大样本不会把 stage-2
-  行整批含入；`--val_size` 从 256 上调至 1,000——分 cell 的 val 切片需要更大样本才有
-  统计意义）。
+  `mix_halluc.py --stage3_mix --halluc_total 14000 --halluc_unsolvable_ratio 0.75
+  --old_domain_ratio 0.6 --code_share 0.24 --val_size 700 --strict_cells --seed 43`
+  产出 `final_halluc_stage3/`
+  （`SEED` 同时是 mix 种子、kkcut 删除顺序种子与 crepe 配额子采样种子——43 ≠ stage-2 的
+  默认 0，stage-3 的 crepe 大样本不会把 stage-2 行整批含入；`--val_size` 700 是幻觉侧的
+  5%，val 从填满的 cell 里按比例切出）。
   训练脚本 `run_qwen3_4b_hallucination_stage3_fully_async.sh` 的 `DATA_DIR` 默认指向它。
 - 续训：`RESUME_PATH=<阶段二 ckpt 目录>`（stage 3 不从头训：拒答 + 指针 + 判断行为由
   stage 2 建立，本阶段在域平衡配比下保持这些行为并适应 kkcut 新形态）。
@@ -1190,11 +1201,11 @@ examples/reasoning_rl/
   占位选项块同构性（风险 7）。label=0 答案层准确率同时对照 `norm_match` 噪声基线（§12 Q17）。
 - **MiP 覆盖检查**：三档 bare 信号与主池同源（GSM8K/MATH）→ 观察"不可解识别"是否只在同源
   数学题上生效（若只在 MiP 式缺条件题上有效，说明学到的是题面特征，不是能力）。
-- **D30 kkcut 覆盖检查（stage 3）**：logic 不可解侧 1,800 全部来自同一合成手术（删单陈述、
-  缺陷类型单一 = underdetermined），且与 kk 可解 1,200 同底题池——按 `task_id` 的
+- **D30 kkcut 覆盖检查（stage 3）**：logic 不可解侧 2,100 全部来自同一合成手术（删单陈述、
+  缺陷类型单一 = underdetermined），且与 kk 可解 700 同底题池——按 `task_id` 的
   `(family, N, index)` 与父题配对，观察"同一谜题删一句 ⇒ 拒答、原题 ⇒ 作答"的**条件行为差**，
-  而不是只看 kkcut 整体拒答率（后者可能只是"题面少一句"的表层特征）。CREPE 扩到 2,144 行
-  （672 + 1,472）后其题面风格捷径（词袋 NB ≈0.61 平衡准确率，风险 7 同源）权重放大，
+  而不是只看 kkcut 整体拒答率（后者可能只是"题面少一句"的表层特征）。CREPE 扩到 1,680 行
+  （400 + 1,280）后其题面风格捷径（词袋 NB ≈0.61 平衡准确率，风险 7 同源）权重放大，
   CREPE-normal 误拒率需单画。
 
 ---
@@ -1245,8 +1256,8 @@ examples/reasoning_rl/
     修复层从奖励中退役后，stage 3 修复行与 stage 2 同走指针契约——该风险不再作用于奖励；
     "修复解命中率"降级为纯监控量（§10），`repaired_answer` 仍在 artifact 中供审计与后续
     实验使用（若未来重新引入修复层，先解决匹配噪声——§12 Q17）。
-14. **D30 kkcut 的单一缺陷形态与表层捷径（stage 3）**：logic 不可解侧 1,800 条全部来自同一
-    种合成手术（删一条陈述 ⇒ 欠定），缺陷类型单一且与 kk 可解 1,200 同底题池——模型可能学
+14. **D30 kkcut 的单一缺陷形态与表层捷径（stage 3）**：logic 不可解侧 2,100 条全部来自同一
+    种合成手术（删一条陈述 ⇒ 欠定），缺陷类型单一且与 kk 可解 700 同底题池——模型可能学
     到"题面句数比花名册少一句 ⇒ 拒答"的**计数捷径**而非"约束不足"推理。防线：① kkcut 行
     保留完整花名册、模板 B 无 `role_words`、无任何句数提示（题面外观与父题只差被删句本身）；
     ② `verify_kk.py` 的 `kkcut:` 通道逐行验证证书（父题唯一解 + 被删句逐字手术 + 删后 ≥2 解），

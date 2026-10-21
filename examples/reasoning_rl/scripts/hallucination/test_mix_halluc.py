@@ -688,9 +688,10 @@ class TestNearDedup:
 class TestStage3Mix:
     """Stage 3 (D30): ``--stage3_mix`` builds the domain-balanced table.
 
-    The table rebalances every stage-2 source so each domain splits 40/60 and
-    the domain weights move to logic 15% / commonsense 20% / math 65%; the new
-    logic unsolvable side is the kkcut synthesis cell.  The old ``--repair_mode``
+    The hallucination domain is 25/75 solvable/unsolvable by side weight and its
+    domain weights are logic 20% / commonsense 20% / math 60%; with the old
+    domain at 60% (and solvable-only) the whole artifact is 70/30.  The new logic
+    unsolvable side is the kkcut synthesis cell.  The old ``--repair_mode``
     (D29) is retired from scoring, so there is no repair quota to test anymore.
     """
 
@@ -699,7 +700,7 @@ class TestStage3Mix:
     # not shortfall redistribution.
     STAGE3_CELL_SHAPES = [
         (BRANCH_SOLVABLE_ROLES, SOURCE_KK, TEMPLATE_B, True, 1400),
-        (BRANCH_UNSOLVABLE_BARE, SOURCE_KK, TEMPLATE_B, False, 2100),
+        (BRANCH_UNSOLVABLE_BARE, SOURCE_KK, TEMPLATE_B, False, 2600),
         (BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, 900),
         (BRANCH_SOLVABLE_NUMERIC, SOURCE_UMWP, TEMPLATE_B, True, 300),
         (BRANCH_SOLVABLE_NUMERIC, SOURCE_MAIN, TEMPLATE_B, True, 200),
@@ -707,7 +708,7 @@ class TestStage3Mix:
         (BRANCH_SOLVABLE_TWO_LAYER, SOURCE_UMWP, TEMPLATE_A, True, 700),
         (BRANCH_SOLVABLE_PAIR, SOURCE_SUM, TEMPLATE_C, True, 7000),
         (BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT, TEMPLATE_A, False, 3600),
-        (BRANCH_UNSOLVABLE_BARE, SOURCE_UMWP, TEMPLATE_B, False, 1500),
+        (BRANCH_UNSOLVABLE_BARE, SOURCE_UMWP, TEMPLATE_B, False, 2600),
         (BRANCH_UNSOLVABLE_BARE, SOURCE_MIP, TEMPLATE_B, False, 350),
         (BRANCH_SOLVABLE_TWO_LAYER, SOURCE_FALSEQA, TEMPLATE_A, True, 1100),
         (BRANCH_SOLVABLE_JUDGE, SOURCE_CREPE, TEMPLATE_B_JUDGE, True, 800),
@@ -717,11 +718,13 @@ class TestStage3Mix:
 
     def test_stage3_table_sums_to_the_total(self):
         quota = mix_halluc.STAGE3_QUOTA
-        assert sum(quota.values()) == 20000
-        assert set(quota) == set(mix_halluc.scaled_quota(20000, 0.6, base=quota))
+        assert sum(quota.values()) == 14000
+        # 14,000 / 0.75 is the table's own knob pair: it must reproduce it to
+        # the row, otherwise the build script's numbers and the table drift.
+        assert mix_halluc.scaled_quota(14000, 0.75, base=quota) == quota
 
     def test_stage3_table_domain_arithmetic(self):
-        """logic 15% / commonsense 20% / math 65%, each 40/60 inside."""
+        """logic 20% / commonsense 20% / math 60%, each 25/75 inside."""
         solvable = defaultdict(int)
         unsolvable = defaultdict(int)
         for (branch, data_source), rows in mix_halluc.STAGE3_QUOTA.items():
@@ -733,16 +736,20 @@ class TestStage3Mix:
                 solvable[domain] += rows
             else:
                 unsolvable[domain] += rows
-        assert solvable == {"logic": 1200, "commonsense": 1600, "math": 5200}
-        assert unsolvable == {"logic": 1800, "commonsense": 2400, "math": 7800}
+        assert solvable == {"logic": 700, "commonsense": 700, "math": 2100}
+        assert unsolvable == {"logic": 2100, "commonsense": 2100, "math": 6300}
 
     def test_stage3_table_has_the_kkcut_cell(self):
         # The synthesised logic unsolvable side (D30): kk_adapter --emit-unsolvable.
-        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_BARE, SOURCE_KK)] == 1800
-        # Supply-capped cells: MiP at its strict-certification ceiling, TreeCut
-        # negatives shrunk so math's 7,800 stays exact.
-        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_BARE, SOURCE_MIP)] == 270
-        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT)] == 3230
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_BARE, SOURCE_KK)] == 2100
+        # Supply-capped cells, each sized below the measured post-dedup supply so
+        # --strict_cells can actually pass: MiP 267, TreeCut positives 405,
+        # TreeCut negatives 3,230, GSM-IC 385, main 26.
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_BARE, SOURCE_MIP)] == 245
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_UNSOLVABLE_DIAG, SOURCE_TREECUT)] == 3030
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_SOLVABLE_NUMERIC, SOURCE_TREECUT)] == 320
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC)] == 340
+        assert mix_halluc.STAGE3_QUOTA[(BRANCH_SOLVABLE_NUMERIC, SOURCE_MAIN)] == 15
 
     def test_stage3_mix_end_to_end(self, tmp_path):
         build = tmp_path / "built_stage3"
@@ -762,17 +769,45 @@ class TestStage3Mix:
         ]) == 0
         train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
         val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
-        assert len(train) == 2000
+        # --halluc_total counts train + val under --stage3_mix.
+        assert len(train) + len(val) == 2000
         # Pair atomicity may return a few split twins to train, so val can come
         # in under the requested carve (the D27 rule, exercised for real here).
         assert 0 < len(val) <= 60
         schema.validate_rows(train + val)
         stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
         assert stats["config"]["stage3_mix"] is True
-        assert stats["achieved_ratios"]["unsolvable_share"] == pytest.approx(0.6)
-        # At total=2000 the rescaled table keeps the domain row counts exactly
-        # at 15/20/65 (the SUM pairs are full rows of the math domain here).
-        assert stats["halluc_by_domain"] == {"logic": 300, "commonsense": 400, "math": 1300}
+        assert stats["config"]["halluc_unsolvable_ratio"] == pytest.approx(0.75)
+        assert stats["config"]["old_domain_ratio"] == pytest.approx(0.6)
+        assert stats["achieved_ratios"]["unsolvable_share"] == pytest.approx(0.75, abs=0.02)
+        # The rescaled table keeps the domain shares at 20/20/60.
+        domain = stats["halluc_by_domain"]
+        total = sum(domain.values())
+        assert domain["logic"] / total == pytest.approx(0.20, abs=0.01)
+        assert domain["commonsense"] / total == pytest.approx(0.20, abs=0.01)
+        assert domain["math"] / total == pytest.approx(0.60, abs=0.01)
+
+    def test_stage3_strict_cells_refuses_a_short_cell(self, tmp_path):
+        """--strict_cells fails on a short cell instead of backfilling it."""
+        build = tmp_path / "built_stage3"
+        build.mkdir()
+        rows = []
+        for branch, data_source, template, solvable, n in self.STAGE3_CELL_SHAPES:
+            # Starve the K&K unsolvable cell: at total=2000 it needs ~300 rows.
+            supply = 10 if (branch, data_source) == (BRANCH_UNSOLVABLE_BARE, SOURCE_KK) else n
+            rows.extend(make_cell_rows(branch, data_source, template, solvable, supply))
+        schema.write_rows_parquet(rows, str(build / "halluc.parquet"))
+        out = tmp_path / "stage3"
+        with pytest.raises(ValueError, match="strict_cells"):
+            mix_halluc.main([
+                "--stage3_mix",
+                "--strict_cells",
+                "--halluc_dir", str(build),
+                "--output_dir", str(out),
+                "--halluc_total", "2000",
+                "--val_size", "60",
+                "--seed", "7",
+            ])
 
     def test_stage3_mix_runs_pair_atomicity(self, tmp_path):
         """Stage 3 uses the stage-2 FalseQA twins, so the val atomicity rule applies."""
@@ -797,3 +832,95 @@ class TestStage3Mix:
         val_ids = {r["extra_info"].get("pair_id") for r in val if r["extra_info"].get("pair_id")}
         train_ids = {r["extra_info"].get("pair_id") for r in train if r["extra_info"].get("pair_id")}
         assert not val_ids & train_ids
+
+    def test_stage3_val_keeps_kkcut_siblings_together(self, tmp_path):
+        """The several cuts of one parent are near-duplicates: no straddling (D30)."""
+        build = tmp_path / "built_stage3"
+        build.mkdir()
+        rows = []
+        for branch, data_source, template, solvable, n in self.STAGE3_CELL_SHAPES:
+            rows.extend(make_cell_rows(branch, data_source, template, solvable, n))
+        # Reshape the K&K unsolvable cell into kkcut sibling groups: four cuts of
+        # one parent differ by a single sentence.
+        kk_cell = (BRANCH_UNSOLVABLE_BARE, SOURCE_KK)
+        for i, row in enumerate(
+            [r for r in rows if (r["extra_info"]["branch"], r["data_source"]) == kk_cell]
+        ):
+            row["extra_info"]["task_id"] = f"kkcut:perturbed_statement:4ppl:{i // 4}:{i % 4}"
+        schema.write_rows_parquet(rows, str(build / "halluc.parquet"))
+        out = tmp_path / "stage3"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", str(build),
+            "--output_dir", str(out),
+            "--halluc_total", "2000",
+            "--val_size", "400",
+            "--seed", "5",
+        ]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
+
+        def kkcut_parents(rows_):
+            return {
+                r["extra_info"]["task_id"].rsplit(":", 1)[0]
+                for r in rows_
+                if r["extra_info"]["task_id"].startswith("kkcut:")
+            }
+
+        assert val and kkcut_parents(val)
+        assert not kkcut_parents(val) & kkcut_parents(train)
+
+    def test_stage3_pins_the_code_share_in_the_old_domain(self, tmp_path):
+        """The hallucination domain has no code, so the replay must oversample it."""
+        build = tmp_path / "built_stage3"
+        build.mkdir()
+        rows = []
+        for branch, data_source, template, solvable, n in self.STAGE3_CELL_SHAPES:
+            rows.extend(make_cell_rows(branch, data_source, template, solvable, n))
+        schema.write_rows_parquet(rows, str(build / "halluc.parquet"))
+
+        stage1 = tmp_path / "stage1"
+        stage1.mkdir()
+        old_rows = []
+        for i, (ability, n) in enumerate((("code", 2000), ("math", 2000), ("logic", 1000), ("stem", 1000))):
+            chunk = make_cell_rows(
+                BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, n, seed=10 + i
+            )
+            for row in chunk:
+                row["ability"] = ability
+                row["extra_info"]["task_id"] = f"s1-{ability}-{row['extra_info']['task_id']}"
+            old_rows.extend(chunk)
+        schema.write_rows_parquet(old_rows, str(stage1 / "train.parquet"))
+
+        out = tmp_path / "stage3"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", str(build),
+            "--stage1_path", str(stage1),
+            "--output_dir", str(out),
+            "--halluc_total", "2000",
+            "--val_size", "60",
+            "--seed", "3",
+        ]) == 0
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+        harvested = stats["harvested_old_domain"]
+        assert harvested["code_rows"] == harvested["code_target"]
+        assert stats["config"]["code_share"] == pytest.approx(0.24)
+        assert stats["achieved_ratios"]["overall_code_share"] == pytest.approx(0.24, abs=0.005)
+        assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(0.6, abs=0.002)
+
+    def test_old_domain_sampling_reports_a_short_code_pool(self):
+        """A code pool below the target is reported, and the row budget still holds."""
+        rows = []
+        for i in range(10):
+            rows.append({"ability": "code", "extra_info": {"task_id": f"c{i}"}})
+        for i in range(100):
+            rows.append({"ability": "math", "extra_info": {"task_id": f"m{i}"}})
+        rng = random.Random(0)
+        chosen, report = mix_halluc.sample_old_domain(rows, 60, 200, 0.24, rng)
+        # 0.24 * 200 = 48 wanted, only 10 exist.
+        assert report["code_target"] == 48
+        assert report["code_rows"] == 10
+        assert report["shortfall"] == 38
+        assert len(chosen) == 60
+        assert len({row["extra_info"]["task_id"] for row in chosen}) == 60

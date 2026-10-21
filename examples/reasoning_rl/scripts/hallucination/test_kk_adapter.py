@@ -1237,7 +1237,7 @@ def test_emit_unsolvable_ships_a_bare_refusal_next_to_the_parent(tmp_path):
     cut = cuts[0]
     info = cut["extra_info"]
     payload = _payload(cut)
-    assert info["task_id"] == "kkcut:perturbed_statement:4ppl:100"
+    assert info["task_id"] == f"kkcut:perturbed_statement:4ppl:100:{info['kkcut_deleted_index']}"
     assert info["branch"] == schema.BRANCH_UNSOLVABLE_BARE
     assert info["template"] == schema.TEMPLATE_B
     assert info["solvable"] is False
@@ -1269,6 +1269,24 @@ def test_emit_unsolvable_ships_a_bare_refusal_next_to_the_parent(tmp_path):
     assert verify_kk.normalise(info["paired_original_text"]) == verify_kk.normalise(PERTURBED_STATEMENT["quiz"])
 
 
+def test_multi_cut_per_group_emits_one_row_per_deleted_statement(tmp_path):
+    """``kkcut_per_group=0`` lifts the cap: every admissible deletion ships once."""
+    rows, report = _build(tmp_path, emit_unsolvable=True, kkcut_per_group=0, seed=0)
+    cuts = _kkcut_rows(rows)
+    assert report["kkcut"]["per_group_cap"] == 0
+    assert len(cuts) > 1
+    ids = [row["extra_info"]["task_id"] for row in rows]
+    assert len(ids) == len(set(ids))
+    deleted = [row["extra_info"]["kkcut_deleted_index"] for row in cuts]
+    assert len(deleted) == len(set(deleted))
+    assert all(task_id.split(":")[-1] == str(row["extra_info"]["kkcut_deleted_index"])
+               for task_id, row in zip([row["extra_info"]["task_id"] for row in cuts], cuts))
+    raw_dir = _write_raw(tmp_path / "raw", GROUP_FILES)
+    reporter = verify_kk.Reporter()
+    verify_kk.check_kkcut(cuts, verify_kk.load_raw_index(raw_dir), raw_dir, reporter)
+    assert reporter.failed == []
+
+
 def test_emit_unsolvable_without_the_flag_is_the_plain_build(tmp_path):
     rows, report = _build(tmp_path)
     assert _kkcut_rows(rows) == []
@@ -1278,6 +1296,7 @@ def test_emit_unsolvable_without_the_flag_is_the_plain_build(tmp_path):
         "skipped": {},
         "per_tier": {},
         "per_family": {},
+        "per_group_cap": 1,
     }
 
 
@@ -1309,7 +1328,8 @@ def test_kkcut_rows_pass_the_dedicated_audit_channel(tmp_path):
     verify_kk.check_contract(kk_rows, reporter)
     verify_kk.check_prompt_contract(kk_rows, reporter)
     assert reporter.failed == []
-    assert verify_kk.parse_kkcut_task_id("kkcut:perturbed_statement:4ppl:100") == ("perturbed_statement", 4, 100)
+    assert verify_kk.parse_kkcut_task_id("kkcut:perturbed_statement:4ppl:100") == ("perturbed_statement", 4, 100, -1)
+    assert verify_kk.parse_kkcut_task_id("kkcut:perturbed_statement:4ppl:100:2") == ("perturbed_statement", 4, 100, 2)
     assert verify_kk.parse_kkcut_task_id(adapter.task_id_of("perturbed_statement", 4, 100)) is None
 
 
@@ -1322,7 +1342,12 @@ def test_kkcut_audit_catches_a_relabelled_deletion(tmp_path):
     cut["extra_info"]["kkcut_deleted_index"] = (cut["extra_info"]["kkcut_deleted_index"] + 1) % 4
     reporter = verify_kk.Reporter()
     verify_kk.check_kkcut(_kkcut_rows(rows), index, raw_dir, reporter)
-    assert reporter.failed == ["kkcut source anchor (parent unique, certificate re-derived, exactly one sentence cut)"]
+    # The relabel contradicts the id's fifth segment *and* the re-derived
+    # certificate, so both gates fire (contract first, then the source anchor).
+    assert reporter.failed == [
+        "kkcut contract invariants (bare refusal, missing_condition, certificate fields)",
+        "kkcut source anchor (parent unique, certificate re-derived, exactly one sentence cut)",
+    ]
 
 
 def test_kkcut_audit_catches_a_forged_solution_count(tmp_path):

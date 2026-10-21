@@ -199,21 +199,26 @@ def normalise(text: str) -> str:
     return " ".join((text or "").split())
 
 
-def parse_kkcut_task_id(task_id: str) -> tuple[str, int, int] | None:
-    """``kkcut:{family}:{N}ppl:{index}`` -> ``(family, N, index)``, or ``None``.
+def parse_kkcut_task_id(task_id: str) -> tuple[str, int, int, int] | None:
+    """``kkcut:{family}:{N}ppl:{index}[:{deleted}]`` -> ``(family, N, index, deleted)``.
 
     The body grammar is the solvable ``kk:`` id's -- the cut row and its parent
     share ``(family, tier, index)`` and differ only in the prefix -- so the same
     vocabulary check applies; only the prefix routes the two contracts apart.
+    ``deleted`` is the fifth segment the multi-deletion build
+    (``--kkcut-per-group``) adds so several cuts of one parent stay distinct;
+    a pre-multi-deletion id returns ``-1`` and the audit falls back to
+    ``extra_info.kkcut_deleted_index``.
     """
     parts = task_id.split(":")
-    if len(parts) != 4 or parts[0] != kk_adapter.KKCUT_PREFIX:
+    if len(parts) not in (4, 5) or parts[0] != kk_adapter.KKCUT_PREFIX:
         return None
     family, tier, raw_index = parts[1], parts[2], parts[3]
     if family not in kk_adapter.FAMILIES or not tier.endswith("ppl"):
         return None
     try:
-        return family, int(tier[:-3]), int(raw_index)
+        deleted = int(parts[4]) if len(parts) == 5 else -1
+        return family, int(tier[:-3]), int(raw_index), deleted
     except ValueError:
         return None
 
@@ -1083,9 +1088,9 @@ def check_kkcut(rows: list[dict], index: dict, raw_dir: str, reporter: Reporter)
         task_id = info["task_id"]
         parsed = parse_kkcut_task_id(task_id)
         if parsed is None:
-            failures.append(f"{task_id}: task_id is not kkcut:{{family}}:{{N}}ppl:{{index}}")
+            failures.append(f"{task_id}: task_id is not kkcut:{{family}}:{{N}}ppl:{{index}}[:{{deleted}}]")
             continue
-        family, count, raw_index = parsed
+        family, count, raw_index, id_deleted = parsed
         payload = payload_of(row)
         if info.get("branch") != schema.BRANCH_UNSOLVABLE_BARE:
             failures.append(f"{task_id}: branch {info.get('branch')!r} (a cut row is a bare refusal)")
@@ -1122,6 +1127,11 @@ def check_kkcut(rows: list[dict], index: dict, raw_dir: str, reporter: Reporter)
             failures.append(f"{task_id}: kkcut_deleted_index {deleted!r} is not an int")
         elif not 0 <= deleted < count:
             failures.append(f"{task_id}: kkcut_deleted_index {deleted} outside 0..{count - 1}")
+        elif id_deleted >= 0 and deleted != id_deleted:
+            failures.append(
+                f"{task_id}: task_id names deleted speaker {id_deleted} but "
+                f"kkcut_deleted_index is {deleted}"
+            )
         statement_text = info.get("kkcut_deleted_statement")
         if not isinstance(statement_text, str) or not statement_text:
             failures.append(f"{task_id}: kkcut_deleted_statement {statement_text!r} is not a formula repr")
@@ -1156,18 +1166,29 @@ def check_kkcut(rows: list[dict], index: dict, raw_dir: str, reporter: Reporter)
         f"{len(rows)} rows, {len(failures)} violations" + (f"; first: {failures[:3]}" if failures else ""),
     )
 
-    # 3. at most one cut per parent group (across channels the parent itself may
-    #    share the key -- that is the design, not a leak).
-    groups: dict[tuple[int, int], list[str]] = collections.defaultdict(list)
+    # 3. one row per (parent group, deleted statement).  The multi-deletion build
+    #    (--kkcut-per-group) deliberately emits several cuts of the same parent,
+    #    so the group key stays (count, index) but the cut must be unique: two
+    #    rows deleting the same statement of the same parent are one task.
+    groups: dict[tuple[int, int], list[tuple[str, int]]] = collections.defaultdict(list)
     for row in rows:
         parsed = parse_kkcut_task_id(row["extra_info"]["task_id"])
         if parsed is not None:
-            groups[(parsed[1], parsed[2])].append(row["extra_info"]["task_id"])
-    duplicated = {key: ids for key, ids in groups.items() if len(ids) > 1}
+            groups[(parsed[1], parsed[2])].append((row["extra_info"]["task_id"], parsed[3]))
+    duplicated: dict[tuple[int, int], list[str]] = {}
+    for key, entries in groups.items():
+        seen: set[object] = set()
+        for task_id, deleted in entries:
+            marker: object = deleted if deleted >= 0 else task_id
+            if marker in seen:
+                duplicated.setdefault(key, []).append(task_id)
+            seen.add(marker)
+    multi = sum(1 for entries in groups.values() if len(entries) > 1)
     reporter.check(
-        "kkcut uniqueness (<= 1 cut row per parent group)",
+        "kkcut uniqueness (one row per (parent group, deleted statement))",
         not duplicated,
-        f"{len(rows)} rows over {len(groups)} parent groups, {len(duplicated)} groups with more than one cut"
+        f"{len(rows)} rows over {len(groups)} parent groups ({multi} multi-cut), "
+        f"{len(duplicated)} duplicated cuts"
         + (f"; first: {sorted(duplicated.items())[:3]}" if duplicated else ""),
     )
 
@@ -1189,7 +1210,7 @@ def check_kkcut(rows: list[dict], index: dict, raw_dir: str, reporter: Reporter)
         if parsed is None:
             failures.append(f"{task_id}: unparseable task_id")
             continue
-        family, count, raw_index = parsed
+        family, count, raw_index, _ = parsed
         source = index.get((family, count, raw_index))
         if source is None:
             failures.append(f"{task_id}: ({family}, {count}, {raw_index}) is not a source row")

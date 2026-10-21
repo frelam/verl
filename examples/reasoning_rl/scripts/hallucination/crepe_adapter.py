@@ -384,8 +384,8 @@ def build_rows(
             reproducible byte for byte.
         sources: which sources to build (``SOURCE_NAMES`` by default).
         quota_overrides: per-group quota replacements for the stage-3
-            domain-balanced mix (D30 raises this source to 672 judgment rows +
-            1,472 bare-refusal rows).  Keys must be :data:`QUOTAS` keys and
+            domain-balanced mix (D30 raises this source to 400 judgment rows +
+            1,280 bare-refusal rows).  Keys must be :data:`QUOTAS` keys and
             values positive; an unknown key is a hard error, not a silent add --
             the two-group structure is fixed by the design doc.  A quota larger
             than the surviving group simply emits the whole group (the funnel's
@@ -507,7 +507,7 @@ def _print_breakdown(rows: list[dict]) -> None:
 
 
 def parse_quota_overrides(text: str) -> dict[tuple[str, str], int]:
-    """``"solvable_judge=672,unsolvable_bare=1472"`` -> a quota_overrides dict.
+    """``"solvable_judge=400,unsolvable_bare=1280"`` -> a quota_overrides dict.
 
     The source element of every key is :data:`SOURCE_CREPE` -- this adapter
     builds CREPE only, so the flag carries the branch name alone.  Unknown
@@ -551,7 +551,7 @@ def main() -> None:
         "--quota-overrides",
         default=None,
         help="comma list of <branch>=<count>, e.g. "
-        "'solvable_judge=672,unsolvable_bare=1472' (stage 3 / D30); "
+        "'solvable_judge=400,unsolvable_bare=1280' (stage 3 / D30); "
         "a group larger than its surviving pool emits the whole pool",
     )
     args = parser.parse_args()
