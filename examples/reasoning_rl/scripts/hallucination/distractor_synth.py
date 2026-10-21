@@ -920,40 +920,60 @@ def load_main_pool(
     reads.  Only rows the stage-1 pipeline marked solvable are eligible.  Its
     control source is MiP, whose base questions are this same GSM8K/SVAMP/MATH
     distribution (design doc section 4.2).
+
+    ``stage1_path`` may be a single parquet or the stage-1 output *directory*.
+    The directory form reads every parquet except ``val.parquet`` -- the same
+    rule ``mix_halluc.read_stage1_pool`` uses, so a sharded stage-1 dump does not
+    silently yield an empty main slice (stage 1's val rows must never become the
+    base of a *train* distractor row).
     """
     import pyarrow.parquet as pq
 
+    path = os.fspath(stage1_path)
+    if os.path.isdir(path):
+        files = [
+            os.path.join(path, name)
+            for name in sorted(os.listdir(path))
+            if name.endswith(".parquet") and name != "val.parquet"
+        ]
+    else:
+        files = [path]
+
     bases: list[BaseQuestion] = []
-    for row_number, row in enumerate(pq.read_table(stage1_path).to_pylist()):
-        prompt = row.get("prompt") or []
-        if not prompt:
-            continue
-        question = (prompt[0].get("content") or "").strip()
-        if not question:
-            continue
-        try:
-            payload = json.loads(row["reward_model"]["ground_truth"])
-        except (ValueError, KeyError, TypeError):
-            continue
-        # A bare scalar (e.g. ground_truth is just "12.5") json-loads fine but is
-        # not the {"answer": ...} payload -- skip it like an unparsable one.
-        if not isinstance(payload, dict):
-            continue
-        answer = payload.get("answer")
-        if not answer:
-            continue
-        bases.append(
-            BaseQuestion(
-                question=question,
-                answer=str(answer),
-                pool=POOL_MAIN,
-                uid=f"main:{row_number}",
-                split=str((row.get("extra_info") or {}).get("split", "train")),
-                index=len(bases),
+    row_number = 0
+    for file in files:
+        for row in pq.read_table(file).to_pylist():
+            index = row_number
+            row_number += 1
+            prompt = row.get("prompt") or []
+            if not prompt:
+                continue
+            question = (prompt[0].get("content") or "").strip()
+            if not question:
+                continue
+            try:
+                payload = json.loads(row["reward_model"]["ground_truth"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            # A bare scalar (e.g. ground_truth is just "12.5") json-loads fine but is
+            # not the {"answer": ...} payload -- skip it like an unparsable one.
+            if not isinstance(payload, dict):
+                continue
+            answer = payload.get("answer")
+            if not answer:
+                continue
+            bases.append(
+                BaseQuestion(
+                    question=question,
+                    answer=str(answer),
+                    pool=POOL_MAIN,
+                    uid=f"main:{index}",
+                    split=str((row.get("extra_info") or {}).get("split", "train")),
+                    index=len(bases),
+                )
             )
-        )
-        if limit is not None and len(bases) >= limit:
-            break
+            if limit is not None and len(bases) >= limit:
+                return bases
     return bases
 
 

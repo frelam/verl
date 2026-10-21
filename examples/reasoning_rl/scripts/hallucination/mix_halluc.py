@@ -92,8 +92,11 @@ Three ordering rules differ from stage 2 under this flag, all to keep the
 artifact on the quota table rather than silently drifting off it:
 
 * the exact-text and MinHash passes run **before** the fill and anchor on the
-  whole stage-1 train pool, so the quota cells are sized at the post-dedup
-  supply and a hallucination row cannot duplicate an unsampled stage-1 row;
+  sampled stage-1 replay rows -- the rows that will actually train -- so the
+  quota cells are sized at the post-dedup supply.  Anchoring
+  on the *whole* stage-1 pool instead was tried and reverted: a stage-1 row that
+  is never sampled cannot leak, and the oversized anchor set halved several
+  cells (UMWP unsolvable 2,571 -> 781, TreeCut positives 405 -> 234);
 * val is carved **out of the filled rows** (proportionally per cell) instead of
   out of the pools, so ``--halluc_total`` counts train + val and the train cells
   keep their requested composition; ``--strict_cells`` makes a short cell a hard
@@ -895,9 +898,6 @@ def main(argv: list[str] | None = None) -> int:
     quota = scaled_quota(args.halluc_total, unsolvable_ratio, base=base)
 
     # --- stage-1 pool (section 7.1), read up front ------------------------------
-    # Stage 3 anchors its dedup on the *whole* stage-1 train pool rather than on
-    # the sampled old rows: a hallucination row must not survive only because the
-    # stage-1 row it duplicates happened not to be sampled this time.
     stage1_rows: list[dict] = []
     old_val_rows: list[dict] = []
     if args.stage1_path:
@@ -906,16 +906,44 @@ def main(argv: list[str] | None = None) -> int:
             raise FileNotFoundError(f"--stage1_path does not exist: {stage1_path}")
         stage1_rows, old_val_rows = read_stage1_pool(stage1_path)
 
+    # Stage 3 samples the old domain *before* the dedup: those rows are the
+    # reference the hallucination domain must not duplicate (a stage-1 row that
+    # is never sampled cannot leak into training, so anchoring on the whole pool
+    # only throws away usable hallucination rows -- measured: UMWP unsolvable
+    # 2,571 -> 781, TreeCut positives 405 -> 234).  The target count comes from
+    # the quota table rather than the fill so the dedup can run first; under
+    # --strict_cells the fill matches the table exactly.
+    old_rows: list[dict] = []
+    old_report: dict = {"code_target": 0, "code_rows": 0, "shortfall": 0, "by_ability": {}}
+    if args.stage1_path and args.stage3_mix:
+        target_halluc_train = max(args.halluc_total - args.val_size, 0)
+        n_old = round(target_halluc_train * old_domain_ratio / (1.0 - old_domain_ratio))
+        if n_old > len(stage1_rows):
+            print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
+            n_old = len(stage1_rows)
+        old_rows, old_report = sample_old_domain(
+            stage1_rows, n_old, target_halluc_train + n_old, code_share, rng
+        )
+        print(
+            f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={old_domain_ratio}, "
+            f"code {old_report['code_rows']}/{old_report['code_target']})"
+        )
+        if old_report["shortfall"] > 0:
+            print(
+                f"[mix_halluc] WARNING: code pool short by {old_report['shortfall']} row(s); "
+                f"the whole train set will miss the {code_share:.0%} code target"
+            )
+
     dropped_old = dropped_self = 0
     minhash_dropped = minhash_twins = 0
 
     if args.stage3_mix:
-        # Stage 3 dedups *before* the fill.  Its quota table is sized at the
-        # post-dedup supply, so dropping rows afterwards (stage 2's order) is what
-        # made the earlier artifact land short in exactly the cells the near-
-        # duplicate pass hits hardest -- GSM-IC 800 -> 385, main 100 -> 26.
+        # Stage 3 dedups *before* the fill, anchored on the sampled old rows (the
+        # rows that actually train), so dropping rows afterwards (stage 2's order)
+        # is what made the earlier artifact land short in exactly the cells the
+        # near-duplicate pass hits hardest -- GSM-IC 800 -> 385, main 100 -> 26.
         if not args.no_dedup:
-            reference = {_question_key(r) for r in stage1_rows}
+            reference = {_question_key(r) for r in old_rows}
             halluc_rows, dropped_old = dedup_against(halluc_rows, reference)
             # Also drop exact duplicates inside the hallucination domain itself:
             # the same source question can reach two branches (e.g. SUM answerable
@@ -934,8 +962,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"[mix_halluc] dedup (pre-fill): -{dropped_old} overlapping stage-1, "
                 f"-{dropped_self} internal"
             )
-        if stage1_rows and args.minhash_threshold > 0:
-            anchor_texts = [_question_key(r) for r in stage1_rows]
+        if old_rows and args.minhash_threshold > 0:
+            anchor_texts = [_question_key(r) for r in old_rows]
             halluc_rows, minhash_dropped, minhash_twins = near_dedup_against_stage1(
                 halluc_rows, anchor_texts, threshold=args.minhash_threshold
             )
@@ -946,6 +974,18 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     pool = index_pool(halluc_rows)
+    # Print the post-dedup supply of every quota cell (and the stray cells the
+    # quota does not ask for).  Without it a --strict_cells failure names the
+    # deficit but not the headroom, which is what deciding on a recalibration
+    # actually needs.
+    supply = {cell: len(pool.get(cell, [])) for cell in quota}
+    print("[mix_halluc] supply per quota cell after dedup (supply/target):")
+    for cell in sorted(quota):
+        short_mark = "  <-- SHORT" if supply[cell] < quota[cell] else ""
+        print(f"    {cell[0]:22s} {cell[1]:34s} {supply[cell]:6d}/{quota[cell]:6d}{short_mark}")
+    extras = {cell: len(rows) for cell, rows in pool.items() if cell not in quota}
+    if extras:
+        print(f"[mix_halluc] rows in cells the quota does not use: {extras}")
     missing = [cell for cell in quota if cell not in pool]
     if missing:
         print(f"[mix_halluc] {len(missing)} quota cell(s) have no adapter output: {missing}")
@@ -961,7 +1001,8 @@ def main(argv: list[str] | None = None) -> int:
         short = [entry for entry in cell_report if entry["shortfall"] - entry["redistributed"] > 0]
         if short:
             detail = "; ".join(
-                f"{entry['cell']}: {entry['filled'] + entry['redistributed']}/{entry['target']}"
+                f"{entry['cell']}: supply {supply.get(tuple(entry['cell']), 0)} "
+                f"filled {entry['filled'] + entry['redistributed']}/{entry['target']}"
                 for entry in short
             )
             if args.strict_cells:
@@ -991,30 +1032,31 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     # --- optional stage-1 mixing (section 7.1) ---------------------------------
-    old_rows: list[dict] = []
-    old_report: dict = {"code_target": 0, "code_rows": 0, "shortfall": 0, "by_ability": {}}
+    # Stage 3 already sampled its replay rows above (they anchored the dedup), so
+    # only stage 2 samples here.  Stage 3 also keeps its val rows out of the
+    # audit: they are appended below, exactly like stage 2's.
     if args.stage1_path:
-        n_old = round(filled_total * old_domain_ratio / (1.0 - old_domain_ratio))
-        if n_old > len(stage1_rows):
-            print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
-            n_old = len(stage1_rows)
-        old_rows, old_report = sample_old_domain(
-            stage1_rows, n_old, filled_total + n_old, code_share, rng
-        )
-        print(
-            f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={old_domain_ratio}, "
-            f"code {old_report['code_rows']}/{old_report['code_target']})"
-        )
-        if old_report["shortfall"] > 0:
-            print(
-                f"[mix_halluc] WARNING: code pool short by {old_report['shortfall']} row(s); "
-                f"the whole train set will miss the {code_share:.0%} code target"
+        if not args.stage3_mix:
+            n_old = round(filled_total * old_domain_ratio / (1.0 - old_domain_ratio))
+            if n_old > len(stage1_rows):
+                print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
+                n_old = len(stage1_rows)
+            old_rows, old_report = sample_old_domain(
+                stage1_rows, n_old, filled_total + n_old, code_share, rng
             )
-        if len(old_rows) < n_old:
             print(
-                f"[mix_halluc] WARNING: stage-1 pool could only supply {len(old_rows)} of "
-                f"{n_old} replay rows; the old-domain share will come out below "
-                f"{old_domain_ratio:.2f}"
+                f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={old_domain_ratio}, "
+                f"code {old_report['code_rows']}/{old_report['code_target']})"
+            )
+            if old_report["shortfall"] > 0:
+                print(
+                    f"[mix_halluc] WARNING: code pool short by {old_report['shortfall']} row(s); "
+                    f"the whole train set will miss the {code_share:.0%} code target"
+                )
+        if len(old_rows) < round(filled_total * old_domain_ratio / (1.0 - old_domain_ratio)):
+            print(
+                f"[mix_halluc] WARNING: stage-1 pool could only supply {len(old_rows)} replay rows; "
+                f"the old-domain share will come out below {old_domain_ratio:.2f}"
             )
         if old_val_rows:
             # Section 7.1 keeps the stage-1 rows verbatim; keeping its val rows in

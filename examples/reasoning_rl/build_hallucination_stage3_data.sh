@@ -98,6 +98,15 @@ fi
 #       default, so the stage-3 sample is not a superset of the stage-2 rows.
 mkdir -p "$BUILT_DIR"
 $PYTHON_BIN "$HALLUC_SCRIPTS/kk_adapter.py"        --raw-dir "$RAW_ROOT/kk"     --out "$BUILT_DIR/kk.parquet"     --emit-unsolvable --kkcut-per-group 0 --seed "$SEED"
+# Fail here, not at the mix, when the kkcut channel produced nothing: --strict_cells
+# would only report "halluc_logic_kk: 0/2100" long after this run has finished.
+$PYTHON_BIN -c "
+import json, sys
+r = json.load(open('$BUILT_DIR/kk_report.json'))['kkcut']
+print('[kk] kkcut emitted %d from %d groups (cap %s), skipped %s' % (
+    r['emitted'], r['groups_attempted'], r['per_group_cap'], r['skipped']))
+sys.exit(0 if r['emitted'] else 1)
+" || { echo "ERROR: kk_adapter emitted no kkcut rows; the stage-3 logic-unsolvable cell cannot be filled." >&2; exit 1; }
 $PYTHON_BIN "$HALLUC_SCRIPTS/mip_adapter.py"       --raw-dir "$RAW_ROOT/mip"    --out "$BUILT_DIR/mip.parquet"
 $PYTHON_BIN "$HALLUC_SCRIPTS/falseqa_adapter.py"   --raw-dir "$RAW_ROOT/falseqa" --out "$BUILT_DIR/falseqa.parquet"
 $PYTHON_BIN "$HALLUC_SCRIPTS/gsm_ic_adapter.py"    --raw-dir "$RAW_ROOT/gsmic"  --out "$BUILT_DIR/gsmic.parquet"
@@ -110,10 +119,13 @@ $PYTHON_BIN "$HALLUC_SCRIPTS/crepe_adapter.py"     --raw-dir "$RAW_ROOT/crepe"  
 #     Same fallback as the stage-2 build: without a stage-1 math parquet the
 #     cell is left to mix_halluc's shortfall redistribution.
 DISTRACTOR_ARGS=(--raw-dir "$RAW_ROOT" --out "$BUILT_DIR/d17.parquet")
-if [ -f "$STAGE1_DATA_DIR/train.parquet" ]; then
-    DISTRACTOR_ARGS+=(--stage1-path "$STAGE1_DATA_DIR/train.parquet")
+if [ -d "$STAGE1_DATA_DIR" ]; then
+    # The directory form reads every parquet except val.parquet, so a sharded
+    # stage-1 dump still yields the main slice (a single train.parquet was
+    # required before, and a sharded dump silently produced 0 main rows).
+    DISTRACTOR_ARGS+=(--stage1-path "$STAGE1_DATA_DIR")
 else
-    echo "WARNING: $STAGE1_DATA_DIR/train.parquet not found; building distractors without the stage-1 main pool" >&2
+    echo "WARNING: $STAGE1_DATA_DIR not found; building distractors without the stage-1 main pool" >&2
     DISTRACTOR_ARGS+=(--main-quota 0)
 fi
 $PYTHON_BIN "$HALLUC_SCRIPTS/distractor_synth.py" "${DISTRACTOR_ARGS[@]}"
