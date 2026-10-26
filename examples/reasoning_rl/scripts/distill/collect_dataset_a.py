@@ -57,9 +57,13 @@ Notes
   the variable (the default) needs no system prompt here either.  When given
   (argument or env var), it is prepended to every prompt unless the row already
   carries one.
-* ``code_*`` rows are skipped unless ``--sandbox_fusion_url`` is given: their
-  reward only works against a code sandbox, and scoring them without one would
-  silently discard every correct generation.
+* ``code_*`` rows follow the same two-tier rule as the RL run: with
+  ``SANDBOX_FUSION_URL`` (the env knob the training launcher reads) or
+  ``--sandbox_fusion_url`` they are verified by the remote sandbox; without one
+  the reward falls back to the local ``prime_code`` runner, exactly as training
+  did.  The local fallback executes model-generated code on this host and is
+  CPU-heavy, so it wants a lower ``--score_workers`` and a sandbox is still the
+  better choice for large collections.
 """
 
 from __future__ import annotations
@@ -144,8 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sandbox_fusion_url",
-        default="",
-        help="code reward sandbox; code rows are skipped when empty",
+        default=os.environ.get("SANDBOX_FUSION_URL", ""),
+        help="code reward sandbox, e.g. http://<host>/run_code (default: $SANDBOX_FUSION_URL, "
+        "the same env knob the training launcher reads); empty = local prime_code fallback",
     )
     parser.add_argument("--min_score", type=float, default=1.0, help="keep trajectories with score >= this")
     parser.add_argument("--max_per_prompt", type=int, default=0, help="cap kept trajectories per prompt (0 = keep all)")
@@ -291,14 +296,17 @@ def main(argv: list[str] | None = None) -> int:
         rows = [row for row in rows if str(row.get("ability") or "") in allowed]
         logger.info("ability filter %s: %d -> %d rows", sorted(allowed), before, len(rows))
 
-    if not args.sandbox_fusion_url:
+    if args.sandbox_fusion_url:
+        logger.info("code reward sandbox: %s", args.sandbox_fusion_url)
+    else:
         code_rows = [row for row in rows if str(row.get("data_source") or "").startswith("code")]
         if code_rows:
             logger.warning(
-                "skipping %d code rows: their reward needs --sandbox_fusion_url",
+                "%d code rows will be verified by the local prime_code fallback (no SANDBOX_FUSION_URL): "
+                "model-generated code runs on this host, exactly as the RL run did; lower --score_workers "
+                "and raise --timeout if the machine is small",
                 len(code_rows),
             )
-            rows = [row for row in rows if not str(row.get("data_source") or "").startswith("code")]
 
     rng = random.Random(args.seed)
     rng.shuffle(rows)
