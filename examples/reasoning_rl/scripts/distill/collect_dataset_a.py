@@ -51,9 +51,12 @@ Notes
 -----
 * The service must be OpenAI-compatible (vLLM's ``/v1``); ``--model`` defaults
   to the first id returned by ``GET /models``.
-* ``--system_prompt`` must match the RL run's ``REASONING_RL_SYSTEM_PROMPT``
-  (the env var is used as the default) so the DPO prompt distribution matches
-  the rollout distribution.
+* ``--system_prompt`` is OPTIONAL and only needed when the RL run itself
+  injected ``REASONING_RL_SYSTEM_PROMPT``.  That system message is added at
+  training time and is not stored in the parquet rows, so a run that never set
+  the variable (the default) needs no system prompt here either.  When given
+  (argument or env var), it is prepended to every prompt unless the row already
+  carries one.
 * ``code_*`` rows are skipped unless ``--sandbox_fusion_url`` is given: their
   reward only works against a code sandbox, and scoring them without one would
   silently discard every correct generation.
@@ -128,7 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--timeout", type=float, default=1800.0, help="per-request timeout (s)")
     parser.add_argument("--max_retries", type=int, default=3)
-    parser.add_argument("--system_prompt", default=os.environ.get("REASONING_RL_SYSTEM_PROMPT", ""))
+    parser.add_argument(
+        "--system_prompt",
+        default=os.environ.get("REASONING_RL_SYSTEM_PROMPT", ""),
+        help="system message prepended to every prompt; only needed if the RL run set "
+        "REASONING_RL_SYSTEM_PROMPT (default: that env var, empty = no injection)",
+    )
     parser.add_argument(
         "--abilities",
         default="",
@@ -268,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.convert_only:
         _convert(args.output_dir)
         return 0
+
+    if args.system_prompt:
+        logger.info("system prompt: %.120s", args.system_prompt)
+    else:
+        logger.info("system prompt: none (no injection)")
 
     rows = read_parquet_rows(args.input)
     logger.info("loaded %d rows from %s", len(rows), args.input)
