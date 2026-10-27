@@ -82,7 +82,9 @@ Routing (data_source prefix -> verifier):
 ``if_*``             instruction-following (Nemotron-RL-instruction_following):
                      re-check every constraint in ground_truth against the
                      model response; reward 1.0 iff ALL pass (NeMo-Gym
-                     ``grading_mode="binary"``).  Only the final (post-</think>)
+                     ``grading_mode="binary"``).  The stage-4 builder may opt
+                     into ``grading_mode="fraction"`` (passed / total) instead;
+                     absent means binary.  Only the final (post-</think>)
                      response is verified — the think block is internal
                      reasoning.  ``if_verifier`` implements the full
                      ``verifiable_instructions`` checker registry (54 ids,
@@ -93,6 +95,15 @@ Routing (data_source prefix -> verifier):
                      echoing.  Install ``langdetect`` for the reference
                      language checks (otherwise a Latin-script target language
                      such as Spanish cannot be recognised).
+``bbh_*``            stage-4 BBH-gap domain (D32): benchmark-native answers
+                     instead of the boxed abstention contract.  ``bbh_dyck``
+                     compares the closing-bracket token sequence;
+                     ``bbh_geometric_shapes`` / ``bbh_disambiguation_qa`` /
+                     ``bbh_movie_recommendation`` compare the option letter;
+                     ``bbh_causal_judgement`` compares yes/no.  Both
+                     ``\\boxed{...}`` and a bare final-line answer are accepted
+                     (``bbh_verifier``), and only the post-``</think>`` response
+                     is read.
 ===================  =====================================================
 
 Every branch returns ``{"score": float}`` so the naive reward manager lifts
@@ -136,6 +147,7 @@ from decimal import ROUND_HALF_UP, Decimal
 logger = logging.getLogger(__name__)
 
 try:
+    from examples.reasoning_rl.reward.bbh_verifier import verify_bbh
     from examples.reasoning_rl.reward.enigmata_verifier import strip_prose_prefix, verify_enigmata
     from examples.reasoning_rl.reward.reasoning_gym_verifier import seed_from_extra_info, verify_reasoning_gym
 except ImportError:
@@ -144,6 +156,7 @@ except ImportError:
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from bbh_verifier import verify_bbh
     from enigmata_verifier import strip_prose_prefix, verify_enigmata
     from reasoning_gym_verifier import seed_from_extra_info, verify_reasoning_gym
 
@@ -1666,8 +1679,17 @@ def _extract_final_response(solution_str: str) -> str:
 def _if_score(solution_str: str, ground_truth: str) -> float:
     """Verify the final response against the IF constraint list.
 
-    ground_truth is the JSON string written by to_parquet_if.py:
-      {"constraints": [{"id": "<category>:<type>", "kwargs": {...}}, ...]}
+    ground_truth is the JSON string written by ``if_adapter.py`` (stage 4) /
+    ``to_parquet_if.py`` (stage 1)::
+
+        {"constraints": [{"id": "<category>:<type>", "kwargs": {...}}, ...],
+         "grading_mode": "binary" | "fraction"}
+
+    ``binary`` (the default when the key is absent) is the NeMo-Gym / IFBench
+    convention: 1.0 iff EVERY constraint passes.  ``fraction`` is the stage-4
+    opt-in graded variant (passed / total), for runs where the all-or-nothing
+    signal is too sparse; an unevaluable constraint still counts as failed in
+    both modes, so a malformed ground truth can never inflate the score.
     """
     try:
         from examples.reasoning_rl.reward.if_verifier import verify_instructions
@@ -1686,16 +1708,21 @@ def _if_score(solution_str: str, ground_truth: str) -> float:
         return 0.0
     if isinstance(payload, dict):
         constraints = payload.get("constraints", [])
+        grading_mode = str(payload.get("grading_mode", "binary")).strip().lower()
     elif isinstance(payload, list):
         constraints = payload
+        grading_mode = "binary"
     else:
         constraints = []
+        grading_mode = "binary"
     if not isinstance(constraints, list) or not constraints:
         return 0.0
     response = _extract_final_response(solution_str)
     if not response:
         return 0.0
-    score, _ = verify_instructions(response, constraints)
+    score, follow = verify_instructions(response, constraints)
+    if grading_mode == "fraction" and follow:
+        score = sum(follow) / len(follow)
     return float(score)
 
 
@@ -1787,7 +1814,7 @@ def compute_score(
     """
     if not format_ok(solution_str):
         return {"score": _repetition_adjusted(solution_str, 0.0)}
-    if not data_source.startswith(("math", "code", "logic", "stem", "if")):
+    if not data_source.startswith(("math", "code", "logic", "stem", "if", "bbh")):
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
     try:
         if data_source.startswith("math"):
@@ -1798,6 +1825,10 @@ def compute_score(
             score = _logic_score(solution_str, ground_truth, data_source, extra_info)
         elif data_source.startswith("stem"):
             score = _math_score(solution_str, ground_truth)
+        elif data_source.startswith("bbh"):
+            # Stage-4 BBH-gap domain (D32): benchmark-native answer shapes
+            # (bracket suffix / option letter / yes-no), not the boxed contract.
+            score = verify_bbh(solution_str, ground_truth, data_source)
         else:  # if_*
             score = _if_score(solution_str, ground_truth)
     except Exception:

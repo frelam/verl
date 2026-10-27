@@ -108,6 +108,65 @@ would dilute code from ~25% of the old domain to ~15% of the whole train set.
 Code is drawn to the requested share of the *whole* train set and the remaining
 abilities keep the old domain's proportions, which leaves math/code/logic close
 to stage 1's own mix.
+
+Stage 4: ``--if_ratio`` (D31)
+-----------------------------
+
+Stage 4 keeps the stage-3 mix and injects the instruction-following (IF) domain
+at a requested share of the **final** train set.  The knobs are orthogonal to
+``--stage3_mix``:
+
+* ``--if_path`` -- the IF pool built by ``if_adapter.py``;
+* ``--if_ratio`` (0.15 for the stage-4 build) -- IF share of the final train set.
+  The IF row count is ``ratio / (1 - ratio) * (halluc_train + old_domain)``, so
+  the hallucination domain keeps its absolute size and the old:hallucination
+  ratio is unchanged; only the total grows.  The old-domain code target
+  (``--code_share``) is computed against the final total, so code keeps its
+  share of the artifact rather than of the non-IF part;
+* ``--if_val_size`` -- IF val rows, carved out of the IF pool *before* the train
+  sample (default ``ratio / (1 - ratio) * (hallucination val + old val)``), so
+  val keeps the same domain mix as train;
+* ``--exclude_path`` -- previously trained artifacts (stage 1 / 2 / 3
+  ``train.parquet``).  Rows whose question already appears there are removed
+  from the old-domain replay pool and from the IF pool.  This is the
+  anti-overfitting lever: with the *full* domain pools supplied through
+  ``--old_pool_path`` the replay is drawn from the unseen tail instead of
+  repeating the exact rows the model was already trained on;
+* ``--old_pool_path`` -- extra old-domain pool files/directories appended to
+  ``--stage1_path``.  Point these at ``$DATA_ROOT/{math,code,logic,stem}`` (the
+  raw pools) to give the refresh draw access to rows the stage-1 mix never
+  sampled.  Their ``val.parquet`` is skipped, never merged into stage-4 val.
+
+The IF rows use ``data_source="if_nemotron"``, so the reward delegates them to
+``compute_score.py``'s ``if_*`` branch unchanged; their ground truth is the
+constraint list the verifier re-checks (``{"constraints": [...],
+"grading_mode": "binary"|"fraction"}``).
+
+Stage 4: ``--bbh_ratio`` (D32)
+------------------------------
+
+A second additive domain repairs the five BIG-Bench-Hard subtasks the stage-3
+checkpoint is weakest on (``BBH_Benchmark_评测分析报告.md``): Dyck languages,
+geometric shapes, disambiguation QA, causal judgement and movie
+recommendation.  The rows are built by ``bbh_adapter.py``; they use the
+benchmark's native answer shape and are scored by ``reward/bbh_verifier.py``.
+
+The two additive domains share one formula over the fixed non-additive part
+``N`` (hallucination train + old-domain replay)::
+
+    if  = if_ratio  / (1 - if_ratio  - bbh_ratio) * N
+    bbh = bbh_ratio / (1 - if_ratio  - bbh_ratio) * N
+
+so the *final* train set has exactly the requested IF and BBH shares, and the
+stage-3 part keeps its absolute size.  With ``if_ratio=0`` this reduces to the
+stage-4 behaviour documented above, and with ``bbh_ratio=0`` it is byte-for-byte
+the previous stage-4 mix.
+
+``--bbh_weights`` sets the per-source split inside the BBH domain (default
+Dyck 30%, geometric 20%, disambiguation 20%, causal 15%, movie 15%); a source
+that cannot meet its share is reported and its leftover is redistributed across
+the other BBH sources, never into the hallucination or old-domain cells.
+
 """
 
 from __future__ import annotations
@@ -709,7 +768,18 @@ def near_dedup_against_stage1(
 
 
 def _question_key(row: dict) -> str:
-    """Normalised problem text of a row, template instruction block removed."""
+    """Normalised problem text of a row, template instruction block removed.
+
+    A **multi-message** prompt (stage-4 IF rows keep the raw WildChat
+    conversation) is joined whole: ``schema.question_of`` reads only the first
+    message, which would key every IF row on its system turn and make
+    ``--exclude-path`` misses.  Single-message rows keep the stage-1/2/3
+    behaviour exactly (the shared template block is stripped).
+    """
+    prompt = row.get("prompt") or []
+    if len(prompt) > 1:
+        text = " ".join(str(message.get("content", "")) for message in prompt)
+        return " ".join(text.split()).casefold()
     return " ".join(schema.question_of(row).split()).casefold()
 
 
@@ -735,6 +805,49 @@ def read_stage1_pool(path: str) -> tuple[list[dict], list[dict]]:
     if not val_rows:
         print("[mix_halluc] stage-1 directory has no val.parquet; stage-2 val stays hallucination-only")
     return train_rows, val_rows
+
+
+def read_old_pool(path: str) -> list[dict]:
+    """Rows of an extra old-domain pool (stage 4, ``--old_pool_path``).
+
+    This is a *raw* domain pool (``math`` / ``code`` / ``logic`` / ``stem``), not
+    a mixed split, so it supplies train rows only: a ``val.parquet`` inside the
+    directory is skipped rather than appended to stage-4 val.  Pointing
+    ``--stage1_path`` at the same directory would instead fold a pool's val rows
+    into train (``read_stage1_pool`` keeps only a split's own ``val.parquet``
+    out), and mixing the two conventions is how a val leak creeps in.
+    """
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--old_pool_path does not exist: {path}")
+    if not os.path.isdir(path):
+        return read_parquet_rows(path)
+    rows: list[dict] = []
+    for file in resolve_parquet_files(path):
+        if "val" in os.path.basename(file).lower():
+            continue
+        rows.extend(read_parquet_rows(file))
+    return rows
+
+
+def read_excluded_keys(paths: list[str] | None) -> set[str]:
+    """Question keys of previously trained artifacts (``--exclude_path``).
+
+    Exact-text only on purpose: the artifacts are the *trained* mixes, whose rows
+    are byte-identical copies of the pool rows (``mix.py`` samples, it does not
+    rewrite), so an exact key is sufficient to identify "already seen" and does
+    not need the cost (and false positives) of a MinHash pass over ~100k rows.
+    """
+    keys: set[str] = set()
+    for path in paths or []:
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            print(f"[mix_halluc] WARNING: --exclude_path does not exist: {path}")
+            continue
+        rows = read_parquet_rows(path)
+        keys.update(_question_key(row) for row in rows)
+        print(f"[mix_halluc] exclusion: {len(rows)} previously trained rows read from {path}")
+    return keys
 
 
 def sample_old_domain(
@@ -803,6 +916,174 @@ def sample_old_domain(
     }
 
 
+#: Stage 4 (D32): per-source share of the BBH-gap domain.  The keys are the
+#: ``data_source`` values ``bbh_adapter.py`` writes.  Dyck gets the largest share
+#: because it is both the weakest subtask (40%) and the cheapest to generate.
+DEFAULT_BBH_WEIGHTS: dict[str, float] = {
+    "bbh_dyck": 0.30,
+    "bbh_geometric_shapes": 0.20,
+    "bbh_disambiguation_qa": 0.20,
+    "bbh_causal_judgement": 0.15,
+    "bbh_movie_recommendation": 0.15,
+}
+
+#: Short task names accepted by ``--bbh_weights`` (``dyck=0.3,...``).
+BBH_WEIGHT_ALIASES: dict[str, str] = {
+    "dyck": "bbh_dyck",
+    "dyck_languages": "bbh_dyck",
+    "geometric": "bbh_geometric_shapes",
+    "geometric_shapes": "bbh_geometric_shapes",
+    "disambiguation": "bbh_disambiguation_qa",
+    "disambiguation_qa": "bbh_disambiguation_qa",
+    "causal": "bbh_causal_judgement",
+    "causal_judgement": "bbh_causal_judgement",
+    "movie": "bbh_movie_recommendation",
+    "movie_recommendation": "bbh_movie_recommendation",
+    **{source: source for source in DEFAULT_BBH_WEIGHTS},
+}
+
+
+def parse_bbh_weights(spec: str | None) -> dict[str, float]:
+    """Parse ``--bbh_weights`` into normalised ``data_source -> share``.
+
+    Missing keys keep their :data:`DEFAULT_BBH_WEIGHTS` value, so a build only
+    has to name the sources it wants to move.  Weights are normalised to sum to
+    one; a zero total or an unknown key is a hard error.
+    """
+    weights = dict(DEFAULT_BBH_WEIGHTS)
+    if spec:
+        for item in spec.split(","):
+            name, separator, value = item.partition("=")
+            if not separator:
+                raise ValueError(f"--bbh_weights item {item!r} is not name=value")
+            key = BBH_WEIGHT_ALIASES.get(name.strip())
+            if key is None:
+                raise ValueError(f"unknown --bbh_weights source {name.strip()!r}; expected one of {sorted(BBH_WEIGHT_ALIASES)}")
+            weight = float(value)
+            if weight < 0:
+                raise ValueError(f"--bbh_weights source {key!r} has a negative weight")
+            weights[key] = weight
+    total = sum(weights.values())
+    if total <= 0:
+        raise ValueError("--bbh_weights must have a positive total")
+    return {source: weight / total for source, weight in weights.items()}
+
+
+def additive_target(ratio: float, other_ratio: float, non_add_rows: int) -> int:
+    """Rows needed for ``ratio`` of the final set with one other additive domain.
+
+    For two additive domains A and B over a fixed non-additive part ``N``::
+
+        a = ra / (1 - ra - rb) * N
+        b = rb / (1 - ra - rb) * N
+
+    so ``a / (a + b + N) == ra`` and ``b / (a + b + N) == rb``.  With
+    ``other_ratio=0`` this is exactly :func:`if_train_target`'s formula.
+    """
+    if not ratio:
+        return 0
+    denominator = 1.0 - ratio - other_ratio
+    if denominator <= 0:
+        raise ValueError(
+            f"additive ratios {ratio:.3f} + {other_ratio:.3f} leave no room for the non-additive part"
+        )
+    return round(ratio / denominator * non_add_rows)
+
+
+def if_train_target(if_ratio: float, non_if_rows: int) -> int:
+    """IF rows needed for ``if_ratio`` of the *final* train set (stage 4, D31).
+
+    ``if_ratio = if / (if + non_if)`` -> ``if = ratio / (1 - ratio) * non_if``.
+    The non-IF part keeps the stage-3 composition (old domain + hallucination
+    domain unchanged in absolute size), and only the total grows.  Kept as the
+    single-domain wrapper of :func:`additive_target` so the stage-4 IF-only
+    behaviour (and its tests) stay pinned.
+    """
+    return additive_target(if_ratio, 0.0, non_if_rows)
+
+
+def _apportion_with_supply(
+    weights: dict[str, float], target: int, supply: dict[str, int]
+) -> dict[str, int]:
+    """Apportion ``target`` over ``weights`` without exceeding any supply.
+
+    One ``_largest_remainder`` pass can assign a source more than it has; the
+    loop re-apportions the unfilled budget over the sources that still have
+    spare rows, so a short movie pool does not shrink the whole BBH domain.
+    """
+    allocation = {source: 0 for source in weights}
+    remaining = min(target, sum(supply.get(source, 0) for source in weights))
+    active = {
+        source: weight
+        for source, weight in weights.items()
+        if weight > 0 and supply.get(source, 0) > 0
+    }
+    while remaining > 0 and active:
+        shares = _largest_remainder(active, remaining)
+        progress = 0
+        for source, take in shares.items():
+            add = min(take, supply.get(source, 0) - allocation[source])
+            if add > 0:
+                allocation[source] += add
+                progress += add
+        if progress == 0:
+            break
+        remaining -= progress
+        active = {
+            source: weight
+            for source, weight in active.items()
+            if supply.get(source, 0) > allocation[source]
+        }
+    return allocation
+
+
+def take_bbh_rows(
+    pool: list[dict],
+    weights: dict[str, float],
+    n_train: int,
+    n_val: int,
+    rng: random.Random,
+) -> tuple[list[dict], list[dict], dict]:
+    """Split the BBH pool into train/val with per-source weights.
+
+    Val is carved **before** train (the same rule as every other domain), and
+    both allocations are capped by each source's supply.  A source without any
+    rows is reported rather than silently disappearing from the weights.
+    """
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for row in pool:
+        buckets[str(row.get("data_source", ""))].append(row)
+    supply = {source: len(rows) for source, rows in buckets.items()}
+    for rows in buckets.values():
+        rng.shuffle(rows)
+
+    val_allocation = _apportion_with_supply(weights, n_val, supply)
+    val_rows: list[dict] = []
+    train_pools: dict[str, list[dict]] = {}
+    for source, rows in buckets.items():
+        take = val_allocation.get(source, 0)
+        val_rows.extend(rows[:take])
+        train_pools[source] = rows[take:]
+
+    train_supply = {source: len(rows) for source, rows in train_pools.items()}
+    train_allocation = _apportion_with_supply(weights, n_train, train_supply)
+    train_rows: list[dict] = []
+    for source, rows in train_pools.items():
+        train_rows.extend(rows[: train_allocation.get(source, 0)])
+
+    report = {
+        "weights": weights,
+        "supply": supply,
+        "target_train": n_train,
+        "target_val": n_val,
+        "train_allocation": {source: train_allocation.get(source, 0) for source in weights},
+        "val_allocation": {source: val_allocation.get(source, 0) for source in weights},
+        "train_total": len(train_rows),
+        "val_total": len(val_rows),
+    }
+    return train_rows, val_rows, report
+
+
 def build_parser() -> argparse.ArgumentParser:
     """The CLI.  Split out from :func:`main` so tests can read the defaults."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -869,6 +1150,64 @@ def build_parser() -> argparse.ArgumentParser:
         "hallucination domain has no code source, so without this a uniform replay "
         "dilutes code to ~0.6 * its stage-1 share.",
     )
+    parser.add_argument(
+        "--old_pool_path",
+        action="append",
+        default=None,
+        help="Stage 4 only: extra old-domain pool file(s)/dir(s) appended to --stage1_path, so the "
+        "refresh draw can reach rows the stage-1 mix never sampled. A pool's val.parquet is skipped.",
+    )
+    parser.add_argument(
+        "--exclude_path",
+        action="append",
+        default=None,
+        help="Stage 4 only: previously trained artifact(s) (stage-1/2/3 train parquet or dir). Rows "
+        "whose question already appears there are removed from the old-domain replay pool and the IF "
+        "pool, so the new stage trains on the unseen tail (repeatable).",
+    )
+    parser.add_argument("--if_path", default=None, help="Stage 4: instruction-following pool (parquet/dir)")
+    parser.add_argument(
+        "--if_ratio",
+        type=float,
+        default=0.0,
+        help="Stage 4: instruction-following share of the FINAL train set (0 disables). The IF row "
+        "count is if_ratio/(1-if_ratio) * (halluc_train + old_domain), so the stage-3 mix keeps its "
+        "absolute size and only the total grows.",
+    )
+    parser.add_argument(
+        "--if_val_size",
+        type=int,
+        default=None,
+        help="IF val rows carved out of --if_path before the train sample "
+        "(default: if_ratio/(1-if_ratio) * (hallucination val + stage-1 val)).",
+    )
+    parser.add_argument(
+        "--bbh_path",
+        default=None,
+        help="Stage 4 (D32): BBH-gap pool built by bbh_adapter.py (parquet/dir).",
+    )
+    parser.add_argument(
+        "--bbh_ratio",
+        type=float,
+        default=0.0,
+        help="Stage 4 (D32): BBH-gap share of the FINAL train set (0 disables). The BBH row "
+        "count is bbh_ratio/(1-if_ratio-bbh_ratio) * (halluc_train + old_domain), so the "
+        "stage-3 mix and the IF domain keep their absolute size and only the total grows.",
+    )
+    parser.add_argument(
+        "--bbh_val_size",
+        type=int,
+        default=None,
+        help="BBH val rows carved out of --bbh_path before the train sample "
+        "(default: bbh_ratio/(1-if_ratio-bbh_ratio) * (hallucination val + stage-1 val)).",
+    )
+    parser.add_argument(
+        "--bbh_weights",
+        default=None,
+        help="Stage 4 (D32): comma-separated data_source=weight overrides for the BBH domain "
+        "(default: dyck 0.30 / geometric 0.20 / disambiguation 0.20 / causal 0.15 / movie 0.15). "
+        "Short names (dyck, geometric, disambiguation, causal, movie) are accepted.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -892,6 +1231,27 @@ def main(argv: list[str] | None = None) -> int:
     if code_share is None:
         code_share = 0.24 if args.stage3_mix else 0.0
 
+    # Stage 4 (D31): the IF domain is an additive share of the final train set.
+    if not 0.0 <= args.if_ratio < 1.0:
+        raise ValueError(f"--if_ratio must be in [0, 1), got {args.if_ratio}")
+    if args.if_ratio > 0 and not args.if_path:
+        raise ValueError("--if_ratio > 0 requires --if_path (build it with if_adapter.py)")
+    if args.if_path and args.if_ratio == 0:
+        print("[mix_halluc] WARNING: --if_path given but --if_ratio is 0; the IF pool is ignored")
+
+    # Stage 4 (D32): the BBH-gap domain is the second additive share.
+    if not 0.0 <= args.bbh_ratio < 1.0:
+        raise ValueError(f"--bbh_ratio must be in [0, 1), got {args.bbh_ratio}")
+    if args.if_ratio + args.bbh_ratio >= 1.0:
+        raise ValueError(
+            f"--if_ratio ({args.if_ratio}) + --bbh_ratio ({args.bbh_ratio}) must stay below 1.0"
+        )
+    if args.bbh_ratio > 0 and not args.bbh_path:
+        raise ValueError("--bbh_ratio > 0 requires --bbh_path (build it with bbh_adapter.py)")
+    if args.bbh_path and args.bbh_ratio == 0:
+        print("[mix_halluc] WARNING: --bbh_path given but --bbh_ratio is 0; the BBH pool is ignored")
+    bbh_weights = parse_bbh_weights(args.bbh_weights)
+
     files = resolve_parquet_files(halluc_dir)
     halluc_rows = read_parquet_rows(halluc_dir)
     if not halluc_rows:
@@ -910,6 +1270,25 @@ def main(argv: list[str] | None = None) -> int:
             raise FileNotFoundError(f"--stage1_path does not exist: {stage1_path}")
         stage1_rows, old_val_rows = read_stage1_pool(stage1_path)
 
+    # Stage 4 freshness: the raw domain pools widen the replay supply, and the
+    # previously trained artifacts subtract the rows the model already saw, so
+    # the draw lands on the unseen tail.
+    for path in args.old_pool_path or []:
+        extra = read_old_pool(path)
+        stage1_rows.extend(extra)
+        print(f"[mix_halluc] old-domain pool: +{len(extra)} row(s) from {os.path.expanduser(path)}")
+    excluded_keys: set[str] = set()
+    excluded_old_removed = 0
+    if args.exclude_path:
+        excluded_keys = read_excluded_keys(args.exclude_path)
+        before = len(stage1_rows)
+        stage1_rows = [row for row in stage1_rows if _question_key(row) not in excluded_keys]
+        excluded_old_removed = before - len(stage1_rows)
+        print(
+            f"[mix_halluc] old-domain freshness: {excluded_old_removed} previously trained "
+            f"row(s) removed, {len(stage1_rows)} unseen row(s) remain"
+        )
+
     # Stage 3 samples the old domain *before* the dedup: those rows are the
     # reference the hallucination domain must not duplicate (a stage-1 row that
     # is never sampled cannot leak into training, so anchoring on the whole pool
@@ -919,14 +1298,25 @@ def main(argv: list[str] | None = None) -> int:
     # --strict_cells the fill matches the table exactly.
     old_rows: list[dict] = []
     old_report: dict = {"code_target": 0, "code_rows": 0, "shortfall": 0, "by_ability": {}}
-    if args.stage1_path and args.stage3_mix:
+    # Stage 4: the IF and BBH budgets are derived from the non-additive total,
+    # so they must be known before the old domain is drawn (the code target is a
+    # share of the *whole* artifact, which now includes both additive domains).
+    target_if_train = 0
+    target_bbh_train = 0
+    if (args.stage1_path or args.old_pool_path) and args.stage3_mix:
         target_halluc_train = max(args.halluc_total - args.val_size, 0)
         n_old = round(target_halluc_train * old_domain_ratio / (1.0 - old_domain_ratio))
         if n_old > len(stage1_rows):
             print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
             n_old = len(stage1_rows)
+        target_if_train = additive_target(args.if_ratio, args.bbh_ratio, target_halluc_train + n_old)
+        target_bbh_train = additive_target(args.bbh_ratio, args.if_ratio, target_halluc_train + n_old)
         old_rows, old_report = sample_old_domain(
-            stage1_rows, n_old, target_halluc_train + n_old, code_share, rng
+            stage1_rows,
+            n_old,
+            target_halluc_train + n_old + target_if_train + target_bbh_train,
+            code_share,
+            rng,
         )
         print(
             f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={old_domain_ratio}, "
@@ -1039,14 +1429,20 @@ def main(argv: list[str] | None = None) -> int:
     # Stage 3 already sampled its replay rows above (they anchored the dedup), so
     # only stage 2 samples here.  Stage 3 also keeps its val rows out of the
     # audit: they are appended below, exactly like stage 2's.
-    if args.stage1_path:
+    if args.stage1_path or args.old_pool_path:
         if not args.stage3_mix:
             n_old = round(filled_total * old_domain_ratio / (1.0 - old_domain_ratio))
             if n_old > len(stage1_rows):
                 print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
                 n_old = len(stage1_rows)
+            target_if_train = additive_target(args.if_ratio, args.bbh_ratio, filled_total + n_old)
+            target_bbh_train = additive_target(args.bbh_ratio, args.if_ratio, filled_total + n_old)
             old_rows, old_report = sample_old_domain(
-                stage1_rows, n_old, filled_total + n_old, code_share, rng
+                stage1_rows,
+                n_old,
+                filled_total + n_old + target_if_train + target_bbh_train,
+                code_share,
+                rng,
             )
             print(
                 f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={old_domain_ratio}, "
@@ -1104,7 +1500,146 @@ def main(argv: list[str] | None = None) -> int:
             + (f" (incl. {minhash_twins} pair twin(s) kept atomic)" if minhash_twins else "")
         )
 
-    all_train = rows + old_rows
+    # --- stage 4: instruction-following domain (D31) ---------------------------
+    # The IF rows are an additive domain: they do not enter the quota table and
+    # do not change the old:hallucination ratio, they only grow the total.  The
+    # base val count is captured before either additive domain appends its val
+    # rows, so the IF and BBH val targets are computed from the same denominator.
+    additive_val_base = len(val_rows)
+    if_rows: list[dict] = []
+    if_val_rows: list[dict] = []
+    if_report: dict = {}
+    if args.if_ratio > 0:
+        if_path = os.path.expanduser(args.if_path)
+        if not os.path.exists(if_path):
+            raise FileNotFoundError(f"--if_path does not exist: {if_path}")
+        if_pool = read_parquet_rows(if_path)
+        pool_rows = len(if_pool)
+
+        dropped_prev = 0
+        if excluded_keys:
+            before = len(if_pool)
+            if_pool = [row for row in if_pool if _question_key(row) not in excluded_keys]
+            dropped_prev = before - len(if_pool)
+
+        # A prompt must be trained at most once in this artifact: drop IF rows
+        # that duplicate the old domain or the hallucination domain.
+        in_artifact = {_question_key(row) for row in rows + old_rows}
+        before = len(if_pool)
+        if_pool = [row for row in if_pool if _question_key(row) not in in_artifact]
+        dropped_dup = before - len(if_pool)
+
+        n_if_val = args.if_val_size
+        if n_if_val is None:
+            # Mirror the train formula on the val side so val keeps the same
+            # domain mix: IF = if_ratio / (1 - if_ratio - bbh_ratio) * non-add val.
+            n_if_val = additive_target(args.if_ratio, args.bbh_ratio, additive_val_base)
+        n_if_val = min(n_if_val, len(if_pool))
+        if_pool = list(if_pool)
+        rng.shuffle(if_pool)
+        if_val_rows = if_pool[:n_if_val]
+        train_pool = if_pool[n_if_val:]
+
+        # The budget is derived from the *actual* non-additive total, so the
+        # stage-3 cells keep their absolute size even when a quota cell came up
+        # short.
+        desired_if = additive_target(args.if_ratio, args.bbh_ratio, len(rows) + len(old_rows))
+        n_if = min(desired_if, len(train_pool))
+        if n_if < desired_if:
+            print(
+                f"[mix_halluc] WARNING: IF pool can only supply {n_if} row(s) after dedup; "
+                f"the IF share will come out below {args.if_ratio:.2f}"
+            )
+        if_rows = train_pool[:n_if]
+        if_report = {
+            "path": if_path,
+            "pool_rows": pool_rows,
+            "dropped_already_trained": dropped_prev,
+            "dropped_duplicate_of_reasoning_domains": dropped_dup,
+            "target_train": desired_if,
+            "sampled_train": len(if_rows),
+            "sampled_val": len(if_val_rows),
+        }
+        print(
+            f"[mix_halluc] IF domain: pool {pool_rows}, -{dropped_prev} already trained, "
+            f"-{dropped_dup} duplicate, train {len(if_rows)}, val {len(if_val_rows)}"
+        )
+        val_rows = list(val_rows) + if_val_rows
+
+    # --- stage 4: BBH-gap domain (D32) -----------------------------------------
+    # The second additive domain.  It follows the IF rules: dedup against every
+    # reasoning row already in the artifact, carve val before the train draw,
+    # and size both from the same non-additive denominator.  The per-source
+    # split is weighted (Dyck gets the largest share); a short source is
+    # reported and its leftover is re-apportioned inside the BBH domain.
+    bbh_rows: list[dict] = []
+    bbh_val_rows: list[dict] = []
+    bbh_report: dict = {}
+    if args.bbh_ratio > 0:
+        bbh_path = os.path.expanduser(args.bbh_path)
+        if not os.path.exists(bbh_path):
+            raise FileNotFoundError(f"--bbh_path does not exist: {bbh_path}")
+        bbh_pool = read_parquet_rows(bbh_path)
+        pool_rows = len(bbh_pool)
+
+        dropped_prev = 0
+        if excluded_keys:
+            before = len(bbh_pool)
+            bbh_pool = [row for row in bbh_pool if _question_key(row) not in excluded_keys]
+            dropped_prev = before - len(bbh_pool)
+
+        in_artifact = {_question_key(row) for row in rows + old_rows + if_rows}
+        before = len(bbh_pool)
+        bbh_pool = [row for row in bbh_pool if _question_key(row) not in in_artifact]
+        dropped_dup = before - len(bbh_pool)
+
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for row in bbh_pool:
+            key = _question_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        dropped_self = len(bbh_pool) - len(unique)
+        bbh_pool = unique
+
+        n_bbh_val = args.bbh_val_size
+        if n_bbh_val is None:
+            n_bbh_val = additive_target(args.bbh_ratio, args.if_ratio, additive_val_base)
+        desired_bbh = additive_target(args.bbh_ratio, args.if_ratio, len(rows) + len(old_rows))
+        bbh_rows, bbh_val_rows, bbh_counts = take_bbh_rows(
+            bbh_pool, bbh_weights, desired_bbh, n_bbh_val, rng
+        )
+        if len(bbh_rows) < desired_bbh:
+            print(
+                f"[mix_halluc] WARNING: BBH pool can only supply {len(bbh_rows)} row(s) after dedup; "
+                f"the BBH share will come out below {args.bbh_ratio:.2f}"
+            )
+        short_sources = [
+            source
+            for source in bbh_weights
+            if bbh_counts["train_allocation"].get(source, 0)
+            < round(desired_bbh * bbh_weights[source]) - 1
+        ]
+        if short_sources:
+            print(f"[mix_halluc] WARNING: BBH source(s) under their weighted share: {short_sources}")
+        bbh_report = {
+            "path": bbh_path,
+            "pool_rows": pool_rows,
+            "dropped_already_trained": dropped_prev,
+            "dropped_duplicate_of_reasoning_domains": dropped_dup,
+            "dropped_duplicate_within_pool": dropped_self,
+            **bbh_counts,
+        }
+        print(
+            f"[mix_halluc] BBH domain: pool {pool_rows}, -{dropped_prev} already trained, "
+            f"-{dropped_dup} duplicate, -{dropped_self} internal duplicate, "
+            f"train {len(bbh_rows)}, val {len(bbh_val_rows)}; by source {bbh_counts['train_allocation']}"
+        )
+        val_rows = list(val_rows) + bbh_val_rows
+
+    all_train = rows + old_rows + if_rows + bbh_rows
     rng.shuffle(all_train)
     rng.shuffle(val_rows)
     for i, row in enumerate(all_train):
@@ -1142,8 +1677,16 @@ def main(argv: list[str] | None = None) -> int:
         if all_train
         else 0.0,
         "old_domain_share_of_train": len(old_rows) / len(all_train) if all_train else 0.0,
+        # Stage 4 (D31): the IF domain is an additive share; these are the two
+        # numbers the requested --if_ratio is read from.
+        "if_share_of_train": len(if_rows) / len(all_train) if all_train else 0.0,
+        "if_share_of_val": len(if_val_rows) / len(val_rows) if val_rows else 0.0,
+        # Stage 4 (D32): the BBH-gap domain is the second additive share.
+        "bbh_share_of_train": len(bbh_rows) / len(all_train) if all_train else 0.0,
+        "bbh_share_of_val": len(bbh_val_rows) / len(val_rows) if val_rows else 0.0,
+        "hallucination_share_of_train": len(rows) / len(all_train) if all_train else 0.0,
     }
-    halluc_rows_in_val = len(val_rows) - len(old_val_rows)
+    halluc_rows_in_val = len(val_rows) - len(old_val_rows) - len(if_val_rows) - len(bbh_val_rows)
     schema.normalise_extra_info(all_train + val_rows)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1164,10 +1707,29 @@ def main(argv: list[str] | None = None) -> int:
             "strict_cells": args.strict_cells,
             "code_share": code_share,
             "seed": args.seed,
+            # Stage 4 (D31): additive instruction-following domain.
+            "if_ratio": args.if_ratio,
+            "if_path": args.if_path,
+            "if_val_size": args.if_val_size,
+            # Stage 4 (D32): additive BBH-gap domain.
+            "bbh_ratio": args.bbh_ratio,
+            "bbh_path": args.bbh_path,
+            "bbh_val_size": args.bbh_val_size,
+            "bbh_weights": bbh_weights,
+            "exclude_paths": args.exclude_path or [],
+            "old_pool_paths": args.old_pool_path or [],
         },
         "total_train": len(all_train),
         "total_val": len(val_rows),
         "stage1_val_rows_kept_in_val": len(old_val_rows),
+        "if_rows_in_train": len(if_rows),
+        "if_rows_in_val": len(if_val_rows),
+        "if_domain": if_report,
+        "bbh_rows_in_train": len(bbh_rows),
+        "bbh_rows_in_val": len(bbh_val_rows),
+        "bbh_domain": bbh_report,
+        "bbh_by_source": dict(Counter(row["data_source"] for row in bbh_rows)),
+        "old_domain_rows_excluded": excluded_old_removed,
         "halluc_rows_in_train": len(rows),
         "halluc_rows_in_val": halluc_rows_in_val,
         "halluc_target_vs_filled": {
@@ -1186,6 +1748,8 @@ def main(argv: list[str] | None = None) -> int:
             "unsolvable_share": unsolvable_ratio,
             "old_domain_share": old_domain_ratio,
             "code_share": code_share,
+            "if_share": args.if_ratio,
+            "bbh_share": args.bbh_ratio,
         },
         "row_kinds": {
             "solvable_rows": n_solvable_rows,
@@ -1227,6 +1791,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[done] val={len(val_rows)} -> {val_path}")
     print(f"[done] hallucination by branch: {stats['halluc_by_branch']}")
     print(f"[done] hallucination by domain: {stats['halluc_by_domain']}")
+    if args.if_ratio > 0:
+        print(
+            f"[done] IF domain: train={len(if_rows)} ({achieved_ratios['if_share_of_train']:.1%}), "
+            f"val={len(if_val_rows)} ({achieved_ratios['if_share_of_val']:.1%})"
+        )
+    if args.bbh_ratio > 0:
+        print(
+            f"[done] BBH domain: train={len(bbh_rows)} ({achieved_ratios['bbh_share_of_train']:.1%}), "
+            f"val={len(bbh_val_rows)} ({achieved_ratios['bbh_share_of_val']:.1%}), "
+            f"by source={stats['bbh_by_source']}"
+        )
     print(f"[done] template balance: {templates}")
     short = [c for c in cell_report if c["shortfall"] - c["redistributed"] > 0]
     if short:

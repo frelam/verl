@@ -1,6 +1,6 @@
 # 幻觉抵制 Reasoning RL —— 实施设计
 
-> 状态：**实施口径已定稿（D1–D30）**。本文档是这份方案的唯一事实来源与施工图。
+> 状态：**实施口径已定稿（D1–D31）**。本文档是这份方案的唯一事实来源与施工图。
 > 与已有的 `DESIGN.md`（Qwen3-4B reasoning RL 主方案）**并行存在、互不覆盖**：本方案只在训练后程
 > 以「换数据 mix + 换 reward 文件」的方式接入，不修改阶段一任何行为。
 
@@ -43,6 +43,7 @@
 | D28 | 四档不可解行三层 AND-gate | **（D29 后：仅 stage 3；stage 2 已由 D29 回退为两段式，见下）** 四档不可解行（FalseQA-fake / TreeCut 负）的输出契约由 `\boxed{UNSOLVABLE: <选项ID>}` 扩为 `\boxed{UNSOLVABLE: <选项ID>: <修复后的答案>}`；reward 在原「拒答 + 指针命中」两层之上**加第三层「补条件后的正确解」**：三层全对 +1，否则 0。gold 侧新增 `repaired_answer`（必有）与 `repaired_free_text`（FalseQA 置 true 走 `norm_match`；TreeCut 数值走 `math_match`）。来源：FalseQA 用配对真题的 source answer（构造即证书——应用 gold 替换对恰好重放真题题面）；TreeCut 用 `certify_repaired_answer`（恢复 `deleted_sentence` 重跑 `certify_answer`，失败丢整对）。兼容性：缺 `repaired_answer` 的旧 parquet 回退旧两层口径 |
 | D29 | 三层修复契约拆为独立 stage 3 | **动机**：D28 把"判不可解 + 指对选项 + 解出修复后的题"绑进 stage 2 同一个 reward，四档行第三层长期 ≈0 时整行零方差被 `filter_groups` 屏蔽，反而污染 stage 2 的"拒答 + 诊断"信号。**拆分**：① stage 2 四档行回退两段式 `\boxed{UNSOLVABLE: <选项ID>}`（拒答 + 指针命中即 +1；收到三段式输出时第三段被解析但忽略，不奖不罚）；② stage 3 原样保留 D28 三段式契约与三层 AND-gate，由 gt 键 `repair_task=true` 路由（`repair_task` 与模板 `A_repair` 1:1 绑定，schema 强校验；带 `repaired_answer` 无 `repair_task` 的 pre-D29 artifact 走 legacy 回退仍按三层门评分）；③ stage 3 数据 = 纯修复行（FalseQA-repair 928 + TreeCut-repair 4,907，`REPAIR_QUOTA`）+ 旧域回放（`--old_domain_ratio 0.7`），由 `mix_halluc.py --repair_mode` 构建（跳过 `enforce_pair_atomicity`，`A_repair` 模板平衡结构性豁免）；④ adapter 侧 `--repair-contract` 旗标控制是否产出 `repair_task`/`repaired_answer`（stage 2 默认不产出，TreeCut 顺带跳过 `certify_repaired_answer` 的整对丢弃）；⑤ stage 3 训练从 stage-2 ckpt 续训（`run_qwen3_4b_hallucination_stage3_fully_async.sh`），reward 文件与 stage 2 共用 `hallucination_compute_score.py`（路由依据是 ground_truth 的键，不是 data_source） |
 | D30 | stage 3 域平衡重构（kkcut 合成 + 新配比） | **动机**：用户要求全局可解/不可解 = 70/30、老域/幻觉域 = 60/40（可解含两域），且合并后 math/code/logic 比例贴近老域；K&K 无原生不可解 → 合成。**内容**：① `kk_adapter.py --emit-unsolvable` 合成 **kkcut 行**——对已证唯一解的谜题删除一条陈述（`statements` 元组与 `quiz` 文本同步手术），仅当剩余子系统 2^N 全量枚举 **≥2 解** 时保留（删约束只能增解 ⇒ 被删陈述必要，枚举即证书；`verify_kk.py` 新增 `kkcut:` 独立审计通道，独立重推导不复用 adapter 代码）；契约 = 三档裸拒（模板 B、无 `role_words`，MiP 式），审计字段 `kkcut_deleted_index` / `kkcut_deleted_statement` / `kkcut_solutions_after`；`--kkcut-per-group 0` 允许同一父组枚举多条可删陈述，`kkcut:` task_id 增加第 5 段保证唯一；② stage 3 幻觉侧换**域平衡表 `STAGE3_QUOTA`**（14 cell，合计 14,000，§4.8）：logic 20%（2,800 = kk 700 可解 + kkcut 2,100 不可解）/ commonsense 20%（2,800 = FalseQA 300+820 + CREPE 400 判断 + 1,280 裸拒）/ math 60%（8,400 = GSM-IC 340 + UMWP 155/170/1,925 + 主池 15 + TreeCut 320/3,030 + SUM 2,200 + MiP 245），幻觉域内按**边权**（SUM 配对 0.5/0.5）精确 25/75，老域占 train 60% ⇒ 全局 70/30；老域按 **ability 分层抽样**（`--code_share`，stage-3 默认 0.24）：幻觉域没有 code 源，若均匀回放 code 会被稀释到全量的 ~15%，故先取 0.24×train_total 条 code，其余按池内供给比例分给 math/logic/stem，使合并后 math/code/logic ≈ 老域的 45/25/15；旧 `--repair_mode` 与 `REPAIR_QUOTA` 删除（D29 修复层已退役，stage 3 不再消费 `--repair-contract` 产物，配对原子性/去重/模板平衡检查与 stage 2 同一套原样生效）；③ CREPE 配额经 `--quota-overrides solvable_judge=400,unsolvable_bare=1280` 扩到 1,680；④ 构建入口 `build_hallucination_stage3_data.sh`（`HALLUC_TOTAL=14000`、`OLD_DOMAIN_RATIO=0.6`、`VAL_SIZE=700`，kk 带 `--emit-unsolvable --kkcut-per-group 0`，构建后跑 `verify_kk.py` 把坏 cut 行挡在构建期）→ `halluc/built_stage3/` → `mix_halluc.py --stage3_mix --strict_cells` → `final_halluc_stage3/`；**stage 2 表 B 不变** |
+| D31 | stage 4：指令遵从域（15%）+ 老域新鲜化 | **动机**：stage 1–3 的数据模型已训练过一轮，继续在同一批题上压熵会过拟合；同时 stage 3 只优化拒答/判断，缺少显式格式与内容约束的指令遵从信号。**内容**：① 新增 **`if_adapter.py`**，把 `nvidia/Nemotron-RL-instruction_following`（46,391 行，stage 1–3 未使用）构造成 stage-1 schema 的 `if_nemotron` 池——逐行过滤 reward 无法评估的 instruction id（`if_verifier.SUPPORTED_INSTRUCTION_IDS`），prompt 精确去重，`--exclude-path` 剔除已训练过的 prompt，`--quota/--seed` 决定子采样，ground truth = `{"constraints":[…],"grading_mode":"binary\|fraction"}`；② reward 复用 `compute_score.py` 的 `if_*` 分支（`_if_score`），新增 **`grading_mode="fraction"`**（通过约束数 / 总数）；缺省/未知值仍是 NeMo-Gym 的 `binary`（全部通过才 1.0），且约束只校验 `</think>` 之后的可见回答；③ `mix_halluc.py` 新增**正交**旋钮：`--if_ratio`（IF 占**最终** train 的比例，`if = ratio/(1-ratio) × 非 IF 总量`，因此 stage-3 幻觉域绝对规模不变）、`--if_path`、`--if_val_size`（先从 IF 池切 val 再抽 train）；`--exclude_path`（stage 1/2/3 的 train parquet，精确题面命中即从老域回放池与 IF 池剔除）、`--old_pool_path`（把 `$DATA_ROOT/{math,code,logic,stem}` 原始池并入回放供给，从而抽到 stage-1 mix 从未采过的尾部；池内 `val.parquet` 跳过）；④ 构建入口 **`build_hallucination_stage4_data.sh`**（`IF_RATIO=0.15`、`SEED=44` 轮换 kkcut 顺序与 CREPE 子采样、`INCLUDE_OLD_POOLS=1` 默认开启新鲜化，`EXCLUDE_PATHS` 默认 `final`/`final_halluc`/`final_halluc_stage3`）→ `halluc/built_stage4/` → `mix_halluc.py --stage3_mix --strict_cells --if_ratio 0.15` → `final_halluc_stage4/`；构建后断言 IF 实际占比不低于请求值 1pt；⑤ 训练沿用 `run_qwen3_4b_hallucination_stage3_fully_async.sh`（`DATA_DIR=$STAGE4_DIR`、`RESUME_PATH=<stage-3 ckpt>`），reward 文件不变。默认口径下 stage 4 train ≈ 33,250（非 IF）+ 5,868（IF）= 39,118，IF = 15.0%；val ≈ 700（幻觉）+ 255（stage-1 val）+ 105（IF） |
 
 ---
 
@@ -1038,6 +1039,73 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 - reward：**与 stage 2 共用** `reward/hallucination_compute_score.py`——按 gt 键路由（§6），
   同一文件服务两个 stage，无需切换。
 
+### 7.5 阶段四启动方式（D31）
+
+- 数据：`build_hallucination_stage4_data.sh` 一键构建——沿用 stage-3 的 8 个 adapter 与
+  `STAGE3_QUOTA`（`SEED=44` 轮换 kkcut 删除顺序与 CREPE 子采样），另建 IF 池与新鲜化老域：
+  1. `if_adapter.py --out halluc/built_stage4/if.parquet`：过滤 reward 不可评估的 instruction id、
+     prompt 精确去重、`--exclude-path` 剔除 stage 1/2/3 已训练 prompt，写入
+     `{"constraints":[…],"grading_mode":"binary"}`（`IF_GRADING_MODE=fraction` 可切部分分）；
+  2. `EXCLUDE_PATHS`（默认 `final` / `final_halluc` / `final_halluc_stage3`）用于老域回放池与 IF 池；
+  3. `INCLUDE_OLD_POOLS=1` 时 `OLD_POOL_PATHS`（默认 `math/code/logic/stem` 的 `train_*.parquet`）
+     并入回放供给，`--old_pool_path` 的 `val.parquet` 跳过；
+  4. `mix_halluc.py --stage3_mix --strict_cells --if_ratio 0.15 --if_path … --exclude_path …
+     --old_pool_path …` → `final_halluc_stage4/`。IF 是增量域：`if = 0.15/0.85 × (幻觉 train + 老域)`，
+     所以 stage-3 幻觉域绝对规模与 60/40 结构不变，`--code_share 0.24` 按**最终**总量计算；
+     构建末尾断言 IF 实际占比 ≥ 请求值 −1pt。
+- 规模（D31-only 口径，`BBH_RATIO=0`）：非增量基数 33,250（幻觉 13,300 + 老域 19,950）
+  + IF 5,868 = **39,118**，IF **15.0%**；val ≈ 700（幻觉）+ 255（stage-1 val）+ 169（IF）≈ 1,124，
+  IF 仍约 15%。`--val_size` 仍是幻觉侧配额，IF val 默认按同一公式
+  `ratio/(1-ratio) × (幻觉 val + 老域 val)` 从 IF 池**先切后抽** train，因此 val 与 train 不会共用 prompt。
+  D32 默认 `BBH_RATIO=0.10` 时，IF 与 BBH 从同一个非增量基数 N 计算：IF=6,650、BBH=4,433，
+  最终 train **44,333**（IF 15.0% / BBH 10.0% / 非增量 75.0%），见 §7.6。
+- 续训：`RESUME_PATH=<阶段三 ckpt 目录> bash run_qwen3_4b_hallucination_stage4_fully_async.sh`
+  （D31+D32 薄封装，DATA_DIR 默认 `final_halluc_stage4`，其余沿用 stage-3 recipe）。
+- reward：仍是 `reward/hallucination_compute_score.py`；`if_nemotron` 行按 `data_source` 前缀
+  委托给 `compute_score.py::_if_score`，约束只检查 `</think>` 之后的可见回答。
+  **注意**：binary 模式下 IF 组的正确率通常很低（最多 5 条约束全部通过），组内奖励容易全 0；
+  fully-async 不过滤零方差组，若 IF 组长期零方差，优先改用 `IF_GRADING_MODE=fraction` 或检查
+  约束覆盖率报告（`built_stage4/if_report.json`），而不是直接调大 `IF_RATIO`。
+
+### 7.6 阶段四 BBH 薄弱项补强（D32）
+
+- 背景：stage-3 checkpoint 在 BBH 上的分项报告（`BBH_Benchmark_评测分析报告.md`）显示五个明显短板：
+  `dyck_languages` 40%、`disambiguation_qa` 64%、`causal_judgement` 64.7%、
+  `movie_recommendation` 66.4%、`geometric_shapes` 74%。D32 在 stage 4 增加一个**同能力增量域**
+  专门补这五项，不改动 stage-3 幻觉域与 IF 域的绝对规模。
+- **数据纪律（硬约束）**：不读取任何 BBH / BIG-Bench 测试行，也不下载 `lukaemon/bbh` 等镜像。
+  五个子任务的数据来源如下：
+  1. `dyck_languages`：PCFG 重新生成 Dyck-1..4 前缀（BIG-Bench 任务本身就是生成式的；用新 seed
+     生成，不触碰 benchmark 序列）；
+  2. `geometric_shapes`：重新生成 SVG `M/L/A` 路径，并用独立的几何分类器复核标签（四边形按
+     矩形/风筝/梯形，5–8 边按边数），错误标签在构建期直接丢弃；
+  3. `disambiguation_qa`：十个模板族重新生成指代/歧义句（职业线索、说话人知识、所有格歧义、
+     they 单复数、真实两指代歧义等），选项 A/B/C 与原 benchmark 同形；
+  4. `causal_judgement`：十二个因果小故事族（直接因果、共同原因混杂、抢先因、作为/不作为、
+     反事实链、无机制相关、规范违反但有/无因果等），gold 为 Yes/No；
+  5. `movie_recommendation`：使用 **MovieLens latest-small 原始评分**（BIG-Bench 任务本身的数据源），
+     按用户 liked/disliked 重新构造“4 个种子电影 + 1 正选 + 3 负选”的四选一题，而不是 benchmark 的
+     250 条查询。缺少 CSV 时 `bbh_adapter.py` 从 GroupLens 自动下载 `ml-latest-small.zip`。
+- 配比：BBH 域是第二个增量域，与 IF 域共用同一个非增量基数 N（幻觉 train + 老域）：
+  `if = IF_RATIO/(1-IF_RATIO-BBH_RATIO)×N`，`bbh = BBH_RATIO/(1-IF_RATIO-BBH_RATIO)×N`。
+  默认 `IF_RATIO=0.15`、`BBH_RATIO=0.10`，即最终 train 为 75% 非增量 + 15% IF + 10% BBH；
+  stage-3 的 60/40 老域:幻觉域结构保持在其绝对规模内。`--code_share 0.24` 按最终总量计算。
+- BBH 域内部按源加权：Dyck 30% / 几何 20% / 消歧 20% / 因果 15% / 电影 15%
+  （`BBH_WEIGHTS` 可改）。某个源供给不足时，缺口只在 BBH 域内部再分配，不会流入幻觉域或老域；
+  `mix_stats.json → bbh_domain` 记录每个源的目标/实际分配，构建脚本断言 BBH 实际占比 ≥ 请求值 −1pt。
+- 构建：`BBH_RATIO=0.10 bash build_hallucination_stage4_data.sh`。新增产物
+  `halluc/built_stage4/bbh.parquet` 与 `bbh_report.json`（逐任务生成量、去重/排除计数、难度分布）。
+  `RUN_TESTS=1` 时同时跑 `test_bbh_adapter.py` 与 `test_bbh_verifier.py`。
+- reward：`bbh_*` 行在 `compute_score.py` 中路由到 `reward/bbh_verifier.py`，按 benchmark 原生答案
+  形态判分（Dyck 只比括号 token 序列；选择题比选项字母；因果题比最后一个 Yes/No），同时接受
+  `\boxed{...}` 和裸末行答案；`hallucination_compute_score.py` 的 `halluc_*` 分支不变。
+- 训练：`RESUME_PATH=<阶段三 ckpt 目录> bash run_qwen3_4b_hallucination_stage4_fully_async.sh`
+  （薄封装，DATA_DIR 默认 `final_halluc_stage4`，其余沿用 stage-3 recipe）。
+- 风险与监控：消歧/因果是模板重生成，存在模板捷径风险；BBH 域只占 10%，且 `bbh_report.json`
+  记录了每族难度分布。上线后优先看 BBH 五个分项是否提升、stage-3 的幻觉/拒答指标是否回退；
+  若某项仍无改善，先按 `bbh_domain.train_allocation` 确认该源是否被短供，再考虑调 `BBH_WEIGHTS`
+  或在该族内增加词表/模板多样性，而不是直接调大 `BBH_RATIO`。
+
 ---
 
 ## 8. 文件清单（全部新增，零覆盖）
@@ -1046,12 +1114,20 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 examples/reasoning_rl/
 ├── HALLUCINATION_RL_DESIGN.md                     # 本文档
 ├── build_hallucination_stage3_data.sh             # D30 stage 3 数据一键构建（8 adapter 全量重建 → mix --stage3_mix；构建期含 verify_kk 检查）
+├── build_hallucination_stage4_data.sh             # D31+D32 stage 4 数据一键构建（stage-3 表 + IF 池 + BBH 补强池 + 新鲜化老域 → mix --stage3_mix --if_ratio --bbh_ratio）
 ├── run_qwen3_4b_hallucination_stage3_fully_async.sh  # D29 stage 3 训练 recipe（RESUME_PATH=<stage-2 ckpt>）
+├── run_qwen3_4b_hallucination_stage4_fully_async.sh  # D31+D32 stage 4 薄封装（DATA_DIR=final_halluc_stage4，RESUME_PATH=<阶段三 ckpt>）
 ├── reward/
-│   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托；stage 2/3 共用，按 gt 键路由）
-│   └── test_hallucination_compute_score.py
+│   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托；stage 2/3/4 共用，按 gt 键路由）
+│   ├── if_verifier.py                             # IFBench/IFEval 约束校验（54 id）
+│   ├── bbh_verifier.py                            # D32 BBH 补强域判分（Dyck 括号序列 / 选项字母 / Yes-No）
+│   ├── test_hallucination_compute_score.py
+│   └── test_bbh_verifier.py
 └── scripts/hallucination/
     ├── schema.py                                  # pydantic schema + parquet 序列化/校验
+    ├── if_adapter.py                              # D31 指令遵从域构建（约束完整性过滤/去重/quota/grading_mode）
+    ├── bbh_adapter.py                             # D32 BBH 补强域构建（Dyck/几何/消歧/因果重生成 + MovieLens 四选一；不读 BBH 数据）
+    ├── test_bbh_adapter.py                        # D32 生成器/标签自检/去重测试
     ├── verify_kk.py                               # K&K gold 自检/审计（枚举器对照；D30 `kkcut:` 合成行独立审计通道）
     ├── verify_mip.py                              # MiP L1/L2 审计断言：证书、必要性、唯一性
     ├── verify_falseqa.py                          # FalseQA：配对 diff 证书 + 替换对选项断言（§4.3）+ D27 answerable 侧占位替换对/按对 split 断言

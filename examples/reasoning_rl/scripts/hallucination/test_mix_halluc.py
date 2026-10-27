@@ -30,7 +30,7 @@ import json
 import os
 import random
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
@@ -947,3 +947,368 @@ class TestStage3Mix:
         assert report["shortfall"] == 38
         assert len(chosen) == 60
         assert len({row["extra_info"]["task_id"] for row in chosen}) == 60
+
+
+def make_if_rows(n, prefix="if", seed=0):
+    """Stage-4 IF rows in the shape ``if_adapter.py`` emits."""
+    rows = []
+    for i in range(n):
+        rows.append(
+            {
+                "data_source": "if_nemotron",
+                "prompt": [{"role": "user", "content": f"Instruction-following request {prefix} {i}."}],
+                "ability": "if",
+                "reward_model": {
+                    "style": "rule",
+                    "ground_truth": json.dumps(
+                        {
+                            "constraints": [{"id": "punctuation:no_comma", "kwargs": {}}],
+                            "grading_mode": "binary",
+                        }
+                    ),
+                },
+                "extra_info": {
+                    "split": "train",
+                    "index": i,
+                    "task_id": f"{prefix}-{i}",
+                    "domain": "if",
+                    "source": "wildchat",
+                    "difficulty": "",
+                    "prior_solve_rate": -1.0,
+                    "seed": seed,
+                    "pass_rate": -1.0,
+                },
+            }
+        )
+    return rows
+
+
+class TestStage4InstructionFollowing:
+    """Stage 4 (D31): the IF domain is an additive ``--if_ratio`` share.
+
+    The stage-3 domain keeps its absolute size, so the IF rows only grow the
+    total; ``--exclude_path`` / ``--old_pool_path`` are the freshness levers.
+    """
+
+    def _stage3_build(self, tmp_path, scale=1):
+        build = tmp_path / "built_stage3"
+        build.mkdir()
+        rows = []
+        for branch, data_source, template, solvable, n in TestStage3Mix.STAGE3_CELL_SHAPES:
+            rows.extend(make_cell_rows(branch, data_source, template, solvable, n * scale))
+        schema.write_rows_parquet(rows, str(build / "halluc.parquet"))
+        return str(build)
+
+    @staticmethod
+    def _stage1_pool(tmp_path, name="stage1", counts=(("code", 3000), ("math", 3000), ("logic", 1000), ("stem", 1000))):
+        stage1 = tmp_path / name
+        stage1.mkdir()
+        rows = []
+        for ability, n in counts:
+            for i in range(n):
+                row = schema.make_row(
+                    data_source=SOURCE_GSMIC,
+                    question=f"{name} {ability} question {i}?",
+                    ground_truth=schema.ground_truth_json(
+                        schema.ground_truth_payload(solvable=True, answer="42")
+                    ),
+                    template=TEMPLATE_B,
+                    branch=BRANCH_SOLVABLE_NUMERIC,
+                    extra_info={"task_id": f"{name}-{ability}-{i}", "index": i, "seed": 0},
+                )
+                row["ability"] = ability
+                rows.append(row)
+        schema.write_rows_parquet(rows, str(stage1 / "train.parquet"))
+        return str(stage1), rows
+
+    def test_if_train_target_matches_the_share(self):
+        # 15% of the final train set means IF = 0.15 / 0.85 of the non-IF part.
+        assert mix_halluc.if_train_target(0.15, 33250) == 5868
+        assert mix_halluc.if_train_target(0.0, 33250) == 0
+
+    def test_if_ratio_requires_if_path(self, tmp_path):
+        build = self._stage3_build(tmp_path)
+        with pytest.raises(ValueError, match="--if_path"):
+            mix_halluc.main([
+                "--stage3_mix",
+                "--halluc_dir", build,
+                "--output_dir", str(tmp_path / "out"),
+                "--halluc_total", "400",
+                "--if_ratio", "0.15",
+            ])
+
+    def test_if_domain_is_injected_at_the_requested_share(self, tmp_path):
+        build = self._stage3_build(tmp_path)
+        stage1, stage1_rows = self._stage1_pool(tmp_path)
+        if_pool = tmp_path / "if"
+        if_pool.mkdir()
+        schema.write_rows_parquet(make_if_rows(2000), str(if_pool / "if.parquet"))
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--if_path", str(if_pool),
+            "--if_ratio", "0.15",
+            "--output_dir", str(out),
+            "--halluc_total", "2000",
+            "--val_size", "60",
+            "--seed", "13",
+        ]) == 0
+
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+
+        non_if = sum(1 for row in train if row["ability"] != "if")
+        if_train = [row for row in train if row["ability"] == "if"]
+        # The IF rows are additive: the non-IF part is exactly the stage-3 mix
+        # (halluc train + old replay) and the IF count is ratio / (1 - ratio).
+        assert len(if_train) == mix_halluc.if_train_target(0.15, non_if)
+        assert stats["achieved_ratios"]["if_share_of_train"] == pytest.approx(0.15, abs=0.003)
+        assert stats["config"]["if_ratio"] == pytest.approx(0.15)
+        assert stats["if_rows_in_train"] == len(if_train)
+        # Val carries IF rows too, carved from the pool before the train draw.
+        if_val = [row for row in val if row["ability"] == "if"]
+        assert if_val
+        assert stats["achieved_ratios"]["if_share_of_val"] > 0
+        # No prompt may straddle train/val.
+        train_prompts = {mix_halluc._question_key(row) for row in train}
+        val_prompts = {mix_halluc._question_key(row) for row in val}
+        assert not train_prompts & val_prompts
+        # The old domain still holds its share of the non-IF part.
+        assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(0.6 * 0.85, abs=0.01)
+        # Old-domain replay came from the stage-1 pool, not from the IF pool.
+        old_ids = {row["extra_info"]["task_id"] for row in train if row["ability"] != "if"}
+        assert old_ids & {row["extra_info"]["task_id"] for row in stage1_rows}
+
+    def test_if_prompt_duplicating_the_reasoning_domains_is_dropped(self, tmp_path):
+        build = self._stage3_build(tmp_path)
+        stage1, _ = self._stage1_pool(tmp_path)
+        base_args = [
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--if_ratio", "0.15",
+            "--halluc_total", "400",
+            "--val_size", "0",
+            "--if_val_size", "0",
+            "--seed", "17",
+        ]
+
+        # First run: learn which hallucination question actually made it into the
+        # train artifact (the fill samples a quota out of a much larger pool).
+        first_pool = tmp_path / "if_first"
+        first_pool.mkdir()
+        schema.write_rows_parquet(make_if_rows(300), str(first_pool / "if.parquet"))
+        first_out = tmp_path / "stage4_first"
+        assert mix_halluc.main([*base_args, "--if_path", str(first_pool), "--output_dir", str(first_out)]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(first_out), "train.parquet"))
+        halluc = next(row for row in train if str(row["data_source"]).startswith("halluc_"))
+        duplicate = schema.question_of(halluc)
+
+        # Second run: an IF row re-uses that question verbatim and must be dropped
+        # so the same request is not trained twice in one artifact.
+        if_rows = make_if_rows(300) + [
+            {
+                "data_source": "if_nemotron",
+                "prompt": [{"role": "user", "content": duplicate}],
+                "ability": "if",
+                "reward_model": {
+                    "style": "rule",
+                    "ground_truth": json.dumps({"constraints": [{"id": "punctuation:no_comma"}]}),
+                },
+                "extra_info": {"task_id": "if-duplicate", "index": 999, "domain": "if", "source": "wildchat"},
+            }
+        ]
+        if_pool = tmp_path / "if"
+        if_pool.mkdir()
+        schema.write_rows_parquet(if_rows, str(if_pool / "if.parquet"))
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([*base_args, "--if_path", str(if_pool), "--output_dir", str(out)]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        assert all(row["extra_info"]["task_id"] != "if-duplicate" for row in train)
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+        assert stats["if_domain"]["dropped_duplicate_of_reasoning_domains"] == 1
+
+    def test_exclude_path_removes_previously_trained_rows(self, tmp_path):
+        build = self._stage3_build(tmp_path)
+        stage1, stage1_rows = self._stage1_pool(tmp_path, counts=(("code", 600), ("math", 600), ("logic", 300), ("stem", 300)))
+        seen_dir = tmp_path / "stage3_seen"
+        seen_dir.mkdir()
+        seen = stage1_rows[:900]
+        schema.write_rows_parquet(seen, str(seen_dir / "train.parquet"))
+        seen_ids = {row["extra_info"]["task_id"] for row in seen}
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--exclude_path", str(seen_dir),
+            "--output_dir", str(out),
+            "--halluc_total", "400",
+            "--val_size", "20",
+            "--seed", "19",
+        ]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        train_ids = {row["extra_info"]["task_id"] for row in train}
+        # Every old-domain row must come from the 900-row unseen tail.
+        assert not train_ids & seen_ids
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+        assert stats["old_domain_rows_excluded"] == 900
+
+    def test_read_old_pool_skips_val_parquet(self, tmp_path):
+        pool = tmp_path / "math_pool"
+        pool.mkdir()
+        schema.write_rows_parquet(
+            make_cell_rows(BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, 5),
+            str(pool / "train_math.parquet"),
+        )
+        schema.write_rows_parquet(
+            make_cell_rows(BRANCH_SOLVABLE_NUMERIC, SOURCE_GSMIC, TEMPLATE_B, True, 3, seed=1),
+            str(pool / "val.parquet"),
+        )
+        rows = mix_halluc.read_old_pool(str(pool))
+        assert len(rows) == 5
+
+
+class TestStage4BbhGap:
+    """Stage 4 (D32): the BBH-gap domain is the second additive share."""
+
+    SOURCES = (
+        "bbh_dyck",
+        "bbh_geometric_shapes",
+        "bbh_disambiguation_qa",
+        "bbh_causal_judgement",
+        "bbh_movie_recommendation",
+    )
+    TASKS = {
+        "bbh_dyck": "dyck_languages",
+        "bbh_geometric_shapes": "geometric_shapes",
+        "bbh_disambiguation_qa": "disambiguation_qa",
+        "bbh_causal_judgement": "causal_judgement",
+        "bbh_movie_recommendation": "movie_recommendation",
+    }
+
+    def _bbh_rows(self, n_per_source=600, seed=0):
+        rows = []
+        for source in self.SOURCES:
+            for i in range(n_per_source):
+                info = dict(schema.EXTRA_INFO_DEFAULTS)
+                info.update(
+                    {
+                        "split": "train",
+                        "index": i,
+                        "task_id": f"bbh-{source}-{i}",
+                        "domain": "bbh",
+                        "source": f"BBH-gap {source}",
+                        "difficulty": "",
+                        "prior_solve_rate": -1.0,
+                        "seed": seed,
+                        "bbh_task": self.TASKS[source],
+                    }
+                )
+                rows.append(
+                    {
+                        "data_source": source,
+                        "prompt": [{"role": "user", "content": f"{source} question {i}?"}],
+                        "ability": "bbh",
+                        "reward_model": {
+                            "style": "rule",
+                            "ground_truth": json.dumps({"task": self.TASKS[source], "answer": "A"}),
+                        },
+                        "extra_info": info,
+                    }
+                )
+        return rows
+
+    def test_additive_target_matches_both_shares(self):
+        # 15% IF + 10% BBH over a non-additive part N.
+        assert mix_halluc.additive_target(0.15, 0.10, 33250) == 6650
+        assert mix_halluc.additive_target(0.10, 0.15, 33250) == 4433
+        assert mix_halluc.additive_target(0.0, 0.10, 33250) == 0
+
+    def test_bbh_ratio_requires_bbh_path(self, tmp_path):
+        build = TestStage4InstructionFollowing()._stage3_build(tmp_path)
+        with pytest.raises(ValueError, match="--bbh_path"):
+            mix_halluc.main([
+                "--stage3_mix",
+                "--halluc_dir", build,
+                "--output_dir", str(tmp_path / "out"),
+                "--halluc_total", "400",
+                "--bbh_ratio", "0.10",
+            ])
+
+    def test_parse_bbh_weights_accepts_short_names(self):
+        weights = mix_halluc.parse_bbh_weights(
+            "dyck=0.3,geometric=0.2,disambiguation=0.2,causal=0.15,movie=0.15"
+        )
+        assert sum(weights.values()) == pytest.approx(1.0)
+        assert weights["bbh_dyck"] == pytest.approx(0.3)
+        with pytest.raises(ValueError, match="unknown --bbh_weights"):
+            mix_halluc.parse_bbh_weights("nope=1.0")
+
+    def test_apportion_with_supply_caps_a_short_source(self):
+        allocation = mix_halluc._apportion_with_supply(
+            {"a": 0.5, "b": 0.5}, 100, {"a": 10, "b": 100}
+        )
+        assert allocation == {"a": 10, "b": 90}
+
+    def test_bbh_domain_is_injected_at_the_requested_share(self, tmp_path):
+        helper = TestStage4InstructionFollowing()
+        build = helper._stage3_build(tmp_path)
+        stage1, _ = helper._stage1_pool(tmp_path)
+
+        if_pool = tmp_path / "if"
+        if_pool.mkdir()
+        schema.write_rows_parquet(make_if_rows(3000), str(if_pool / "if.parquet"))
+        bbh_pool = tmp_path / "bbh"
+        bbh_pool.mkdir()
+        schema.write_rows_parquet(self._bbh_rows(), str(bbh_pool / "bbh.parquet"))
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--if_path", str(if_pool),
+            "--if_ratio", "0.15",
+            "--bbh_path", str(bbh_pool),
+            "--bbh_ratio", "0.10",
+            "--output_dir", str(out),
+            "--halluc_total", "2000",
+            "--val_size", "60",
+            "--seed", "23",
+        ]) == 0
+
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+
+        non_add = [row for row in train if row["ability"] not in ("if", "bbh")]
+        if_train = [row for row in train if row["ability"] == "if"]
+        bbh_train = [row for row in train if row["ability"] == "bbh"]
+        assert len(if_train) == mix_halluc.additive_target(0.15, 0.10, len(non_add))
+        assert len(bbh_train) == mix_halluc.additive_target(0.10, 0.15, len(non_add))
+        assert stats["achieved_ratios"]["if_share_of_train"] == pytest.approx(0.15, abs=0.005)
+        assert stats["achieved_ratios"]["bbh_share_of_train"] == pytest.approx(0.10, abs=0.005)
+        assert stats["config"]["bbh_ratio"] == pytest.approx(0.10)
+        assert stats["bbh_rows_in_train"] == len(bbh_train)
+        # The per-source weights survive a pool that is larger than the quota.
+        by_source = Counter(row["data_source"] for row in bbh_train)
+        assert set(by_source) == set(self.SOURCES)
+        assert by_source["bbh_dyck"] > by_source["bbh_movie_recommendation"]
+        # Both additive domains contribute val rows, and no prompt straddles.
+        assert any(row["ability"] == "bbh" for row in val)
+        assert any(row["ability"] == "if" for row in val)
+        train_prompts = {mix_halluc._question_key(row) for row in train}
+        val_prompts = {mix_halluc._question_key(row) for row in val}
+        assert not train_prompts & val_prompts
+        # The stage-3 cells keep their absolute size: the non-additive part is
+        # independent of the two additive ratios.
+        assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(
+            0.6 * (1 - 0.15 - 0.10), abs=0.01
+        )

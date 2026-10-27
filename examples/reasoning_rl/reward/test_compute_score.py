@@ -1073,3 +1073,52 @@ class TestCodeCallableNameAlignment:
         gt = json.dumps({"inputs": ["1\n"], "outputs": ["1\n"]})
         sol = think_wrap("```python\ndef anything():\n    pass\n```")
         assert _align_callable_name(sol, gt) == gt
+
+
+# ---------------------------------------------------------------------------
+# instruction-following grading modes (stage 4, D31)
+# ---------------------------------------------------------------------------
+
+
+class TestIfScoreGradingModes:
+    """``_if_score`` is binary by default and ``fraction`` when asked.
+
+    The stage-4 builder writes ``grading_mode`` into the ground truth; a legacy
+    payload without the key must keep the NeMo-Gym all-or-nothing behaviour.
+    """
+
+    CONSTRAINTS = [
+        {"id": "keywords:existence", "kwargs": {"keywords": ["Paris"]}},
+        {"id": "punctuation:no_comma", "kwargs": {}},
+    ]
+
+    @staticmethod
+    def gt(grading_mode=None):
+        payload = {"constraints": TestIfScoreGradingModes.CONSTRAINTS}
+        if grading_mode is not None:
+            payload["grading_mode"] = grading_mode
+        return json.dumps(payload)
+
+    def test_binary_requires_every_constraint(self):
+        assert compute_score("if_nemotron", think_wrap("Paris is lovely."), self.gt()) == {"score": 1.0}
+        assert compute_score("if_nemotron", think_wrap("Paris, France."), self.gt()) == {"score": 0.0}
+
+    def test_binary_is_the_default_for_legacy_payloads(self):
+        assert compute_score("if_nemotron", think_wrap("Paris, France."), self.gt("binary")) == {"score": 0.0}
+        # No ``grading_mode`` key: still binary.
+        assert compute_score("if_nemotron", think_wrap("Paris, France."), self.gt()) == {"score": 0.0}
+
+    def test_fraction_credits_passed_constraints(self):
+        assert compute_score("if_nemotron", think_wrap("Paris, France."), self.gt("fraction")) == {"score": 0.5}
+        assert compute_score("if_nemotron", think_wrap("Paris is lovely."), self.gt("fraction")) == {"score": 1.0}
+
+    def test_unknown_grading_mode_falls_back_to_binary(self):
+        assert compute_score("if_nemotron", think_wrap("Paris, France."), self.gt("nonsense")) == {"score": 0.0}
+
+    def test_constraints_apply_to_the_visible_response_only(self):
+        # The think block mentions a comma; the final answer has none.
+        sol = think_wrap("Paris is lovely.", think="Paris, France is nice")
+        assert compute_score("if_nemotron", sol, self.gt()) == {"score": 1.0}
+
+    def test_empty_constraint_list_scores_zero(self):
+        assert compute_score("if_nemotron", think_wrap("anything"), json.dumps({"constraints": []})) == {"score": 0.0}
