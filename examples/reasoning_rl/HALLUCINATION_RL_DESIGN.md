@@ -1,6 +1,6 @@
 # 幻觉抵制 Reasoning RL —— 实施设计
 
-> 状态：**实施口径已定稿（D1–D31）**。本文档是这份方案的唯一事实来源与施工图。
+> 状态：**实施口径已定稿（D1–D33）**。本文档是这份方案的唯一事实来源与施工图。
 > 与已有的 `DESIGN.md`（Qwen3-4B reasoning RL 主方案）**并行存在、互不覆盖**：本方案只在训练后程
 > 以「换数据 mix + 换 reward 文件」的方式接入，不修改阶段一任何行为。
 
@@ -44,6 +44,7 @@
 | D29 | 三层修复契约拆为独立 stage 3 | **动机**：D28 把"判不可解 + 指对选项 + 解出修复后的题"绑进 stage 2 同一个 reward，四档行第三层长期 ≈0 时整行零方差被 `filter_groups` 屏蔽，反而污染 stage 2 的"拒答 + 诊断"信号。**拆分**：① stage 2 四档行回退两段式 `\boxed{UNSOLVABLE: <选项ID>}`（拒答 + 指针命中即 +1；收到三段式输出时第三段被解析但忽略，不奖不罚）；② stage 3 原样保留 D28 三段式契约与三层 AND-gate，由 gt 键 `repair_task=true` 路由（`repair_task` 与模板 `A_repair` 1:1 绑定，schema 强校验；带 `repaired_answer` 无 `repair_task` 的 pre-D29 artifact 走 legacy 回退仍按三层门评分）；③ stage 3 数据 = 纯修复行（FalseQA-repair 928 + TreeCut-repair 4,907，`REPAIR_QUOTA`）+ 旧域回放（`--old_domain_ratio 0.7`），由 `mix_halluc.py --repair_mode` 构建（跳过 `enforce_pair_atomicity`，`A_repair` 模板平衡结构性豁免）；④ adapter 侧 `--repair-contract` 旗标控制是否产出 `repair_task`/`repaired_answer`（stage 2 默认不产出，TreeCut 顺带跳过 `certify_repaired_answer` 的整对丢弃）；⑤ stage 3 训练从 stage-2 ckpt 续训（`run_qwen3_4b_hallucination_stage3_fully_async.sh`），reward 文件与 stage 2 共用 `hallucination_compute_score.py`（路由依据是 ground_truth 的键，不是 data_source） |
 | D30 | stage 3 域平衡重构（kkcut 合成 + 新配比） | **动机**：用户要求全局可解/不可解 = 70/30、老域/幻觉域 = 60/40（可解含两域），且合并后 math/code/logic 比例贴近老域；K&K 无原生不可解 → 合成。**内容**：① `kk_adapter.py --emit-unsolvable` 合成 **kkcut 行**——对已证唯一解的谜题删除一条陈述（`statements` 元组与 `quiz` 文本同步手术），仅当剩余子系统 2^N 全量枚举 **≥2 解** 时保留（删约束只能增解 ⇒ 被删陈述必要，枚举即证书；`verify_kk.py` 新增 `kkcut:` 独立审计通道，独立重推导不复用 adapter 代码）；契约 = 三档裸拒（模板 B、无 `role_words`，MiP 式），审计字段 `kkcut_deleted_index` / `kkcut_deleted_statement` / `kkcut_solutions_after`；`--kkcut-per-group 0` 允许同一父组枚举多条可删陈述，`kkcut:` task_id 增加第 5 段保证唯一；② stage 3 幻觉侧换**域平衡表 `STAGE3_QUOTA`**（14 cell，合计 14,000，§4.8）：logic 20%（2,800 = kk 700 可解 + kkcut 2,100 不可解）/ commonsense 20%（2,800 = FalseQA 300+820 + CREPE 400 判断 + 1,280 裸拒）/ math 60%（8,400 = GSM-IC 340 + UMWP 155/170/1,925 + 主池 15 + TreeCut 320/3,030 + SUM 2,200 + MiP 245），幻觉域内按**边权**（SUM 配对 0.5/0.5）精确 25/75，老域占 train 60% ⇒ 全局 70/30；老域按 **ability 分层抽样**（`--code_share`，stage-3 默认 0.24）：幻觉域没有 code 源，若均匀回放 code 会被稀释到全量的 ~15%，故先取 0.24×train_total 条 code，其余按池内供给比例分给 math/logic/stem，使合并后 math/code/logic ≈ 老域的 45/25/15；旧 `--repair_mode` 与 `REPAIR_QUOTA` 删除（D29 修复层已退役，stage 3 不再消费 `--repair-contract` 产物，配对原子性/去重/模板平衡检查与 stage 2 同一套原样生效）；③ CREPE 配额经 `--quota-overrides solvable_judge=400,unsolvable_bare=1280` 扩到 1,680；④ 构建入口 `build_hallucination_stage3_data.sh`（`HALLUC_TOTAL=14000`、`OLD_DOMAIN_RATIO=0.6`、`VAL_SIZE=700`，kk 带 `--emit-unsolvable --kkcut-per-group 0`，构建后跑 `verify_kk.py` 把坏 cut 行挡在构建期）→ `halluc/built_stage3/` → `mix_halluc.py --stage3_mix --strict_cells` → `final_halluc_stage3/`；**stage 2 表 B 不变** |
 | D31 | stage 4：指令遵从域（15%）+ 老域新鲜化 | **动机**：stage 1–3 的数据模型已训练过一轮，继续在同一批题上压熵会过拟合；同时 stage 3 只优化拒答/判断，缺少显式格式与内容约束的指令遵从信号。**内容**：① 新增 **`if_adapter.py`**，把 `nvidia/Nemotron-RL-instruction_following`（46,391 行，stage 1–3 未使用）构造成 stage-1 schema 的 `if_nemotron` 池——逐行过滤 reward 无法评估的 instruction id（`if_verifier.SUPPORTED_INSTRUCTION_IDS`），prompt 精确去重，`--exclude-path` 剔除已训练过的 prompt，`--quota/--seed` 决定子采样，ground truth = `{"constraints":[…],"grading_mode":"binary\|fraction"}`；② reward 复用 `compute_score.py` 的 `if_*` 分支（`_if_score`），新增 **`grading_mode="fraction"`**（通过约束数 / 总数）；缺省/未知值仍是 NeMo-Gym 的 `binary`（全部通过才 1.0），且约束只校验 `</think>` 之后的可见回答；③ `mix_halluc.py` 新增**正交**旋钮：`--if_ratio`（IF 占**最终** train 的比例，`if = ratio/(1-ratio) × 非 IF 总量`，因此 stage-3 幻觉域绝对规模不变）、`--if_path`、`--if_val_size`（先从 IF 池切 val 再抽 train）；`--exclude_path`（stage 1/2/3 的 train parquet，精确题面命中即从老域回放池与 IF 池剔除）、`--old_pool_path`（把 `$DATA_ROOT/{math,code,logic,stem}` 原始池并入回放供给，从而抽到 stage-1 mix 从未采过的尾部；池内 `val.parquet` 跳过）；④ 构建入口 **`build_hallucination_stage4_data.sh`**（`IF_RATIO=0.15`、`SEED=44` 轮换 kkcut 顺序与 CREPE 子采样、`INCLUDE_OLD_POOLS=1` 默认开启新鲜化，`EXCLUDE_PATHS` 默认 `final`/`final_halluc`/`final_halluc_stage3`）→ `halluc/built_stage4/` → `mix_halluc.py --stage3_mix --strict_cells --if_ratio 0.15` → `final_halluc_stage4/`；构建后断言 IF 实际占比不低于请求值 1pt；⑤ 训练沿用 `run_qwen3_4b_hallucination_stage3_fully_async.sh`（`DATA_DIR=$STAGE4_DIR`、`RESUME_PATH=<stage-3 ckpt>`），reward 文件不变。默认口径下 stage 4 train ≈ 33,250（非 IF）+ 5,868（IF）= 39,118，IF = 15.0%；val ≈ 700（幻觉）+ 255（stage-1 val）+ 105（IF） |
+| D33 | stage 4：按子任务长度惩罚（维持 DPO 精简习惯） | **动机**：stage 4 从 DPO 精简过思维链的 ckpt 起步，RL 会沿奖励坡度重新拉长 CoT；需要把"正确且简短"的行为锚住。**内容**：① 新统计脚本 `scripts/distill/measure_length_targets.py`——对 DPO ckpt 的 OpenAI 兼容服务（vLLM 必须带 `--reasoning-parser qwen3`）在 stage-4 train mix 上逐 prompt 生成，按 `data_source` 聚合**响应字符数**（默认 `mean`，可选 `p50/p90`，默认丢弃 `finish_reason=length` 的截断样本），产出 `length_stats.json` / `length_targets.json` / `length_targets.env`；样本数 < `--min_samples` 的源依次回退到 `extra_info.domain` 均值与全局 `__default__`；② reward 侧新增 4 个 reward_kwargs（`length_penalty_targets_path` / `length_penalty_coef` / `length_penalty_max`，以及便于单测的内联 `length_penalty_targets`），在分支打分（含委派给 stage-1 的 `math/code/logic/stem/if/bbh` 行）之后对**正分**行扣 `min(MAX, COEF × (len/target − 1))`，目标按 `data_source → extra_info.domain → __default__` 解析；0 分与唯一负分（CREPE 误拒 −1）不罚，`MAX < 1` 保证"正确但长"仍高于"错误但短"；③ stage-4 薄封装读取 `LENGTH_PENALTY_TARGETS_PATH` / `LENGTH_PENALTY_COEF` / `LENGTH_PENALTY_MAX` 三个环境变量并以 `++reward.custom_reward_function.reward_kwargs.*` 注入；不设 targets 时 reward 与 stage 3 完全一致；④ 惩罚开启时每行固定返回 `length_chars` / `length_target` / `length_penalty` 三个 aux 字段——reward-loop 以 batch 首样本的键集合为准（`reward_loop.py:366`），逐样本增删会直接 KeyError |
 
 ---
 
@@ -1106,6 +1107,54 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   若某项仍无改善，先按 `bbh_domain.train_allocation` 确认该源是否被短供，再考虑调 `BBH_WEIGHTS`
   或在该族内增加词表/模板多样性，而不是直接调大 `BBH_RATIO`。
 
+### 7.7 阶段四理想长度与长度惩罚（D33）
+
+- **背景**：stage 4 的起始权重来自 reasoning-efficiency DPO（`scripts/distill/`），其核心资产是
+  **被精简过的思维链**。RL 只看正确性时，长度会沿奖励坡度重新膨胀（长 CoT 通常更容易碰对答案），
+  因此需要一个"正确但过长要扣分"的 shaping 项把 DPO 的简短习惯锚住。
+- **理想长度怎么定义**：用 **DPO 后的权重本身**在 stage-4 train mix 上生成一遍，按子任务
+  （`data_source`）统计平均响应长度。这是"该模型在这个任务上、答得像它自己"的长度，而不是
+  人为设定的预算。
+- **统计口径**：**响应字符数**（含 `<think>...</think>` 与最终回答）。reward 侧拿到的是解码后的
+  `solution_str`，逐样本重新 tokenize 代价高且依赖 tokenizer 版本；字符数与 DPO 流水线的
+  压缩比口径（`build_dataset_b.py` 的 `len(response)`）一致，故两侧统一用字符。
+- **统计脚本**：`python examples/reasoning_rl/scripts/distill/measure_length_targets.py`
+  1. 先把 DPO ckpt 用 vLLM 起成 OpenAI 兼容服务，**必须带 `--reasoning-parser qwen3`**，
+     否则 think 块不会拆到 `reasoning_content`，重建出的响应形状与训练不一致；
+  2. 脚本逐 prompt 调用 `/chat/completions`（默认 `--n 1`，与训练 rollout 的采样参数一致；
+     `--limit_per_source` 可做小规模试跑），按 `data_source` 聚合 `mean`（可选 `p50/p90`），
+     默认丢弃 `finish_reason=length` 的截断样本（真实长度未知，计入会抬高 target）；
+  3. 每个源样本数 < `--min_samples`（默认 20）时，依次回退到 `extra_info.domain` 均值与全局
+     `__default__`，避免小样本 target 抖动；
+  4. 产物：`length_stats.json`（逐源/逐域/全局的 count/mean/p50/p90）、
+     `length_targets.json`（reward 读取的 `unit/targets/by_domain`）、
+     `length_targets.env`（三个训练环境变量）。
+- **reward 公式**（`hallucination_compute_score.py`，分支打分之后）：
+  ```
+  excess  = max(0, length_chars / target - 1)
+  penalty = min(LENGTH_PENALTY_MAX, LENGTH_PENALTY_COEF * excess)   # 默认 0.5 / 0.2
+  score   = score - penalty        # 仅当 score > 0
+  ```
+  - target 解析顺序：`data_source` → `extra_info.domain` → `__default__`；
+  - **只罚正分行**：0 分行不受影响，唯一负分（CREPE `judgment_only` 误拒 = −1）保持原位，
+    §6 的"−1 只有一个来源"不变量不被破坏；
+  - `LENGTH_PENALTY_MAX < 1`（内部硬上限 0.99）：最长的正确回答仍高于任何错误回答（0），
+    正确性排序不被长度项反转；
+  - 惩罚在 GRPO 组内归一化后体现为"同组正确回答里更短的 advantage 更高"——这正是维持
+    DPO 精简习惯所需的信号；全对组不再零方差。
+- **接入方式**：stage-4 薄封装读取 `LENGTH_PENALTY_TARGETS_PATH` / `LENGTH_PENALTY_COEF` /
+  `LENGTH_PENALTY_MAX`，以 `++reward.custom_reward_function.reward_kwargs.*` 注入
+  （reward-loop 的 worker 不一定继承启动 shell 的环境变量，走配置最稳）；
+  `length_targets.env` 就是给 `source` 用的。targets 文件必须对 **rollouter 节点**可读。
+- **关闭即回到 stage 3**：不传 targets 时 reward 的输出与 stage 2/3 逐字节一致（不新增 aux 键）。
+  开启后每行固定返回 `length_chars` / `length_target` / `length_penalty`，供 §10 监控使用。
+- **val 口径**：验证也用同一 reward，开启惩罚后 `reward/mean` 不再等于准确率（含长度扣分）。
+  与 stage 3 横向对比时用 `score + length_penalty` 还原未罚分（长度项只在正分行非零）；
+  分域准确率仍按 §10 的判分分支单独统计。
+- **调参建议**：先按默认 `COEF=0.2 / MAX=0.5` 跑；若长度仍持续上涨，先把 `COEF` 提到 0.3–0.4
+  （`MAX` 保持 < 1）；若正确率随长度一起下降，先检查 target 是否被少数极短样本拉低
+  （改 `--target_metric p50` 或提高 `--min_samples`），而不是直接加大惩罚。
+
 ---
 
 ## 8. 文件清单（全部新增，零覆盖）
@@ -1116,14 +1165,14 @@ examples/reasoning_rl/
 ├── build_hallucination_stage3_data.sh             # D30 stage 3 数据一键构建（8 adapter 全量重建 → mix --stage3_mix；构建期含 verify_kk 检查）
 ├── build_hallucination_stage4_data.sh             # D31+D32 stage 4 数据一键构建（stage-3 表 + IF 池 + BBH 补强池 + 新鲜化老域 → mix --stage3_mix --if_ratio --bbh_ratio）
 ├── run_qwen3_4b_hallucination_stage3_fully_async.sh  # D29 stage 3 训练 recipe（RESUME_PATH=<stage-2 ckpt>）
-├── run_qwen3_4b_hallucination_stage4_fully_async.sh  # D31+D32 stage 4 薄封装（DATA_DIR=final_halluc_stage4，RESUME_PATH=<阶段三 ckpt>）
+├── run_qwen3_4b_hallucination_stage4_fully_async.sh  # D31+D32+D33 stage 4 薄封装（DATA_DIR=final_halluc_stage4，RESUME_PATH=<DPO ckpt>，长度惩罚环境变量）
 ├── reward/
-│   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托；stage 2/3/4 共用，按 gt 键路由）
+│   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托；stage 2/3/4 共用，按 gt 键路由；D33 按子任务长度惩罚）
 │   ├── if_verifier.py                             # IFBench/IFEval 约束校验（54 id）
 │   ├── bbh_verifier.py                            # D32 BBH 补强域判分（Dyck 括号序列 / 选项字母 / Yes-No）
 │   ├── test_hallucination_compute_score.py
 │   └── test_bbh_verifier.py
-└── scripts/hallucination/
+├── scripts/hallucination/
     ├── schema.py                                  # pydantic schema + parquet 序列化/校验
     ├── if_adapter.py                              # D31 指令遵从域构建（约束完整性过滤/去重/quota/grading_mode）
     ├── bbh_adapter.py                             # D32 BBH 补强域构建（Dyck/几何/消歧/因果重生成 + MovieLens 四选一；不读 BBH 数据）
@@ -1149,6 +1198,10 @@ examples/reasoning_rl/
     ├── fetch_raw.py                               # 各源原始数据下载（离线构建用；KUQ 已随 D25 移除）
     ├── mix_halluc.py
     └── test_*.py                                  # 每个 adapter / mix / schema 的单元测试
+└── scripts/distill/
+    ├── common.py                                  # DPO 流水线公共 helper（vLLM HTTP / think 拆分 / resume / 统计）
+    ├── collect_dataset_a.py / build_dataset_b.py / build_dpo_pairs.py  # reasoning-efficiency DPO（stage 4 起点权重）
+    └── measure_length_targets.py                  # D33 理想长度统计（DPO ckpt 逐 data_source 平均字符长度 → length_targets.json/env）
 ```
 
 > **实现口径（2026-09-20 复核，清单补充与缺口）**：
@@ -1283,6 +1336,12 @@ examples/reasoning_rl/
   而不是只看 kkcut 整体拒答率（后者可能只是"题面少一句"的表层特征）。CREPE 扩到 1,680 行
   （400 + 1,280）后其题面风格捷径（词袋 NB ≈0.61 平衡准确率，风险 7 同源）权重放大，
   CREPE-normal 误拒率需单画。
+- **D33 长度惩罚（仅 stage 4，按 `data_source` 分开画）**：`length_chars / length_target`
+  的均值、p50、p90，`length_penalty` 均值，以及**超长率**（`length_chars > 1.5 × target` 的比例）。
+  健康状态：比值中位数回到 1 附近、超长率下降，同时可解正确率 / 拒答指标不回退；若长度不降而
+  正确率下降，先看 `length_stats.json` 里该源的 `target_from` 是否回退到了 `domain`/`default`
+  （小样本或分域均值不适合该任务），再考虑调小 `LENGTH_PENALTY_COEF`。三个 aux 字段随
+  `reward_extra_info` 上报（开启惩罚时每行都有；reward-loop 只按 batch 首样本的键集合收集）。
 
 ---
 

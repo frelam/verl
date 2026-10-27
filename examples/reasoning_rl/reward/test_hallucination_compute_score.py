@@ -37,12 +37,14 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hallucination_compute_score as hcs
 from hallucination_compute_score import (
     STATUS_ANSWER,
     STATUS_NONE,
     STATUS_SOLVABLE_MARKER,
     STATUS_UNSOLVABLE_BARE,
     STATUS_UNSOLVABLE_OPTION,
+    apply_length_penalty,
     compute_score,
     extract_final,
     kk_match,
@@ -957,3 +959,189 @@ class TestRepetitionPenalty:
             gt_json(solvable=True, answer="540"),
         )
         assert res["score"] == 1.0
+
+
+def padded_response(total_chars: int, answer: str = "\\boxed{540}") -> str:
+    """A compliant response whose total length is exactly ``total_chars``.
+
+    The filler uses unique words so the n-gram repetition penalty stays at zero
+    and the length assertions measure only the D33 penalty.
+    """
+    filler = " ".join(f"w{i}" for i in range(20_000))
+    need = total_chars - 17 - len(answer)  # "<think>" + "</think>" + "\n\n"
+    assert need >= 1
+    return think_wrap(answer, think=filler[:need])
+
+
+class TestLengthPenalty:
+    """Stage-4 D33 over-length penalty (per-subtask character targets)."""
+
+    SOURCE = "halluc_math_gsmic"
+    GT = gt_json(solvable=True, answer="540")
+
+    def test_disabled_by_default(self):
+        res = compute_score(self.SOURCE, padded_response(3000), self.GT)
+        assert res == {"score": 1.0}
+
+    def test_no_penalty_at_or_below_target(self):
+        for total in (100, 400):
+            res = compute_score(
+                self.SOURCE,
+                padded_response(total),
+                self.GT,
+                length_penalty_targets={self.SOURCE: 400},
+            )
+            assert res["length_chars"] == total
+            assert res["length_target"] == 400
+            assert res["length_penalty"] == 0.0
+            assert res["score"] == 1.0
+
+    def test_penalty_scales_with_excess(self):
+        # 600 chars vs a 400-char target: excess 0.5 -> 0.2 * 0.5 = 0.1.
+        res = compute_score(
+            self.SOURCE,
+            padded_response(600),
+            self.GT,
+            length_penalty_targets={self.SOURCE: 400},
+        )
+        assert res["length_penalty"] == pytest.approx(0.1)
+        assert res["score"] == pytest.approx(0.9)
+
+    def test_penalty_is_capped(self):
+        # 4000 vs 100 -> excess 39 -> far past the 0.5 cap.
+        res = compute_score(
+            self.SOURCE,
+            padded_response(4000),
+            self.GT,
+            length_penalty_targets={self.SOURCE: 100},
+        )
+        assert res["length_penalty"] == pytest.approx(0.5)
+        assert res["score"] == pytest.approx(0.5)
+
+    def test_correct_long_still_beats_wrong_short(self):
+        long_correct = compute_score(
+            self.SOURCE,
+            padded_response(4000),
+            self.GT,
+            length_penalty_targets={self.SOURCE: 100},
+        )
+        short_wrong = compute_score(
+            self.SOURCE,
+            padded_response(200, answer="\\boxed{541}"),
+            gt_json(solvable=True, answer="540"),
+            length_penalty_targets={self.SOURCE: 100},
+        )
+        assert short_wrong["score"] == 0.0
+        assert short_wrong["length_penalty"] == 0.0  # only positive scores are penalized
+        assert long_correct["score"] > short_wrong["score"]
+
+    def test_negative_scores_keep_their_single_meaning(self):
+        # A CREPE misrefusal stays exactly -1, however long it is.
+        res = compute_score(
+            "halluc_commonsense_crepe",
+            padded_response(4000, answer="\\boxed{UNSOLVABLE}"),
+            gt_json(solvable=True, judgment_only=True, answer="yes"),
+            length_penalty_targets={"halluc_commonsense_crepe": 100},
+        )
+        assert res["score"] == -1.0
+        assert res["length_penalty"] == 0.0
+
+    def test_aux_keys_are_uniform_when_the_feature_is_on(self):
+        # The reward loop keys the batch off the FIRST sample, so a row without a
+        # target must still carry the three aux fields.
+        res = compute_score(
+            self.SOURCE,
+            padded_response(600),
+            self.GT,
+            length_penalty_targets={"some_other_source": 100},
+        )
+        assert set(res) == {"score", "length_chars", "length_target", "length_penalty"}
+        assert res["length_target"] == 0
+        assert res["length_penalty"] == 0.0
+        assert res["score"] == 1.0
+
+    def test_target_lookup_source_then_domain_then_default(self):
+        # source wins over domain and default.
+        _, aux = apply_length_penalty(
+            "a", {"domain": "math"}, "x" * 600, 1.0,
+            targets={"a": 600, "__default__": 300}, domains={"math": 400},
+        )
+        assert aux["length_target"] == 600
+        assert aux["length_penalty"] == 0.0
+        # no source -> domain.
+        _, aux = apply_length_penalty(
+            "a", {"domain": "math"}, "x" * 600, 1.0, targets={}, domains={"math": 400}
+        )
+        assert aux["length_target"] == 400
+        assert aux["length_penalty"] == pytest.approx(0.1)
+        # neither -> __default__.
+        _, aux = apply_length_penalty(
+            "a", {"domain": "math"}, "x" * 600, 1.0, targets={"__default__": 300}, domains={}
+        )
+        assert aux["length_target"] == 300
+        assert aux["length_penalty"] == pytest.approx(0.2)
+
+    def test_targets_file_is_loaded(self, tmp_path):
+        path = tmp_path / "length_targets.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "unit": "chars",
+                    "targets": {self.SOURCE: 400},
+                    "by_domain": {"math": 800},
+                }
+            ),
+            encoding="utf-8",
+        )
+        res = compute_score(
+            self.SOURCE,
+            padded_response(600),
+            self.GT,
+            length_penalty_targets_path=str(path),
+        )
+        assert res["length_target"] == 400
+        assert res["score"] == pytest.approx(0.9)
+
+    def test_non_character_targets_are_rejected(self, tmp_path):
+        # A token-based target applied to character lengths would be wrong; the
+        # reward disables the penalty instead (no aux keys = feature off).
+        path = tmp_path / "length_targets.json"
+        path.write_text(
+            json.dumps({"unit": "tokens", "targets": {self.SOURCE: 100}}),
+            encoding="utf-8",
+        )
+        res = compute_score(
+            self.SOURCE,
+            padded_response(600),
+            self.GT,
+            length_penalty_targets_path=str(path),
+        )
+        assert res == {"score": 1.0}
+
+    def test_delegated_source_is_penalized_too(self, monkeypatch):
+        # Stage 4 mixes old domains / IF / BBH with the halluc rows; the penalty
+        # applies after whichever branch produced the score.
+        monkeypatch.setattr(hcs, "_base_compute_score", lambda *a, **k: {"score": 1.0})
+        res = compute_score(
+            "math_dapo",
+            padded_response(600),
+            "540",
+            length_penalty_targets={"math_dapo": 400},
+        )
+        assert res["length_penalty"] == pytest.approx(0.1)
+        assert res["score"] == pytest.approx(0.9)
+
+    def test_penalty_without_target_is_zero(self):
+        score, aux = apply_length_penalty("a", {}, "x" * 600, 1.0, targets={}, domains={})
+        assert score == 1.0
+        assert aux["length_target"] == 0
+        assert aux["length_penalty"] == 0.0
+
+    def test_max_penalty_is_clamped_below_one(self):
+        # Even a misconfigured LENGTH_PENALTY_MAX cannot push a correct answer
+        # below a wrong one (0).
+        score, _ = apply_length_penalty(
+            "a", {}, "x" * 10_000, 1.0,
+            targets={"a": 100}, coef=1.0, max_penalty=5.0,
+        )
+        assert score == pytest.approx(0.01)

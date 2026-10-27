@@ -74,6 +74,26 @@ data_source").  That keeps a new source source-agnostic: any row whose
 touching this file.  ``halluc_math_gsmic`` needs no special case either: its rows
 are plain numeric solvable rows, so the numeric branch already scores them with
 the same stage-1 matcher chain section 6 asks for.
+
+Stage-4 length penalty (D33)
+----------------------------
+
+Stage 4 starts from the DPO-trimmed checkpoint and must *keep* its concise
+chain-of-thought habit.  The reward therefore accepts an optional per-subtask
+length target (``length_penalty_targets_path`` pointing at the JSON emitted by
+``scripts/distill/measure_length_targets.py``) and, on every **positively
+scored** row, subtracts::
+
+    excess  = max(0, len(response) / target - 1)      # characters
+    penalty = min(length_penalty_max, length_penalty_coef * excess)
+
+The penalty is applied only when the base score is > 0, so (a) ``-1`` keeps its
+single meaning (``judgment_only`` misrefusal), and (b) correctness ordering is
+preserved as long as ``length_penalty_max < 1``.  Rows whose ``data_source`` is
+missing from the target file fall back to ``extra_info.domain`` and then to the
+file's ``__default__``.  With no target file the reward is byte-identical to the
+stage-2/3 behaviour.  Route: ``measure_length_targets.py`` -> ``length_targets.env``
+-> stage-4 launcher -> ``reward.custom_reward_function.reward_kwargs.*``.
 """
 
 from __future__ import annotations
@@ -83,6 +103,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -596,6 +617,178 @@ def score_halluc_row(data_source: str, solution_str: str, ground_truth, extra_in
 
 
 # ---------------------------------------------------------------------------
+# stage-4 length penalty (D33)
+# ---------------------------------------------------------------------------
+
+#: Defaults of the over-length penalty.  ``max`` must stay below 1 so a very long
+#: but correct answer (>= 1 - max) still outranks a wrong one (0) and keeps the
+#: correctness ordering the whole reward matrix is built on.
+_DEFAULT_LENGTH_PENALTY_COEF = 0.2
+_DEFAULT_LENGTH_PENALTY_MAX = 0.5
+_LENGTH_PENALTY_MAX_CAP = 0.99
+
+#: path -> ((mtime, size), normalised payload).  ``compute_score`` runs once per
+#: rollout, so the target file is read on the first call (and after an edit), not
+#: on every sample.
+_LENGTH_TARGETS_CACHE: dict[str, tuple[tuple[float, int], tuple[dict, dict]]] = {}
+
+
+def _is_positive_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _normalise_length_targets(payload) -> tuple[dict[str, float], dict[str, float]]:
+    """Parse a target payload into ``({data_source: target}, {domain: target})``.
+
+    Accepted shapes:
+
+    * the stats script's artifact --
+      ``{"unit": "chars", "targets": {...}, "by_domain": {...}}``;
+    * a bare ``{data_source: target}`` mapping (hand-written files).
+
+    Only character targets are supported: the reward measures ``len(solution_str)``
+    and cannot re-tokenise every rollout cheaply.  A payload explicitly tagged with
+    another unit is rejected (logged, penalty disabled) rather than silently
+    applied to the wrong scale.
+    """
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            logger.warning("[halluc] length targets are not valid JSON; length penalty disabled")
+            return {}, {}
+    if not isinstance(payload, Mapping):
+        logger.warning("[halluc] length targets must be a mapping; length penalty disabled")
+        return {}, {}
+    payload = dict(payload)
+
+    unit = payload.get("unit")
+    if unit is not None and str(unit).lower() not in ("char", "chars", "character", "characters"):
+        logger.warning(
+            "[halluc] length targets are in %r but the reward measures characters; length penalty disabled",
+            unit,
+        )
+        return {}, {}
+
+    targets = payload.get("targets")
+    domains = payload.get("by_domain")
+    if targets is None:
+        if all(_is_positive_number(value) for value in payload.values()):
+            targets = payload
+        else:
+            targets = {}
+    if not isinstance(targets, Mapping):
+        targets = {}
+    if not isinstance(domains, Mapping):
+        domains = {}
+    clean_targets = {
+        str(key): float(value) for key, value in (targets or {}).items() if _is_positive_number(value)
+    }
+    clean_domains = {
+        str(key): float(value) for key, value in (domains or {}).items() if _is_positive_number(value)
+    }
+    return clean_targets, clean_domains
+
+
+def _read_length_targets_file(path) -> tuple[dict[str, float], dict[str, float]]:
+    """Load (and cache) the target file emitted by ``measure_length_targets.py``."""
+    resolved = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    cached = _LENGTH_TARGETS_CACHE.get(resolved)
+    try:
+        stamp = (os.path.getmtime(resolved), os.path.getsize(resolved))
+    except OSError:
+        if cached is not None:
+            # A transient stat failure must not flip the feature off mid-batch:
+            # every sample of a batch has to return the same aux key set.
+            logger.warning("[halluc] length-target file %s became unreadable; keeping the cached targets", resolved)
+            return cached[1]
+        logger.warning("[halluc] length-target file %s is unreadable; length penalty disabled", resolved)
+        return {}, {}
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        with open(resolved, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        if cached is not None:
+            logger.exception("[halluc] cannot re-read length-target file %s; keeping the cached targets", resolved)
+            return cached[1]
+        logger.exception("[halluc] cannot parse length-target file %s; length penalty disabled", resolved)
+        return {}, {}
+    normalised = _normalise_length_targets(payload)
+    _LENGTH_TARGETS_CACHE[resolved] = (stamp, normalised)
+    if normalised[0] or normalised[1]:
+        logger.info(
+            "[halluc] length targets loaded from %s: %d sources, %d domains",
+            resolved,
+            len(normalised[0]),
+            len(normalised[1]),
+        )
+    return normalised
+
+
+def _resolve_length_target(
+    data_source, extra_info, targets: dict[str, float], domains: dict[str, float]
+) -> float | None:
+    """``data_source`` -> ``extra_info.domain`` -> ``__default__`` target."""
+    source = str(data_source or "")
+    if source in targets:
+        return targets[source]
+    domain = ""
+    if isinstance(extra_info, Mapping):
+        domain = str(extra_info.get("domain") or extra_info.get("ability") or "")
+    if domain:
+        if domain in domains:
+            return domains[domain]
+        if domain in targets:
+            return targets[domain]
+    return targets.get("__default__") or domains.get("__default__")
+
+
+def _length_penalty(char_length: int, target: float, coef: float, max_penalty: float) -> float:
+    """Over-length penalty in points; 0 at or below the target."""
+    if target <= 0 or char_length <= target:
+        return 0.0
+    excess = char_length / target - 1.0
+    return min(max_penalty, coef * excess)
+
+
+def apply_length_penalty(
+    data_source,
+    extra_info,
+    solution_str: str,
+    score: float,
+    *,
+    targets: dict[str, float] | None = None,
+    domains: dict[str, float] | None = None,
+    coef: float = _DEFAULT_LENGTH_PENALTY_COEF,
+    max_penalty: float = _DEFAULT_LENGTH_PENALTY_MAX,
+) -> tuple[float, dict[str, float | int]]:
+    """Subtract the over-length penalty from a positive score (D33).
+
+    Returns ``(score, aux)`` with the three numeric aux fields every sample must
+    carry once the feature is on -- the reward loop takes the key set from the
+    FIRST sample of a batch (``reward_loop.py``), so a per-sample key set would
+    crash the collation.  ``length_target == 0`` means "no target for this row".
+    """
+    length = len(solution_str or "")
+    targets = targets or {}
+    domains = domains or {}
+    target = _resolve_length_target(data_source, extra_info, targets, domains)
+    coef = max(0.0, float(coef))
+    max_penalty = min(max(0.0, float(max_penalty)), _LENGTH_PENALTY_MAX_CAP)
+    penalty = 0.0
+    if score > 0.0 and target is not None:
+        penalty = _length_penalty(length, target, coef, max_penalty)
+        score = max(0.0, score - penalty)
+    return score, {
+        "length_chars": length,
+        "length_target": int(round(target)) if target is not None else 0,
+        "length_penalty": penalty,
+    }
+
+
+# ---------------------------------------------------------------------------
 # dispatcher
 # ---------------------------------------------------------------------------
 
@@ -605,6 +798,10 @@ def compute_score(
     solution_str,
     ground_truth,
     extra_info=None,
+    length_penalty_targets=None,
+    length_penalty_targets_path=None,
+    length_penalty_coef=None,
+    length_penalty_max=None,
     **kwargs,
 ):
     """Route ``halluc_*`` rows to the abstention scorer, everything else to stage 1.
@@ -619,11 +816,53 @@ def compute_score(
     credit even when the abstention verdict itself is right, and the
     format-gate/crash zeros are adjusted too, so a death loop can never score
     above a clean refusal.
+
+    Stage 4 (D33) additionally applies the optional per-subtask length penalty
+    after the branch score: ``length_penalty_targets`` (mapping or JSON string) or
+    ``length_penalty_targets_path`` (the stats script's file) supplies the ideal
+    character lengths, ``length_penalty_coef`` / ``length_penalty_max`` tune the
+    slope and the cap.  The four length kwargs are consumed here and never reach
+    the stage-1 dispatcher.  When targets are configured, every sample returns the
+    same aux keys (``length_chars`` / ``length_target`` / ``length_penalty``) or
+    the reward-loop batch collation would drop them inconsistently.
     """
+    if length_penalty_targets_path:
+        targets, domains = _read_length_targets_file(length_penalty_targets_path)
+    elif length_penalty_targets is not None:
+        targets, domains = _normalise_length_targets(length_penalty_targets)
+    else:
+        targets, domains = {}, {}
+    length_penalty_on = bool(targets or domains)
+
     if not isinstance(data_source, str) or not data_source.startswith(HALLUC_PREFIX):
-        return _base_compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
+        result = _base_compute_score(data_source, solution_str, ground_truth, extra_info, **kwargs)
+        payload = dict(result) if isinstance(result, dict) else {"score": float(result)}
+    else:
+        try:
+            score = _repetition_adjusted(
+                solution_str, score_halluc_row(data_source, solution_str, ground_truth, extra_info)
+            )
+        except Exception:
+            logger.exception("[halluc] dispatcher crashed for %s; scoring 0", data_source)
+            score = _repetition_adjusted(solution_str, 0.0)
+        payload = {"score": score}
+
+    if not length_penalty_on:
+        return payload
     try:
-        return {"score": _repetition_adjusted(solution_str, score_halluc_row(data_source, solution_str, ground_truth, extra_info))}
+        coef = _DEFAULT_LENGTH_PENALTY_COEF if length_penalty_coef is None else float(length_penalty_coef)
+        max_penalty = _DEFAULT_LENGTH_PENALTY_MAX if length_penalty_max is None else float(length_penalty_max)
+        payload["score"], aux = apply_length_penalty(
+            data_source,
+            extra_info,
+            solution_str,
+            float(payload["score"]),
+            targets=targets,
+            domains=domains,
+            coef=coef,
+            max_penalty=max_penalty,
+        )
+        payload.update(aux)
     except Exception:
-        logger.exception("[halluc] dispatcher crashed for %s; scoring 0", data_source)
-        return {"score": _repetition_adjusted(solution_str, 0.0)}
+        logger.exception("[halluc] length penalty crashed for %s; keeping the base score", data_source)
+    return payload
