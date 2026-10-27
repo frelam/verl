@@ -1312,3 +1312,372 @@ class TestStage4BbhGap:
         assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(
             0.6 * (1 - 0.15 - 0.10), abs=0.01
         )
+
+
+class TestStage4AbilityMatch:
+    """Stage 4 follow-up: keep the stage-3 ability mix in the reasoning part.
+
+    Hard math counts inside the math budget, so it replaces old-domain math
+    replay one-for-one; the freed replay slots go to the abilities the new
+    domains under-supply, and the artifact total is unchanged.
+    """
+
+    def test_stage3_profile_quotas(self):
+        quotas, report = mix_halluc.old_domain_ability_quotas(
+            mix_halluc.STAGE3_ABILITY_PROFILE,
+            reasoning_rows=33250,
+            halluc_counts={"math": 7980, "logic": 2660, "commonsense": 2660},
+            fixed_counts={"math": 6650},
+            n_old=13300,
+        )
+        assert quotas == {
+            "math": 532,
+            "code": 7980,
+            "logic": 2394,
+            "commonsense": 0,
+            "stem": 2394,
+        }
+        assert sum(quotas.values()) == 13300
+        assert report["targets"] == mix_halluc.STAGE3_ABILITY_PROFILE
+
+    def test_overflow_is_absorbed_without_changing_the_total(self):
+        # A math target below halluc + hard math clamps to zero; the residue is
+        # taken from the largest quota so the replay total stays n_old.
+        quotas, _ = mix_halluc.old_domain_ability_quotas(
+            {"math": 1000, "code": 1000},
+            reasoning_rows=2500,
+            halluc_counts={"math": 1200},
+            fixed_counts={"math": 600},
+            n_old=700,
+        )
+        assert quotas["math"] == 0
+        assert sum(quotas.values()) == 700
+
+    def test_read_ability_reference(self, tmp_path):
+        path = tmp_path / "stage3_stats.json"
+        path.write_text(
+            json.dumps({"train_by_ability": {"math": 10, "code": 5, "logic": 3, "empty": 0}}),
+            encoding="utf-8",
+        )
+        assert mix_halluc.read_ability_reference(str(path)) == {
+            "math": 10,
+            "code": 5,
+            "logic": 3,
+        }
+        path.write_text(json.dumps({"total_train": 1}), encoding="utf-8")
+        with pytest.raises(ValueError, match="train_by_ability"):
+            mix_halluc.read_ability_reference(str(path))
+
+    def test_sample_old_domain_by_ability_reports_shortfall(self):
+        rows = (
+            [{"ability": "code"}] * 5
+            + [{"ability": "math"}] * 1
+            + [{"ability": "logic"}] * 0
+        )
+        chosen, report = mix_halluc.sample_old_domain_by_ability(
+            rows, {"code": 3, "math": 2, "logic": 1}, random.Random(0)
+        )
+        assert report["actual_by_ability"] == {"code": 3, "math": 1, "logic": 0}
+        assert report["shortfall_by_ability"] == {"code": 0, "math": 1, "logic": 1}
+        assert len(chosen) == 4
+
+    def test_ability_match_requires_stage3_mix(self, tmp_path):
+        build = TestStage4InstructionFollowing()._stage3_build(tmp_path)
+        with pytest.raises(ValueError, match="require --stage3_mix"):
+            mix_halluc.main([
+                "--halluc_dir", build,
+                "--output_dir", str(tmp_path / "out"),
+                "--halluc_total", "400",
+                "--match_stage3_abilities",
+            ])
+
+    def test_ability_matched_domain_keeps_the_total_and_the_mix(self, tmp_path):
+        helper = TestStage4InstructionFollowing()
+        build = helper._stage3_build(tmp_path)
+        stage1, _ = helper._stage1_pool(tmp_path)
+
+        if_pool = tmp_path / "if"
+        if_pool.mkdir()
+        schema.write_rows_parquet(make_if_rows(3000), str(if_pool / "if.parquet"))
+        bbh_pool = tmp_path / "bbh"
+        bbh_pool.mkdir()
+        schema.write_rows_parquet(TestStage4BbhGap()._bbh_rows(), str(bbh_pool / "bbh.parquet"))
+        hard_pool = tmp_path / "hard_math"
+        hard_pool.mkdir()
+        schema.write_rows_parquet(
+            TestStage4HardMath()._hard_math_rows(), str(hard_pool / "hard_math.parquet")
+        )
+
+        # Small-scale stage-3 reference: same 45.6/24/15.2/8/7.2 shape as the
+        # real artifact, summing to reasoning = halluc_train + old + hard math.
+        reference = {
+            "math": 2200,
+            "code": 1160,
+            "logic": 740,
+            "commonsense": 388,
+            "stem": 362,
+        }
+        assert sum(reference.values()) == 4850
+        reference_path = tmp_path / "stage3_stats.json"
+        reference_path.write_text(
+            json.dumps({"train_by_ability": reference}), encoding="utf-8"
+        )
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--if_path", str(if_pool),
+            "--if_ratio", "0.15",
+            "--bbh_path", str(bbh_pool),
+            "--bbh_ratio", "0.10",
+            "--hard_math_path", str(hard_pool),
+            "--hard_math_ratio", "0.15",
+            "--old_domain_ratio", "0.5",
+            "--ability_reference_path", str(reference_path),
+            "--output_dir", str(out),
+            "--halluc_total", "2000",
+            "--val_size", "60",
+            "--seed", "37",
+        ]) == 0
+
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+        # Total is the same as the unmatched build at this scale.
+        assert stats["total_train"] == 6467
+        assert stats["ability_match"]["targets"] == reference
+        achieved = stats["achieved_ratios"]["ability_share_of_reasoning"]
+        for ability, target in reference.items():
+            assert achieved.get(ability, 0.0) == pytest.approx(target / 4850, abs=0.01)
+        # Old domain total and share are unchanged; only its internal mix moved.
+        assert stats["harvested_old_domain"]["requested_rows"] == 1940
+        assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(0.30, abs=0.01)
+        # Math is supplied mostly by hard math + the halluc domain, not replay.
+        old_actual = stats["harvested_old_domain"]["actual_by_ability"]
+        assert old_actual["code"] == 1160
+        assert old_actual["math"] == 66
+        assert old_actual["logic"] == 352
+        assert old_actual["stem"] == 362
+
+
+class TestStage4HardMath:
+    """Stage 4 (D34): the hard-math domain is the third additive share.
+
+    The stage-4 data plan cuts the old-domain replay to 30% of the final train
+    set and fills the freed share with AIME-adjacent problems; the total volume
+    stays at the previous stage-4 scale.
+    """
+
+    SOURCES = ("math_hard_ace_reason", "math_hard_deepscaler", "math_hard_deepmath")
+
+    def _hard_math_rows(self, n_per_source=600, seed=0):
+        rows = []
+        for source in self.SOURCES:
+            for i in range(n_per_source):
+                info = dict(schema.EXTRA_INFO_DEFAULTS)
+                info.update(
+                    {
+                        "split": "train",
+                        "index": i,
+                        "task_id": f"{source}-{i}",
+                        "domain": "math",
+                        "source": source,
+                        "difficulty": "6",
+                        "prior_solve_rate": -1.0,
+                        "seed": seed,
+                        "pass_rate": 0.5,
+                    }
+                )
+                rows.append(
+                    {
+                        "data_source": source,
+                        "prompt": [
+                            {
+                                "role": "user",
+                                "content": f"{source} question {i}? Please reason step by step, and put your final answer within \\boxed{{}}.",
+                            }
+                        ],
+                        "ability": "math",
+                        "reward_model": {"style": "rule", "ground_truth": str(i)},
+                        "extra_info": info,
+                    }
+                )
+        return rows
+
+    def test_additive_targets_keep_all_three_shares(self):
+        # 15% IF + 10% BBH + 15% hard math over N = 26,600 (halluc 13,300 + old 13,300).
+        targets = mix_halluc.additive_targets(
+            {"if": 0.15, "bbh": 0.10, "hard_math": 0.15}, 26600
+        )
+        assert targets == {"if": 6650, "bbh": 4433, "hard_math": 6650}
+        assert sum(targets.values()) + 26600 == 44333
+        assert mix_halluc.additive_targets({"if": 0.0}, 100) == {"if": 0}
+
+    def test_additive_targets_reject_an_impossible_total(self):
+        with pytest.raises(ValueError, match="no room"):
+            mix_halluc.additive_targets({"a": 0.6, "b": 0.4}, 100)
+
+    def test_parse_hard_math_weights_accepts_short_names(self):
+        weights = mix_halluc.parse_hard_math_weights(
+            "ace_reason=0.4,deepscaler=0.35,deepmath=0.25"
+        )
+        assert sum(weights.values()) == pytest.approx(1.0)
+        assert weights["math_hard_deepmath"] == pytest.approx(0.25)
+        with pytest.raises(ValueError, match="unknown --hard_math_weights"):
+            mix_halluc.parse_hard_math_weights("nope=1.0")
+
+    def test_hard_math_ratio_requires_path(self, tmp_path):
+        build = TestStage4InstructionFollowing()._stage3_build(tmp_path)
+        with pytest.raises(ValueError, match="--hard_math_path"):
+            mix_halluc.main([
+                "--stage3_mix",
+                "--halluc_dir", build,
+                "--output_dir", str(tmp_path / "out"),
+                "--halluc_total", "400",
+                "--hard_math_ratio", "0.15",
+            ])
+
+    def test_hard_math_domain_is_injected_at_the_requested_share(self, tmp_path):
+        helper = TestStage4InstructionFollowing()
+        build = helper._stage3_build(tmp_path)
+        stage1, _ = helper._stage1_pool(tmp_path, counts=(("code", 3000), ("math", 3000), ("logic", 1000), ("stem", 1000)))
+
+        if_pool = tmp_path / "if"
+        if_pool.mkdir()
+        schema.write_rows_parquet(make_if_rows(3000), str(if_pool / "if.parquet"))
+        bbh_pool = tmp_path / "bbh"
+        bbh_pool.mkdir()
+        schema.write_rows_parquet(
+            TestStage4BbhGap()._bbh_rows(), str(bbh_pool / "bbh.parquet")
+        )
+        hard_pool = tmp_path / "hard_math"
+        hard_pool.mkdir()
+        schema.write_rows_parquet(self._hard_math_rows(), str(hard_pool / "hard_math.parquet"))
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--if_path", str(if_pool),
+            "--if_ratio", "0.15",
+            "--bbh_path", str(bbh_pool),
+            "--bbh_ratio", "0.10",
+            "--hard_math_path", str(hard_pool),
+            "--hard_math_ratio", "0.15",
+            "--old_domain_ratio", "0.5",
+            "--output_dir", str(out),
+            "--halluc_total", "2000",
+            "--val_size", "60",
+            "--seed", "29",
+        ]) == 0
+
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        val = mix_halluc.read_parquet_rows(os.path.join(str(out), "val.parquet"))
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+
+        hard_sources = set(self.SOURCES)
+        non_add = [
+            row
+            for row in train
+            if row["data_source"] not in hard_sources and row["ability"] not in ("if", "bbh")
+        ]
+        hard_train = [row for row in train if row["data_source"] in hard_sources]
+        targets = mix_halluc.additive_targets(
+            {"if": 0.15, "bbh": 0.10, "hard_math": 0.15}, len(non_add)
+        )
+        assert len(hard_train) == targets["hard_math"]
+        assert stats["achieved_ratios"]["hard_math_share_of_train"] == pytest.approx(0.15, abs=0.005)
+        assert stats["config"]["hard_math_ratio"] == pytest.approx(0.15)
+        assert stats["hard_math_rows_in_train"] == len(hard_train)
+        # The per-source weights survive a pool larger than the quota.
+        by_source = Counter(row["data_source"] for row in hard_train)
+        assert set(by_source) == set(self.SOURCES)
+        assert by_source["math_hard_ace_reason"] > by_source["math_hard_deepmath"]
+        # The measured pass rate survives the mix (it is the difficulty signal).
+        assert all(row["extra_info"]["pass_rate"] == pytest.approx(0.5) for row in hard_train)
+        # Every additive domain contributes val rows, and no prompt straddles.
+        assert any(row["data_source"] in self.SOURCES for row in val)
+        train_prompts = {mix_halluc._question_key(row) for row in train}
+        val_prompts = {mix_halluc._question_key(row) for row in val}
+        assert not train_prompts & val_prompts
+        # With old_domain_ratio 0.5 the old domain is 30% of the final set
+        # (0.5 * (1 - 0.15 - 0.10 - 0.15)), i.e. the stage-4 data-plan target.
+        assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(
+            0.5 * (1 - 0.15 - 0.10 - 0.15), abs=0.01
+        )
+
+    def test_hard_math_prompt_duplicating_the_reasoning_domains_is_dropped(self, tmp_path):
+        helper = TestStage4InstructionFollowing()
+        build = helper._stage3_build(tmp_path)
+        stage1, _ = helper._stage1_pool(tmp_path, counts=(("code", 1200), ("math", 1200), ("logic", 400), ("stem", 400)))
+        base_args = [
+            "--stage3_mix",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--hard_math_ratio", "0.15",
+            "--halluc_total", "400",
+            "--val_size", "0",
+            "--hard_math_val_size", "0",
+            "--seed", "31",
+        ]
+
+        first_pool = tmp_path / "hard_first"
+        first_pool.mkdir()
+        schema.write_rows_parquet(self._hard_math_rows(300), str(first_pool / "hard_math.parquet"))
+        first_out = tmp_path / "stage4_first"
+        assert mix_halluc.main([*base_args, "--hard_math_path", str(first_pool), "--output_dir", str(first_out)]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(first_out), "train.parquet"))
+        halluc = next(row for row in train if str(row["data_source"]).startswith("halluc_"))
+        duplicate = schema.question_of(halluc)
+
+        rows = self._hard_math_rows(300) + [
+            {
+                "data_source": "math_hard_deepmath",
+                "prompt": [{"role": "user", "content": duplicate}],
+                "ability": "math",
+                "reward_model": {"style": "rule", "ground_truth": "42"},
+                "extra_info": {"task_id": "hard-duplicate", "index": 999, "domain": "math"},
+            }
+        ]
+        hard_pool = tmp_path / "hard_math"
+        hard_pool.mkdir()
+        schema.write_rows_parquet(rows, str(hard_pool / "hard_math.parquet"))
+
+        out = tmp_path / "stage4"
+        assert mix_halluc.main([*base_args, "--hard_math_path", str(hard_pool), "--output_dir", str(out)]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(str(out), "train.parquet"))
+        assert all(row["extra_info"]["task_id"] != "hard-duplicate" for row in train)
+        stats = json.load(open(os.path.join(str(out), "mix_stats.json")))
+        assert stats["hard_math_domain"]["dropped_duplicate_of_reasoning_domains"] >= 1
+
+    def test_hard_math_pool_with_an_unweighted_source_is_rejected(self, tmp_path):
+        helper = TestStage4InstructionFollowing()
+        build = helper._stage3_build(tmp_path)
+        pool = tmp_path / "hard_math"
+        pool.mkdir()
+        rows = self._hard_math_rows(10)
+        # DAPO is a supported adapter source but has no default mixer weight;
+        # silently dropping it would under-fill the domain, so the mixer refuses.
+        rows.append(
+            {
+                "data_source": "math_hard_dapo",
+                "prompt": [{"role": "user", "content": "DAPO problem? Please reason step by step."}],
+                "ability": "math",
+                "reward_model": {"style": "rule", "ground_truth": "1"},
+                "extra_info": {"task_id": "hard-dapo-0", "index": 999, "domain": "math"},
+            }
+        )
+        schema.write_rows_parquet(rows, str(pool / "hard_math.parquet"))
+        with pytest.raises(ValueError, match="weights do not cover"):
+            mix_halluc.main([
+                "--stage3_mix",
+                "--halluc_dir", build,
+                "--hard_math_path", str(pool),
+                "--hard_math_ratio", "0.15",
+                "--output_dir", str(tmp_path / "out"),
+                "--halluc_total", "400",
+                "--val_size", "0",
+                "--hard_math_val_size", "0",
+            ])

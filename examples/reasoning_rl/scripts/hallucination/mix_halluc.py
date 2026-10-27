@@ -167,6 +167,55 @@ Dyck 30%, geometric 20%, disambiguation 20%, causal 15%, movie 15%); a source
 that cannot meet its share is reported and its leftover is redistributed across
 the other BBH sources, never into the hallucination or old-domain cells.
 
+Stage 4: ``--hard_math_ratio`` (D34)
+------------------------------------
+
+The third additive domain carries the **hard-math** pool built by
+``hard_math_adapter.py`` (AceReason-Math / DeepScaleR-Preview / DeepMath-103K
+level >= 6).  It is what replaces most of the old-domain replay when the old
+domain is cut to 30% of the final train set: with ``--old_domain_ratio 0.5`` and
+``--hard_math_ratio 0.15`` the final set keeps the stage-4 volume
+(``hallucination 30% + old 30% + hard math 15% + IF 15% + BBH 10%``) while the
+math that is replayed is AIME-adjacent instead of Big-Math-level.
+
+The row count uses the same additive formula over the fixed non-additive part
+``N`` (hallucination train + old-domain replay)::
+
+    if        = if_ratio        / (1 - if - bbh - hard) * N
+    bbh       = bbh_ratio       / (1 - if - bbh - hard) * N
+    hard_math = hard_math_ratio / (1 - if - bbh - hard) * N
+
+``--hard_math_weights`` sets the per-source split (default AceReason 40% /
+DeepScaleR 35% / DeepMath 25%); a short source's leftover is re-apportioned
+inside the hard-math domain only.  Rows are exact-deduped against every reasoning
+row already in the artifact (hallucination + old + IF + BBH), so a prompt trains
+at most once.
+
+Stage 4: ``--match_stage3_abilities`` (D34 follow-up)
+-----------------------------------------------------
+
+The stage-4 request is "keep the stage-3 ability mix, replace old-domain data
+with the new hard math, keep the total".  With this flag (or an explicit
+``--ability_reference_path`` pointing at the stage-3 ``mix_stats.json``):
+
+* the IF and BBH domains are new capabilities and stay out of the accounting;
+* the remaining *reasoning part* (hallucination train + old replay + hard math,
+  which is exactly 75% of the artifact) is apportioned by the stage-3
+  ``train_by_ability`` proportions (built-in
+  :data:`STAGE3_ABILITY_PROFILE` when no file is given);
+* hard math counts **inside** the math budget, so it replaces old-domain math
+  replay; the replay quotas for the other abilities are
+  ``target - hallucination - hard math`` and the freed replay slots go to
+  code / logic / stem;
+* the old-domain total (and therefore the artifact total) is unchanged -- only
+  its internal ability mix moves.
+
+At the default knobs this turns the old replay from ``code 7,093 / math 3,724 /
+logic 1,241 / stem 1,241`` into ``code 7,980 / logic 2,394 / stem 2,394 /
+math 532`` while keeping 13,300 replay rows and 44,333 train rows.  The achieved
+mix is written to ``mix_stats.json -> achieved_ratios.ability_share_of_reasoning``
+and cross-checked by the build script (≤1pt deviation from stage 3).
+
 """
 
 from __future__ import annotations
@@ -916,6 +965,132 @@ def sample_old_domain(
     }
 
 
+#: Reference ability profile of the stage-3 artifact (D30 design counts at its
+#: default knobs, 33,250 train rows): logic/math/commonsense come from the
+#: hallucination quota table, code/logic/stem/math from the replay draw.  It is
+#: only the fallback when the actual stage-3 ``mix_stats.json`` is unavailable;
+#: the build passes the real file whenever it exists.
+STAGE3_ABILITY_PROFILE: dict[str, int] = {
+    "math": 15162,
+    "code": 7980,
+    "logic": 5054,
+    "commonsense": 2660,
+    "stem": 2394,
+}
+
+
+def read_ability_reference(path: str) -> dict[str, int]:
+    """Read ``train_by_ability`` from a previous artifact's ``mix_stats.json``."""
+    import json
+
+    path = os.path.expanduser(path)
+    with open(path, encoding="utf-8") as handle:
+        stats = json.load(handle)
+    raw = stats.get("train_by_ability")
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"{path}: train_by_ability is missing or empty")
+    counts: dict[str, int] = {}
+    for ability, value in raw.items():
+        key = str(ability or "").strip()
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if key and count > 0:
+            counts[key] = count
+    if not counts:
+        raise ValueError(f"{path}: train_by_ability has no positive entries")
+    return counts
+
+
+def quota_ability_counts(quota: dict[tuple[str, str], int], total: int) -> dict[str, int]:
+    """Ability counts of the hallucination quota, rescaled to its train size.
+
+    ``--val_size`` is carved proportionally per cell, so scaling the whole quota
+    to ``total`` reproduces the train ability mix to within the val rounding.
+    """
+    if total <= 0:
+        return {}
+    counts: Counter[str] = Counter()
+    for (_, data_source), rows in quota.items():
+        ability = schema.SOURCES.get(data_source, ("", ""))[0]
+        if ability:
+            counts[ability] += rows
+    if not counts:
+        return {}
+    return _largest_remainder(dict(counts), total)
+
+
+def old_domain_ability_quotas(
+    reference_counts: dict[str, int],
+    reasoning_rows: int,
+    halluc_counts: dict[str, int],
+    fixed_counts: dict[str, int],
+    n_old: int,
+) -> tuple[dict[str, int], dict]:
+    """Old-domain rows per ability that make the reasoning part match stage 3.
+
+    The hard-math domain is *inside* the math budget: the math target is
+    ``stage3_math_share * reasoning_rows``, and whatever the hallucination
+    domain and the hard-math domain already supply is subtracted before the
+    replay draw.  That is the "replace old-domain math with the new hard math,
+    keep the total" rule -- when ``hard_math`` is larger than the old math
+    replay, the old math slice shrinks to zero and the other abilities take the
+    freed replay slots.
+
+    A negative residual is clamped to zero (the new domain cannot be shrunk by
+    the old replay); the overflow is then removed from the largest quota so the
+    old-domain total -- and therefore the artifact total -- stays ``n_old``.
+    """
+    targets = _largest_remainder(reference_counts, reasoning_rows)
+    quotas = {
+        ability: max(0, target - halluc_counts.get(ability, 0) - fixed_counts.get(ability, 0))
+        for ability, target in targets.items()
+    }
+    total = sum(quotas.values())
+    if total != n_old:
+        # Keep the artifact total fixed: absorb the rounding/overflow in the
+        # largest quota.  This is at most a handful of rows in practice.
+        key = max(quotas, key=lambda ability: quotas[ability])
+        quotas[key] = max(0, quotas[key] + (n_old - total))
+    return quotas, {
+        "reasoning_rows": reasoning_rows,
+        "targets": targets,
+        "halluc": dict(halluc_counts),
+        "fixed": dict(fixed_counts),
+        "requested": dict(quotas),
+        "requested_total": sum(quotas.values()),
+    }
+
+
+def sample_old_domain_by_ability(
+    rows: list[dict], quotas: dict[str, int], rng: random.Random
+) -> tuple[list[dict], dict]:
+    """Draw exactly ``quotas[ability]`` rows per ability (capped by supply)."""
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        buckets[str(row.get("ability", ""))].append(row)
+    chosen: list[dict] = []
+    actual: dict[str, int] = {}
+    shortfall: dict[str, int] = {}
+    for ability, quota in quotas.items():
+        take = min(max(int(quota), 0), len(buckets.get(ability, [])))
+        if take:
+            chosen.extend(rng.sample(buckets[ability], take))
+        actual[ability] = take
+        shortfall[ability] = max(0, int(quota) - take)
+    code_target = int(quotas.get("code", 0))
+    return chosen, {
+        "code_target": code_target,
+        "code_rows": actual.get("code", 0),
+        "shortfall": shortfall.get("code", 0),
+        "by_ability": dict(Counter(str(row.get("ability", "")) for row in chosen)),
+        "requested_by_ability": dict(quotas),
+        "actual_by_ability": actual,
+        "shortfall_by_ability": shortfall,
+    }
+
+
 #: Stage 4 (D32): per-source share of the BBH-gap domain.  The keys are the
 #: ``data_source`` values ``bbh_adapter.py`` writes.  Dyck gets the largest share
 #: because it is both the weakest subtask (40%) and the cheapest to generate.
@@ -950,23 +1125,79 @@ def parse_bbh_weights(spec: str | None) -> dict[str, float]:
     has to name the sources it wants to move.  Weights are normalised to sum to
     one; a zero total or an unknown key is a hard error.
     """
-    weights = dict(DEFAULT_BBH_WEIGHTS)
+    return _parse_source_weights(spec, DEFAULT_BBH_WEIGHTS, BBH_WEIGHT_ALIASES, "--bbh_weights")
+
+
+#: Stage 4 (D34): per-source share of the hard-math domain.  The keys are the
+#: ``data_source`` values ``hard_math_adapter.py`` writes.
+DEFAULT_HARD_MATH_WEIGHTS: dict[str, float] = {
+    "math_hard_ace_reason": 0.40,
+    "math_hard_deepscaler": 0.35,
+    "math_hard_deepmath": 0.25,
+}
+
+#: Short names accepted by ``--hard_math_weights`` (``ace_reason=0.4,...``).
+HARD_MATH_WEIGHT_ALIASES: dict[str, str] = {
+    "ace": "math_hard_ace_reason",
+    "ace_reason": "math_hard_ace_reason",
+    "acereason": "math_hard_ace_reason",
+    "deepscaler": "math_hard_deepscaler",
+    "deepscale": "math_hard_deepscaler",
+    "deepmath": "math_hard_deepmath",
+    "deepmath_103k": "math_hard_deepmath",
+    "dapo": "math_hard_dapo",
+    **{source: source for source in DEFAULT_HARD_MATH_WEIGHTS},
+}
+
+
+def parse_hard_math_weights(spec: str | None) -> dict[str, float]:
+    """Parse ``--hard_math_weights`` into normalised ``data_source -> share``."""
+    return _parse_source_weights(
+        spec, DEFAULT_HARD_MATH_WEIGHTS, HARD_MATH_WEIGHT_ALIASES, "--hard_math_weights"
+    )
+
+
+def _parse_source_weights(
+    spec: str | None, defaults: dict[str, float], aliases: dict[str, str], flag: str
+) -> dict[str, float]:
+    weights = dict(defaults)
     if spec:
         for item in spec.split(","):
             name, separator, value = item.partition("=")
             if not separator:
-                raise ValueError(f"--bbh_weights item {item!r} is not name=value")
-            key = BBH_WEIGHT_ALIASES.get(name.strip())
+                raise ValueError(f"{flag} item {item!r} is not name=value")
+            key = aliases.get(name.strip())
             if key is None:
-                raise ValueError(f"unknown --bbh_weights source {name.strip()!r}; expected one of {sorted(BBH_WEIGHT_ALIASES)}")
+                raise ValueError(f"unknown {flag} source {name.strip()!r}; expected one of {sorted(aliases)}")
             weight = float(value)
             if weight < 0:
-                raise ValueError(f"--bbh_weights source {key!r} has a negative weight")
+                raise ValueError(f"{flag} source {key!r} has a negative weight")
             weights[key] = weight
     total = sum(weights.values())
     if total <= 0:
-        raise ValueError("--bbh_weights must have a positive total")
+        raise ValueError(f"{flag} must have a positive total")
     return {source: weight / total for source, weight in weights.items()}
+
+
+def additive_targets(ratios: dict[str, float], non_add_rows: int) -> dict[str, int]:
+    """Rows of every additive domain over a fixed non-additive part ``N``.
+
+    For additive shares ``r_d`` over the same base, each domain holds
+    ``r_d / (1 - sum(r)) * N`` rows, so ``d / (sum(all d) + N) == r_d``.  This is
+    the multi-domain form of :func:`additive_target`; using it for *all* domains
+    in one pass is what keeps the shares exact when a third domain is added.
+    """
+    total_ratio = sum(ratios.values())
+    if total_ratio <= 0:
+        return {key: 0 for key in ratios}
+    if total_ratio >= 1.0:
+        raise ValueError(
+            f"additive ratios {total_ratio:.3f} leave no room for the non-additive part"
+        )
+    return {
+        key: round(ratio / (1.0 - total_ratio) * non_add_rows) if ratio else 0
+        for key, ratio in ratios.items()
+    }
 
 
 def additive_target(ratio: float, other_ratio: float, non_add_rows: int) -> int:
@@ -1037,14 +1268,14 @@ def _apportion_with_supply(
     return allocation
 
 
-def take_bbh_rows(
+def take_weighted_rows(
     pool: list[dict],
     weights: dict[str, float],
     n_train: int,
     n_val: int,
     rng: random.Random,
 ) -> tuple[list[dict], list[dict], dict]:
-    """Split the BBH pool into train/val with per-source weights.
+    """Split a weighted additive pool into train/val (BBH and hard math).
 
     Val is carved **before** train (the same rule as every other domain), and
     both allocations are capped by each source's supply.  A source without any
@@ -1117,7 +1348,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--old_domain_ratio",
         type=float,
         default=None,
-        help="stage-1 share of the mix (default: 0.7, or 0.6 with --stage3_mix)",
+        help="stage-1 share of the non-additive part (default: 0.7, or 0.6 with --stage3_mix). "
+        "The stage-4 data plan (D34) passes 0.5, which puts the old domain at 30%% of the final "
+        "train set once the three additive domains are added.",
     )
     parser.add_argument(
         "--strict_cells",
@@ -1148,7 +1381,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Share of the *whole train set* that must be ability == 'code' in the stage-1 "
         "replay (default: 0.24 with --stage3_mix, 0 = uniform stage-1 sampling). The "
         "hallucination domain has no code source, so without this a uniform replay "
-        "dilutes code to ~0.6 * its stage-1 share.",
+        "dilutes code to ~0.6 * its stage-1 share.  Ignored when "
+        "--match_stage3_abilities/--ability_reference_path is set: the replay is then "
+        "allocated per ability instead.",
+    )
+    parser.add_argument(
+        "--match_stage3_abilities",
+        action="store_true",
+        help="Stage 4: make the reasoning part (everything except the IF and BBH additive "
+        "domains) reproduce the stage-3 ability mix.  The hard-math domain counts inside the "
+        "math budget, so its rows replace old-domain math replay 1:1 and the freed replay "
+        "slots go to the under-represented abilities; the artifact total is unchanged.  "
+        "Uses --ability_reference_path when given, else the built-in stage-3 profile.",
+    )
+    parser.add_argument(
+        "--ability_reference_path",
+        default=None,
+        help="A previous artifact's mix_stats.json (reads train_by_ability); implies "
+        "--match_stage3_abilities.  Stage 4 defaults to "
+        "$DATA_ROOT/final_halluc_stage3/mix_stats.json in the build script.",
     )
     parser.add_argument(
         "--old_pool_path",
@@ -1208,6 +1459,32 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: dyck 0.30 / geometric 0.20 / disambiguation 0.20 / causal 0.15 / movie 0.15). "
         "Short names (dyck, geometric, disambiguation, causal, movie) are accepted.",
     )
+    parser.add_argument(
+        "--hard_math_path",
+        default=None,
+        help="Stage 4 (D34): hard-math pool built by hard_math_adapter.py (parquet/dir).",
+    )
+    parser.add_argument(
+        "--hard_math_ratio",
+        type=float,
+        default=0.0,
+        help="Stage 4 (D34): hard-math share of the FINAL train set (0 disables). The row count is "
+        "hard_math_ratio/(1-if_ratio-bbh_ratio-hard_math_ratio) * (halluc_train + old_domain), so "
+        "the stage-3 mix and the other additive domains keep their absolute size.",
+    )
+    parser.add_argument(
+        "--hard_math_val_size",
+        type=int,
+        default=None,
+        help="Hard-math val rows carved out of --hard_math_path before the train sample "
+        "(default: the same additive formula applied to the non-additive val rows).",
+    )
+    parser.add_argument(
+        "--hard_math_weights",
+        default=None,
+        help="Stage 4 (D34): comma-separated data_source=weight overrides for the hard-math domain "
+        "(default: ace_reason 0.40 / deepscaler 0.35 / deepmath 0.25).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -1242,15 +1519,42 @@ def main(argv: list[str] | None = None) -> int:
     # Stage 4 (D32): the BBH-gap domain is the second additive share.
     if not 0.0 <= args.bbh_ratio < 1.0:
         raise ValueError(f"--bbh_ratio must be in [0, 1), got {args.bbh_ratio}")
-    if args.if_ratio + args.bbh_ratio >= 1.0:
-        raise ValueError(
-            f"--if_ratio ({args.if_ratio}) + --bbh_ratio ({args.bbh_ratio}) must stay below 1.0"
-        )
     if args.bbh_ratio > 0 and not args.bbh_path:
         raise ValueError("--bbh_ratio > 0 requires --bbh_path (build it with bbh_adapter.py)")
     if args.bbh_path and args.bbh_ratio == 0:
         print("[mix_halluc] WARNING: --bbh_path given but --bbh_ratio is 0; the BBH pool is ignored")
     bbh_weights = parse_bbh_weights(args.bbh_weights)
+
+    # Stage 4 (D34): the hard-math domain is the third additive share.
+    if not 0.0 <= args.hard_math_ratio < 1.0:
+        raise ValueError(f"--hard_math_ratio must be in [0, 1), got {args.hard_math_ratio}")
+    if args.if_ratio + args.bbh_ratio + args.hard_math_ratio >= 1.0:
+        raise ValueError(
+            f"--if_ratio ({args.if_ratio}) + --bbh_ratio ({args.bbh_ratio}) + "
+            f"--hard_math_ratio ({args.hard_math_ratio}) must stay below 1.0"
+        )
+    if args.hard_math_ratio > 0 and not args.hard_math_path:
+        raise ValueError(
+            "--hard_math_ratio > 0 requires --hard_math_path (build it with hard_math_adapter.py)"
+        )
+    if args.hard_math_path and args.hard_math_ratio == 0:
+        print("[mix_halluc] WARNING: --hard_math_path given but --hard_math_ratio is 0; the hard-math pool is ignored")
+    hard_math_weights = parse_hard_math_weights(args.hard_math_weights)
+
+    # Stage 4 (D34 follow-up): the ability reference only makes sense on top of
+    # the stage-3 table (it is the reasoning part that is matched).
+    if (args.match_stage3_abilities or args.ability_reference_path) and not args.stage3_mix:
+        raise ValueError("--match_stage3_abilities/--ability_reference_path require --stage3_mix")
+    if args.ability_reference_path and not os.path.exists(os.path.expanduser(args.ability_reference_path)):
+        raise FileNotFoundError(f"--ability_reference_path does not exist: {args.ability_reference_path}")
+
+    # The additive ratios share one denominator; computing them together is what
+    # keeps every requested share exact when a third domain is added.
+    additive_ratios = {
+        "if": args.if_ratio,
+        "bbh": args.bbh_ratio,
+        "hard_math": args.hard_math_ratio,
+    }
 
     files = resolve_parquet_files(halluc_dir)
     halluc_rows = read_parquet_rows(halluc_dir)
@@ -1298,31 +1602,72 @@ def main(argv: list[str] | None = None) -> int:
     # --strict_cells the fill matches the table exactly.
     old_rows: list[dict] = []
     old_report: dict = {"code_target": 0, "code_rows": 0, "shortfall": 0, "by_ability": {}}
-    # Stage 4: the IF and BBH budgets are derived from the non-additive total,
-    # so they must be known before the old domain is drawn (the code target is a
-    # share of the *whole* artifact, which now includes both additive domains).
+    # Stage 4 (D34 follow-up): set when the replay is allocated per ability to
+    # reproduce the stage-3 mix; reported in mix_stats.json.
+    ability_match: dict | None = None
+    # Stage 4: the additive budgets (IF / BBH / hard math) are derived from the
+    # non-additive total, so they must be known before the old domain is drawn
+    # (the code target is a share of the *whole* artifact).
     target_if_train = 0
     target_bbh_train = 0
+    target_hard_math_train = 0
     if (args.stage1_path or args.old_pool_path) and args.stage3_mix:
         target_halluc_train = max(args.halluc_total - args.val_size, 0)
         n_old = round(target_halluc_train * old_domain_ratio / (1.0 - old_domain_ratio))
         if n_old > len(stage1_rows):
             print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
             n_old = len(stage1_rows)
-        target_if_train = additive_target(args.if_ratio, args.bbh_ratio, target_halluc_train + n_old)
-        target_bbh_train = additive_target(args.bbh_ratio, args.if_ratio, target_halluc_train + n_old)
-        old_rows, old_report = sample_old_domain(
-            stage1_rows,
-            n_old,
-            target_halluc_train + n_old + target_if_train + target_bbh_train,
-            code_share,
-            rng,
-        )
+        additive = additive_targets(additive_ratios, target_halluc_train + n_old)
+        target_if_train = additive["if"]
+        target_bbh_train = additive["bbh"]
+        target_hard_math_train = additive["hard_math"]
+        ability_match = None
+        if args.match_stage3_abilities or args.ability_reference_path:
+            # D34 follow-up: keep the stage-3 ability mix inside the reasoning
+            # part.  Hard math is inside the math budget, so it replaces old
+            # replay one-for-one and the freed replay slots go to the abilities
+            # the new domains under-supply.
+            reference_counts = (
+                read_ability_reference(args.ability_reference_path)
+                if args.ability_reference_path
+                else dict(STAGE3_ABILITY_PROFILE)
+            )
+            reasoning_rows = (
+                target_halluc_train + n_old + target_hard_math_train
+            )
+            halluc_ability = quota_ability_counts(quota, target_halluc_train)
+            fixed_ability = {"math": target_hard_math_train} if target_hard_math_train else {}
+            quotas, ability_match = old_domain_ability_quotas(
+                reference_counts, reasoning_rows, halluc_ability, fixed_ability, n_old
+            )
+            old_rows, old_report = sample_old_domain_by_ability(stage1_rows, quotas, rng)
+            print(
+                f"[mix_halluc] ability-matched replay: reasoning={reasoning_rows}, "
+                f"targets={ability_match['targets']}, old quotas={quotas}"
+            )
+            short = {k: v for k, v in old_report["shortfall_by_ability"].items() if v > 0}
+            if short:
+                print(
+                    f"[mix_halluc] WARNING: old-domain ability shortfall {short}; "
+                    f"the reasoning part will miss its stage-3 ability target"
+                )
+        else:
+            old_rows, old_report = sample_old_domain(
+                stage1_rows,
+                n_old,
+                target_halluc_train
+                + n_old
+                + target_if_train
+                + target_bbh_train
+                + target_hard_math_train,
+                code_share,
+                rng,
+            )
         print(
             f"[mix_halluc] stage-1 rows: {len(old_rows)} (old_domain_ratio={old_domain_ratio}, "
             f"code {old_report['code_rows']}/{old_report['code_target']})"
         )
-        if old_report["shortfall"] > 0:
+        if old_report["shortfall"] > 0 and ability_match is None:
             print(
                 f"[mix_halluc] WARNING: code pool short by {old_report['shortfall']} row(s); "
                 f"the whole train set will miss the {code_share:.0%} code target"
@@ -1435,12 +1780,18 @@ def main(argv: list[str] | None = None) -> int:
             if n_old > len(stage1_rows):
                 print(f"[mix_halluc] WARNING: stage-1 pool {len(stage1_rows)} < {n_old} requested; taking all")
                 n_old = len(stage1_rows)
-            target_if_train = additive_target(args.if_ratio, args.bbh_ratio, filled_total + n_old)
-            target_bbh_train = additive_target(args.bbh_ratio, args.if_ratio, filled_total + n_old)
+            additive = additive_targets(additive_ratios, filled_total + n_old)
+            target_if_train = additive["if"]
+            target_bbh_train = additive["bbh"]
+            target_hard_math_train = additive["hard_math"]
             old_rows, old_report = sample_old_domain(
                 stage1_rows,
                 n_old,
-                filled_total + n_old + target_if_train + target_bbh_train,
+                filled_total
+                + n_old
+                + target_if_train
+                + target_bbh_train
+                + target_hard_math_train,
                 code_share,
                 rng,
             )
@@ -1532,8 +1883,8 @@ def main(argv: list[str] | None = None) -> int:
         n_if_val = args.if_val_size
         if n_if_val is None:
             # Mirror the train formula on the val side so val keeps the same
-            # domain mix: IF = if_ratio / (1 - if_ratio - bbh_ratio) * non-add val.
-            n_if_val = additive_target(args.if_ratio, args.bbh_ratio, additive_val_base)
+            # domain mix; all additive domains share the same denominator.
+            n_if_val = additive_targets(additive_ratios, additive_val_base)["if"]
         n_if_val = min(n_if_val, len(if_pool))
         if_pool = list(if_pool)
         rng.shuffle(if_pool)
@@ -1543,7 +1894,7 @@ def main(argv: list[str] | None = None) -> int:
         # The budget is derived from the *actual* non-additive total, so the
         # stage-3 cells keep their absolute size even when a quota cell came up
         # short.
-        desired_if = additive_target(args.if_ratio, args.bbh_ratio, len(rows) + len(old_rows))
+        desired_if = additive_targets(additive_ratios, len(rows) + len(old_rows))["if"]
         n_if = min(desired_if, len(train_pool))
         if n_if < desired_if:
             print(
@@ -1606,9 +1957,9 @@ def main(argv: list[str] | None = None) -> int:
 
         n_bbh_val = args.bbh_val_size
         if n_bbh_val is None:
-            n_bbh_val = additive_target(args.bbh_ratio, args.if_ratio, additive_val_base)
-        desired_bbh = additive_target(args.bbh_ratio, args.if_ratio, len(rows) + len(old_rows))
-        bbh_rows, bbh_val_rows, bbh_counts = take_bbh_rows(
+            n_bbh_val = additive_targets(additive_ratios, additive_val_base)["bbh"]
+        desired_bbh = additive_targets(additive_ratios, len(rows) + len(old_rows))["bbh"]
+        bbh_rows, bbh_val_rows, bbh_counts = take_weighted_rows(
             bbh_pool, bbh_weights, desired_bbh, n_bbh_val, rng
         )
         if len(bbh_rows) < desired_bbh:
@@ -1639,7 +1990,90 @@ def main(argv: list[str] | None = None) -> int:
         )
         val_rows = list(val_rows) + bbh_val_rows
 
-    all_train = rows + old_rows + if_rows + bbh_rows
+    # --- stage 4: hard-math domain (D34) ---------------------------------------
+    # The third additive domain (AceReason / DeepScaleR / DeepMath level >= 6).
+    # Same rules as IF and BBH: exact-dedup against every reasoning row already
+    # in the artifact, carve val before the train draw, and size both from the
+    # same non-additive denominator.  The per-source split is weighted, and a
+    # short source's leftover is re-apportioned inside this domain only.
+    hard_math_rows: list[dict] = []
+    hard_math_val_rows: list[dict] = []
+    hard_math_report: dict = {}
+    if args.hard_math_ratio > 0:
+        hard_math_path = os.path.expanduser(args.hard_math_path)
+        if not os.path.exists(hard_math_path):
+            raise FileNotFoundError(f"--hard_math_path does not exist: {hard_math_path}")
+        hard_math_pool = read_parquet_rows(hard_math_path)
+        pool_rows = len(hard_math_pool)
+
+        unexpected = sorted(
+            {str(row.get("data_source", "")) for row in hard_math_pool} - set(hard_math_weights)
+        )
+        if unexpected:
+            raise ValueError(
+                f"hard-math pool carries data_source(s) the weights do not cover: {unexpected}. "
+                "Add them to --hard_math_weights or rebuild the pool with a matching --sources."
+            )
+
+        dropped_prev = 0
+        if excluded_keys:
+            before = len(hard_math_pool)
+            hard_math_pool = [row for row in hard_math_pool if _question_key(row) not in excluded_keys]
+            dropped_prev = before - len(hard_math_pool)
+
+        in_artifact = {_question_key(row) for row in rows + old_rows + if_rows + bbh_rows}
+        before = len(hard_math_pool)
+        hard_math_pool = [row for row in hard_math_pool if _question_key(row) not in in_artifact]
+        dropped_dup = before - len(hard_math_pool)
+
+        seen: set[str] = set()
+        unique: list[dict] = []
+        for row in hard_math_pool:
+            key = _question_key(row)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        dropped_self = len(hard_math_pool) - len(unique)
+        hard_math_pool = unique
+
+        n_hard_math_val = args.hard_math_val_size
+        if n_hard_math_val is None:
+            n_hard_math_val = additive_targets(additive_ratios, additive_val_base)["hard_math"]
+        desired_hard_math = additive_targets(additive_ratios, len(rows) + len(old_rows))["hard_math"]
+        hard_math_rows, hard_math_val_rows, hard_math_counts = take_weighted_rows(
+            hard_math_pool, hard_math_weights, desired_hard_math, n_hard_math_val, rng
+        )
+        if len(hard_math_rows) < desired_hard_math:
+            print(
+                f"[mix_halluc] WARNING: hard-math pool can only supply {len(hard_math_rows)} row(s) "
+                f"after dedup; the hard-math share will come out below {args.hard_math_ratio:.2f}"
+            )
+        short_sources = [
+            source
+            for source in hard_math_weights
+            if hard_math_counts["train_allocation"].get(source, 0)
+            < round(desired_hard_math * hard_math_weights[source]) - 1
+        ]
+        if short_sources:
+            print(f"[mix_halluc] WARNING: hard-math source(s) under their weighted share: {short_sources}")
+        hard_math_report = {
+            "path": hard_math_path,
+            "pool_rows": pool_rows,
+            "dropped_already_trained": dropped_prev,
+            "dropped_duplicate_of_reasoning_domains": dropped_dup,
+            "dropped_duplicate_within_pool": dropped_self,
+            **hard_math_counts,
+        }
+        print(
+            f"[mix_halluc] hard-math domain: pool {pool_rows}, -{dropped_prev} already trained, "
+            f"-{dropped_dup} duplicate, -{dropped_self} internal duplicate, "
+            f"train {len(hard_math_rows)}, val {len(hard_math_val_rows)}; "
+            f"by source {hard_math_counts['train_allocation']}"
+        )
+        val_rows = list(val_rows) + hard_math_val_rows
+
+    all_train = rows + old_rows + if_rows + bbh_rows + hard_math_rows
     rng.shuffle(all_train)
     rng.shuffle(val_rows)
     for i, row in enumerate(all_train):
@@ -1684,9 +2118,29 @@ def main(argv: list[str] | None = None) -> int:
         # Stage 4 (D32): the BBH-gap domain is the second additive share.
         "bbh_share_of_train": len(bbh_rows) / len(all_train) if all_train else 0.0,
         "bbh_share_of_val": len(bbh_val_rows) / len(val_rows) if val_rows else 0.0,
+        # Stage 4 (D34): the hard-math domain is the third additive share.
+        "hard_math_share_of_train": len(hard_math_rows) / len(all_train) if all_train else 0.0,
+        "hard_math_share_of_val": len(hard_math_val_rows) / len(val_rows) if val_rows else 0.0,
         "hallucination_share_of_train": len(rows) / len(all_train) if all_train else 0.0,
     }
-    halluc_rows_in_val = len(val_rows) - len(old_val_rows) - len(if_val_rows) - len(bbh_val_rows)
+    # Stage 4 (D34 follow-up): the stage-3 ability mix is preserved inside the
+    # reasoning part (everything except the IF/BBH additive domains).  Hard math
+    # is counted under "math"; if/math/bbh abilities come from their own domains.
+    reasoning_ability = Counter(
+        str(row.get("ability", "")) for row in all_train if row.get("ability") not in ("if", "bbh")
+    )
+    reasoning_rows = sum(reasoning_ability.values())
+    achieved_ratios["reasoning_rows"] = reasoning_rows
+    achieved_ratios["ability_share_of_reasoning"] = {
+        ability: count / reasoning_rows for ability, count in reasoning_ability.items()
+    } if reasoning_rows else {}
+    halluc_rows_in_val = (
+        len(val_rows)
+        - len(old_val_rows)
+        - len(if_val_rows)
+        - len(bbh_val_rows)
+        - len(hard_math_val_rows)
+    )
     schema.normalise_extra_info(all_train + val_rows)
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1716,6 +2170,14 @@ def main(argv: list[str] | None = None) -> int:
             "bbh_path": args.bbh_path,
             "bbh_val_size": args.bbh_val_size,
             "bbh_weights": bbh_weights,
+            # Stage 4 (D34): additive hard-math domain.
+            "hard_math_ratio": args.hard_math_ratio,
+            "hard_math_path": args.hard_math_path,
+            "hard_math_val_size": args.hard_math_val_size,
+            "hard_math_weights": hard_math_weights,
+            # Stage 4 (D34 follow-up): ability-matched replay.
+            "match_stage3_abilities": bool(args.match_stage3_abilities or args.ability_reference_path),
+            "ability_reference_path": args.ability_reference_path,
             "exclude_paths": args.exclude_path or [],
             "old_pool_paths": args.old_pool_path or [],
         },
@@ -1729,6 +2191,11 @@ def main(argv: list[str] | None = None) -> int:
         "bbh_rows_in_val": len(bbh_val_rows),
         "bbh_domain": bbh_report,
         "bbh_by_source": dict(Counter(row["data_source"] for row in bbh_rows)),
+        "hard_math_rows_in_train": len(hard_math_rows),
+        "hard_math_rows_in_val": len(hard_math_val_rows),
+        "hard_math_domain": hard_math_report,
+        "hard_math_by_source": dict(Counter(row["data_source"] for row in hard_math_rows)),
+        "ability_match": ability_match,
         "old_domain_rows_excluded": excluded_old_removed,
         "halluc_rows_in_train": len(rows),
         "halluc_rows_in_val": halluc_rows_in_val,
@@ -1750,6 +2217,7 @@ def main(argv: list[str] | None = None) -> int:
             "code_share": code_share,
             "if_share": args.if_ratio,
             "bbh_share": args.bbh_ratio,
+            "hard_math_share": args.hard_math_ratio,
         },
         "row_kinds": {
             "solvable_rows": n_solvable_rows,
@@ -1770,6 +2238,9 @@ def main(argv: list[str] | None = None) -> int:
             "code_rows": old_report["code_rows"],
             "code_shortfall": old_report["shortfall"],
             "by_ability": old_report["by_ability"],
+            "requested_by_ability": old_report.get("requested_by_ability"),
+            "actual_by_ability": old_report.get("actual_by_ability", old_report["by_ability"]),
+            "shortfall_by_ability": old_report.get("shortfall_by_ability"),
         },
         "train_by_ability": dict(Counter(r["ability"] for r in all_train)),
         "train_by_source": dict(Counter(r["extra_info"].get("source", "") for r in all_train)),
@@ -1801,6 +2272,13 @@ def main(argv: list[str] | None = None) -> int:
             f"[done] BBH domain: train={len(bbh_rows)} ({achieved_ratios['bbh_share_of_train']:.1%}), "
             f"val={len(bbh_val_rows)} ({achieved_ratios['bbh_share_of_val']:.1%}), "
             f"by source={stats['bbh_by_source']}"
+        )
+    if args.hard_math_ratio > 0:
+        print(
+            f"[done] hard-math domain: train={len(hard_math_rows)} "
+            f"({achieved_ratios['hard_math_share_of_train']:.1%}), "
+            f"val={len(hard_math_val_rows)} ({achieved_ratios['hard_math_share_of_val']:.1%}), "
+            f"by source={stats['hard_math_by_source']}"
         )
     print(f"[done] template balance: {templates}")
     short = [c for c in cell_report if c["shortfall"] - c["redistributed"] > 0]

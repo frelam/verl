@@ -34,6 +34,7 @@ from compute_score import (
     _labeled_decimal_match,
     _math_last_resort,
     _normalized_text_match,
+    _numeric_literal_match,
     _or_branch_match,
     _repetition_penalty,
     _yes_no_match,
@@ -490,6 +491,59 @@ class TestNormalizedTextMatch:
 
     def test_text_wrapper_wrong_content_rejected(self):
         assert not _normalized_text_match(think_wrap("\\boxed{\\text{positive number}}"), "negative number")
+
+
+class TestNumericLiteralMatch:
+    """Stage-4 hard-math (D34): exact rational comparison of AIME-style answers.
+
+    These run without math_verify on purpose: the whole point of the matcher is
+    that a plain integer/fraction ground truth should not depend on the symbolic
+    parser at all.
+    """
+
+    def test_aime_leading_zeros(self):
+        # AIME answers are three-digit; the model often boxes 042 for 42.
+        assert _numeric_literal_match(think_wrap("\\boxed{042}"), "42")
+        assert _numeric_literal_match(think_wrap("\\boxed{007}"), "7")
+
+    def test_thousands_separators(self):
+        assert _numeric_literal_match(think_wrap("\\boxed{1,234}"), "1234")
+        assert _numeric_literal_match(think_wrap("\\boxed{1234}"), "1,234")
+
+    def test_fraction_spellings(self):
+        assert _numeric_literal_match(think_wrap("\\boxed{\\dfrac{1}{2}}"), "1/2")
+        assert _numeric_literal_match(think_wrap("\\boxed{\\frac{1}{2}}"), "0.5")
+        assert _numeric_literal_match(think_wrap("\\boxed{0.5}"), "1/2")
+        assert _numeric_literal_match(think_wrap("\\boxed{-\\frac{3}{4}}"), "-3/4")
+        assert _numeric_literal_match(think_wrap("\\boxed{\\frac{-3}{4}}"), "-0.75")
+
+    def test_decimal_trailing_zero(self):
+        assert _numeric_literal_match(think_wrap("\\boxed{0042.0}"), "42")
+
+    def test_wrong_value_rejected(self):
+        assert not _numeric_literal_match(think_wrap("\\boxed{28}"), "29")
+        assert not _numeric_literal_match(think_wrap("\\boxed{1234}"), "1,235")
+
+    def test_rounded_decimal_is_not_exact(self):
+        # 0.333 is a rounded 1/3, not an exact rational match; that class is
+        # _rounded_decimal_match's job and must stay separate.
+        assert not _numeric_literal_match(think_wrap("\\boxed{0.333}"), "1/3")
+
+    def test_percent_unit_is_not_dropped(self):
+        assert _numeric_literal_match(think_wrap("\\boxed{42\\%}"), "42\\%")
+        assert not _numeric_literal_match(think_wrap("\\boxed{42\\%}"), "42")
+
+    def test_symbolic_answer_falls_through(self):
+        # Not a "simple" answer: the helper must decline, not crash, so the
+        # symbolic last resorts keep their say.
+        assert not _numeric_literal_match(think_wrap("\\boxed{\\frac{\\sqrt{2}}{2}}"), "\\frac{\\sqrt{2}}{2}")
+        assert not _numeric_literal_match(think_wrap("\\boxed{2\\pi}"), "2\\pi")
+
+    def test_no_boxed_no_match(self):
+        assert not _numeric_literal_match(think_wrap("the answer is 42"), "42")
+
+    def test_last_resort_uses_it_first(self):
+        assert _math_last_resort(think_wrap("\\boxed{042}"), "42")
 
 
 class TestConditionalMatch:

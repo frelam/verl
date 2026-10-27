@@ -1,6 +1,6 @@
 # 幻觉抵制 Reasoning RL —— 实施设计
 
-> 状态：**实施口径已定稿（D1–D33）**。本文档是这份方案的唯一事实来源与施工图。
+> 状态：**实施口径已定稿（D1–D34）**。本文档是这份方案的唯一事实来源与施工图。
 > 与已有的 `DESIGN.md`（Qwen3-4B reasoning RL 主方案）**并行存在、互不覆盖**：本方案只在训练后程
 > 以「换数据 mix + 换 reward 文件」的方式接入，不修改阶段一任何行为。
 
@@ -45,6 +45,7 @@
 | D30 | stage 3 域平衡重构（kkcut 合成 + 新配比） | **动机**：用户要求全局可解/不可解 = 70/30、老域/幻觉域 = 60/40（可解含两域），且合并后 math/code/logic 比例贴近老域；K&K 无原生不可解 → 合成。**内容**：① `kk_adapter.py --emit-unsolvable` 合成 **kkcut 行**——对已证唯一解的谜题删除一条陈述（`statements` 元组与 `quiz` 文本同步手术），仅当剩余子系统 2^N 全量枚举 **≥2 解** 时保留（删约束只能增解 ⇒ 被删陈述必要，枚举即证书；`verify_kk.py` 新增 `kkcut:` 独立审计通道，独立重推导不复用 adapter 代码）；契约 = 三档裸拒（模板 B、无 `role_words`，MiP 式），审计字段 `kkcut_deleted_index` / `kkcut_deleted_statement` / `kkcut_solutions_after`；`--kkcut-per-group 0` 允许同一父组枚举多条可删陈述，`kkcut:` task_id 增加第 5 段保证唯一；② stage 3 幻觉侧换**域平衡表 `STAGE3_QUOTA`**（14 cell，合计 14,000，§4.8）：logic 20%（2,800 = kk 700 可解 + kkcut 2,100 不可解）/ commonsense 20%（2,800 = FalseQA 300+820 + CREPE 400 判断 + 1,280 裸拒）/ math 60%（8,400 = GSM-IC 340 + UMWP 155/170/1,925 + 主池 15 + TreeCut 320/3,030 + SUM 2,200 + MiP 245），幻觉域内按**边权**（SUM 配对 0.5/0.5）精确 25/75，老域占 train 60% ⇒ 全局 70/30；老域按 **ability 分层抽样**（`--code_share`，stage-3 默认 0.24）：幻觉域没有 code 源，若均匀回放 code 会被稀释到全量的 ~15%，故先取 0.24×train_total 条 code，其余按池内供给比例分给 math/logic/stem，使合并后 math/code/logic ≈ 老域的 45/25/15；旧 `--repair_mode` 与 `REPAIR_QUOTA` 删除（D29 修复层已退役，stage 3 不再消费 `--repair-contract` 产物，配对原子性/去重/模板平衡检查与 stage 2 同一套原样生效）；③ CREPE 配额经 `--quota-overrides solvable_judge=400,unsolvable_bare=1280` 扩到 1,680；④ 构建入口 `build_hallucination_stage3_data.sh`（`HALLUC_TOTAL=14000`、`OLD_DOMAIN_RATIO=0.6`、`VAL_SIZE=700`，kk 带 `--emit-unsolvable --kkcut-per-group 0`，构建后跑 `verify_kk.py` 把坏 cut 行挡在构建期）→ `halluc/built_stage3/` → `mix_halluc.py --stage3_mix --strict_cells` → `final_halluc_stage3/`；**stage 2 表 B 不变** |
 | D31 | stage 4：指令遵从域（15%）+ 老域新鲜化 | **动机**：stage 1–3 的数据模型已训练过一轮，继续在同一批题上压熵会过拟合；同时 stage 3 只优化拒答/判断，缺少显式格式与内容约束的指令遵从信号。**内容**：① 新增 **`if_adapter.py`**，把 `nvidia/Nemotron-RL-instruction_following`（46,391 行，stage 1–3 未使用）构造成 stage-1 schema 的 `if_nemotron` 池——逐行过滤 reward 无法评估的 instruction id（`if_verifier.SUPPORTED_INSTRUCTION_IDS`），prompt 精确去重，`--exclude-path` 剔除已训练过的 prompt，`--quota/--seed` 决定子采样，ground truth = `{"constraints":[…],"grading_mode":"binary\|fraction"}`；② reward 复用 `compute_score.py` 的 `if_*` 分支（`_if_score`），新增 **`grading_mode="fraction"`**（通过约束数 / 总数）；缺省/未知值仍是 NeMo-Gym 的 `binary`（全部通过才 1.0），且约束只校验 `</think>` 之后的可见回答；③ `mix_halluc.py` 新增**正交**旋钮：`--if_ratio`（IF 占**最终** train 的比例，`if = ratio/(1-ratio) × 非 IF 总量`，因此 stage-3 幻觉域绝对规模不变）、`--if_path`、`--if_val_size`（先从 IF 池切 val 再抽 train）；`--exclude_path`（stage 1/2/3 的 train parquet，精确题面命中即从老域回放池与 IF 池剔除）、`--old_pool_path`（把 `$DATA_ROOT/{math,code,logic,stem}` 原始池并入回放供给，从而抽到 stage-1 mix 从未采过的尾部；池内 `val.parquet` 跳过）；④ 构建入口 **`build_hallucination_stage4_data.sh`**（`IF_RATIO=0.15`、`SEED=44` 轮换 kkcut 顺序与 CREPE 子采样、`INCLUDE_OLD_POOLS=1` 默认开启新鲜化，`EXCLUDE_PATHS` 默认 `final`/`final_halluc`/`final_halluc_stage3`）→ `halluc/built_stage4/` → `mix_halluc.py --stage3_mix --strict_cells --if_ratio 0.15` → `final_halluc_stage4/`；构建后断言 IF 实际占比不低于请求值 1pt；⑤ 训练沿用 `run_qwen3_4b_hallucination_stage3_fully_async.sh`（`DATA_DIR=$STAGE4_DIR`、`RESUME_PATH=<stage-3 ckpt>`），reward 文件不变。默认口径下 stage 4 train ≈ 33,250（非 IF）+ 5,868（IF）= 39,118，IF = 15.0%；val ≈ 700（幻觉）+ 255（stage-1 val）+ 105（IF） |
 | D33 | stage 4：按子任务长度惩罚（维持 DPO 精简习惯） | **动机**：stage 4 从 DPO 精简过思维链的 ckpt 起步，RL 会沿奖励坡度重新拉长 CoT；需要把"正确且简短"的行为锚住。**内容**：① 新统计脚本 `scripts/distill/measure_length_targets.py`——对 DPO ckpt 的 OpenAI 兼容服务（vLLM 必须带 `--reasoning-parser qwen3`）在 stage-4 train mix 上逐 prompt 生成，按 `data_source` 聚合**响应字符数**（默认 `mean`，可选 `p50/p90`，默认丢弃 `finish_reason=length` 的截断样本），产出 `length_stats.json` / `length_targets.json` / `length_targets.env`；样本数 < `--min_samples` 的源依次回退到 `extra_info.domain` 均值与全局 `__default__`；② reward 侧新增 4 个 reward_kwargs（`length_penalty_targets_path` / `length_penalty_coef` / `length_penalty_max`，以及便于单测的内联 `length_penalty_targets`），在分支打分（含委派给 stage-1 的 `math/code/logic/stem/if/bbh` 行）之后对**正分**行扣 `min(MAX, COEF × (len/target − 1))`，目标按 `data_source → extra_info.domain → __default__` 解析；0 分与唯一负分（CREPE 误拒 −1）不罚，`MAX < 1` 保证"正确但长"仍高于"错误但短"；③ stage-4 薄封装读取 `LENGTH_PENALTY_TARGETS_PATH` / `LENGTH_PENALTY_COEF` / `LENGTH_PENALTY_MAX` 三个环境变量并以 `++reward.custom_reward_function.reward_kwargs.*` 注入；不设 targets 时 reward 与 stage 3 完全一致；④ 惩罚开启时每行固定返回 `length_chars` / `length_target` / `length_penalty` 三个 aux 字段——reward-loop 以 batch 首样本的键集合为准（`reward_loop.py:366`），逐样本增删会直接 KeyError |
+| D34 | stage 4：高难度数学域（15%）+ 老域降到 30% | **动机**：benchmark 报告显示高难数学是当前最弱项，而 stage 1–3 的数学回放以 Big-Math/DAPO 为主（难度低于 AIME）；stage 4 要在不扩大总量的前提下补齐这部分能力。**内容**：① 新增 **`hard_math_adapter.py`**，从 `nvidia/AceReason-Math`（≈50k，AMC–AIME）、`agentica-org/DeepScaleR-Preview-Dataset`（≈40k，AIME 1984-2023 + AMC + Omni-MATH + Still）、`zwhe99/DeepMath-103K`（难度 ≥ 6 子集）构建 `math_hard_*` 池（`dapo` 作为可选第四源，默认权重 0，因为它就是老域数学池）；② **答案格式统一**：只保留整数 / 简单分数 / 短小数（可带 `\%`），复杂符号答案默认丢弃（`--keep-symbolic` 可保留）；图片依赖题（`<image>` / Asymptote）始终丢弃；ground truth 只去 `$...$` / `\boxed{}` 包装，不改写数值；③ **去重**：池内 exact + MinHash（跨源重叠明显），可选 `--anchor-path` 对老域数学池做 MinHash 去近重，`--exclude-path` 按精确题面剔除已训练行；④ **去污染**：`--decontaminate-path`（默认 `$DATA_ROOT/val/aime_2024_2025.parquet` 等四个候选）做 word 8-gram + MinHash，未提供时**构建失败**（`--allow-no-decontamination` 仅调试）；⑤ **难度过滤**（不可省）：在 stage-4 起始 ckpt 的 vLLM OpenAI 服务上每题采样 `--difficulty-k 8`（可到 16），用训练 reward 打分，只保留通过率 ∈ `[0.1, 0.9]` 的题（全对/全错都丢弃），通过率写入 `extra_info.pass_rate`；结果按 `task_id` 缓存在 `<out>_difficulty.jsonl`，可断点续跑与分片；reward 不可用（缺 verl/math_verify）时 preflight 直接报错，不会把整池误判成全错；⑥ `mix_halluc.py` 新增第三个增量域 `--hard_math_ratio`（占最终 train 的 15%）、`--hard_math_path`、`--hard_math_weights`、`--hard_math_val_size`，三个增量域共用分母 `1 - if - bbh - hard`；`--old_domain_ratio` 由 0.6 降到 **0.5**，老域因此占最终 train 的 **30%**，最终构成 **幻觉 30% / 老域 30% / hard math 15% / IF 15% / BBH 10%**，train 总量仍约 **44.3k**；老域内部按 stage-3 的 `train_by_ability` 逐项匹配（`--match_stage3_abilities`，hard math 计入 math 预算并等量替换老域 math），老域总数仍 13,300，`--code_share` 退化为该模式关闭时的回退旋钮（0.16）；⑦ reward 侧 `compute_score.py` 的 math 分支新增 **`_numeric_literal_match`** 兜底层（`_math_last_resort` 首位）：用 `Fraction` 精确比较 AIME 风格字面量（`042 == 42`、`1,234 == 1234`、`\dfrac{1}{2} == 0.5`），但 `0.333 != 1/3`，避免把四舍五入误判为精确相等；`math_hard_*` 前缀仍路由到同一 stage-1 数学匹配链；⑧ 构建入口 `build_hallucination_stage4_data.sh`（`HARD_MATH_RATIO=0.15`、`HARD_MATH_DIFFICULTY_BASE_URL`/`MODEL` 必填，`SKIP_HARD_MATH_DIFFICULTY=1` 仅调试），构建后断言 hard math 实际占比 ≥ 请求值 −1pt 且 pass-rate 数据非空 |
 
 ---
 
@@ -1062,6 +1063,9 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   最终 train **44,333**（IF 15.0% / BBH 10.0% / 非增量 75.0%），见 §7.6。
 - 续训：`RESUME_PATH=<阶段三 ckpt 目录> bash run_qwen3_4b_hallucination_stage4_fully_async.sh`
   （D31+D32 薄封装，DATA_DIR 默认 `final_halluc_stage4`，其余沿用 stage-3 recipe）。
+  > **D34 更新**：本节的老域/幻觉域 60/40 与 `--old_domain_ratio 0.6` 是 D31+D32 口径；
+  > D34 起默认 `--old_domain_ratio 0.5`（老域 30%），并新增 hard-math 增量域，
+  > 最终 total 仍是 44,333，配比见 §7.8。
 - reward：仍是 `reward/hallucination_compute_score.py`；`if_nemotron` 行按 `data_source` 前缀
   委托给 `compute_score.py::_if_score`，约束只检查 `</think>` 之后的可见回答。
   **注意**：binary 模式下 IF 组的正确率通常很低（最多 5 条约束全部通过），组内奖励容易全 0；
@@ -1155,6 +1159,94 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   （`MAX` 保持 < 1）；若正确率随长度一起下降，先检查 target 是否被少数极短样本拉低
   （改 `--target_metric p50` 或提高 `--min_samples`），而不是直接加大惩罚。
 
+### 7.8 阶段四高难度数学域（D34）
+
+- **背景**：`BBH_Benchmark_评测分析报告.md` 显示高难数学是最弱项；stage 1 的数学池以
+  Big-Math（~251k，NuminaMath 派生）为主，难度整体低于 AIME，而 stage 4 要"补齐并提升"能力。
+  D34 在不扩大数据总量的前提下，把老域回放从 45% 降到 30%，腾出的 15% 换成 AIME 级数学。
+- **数据源（默认三源，可选第四源）**：
+
+  | key | 数据集 | 规模 | 说明 |
+  |---|---|---|---|
+  | `ace_reason` | `nvidia/AceReason-Math` | ~50k | 为 RLVR 清洗，难度 AMC–AIME |
+  | `deepscaler` | `agentica-org/DeepScaleR-Preview-Dataset` | ~40k | AIME 1984–2023 + AMC + Omni-MATH + Still |
+  | `deepmath` | `zwhe99/DeepMath-103K` | ~103k | 只取难度 ≥ 6（`--deepmath-min-difficulty`） |
+  | `dapo`（可选） | `BytedTsinghua-SIA/DAPO-Math-17k` | ~17k | 默认权重 0：它已是老域数学池的主力 |
+
+  `HARD_MATH_WEIGHTS` 默认 AceReason 40% / DeepScaleR 35% / DeepMath 25%。
+- **五道清洗闸门（顺序固定，逐级计数写入 `hard_math_report.json`）**：
+  1. **答案格式统一**：`numeric_literal()` 只接受整数（含前导零/千分位）、短小数、简单分数
+     （`a/b`、`\frac{a}{b}`）以及带 `\%` 的同类数值；`\sqrt`、`\pi`、区间、元组、字母选项、
+     文字答案一律丢弃（`--keep-symbolic` 可关闭该闸，但需要在 reward 侧另配 judge 兜底）。
+     ground truth 只去 `$...$` / `\boxed{}` 包装，**不改写数值**。图片依赖题（`<image>` /
+     Asymptote）始终丢弃。
+  2. **去重（n-gram + 语义）**：池内 exact（normalized text）+ MinHash Jaccard 0.6；三个源
+     互相重叠明显，这一步通常删掉 20–40%。可选 **embedding 语义层**（
+     `--embedding-base-url` 指向 vLLM `/v1/embeddings`，默认模型
+     `Qwen/Qwen3-Embedding-8B`，余弦阈值 0.95）：用随机超平面 LSH（64 bit / 8 band）做候选召回，
+     只对同桶候选算精确余弦，复杂度近似 O(N)，内存只保留一份 `(N, D)` float32 矩阵
+     （keep 向量原地压缩）。它补的是 n-gram 抓不到的改写题；不配该 URL 时只有 MinHash。
+     `--anchor-path` 可再对老域数学池做一次 reference-set MinHash，避免 hard 域和老域回放
+     重复训练同一道题；`--exclude-path` 按精确题面剔除已训练行。
+  3. **去污染（fail-closed）**：`--decontaminate-path` 指向 AIME 2024/2025（默认尝试
+     `$DATA_ROOT/val/aime_2024_2025.parquet`、`aime_2024.parquet`、`aime_2025.parquet`、
+     `aime.parquet`），先做 word 8-gram，再做 MinHash 0.8。候选文件全不存在时构建直接失败；
+     `--allow-no-decontamination` 只用于调试。理由：AIME 2024/2025 是主评估口径，训练集混入
+     会让 stage-4 的收益不可信（DESIGN.md §3 的红线）。
+  4. **候选配额**：`--candidate-quota 28000`（约为 mix 需求 6.9k 的 4 倍），按权重分配到各源，
+     **先截断再做难度过滤**，避免对 16 万道题全部跑 8 次采样。
+  5. **难度过滤（不可省）**：在 stage-4 起始 checkpoint 的 vLLM OpenAI 服务上每题采样
+     `--difficulty-k 8`（可 16），采样参数与训练一致（temperature 1.0，max_tokens 8192），
+     用**训练用 reward** 打分，只保留通过率 ∈ `[0.1, 0.9]` 的题；全对（零梯度）与全错
+     （4B 模型在 AIME 级题上全错比例很高）都丢弃。通过率写入 `extra_info.pass_rate`，
+     与 `scripts/difficulty_tag.py` 同一字段。结果按 `task_id` 缓存到
+     `<out>_difficulty.jsonl`（+ `.done`），支持断点续跑；`--num-shards/--shard-index`
+     可多进程生成，全部完成后以 `--num-shards 1` 再跑一次即可从缓存装配完整 parquet，
+     不会重复生成。**reward 预检**：开跑前用一正一负两条合成样本验证 `compute_score`，
+     若缺少 verl/math_verify 导致数学 reward 恒为 0，立即报错而不是把整池判成全错。
+- **配比与总量**：`--old_domain_ratio 0.5` ⇒ 老域 = 幻觉域 = 30% 最终 train；三个增量域
+  `IF 15% / BBH 10% / hard math 15%` 共用分母 `1 − 0.15 − 0.10 − 0.15 = 0.60`：
+  ```
+  幻觉 train 13,300 (30%) + 老域 13,300 (30%) + hard math 6,650 (15%)
+    + IF 6,650 (15%) + BBH 4,433 (10%) = 44,333
+  ```
+  与 D31+D32 的 44,333 完全一致，即"总量不变、只换结构"。val ≈ 700（幻觉）+ 255（stage-1）
+  + 239（hard math）+ 239（IF）+ 159（BBH）≈ 1,592。
+- **保持 stage-3 的 ability 配比**：IF / BBH 是新增能力，固定占 25%；其余 75%
+  （33,250 行，恰好等于 stage-3 的 train 总量）按 stage-3 的 `train_by_ability`
+  逐项匹配。**hard math 计入 math 预算**，所以它等量替换老域 math 回放；腾出的
+  老域槽位分给 code / logic / stem。默认数值：
+
+  | ability | stage-3 | stage-4 目标 | 来源拆分 |
+  |---|---|---|---|
+  | math | 15,162 | 15,162 | 幻觉 7,980 + hard math 6,650 + 老域 532 |
+  | code | 7,980 | 7,980 | 老域 7,980 |
+  | logic | 5,054 | 5,054 | 幻觉 2,660 + 老域 2,394 |
+  | commonsense | 2,660 | 2,660 | 幻觉 2,660 |
+  | stem | 2,394 | 2,394 | 老域 2,394 |
+  | **reasoning 合计** | **33,250** | **33,250** | + IF 6,650 + BBH 4,433 = **44,333** |
+
+  老域总数仍是 13,300（30%），但内部从 code 7,093 / math 3,724 / logic 1,241 /
+  stem 1,241 调整为 code 7,980 / logic 2,394 / stem 2,394 / math 532：hard math
+  6,650 行进入 math 预算，老域 math 因此从 3,724 压到 532，让出的 3,192 个回放
+  槽位补回 code / logic / stem。
+  实现：`mix_halluc.py --match_stage3_abilities` + `--ability_reference_path
+  <stage3 mix_stats.json>`（文件缺失时回退到内置 `STAGE3_ABILITY_PROFILE`）；
+  构建脚本默认 `MATCH_STAGE3_ABILITIES=1`、`ABILITY_MIX_REFERENCE=
+  $DATA_ROOT/final_halluc_stage3/mix_stats.json`，并在构建后断言每个 ability
+  与 stage-3 占比偏差 ≤1pt、老域总数不变。`CODE_SHARE` 退化为该模式关闭时的
+  回退旋钮（0.16 仍保持旧的老域内部比例）。
+- **reward**：`math_hard_*` 前缀走 `compute_score.py` 的 `math_*` 分支（stage-1 匹配链不变）。
+  D34 在 `_math_last_resort` 首位新增 `_numeric_literal_match`：用 `Fraction` 精确比较
+  AIME 风格字面量，覆盖 `\boxed{042}` vs `42`、`\boxed{1,234}` vs `1234`、
+  `\dfrac{1}{2}` vs `0.5` 三类已知假阴性；比较是精确有理数，所以 `0.333` 仍不等于 `1/3`
+  （四舍五入由 `_rounded_decimal_match` 单独负责），百分号作为单位参与比较（`42\%` ≠ `42`）。
+- **监控**：`mix_stats.json → hard_math_by_source` / `hard_math_share_of_train`；构建脚本断言
+  hard math 实际占比 ≥ 请求值 −1pt 且 `hard_math_report.json.difficulty.scored > 0`。
+  训练后优先看 AIME 2024/2025 与 AMC23 的分项提升，同时确认 stage-3 的幻觉/拒答指标没有回退
+  （老域占比从 45% 降到 30% 是这一轮最大的回退风险，若回退明显，先把 `OLD_DOMAIN_RATIO`
+  调回 0.55 或提高 `HARD_MATH_WEIGHTS` 中 DeepMath 的占比，而不是直接加总量）。
+
 ---
 
 ## 8. 文件清单（全部新增，零覆盖）
@@ -1163,9 +1255,9 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
 examples/reasoning_rl/
 ├── HALLUCINATION_RL_DESIGN.md                     # 本文档
 ├── build_hallucination_stage3_data.sh             # D30 stage 3 数据一键构建（8 adapter 全量重建 → mix --stage3_mix；构建期含 verify_kk 检查）
-├── build_hallucination_stage4_data.sh             # D31+D32 stage 4 数据一键构建（stage-3 表 + IF 池 + BBH 补强池 + 新鲜化老域 → mix --stage3_mix --if_ratio --bbh_ratio）
+├── build_hallucination_stage4_data.sh             # D31+D32+D34 stage 4 数据一键构建（stage-3 表 + IF 池 + BBH 补强池 + 高难数学池 + 新鲜化老域 → mix --stage3_mix --if_ratio --bbh_ratio --hard_math_ratio）
 ├── run_qwen3_4b_hallucination_stage3_fully_async.sh  # D29 stage 3 训练 recipe（RESUME_PATH=<stage-2 ckpt>）
-├── run_qwen3_4b_hallucination_stage4_fully_async.sh  # D31+D32+D33 stage 4 薄封装（DATA_DIR=final_halluc_stage4，RESUME_PATH=<DPO ckpt>，长度惩罚环境变量）
+├── run_qwen3_4b_hallucination_stage4_fully_async.sh  # D31+D32+D33+D34 stage 4 薄封装（DATA_DIR=final_halluc_stage4，RESUME_PATH=<DPO ckpt>，长度惩罚环境变量）
 ├── reward/
 │   ├── hallucination_compute_score.py             # 新 dispatcher（老前缀委托；stage 2/3/4 共用，按 gt 键路由；D33 按子任务长度惩罚）
 │   ├── if_verifier.py                             # IFBench/IFEval 约束校验（54 id）
@@ -1177,6 +1269,8 @@ examples/reasoning_rl/
     ├── if_adapter.py                              # D31 指令遵从域构建（约束完整性过滤/去重/quota/grading_mode）
     ├── bbh_adapter.py                             # D32 BBH 补强域构建（Dyck/几何/消歧/因果重生成 + MovieLens 四选一；不读 BBH 数据）
     ├── test_bbh_adapter.py                        # D32 生成器/标签自检/去重测试
+    ├── hard_math_adapter.py                       # D34 高难数学域构建（AceReason/DeepScaleR/DeepMath≥6 → 答案格式过滤 → 去重 → AIME 去污染 → pass@k 难度过滤）
+    ├── test_hard_math_adapter.py                  # D34 答案格式/去污染/去重/配额/难度过滤单测
     ├── verify_kk.py                               # K&K gold 自检/审计（枚举器对照；D30 `kkcut:` 合成行独立审计通道）
     ├── verify_mip.py                              # MiP L1/L2 审计断言：证书、必要性、唯一性
     ├── verify_falseqa.py                          # FalseQA：配对 diff 证书 + 替换对选项断言（§4.3）+ D27 answerable 侧占位替换对/按对 split 断言

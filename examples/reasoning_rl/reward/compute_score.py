@@ -52,7 +52,13 @@ Routing (data_source prefix -> verifier):
                      are skipped -- a single-letter MCQ gold would be renamed
                      into ANY single-letter prediction); and fixed-point numeric
                      equivalence recovers predictions that evaluate a formula
-                     the gt left unevaluated (``a(1 - 10\%)^2`` vs ``0.81a``)
+                     the gt left unevaluated (``a(1 - 10\%)^2`` vs ``0.81a``).
+                     Stage-4 hard-math rows (``math_hard_*``, D34) use this
+                     same path; their builder keeps only integer /
+                     simple-fraction answers, and the last-resort list starts
+                     with an exact-rational comparison of those literals
+                     (``042`` == ``42``, ``\\dfrac{1}{2}`` == ``0.5``, while
+                     ``0.333`` still != ``1/3``)
 ``code_*``           sandbox_fusion when ``sandbox_fusion_url`` is set,
                      else prime_code local execution (smoke runs only)
 ``logic_*``          rule verifier: extract the final answer
@@ -143,6 +149,7 @@ import math
 import re
 from collections import Counter
 from decimal import ROUND_HALF_UP, Decimal
+from fractions import Fraction
 
 logger = logging.getLogger(__name__)
 
@@ -1144,10 +1151,125 @@ def _or_branch_match(solution_str: str, ground_truth: str) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# AIME-style numeric literal match (stage-4 hard math, D34)
+# ---------------------------------------------------------------------------
+
+#: Short forms AIME-style answers take: an integer (optionally comma-grouped),
+#: a decimal, or a simple fraction.  ``X\%`` is accepted as a separate unit.
+_LITERAL_SIMPLE_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+_LITERAL_GROUPED_INT_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+$")
+_LITERAL_FRAC_SHORT_RE = re.compile(r"\\[dt]?frac\s*(\d)\s*(\d)")
+_LITERAL_FRAC_RE = re.compile(r"\\[dt]?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+_LITERAL_PERCENT_RE = re.compile(r"(?:\\%|%)\s*$")
+_LITERAL_TEXT_WRAP_RE = re.compile(r"\\(?:text|mathrm|textrm)\s*\{([^{}]*)\}")
+_LITERAL_STRIP_TOKENS = ("\\left", "\\right", "\\,", "\\!", "\\;", "\\ ", "\\quad", "\\qquad")
+
+
+def _literal_fraction(token: str) -> Fraction | None:
+    """One unsigned integer/decimal token -> exact Fraction, or None."""
+    if not _LITERAL_SIMPLE_RE.match(token):
+        return None
+    try:
+        return Fraction(Decimal(token)) if "." in token else Fraction(token)
+    except (ArithmeticError, ValueError):
+        return None
+
+
+def _canonical_numeric_literal(text: str) -> tuple[Fraction, str] | None:
+    """``(value, unit)`` of a plain numeric answer, or None.
+
+    Accepted shapes are exactly the AIME-style answers the stage-4 hard-math
+    builder keeps: integers (including leading zeros and thousands separators),
+    decimals, simple fractions (``a/b`` or ``\\frac{a}{b}``) and the same with a
+    trailing percent sign.  The unit is tracked so ``42`` and ``42\\%`` never
+    compare equal (a percent ground truth has its own matcher).
+    """
+    s = str(text or "").strip()
+    if not s:
+        return None
+    s = s.replace("$", "")
+    for token in _LITERAL_STRIP_TOKENS:
+        s = s.replace(token, "")
+    s = _LITERAL_TEXT_WRAP_RE.sub(r"\1", s).strip()
+    if not s:
+        return None
+
+    unit = ""
+    if _LITERAL_PERCENT_RE.search(s):
+        unit = "%"
+        s = _LITERAL_PERCENT_RE.sub("", s).strip()
+    if not s:
+        return None
+
+    # Rewrite at most a couple of *nested-free* fractions; a nested \\frac is not
+    # a simple fraction and falls through to the reject path.
+    for _ in range(3):
+        rewritten = _LITERAL_FRAC_SHORT_RE.sub(r"\1/\2", s)
+        rewritten = _LITERAL_FRAC_RE.sub(r"\1/\2", rewritten).replace(" ", "")
+        if rewritten == s:
+            break
+        s = rewritten
+    s = s.replace(" ", "")
+
+    sign = 1
+    if s.startswith("+"):
+        s = s[1:]
+    elif s.startswith("-"):
+        sign = -1
+        s = s[1:]
+    if not s:
+        return None
+    if _LITERAL_GROUPED_INT_RE.match(s):
+        s = s.replace(",", "")
+    if s.count("/") > 1:
+        return None
+    if "/" in s:
+        numerator, _, denominator = s.partition("/")
+        if not numerator or not denominator:
+            return None
+        top, bottom = _literal_fraction(numerator), _literal_fraction(denominator)
+        if top is None or bottom is None or bottom == 0:
+            return None
+        value = top / bottom
+    else:
+        value = _literal_fraction(s)
+        if value is None:
+            return None
+    return sign * value, unit
+
+
+def _numeric_literal_match(solution_str: str, ground_truth: str) -> bool:
+    """Exact rational comparison of an AIME-style numeric answer (D34).
+
+    The stage-4 hard-math domain is filtered to integer / simple-fraction
+    answers precisely so this class of false negative disappears: a model's
+    ``\\boxed{042}`` (AIME answers are three-digit) must equal the gold ``42``,
+    ``\\boxed{1,234}`` must equal ``1234``, and ``\\dfrac{1}{2}`` / ``1/2`` /
+    ``0.5`` must all compare equal.  The comparison is exact (``Fraction``), so
+    ``0.333`` still never matches ``1/3`` -- that is the strict verifier's or
+    ``_rounded_decimal_match``'s job, and conflating them would credit a wrong
+    answer.
+
+    Additive-only and cheap: it runs first in :func:`_math_last_resort`, after
+    the strict verifier has already failed.
+    """
+    pred_text = _extract_boxed(solution_str)
+    if pred_text is None:
+        return False
+    gt_text = _extract_boxed(ground_truth) or ground_truth
+    pred = _canonical_numeric_literal(pred_text)
+    gold = _canonical_numeric_literal(gt_text)
+    if pred is None or gold is None:
+        return False
+    return pred == gold
+
+
 def _math_last_resort(solution_str: str, ground_truth: str) -> bool:
     """Credit-adding fallbacks for known ground-truth format noise."""
     return (
-        _rounded_decimal_match(solution_str, ground_truth)
+        _numeric_literal_match(solution_str, ground_truth)
+        or _rounded_decimal_match(solution_str, ground_truth)
         or _normalized_text_match(solution_str, ground_truth)
         or _yes_no_match(solution_str, ground_truth)
         or _gt_segment_match(solution_str, ground_truth)

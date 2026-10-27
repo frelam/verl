@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Hallucination-resistance stage 4 (HALLUCINATION_RL_DESIGN.md D31 + D32) | Qwen3-4B
+# Hallucination-resistance stage 4 (HALLUCINATION_RL_DESIGN.md D31 + D32 + D34) | Qwen3-4B
 #
 # Thin stage-4 wrapper around the stage-3 fully-async recipe.  Stage 4 uses the
 # same trainer / rollout / reward stack; only the data directory changes:
 #
-#   * stage-3 domain-balanced mix (hallucination + old-domain replay),
+#   * stage-3 domain-balanced mix (hallucination 30% + old-domain replay 30%),
 #   * + instruction-following domain (D31, ~15%),
 #   * + BBH-gap skill-repair domain (D32, ~10%; built by bbh_adapter.py from
 #     fresh same-ability generators, never from BBH rows),
+#   * + hard-math domain (D34, ~15%; AceReason / DeepScaleR / DeepMath level>=6,
+#     answer-format filtered, AIME-decontaminated, pass-rate filtered to 0.1-0.9),
 #   * + fresh old-domain replay (--exclude_path).
 #
 # The reward is still reward/hallucination_compute_score.py: `halluc_*` rows use
-# the abstention dispatcher, `if_*` rows delegate to the IF verifier, and
-# `bbh_*` rows delegate to reward/bbh_verifier.py (benchmark-native bracket /
-# option-letter / yes-no answers).
+# the abstention dispatcher, `if_*` rows delegate to the IF verifier, `bbh_*`
+# rows delegate to reward/bbh_verifier.py, and `math_hard_*` rows use the stage-1
+# math path (compute_score.py) with the D34 exact-rational literal fallback.
 #
 # Build the data first:
 #   bash build_hallucination_stage4_data.sh

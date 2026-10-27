@@ -75,6 +75,13 @@ touching this file.  ``halluc_math_gsmic`` needs no special case either: its row
 are plain numeric solvable rows, so the numeric branch already scores them with
 the same stage-1 matcher chain section 6 asks for.
 
+Stage-4 hard-math rows (``math_hard_*``, D34) stay on the delegate branch as
+well: they carry the same ``math`` prefix, so ``compute_score.py`` scores them
+with the stage-1 math chain, whose last-resort list now also compares
+AIME-style integer / simple-fraction literals as exact rationals
+(``_numeric_literal_match``).  No hallucination flag is involved, which is what
+keeps the abstention contract and the hard-math contract from ever overlapping.
+
 Stage-4 length penalty (D33)
 ----------------------------
 
