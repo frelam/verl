@@ -21,6 +21,14 @@ trajectories that score 1.  Sampling N times per prompt is what fixes the "one
 sample was wrong, but the prompt is still useful" case: the prompt is only
 dropped when none of its N samples is correct.
 
+``--empty_rounds`` (default 2) makes "none of its N samples is correct" mean
+*none across all rounds*: a prompt whose whole first batch is incorrect is
+re-sampled with another ``--n`` fresh trajectories instead of being dropped, up
+to ``--empty_rounds`` extra rounds.  A prompt is never re-sampled once it has one
+correct trajectory, so the extra generation cost only lands on the hard tail
+(unsolvable/refusal rows), which is exactly where a small ``--n`` would
+otherwise lose whole questions.
+
 Scoring is the stage-2/3 dispatcher itself
 (``examples/reasoning_rl/reward/hallucination_compute_score.py``), so dataset A
 is by construction "what the RL run considers correct" -- format gate,
@@ -115,6 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api_key", default=os.environ.get("OPENAI_API_KEY", ""))
     parser.add_argument("--model", default="", help="served model id (empty = first id from GET /models)")
     parser.add_argument("--n", type=int, default=8, help="samples per prompt; only correct ones are kept")
+    parser.add_argument(
+        "--empty_rounds",
+        type=int,
+        default=2,
+        help="extra sampling rounds for a prompt whose whole batch was incorrect "
+        "(0 = drop it immediately, the pre-resampling behaviour)",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=-1, help="-1 disables top-k (vLLM extension)")
@@ -334,100 +349,138 @@ def main(argv: list[str] | None = None) -> int:
     started = time.time()
     last_logged = 0
     batch_size = max(1, args.concurrency)
-    for start in range(0, len(pending), batch_size):
-        batch = pending[start : start + batch_size]
-        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            generated = list(pool.map(lambda row: _generate_one(row, args, model_id), batch))
-
-        # (row, message-list, sample, original index) in a stable order.
-        scoring_tasks = []
-        for item in generated:
-            row = item["row"]
-            if item["error"]:
-                counters["generation_errors"] += 1
-                logger.warning("[gen] %s: %s", task_key(row), item["error"])
-                continue
-            for index, sample in enumerate(item["samples"]):
-                scoring_tasks.append((row, item["messages"], sample, index))
-
-        with ThreadPoolExecutor(max_workers=max(1, args.score_workers)) as pool:
-            scores = list(
-                pool.map(
-                    lambda task: score_response(
-                        reward_fn, task[0], task[2]["response"], args.sandbox_fusion_url or None
-                    ),
-                    scoring_tasks,
-                )
-            )
-
-        # Group the scored trajectories back per prompt, keep only correct ones.
-        per_prompt: dict[str, list[tuple[int, dict, float]]] = {}
-        prompt_rows: dict[str, dict] = {}
-        messages_by_prompt: dict[str, list[dict]] = {}
-        for (row, messages, sample, index), score in zip(scoring_tasks, scores, strict=True):
-            key = task_key(row)
-            per_prompt.setdefault(key, []).append((index, sample, score))
-            prompt_rows[key] = row
-            messages_by_prompt[key] = messages
-            counters["generated"] += 1
-
-        finished_rows = []
-        finished_done = []
-        for key in per_prompt:
-            row = prompt_rows[key]
-            kept = [(index, sample, score) for index, sample, score in per_prompt[key] if score >= args.min_score]
-            kept.sort(key=lambda item: (item[1]["response_tokens"], len(item[1]["response"])))
-            if args.max_per_prompt > 0:
-                kept = kept[: args.max_per_prompt]
-            summary = dict(
-                data_source=str(row.get("data_source") or ""),
-                ability=str(row.get("ability") or ""),
-                ground_truth=ground_truth_of(row),
-                extra_info=row.get("extra_info") or {},
-            )
-            for index, sample, score in kept:
-                finished_rows.append(
-                    {
-                        "sample_id": make_sample_id(key, index),
-                        "task_id": key,
-                        "gen_index": index,
-                        "prompt": messages_by_prompt[key],
-                        "response": sample["response"],
-                        "score": float(score),
-                        "prompt_tokens": sample["prompt_tokens"],
-                        "response_tokens": sample["response_tokens"],
-                        "finish_reason": sample["finish_reason"],
-                        "gen_model": model_id,
-                        **summary,
-                    }
-                )
-            counters["kept"] += len(kept)
-            counters["prompts_done"] += 1
-            if not kept:
-                counters["prompts_without_correct_sample"] += 1
-            finished_done.append(key)
-
-        # Rows are only persisted once the whole prompt is finished, so a crash
-        # can never leave a half-written prompt behind that resume would skip.
-        append_jsonl(samples_path, finished_rows)
-        append_done(done_path, finished_done)
-
-        if counters["prompts_done"] - last_logged >= max(1, args.log_every):
-            last_logged = counters["prompts_done"]
-            elapsed = time.time() - started
-            rate = counters["prompts_done"] / max(elapsed, 1e-9)
+    empty_rounds = max(0, args.empty_rounds)
+    # ``queue`` is round 0's prompt list; every later round only carries the
+    # prompts whose whole previous batch was incorrect.
+    queue = pending
+    for round_index in range(empty_rounds + 1):
+        retry_queue: list[dict] = []
+        if round_index:
             logger.info(
-                "[progress] prompts=%d/%d kept=%d generated=%d rate=%.2f prompt/s eta=%.1f min errors=%d",
-                counters["prompts_done"],
-                len(pending),
-                counters["kept"],
-                counters["generated"],
-                rate,
-                (len(pending) - counters["prompts_done"]) / max(rate, 1e-9) / 60.0,
-                counters["generation_errors"],
+                "[resample] round %d/%d: %d prompts had no correct sample, sampling n=%d again",
+                round_index,
+                empty_rounds,
+                len(queue),
+                args.n,
             )
+        for start in range(0, len(queue), batch_size):
+            batch = queue[start : start + batch_size]
+            with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+                generated = list(pool.map(lambda row: _generate_one(row, args, model_id), batch))
+
+            # (row, message-list, sample, original index) in a stable order.
+            scoring_tasks = []
+            # Prompts that got a generation reply, kept even when every returned
+            # response is empty: an empty reply is "no correct sample", so the
+            # prompt must go through the retry decision like any other.
+            attempted: dict[str, tuple[dict, list[dict]]] = {}
+            for item in generated:
+                row = item["row"]
+                if item["error"]:
+                    counters["generation_errors"] += 1
+                    logger.warning("[gen] %s: %s", task_key(row), item["error"])
+                    continue
+                key = task_key(row)
+                attempted[key] = (row, item["messages"])
+                for index, sample in enumerate(item["samples"]):
+                    scoring_tasks.append((row, item["messages"], sample, index))
+
+            with ThreadPoolExecutor(max_workers=max(1, args.score_workers)) as pool:
+                scores = list(
+                    pool.map(
+                        lambda task: score_response(
+                            reward_fn, task[0], task[2]["response"], args.sandbox_fusion_url or None
+                        ),
+                        scoring_tasks,
+                    )
+                )
+
+            # Group the scored trajectories back per prompt, keep only correct ones.
+            per_prompt: dict[str, list[tuple[int, dict, float]]] = {}
+            for (row, messages, sample, index), score in zip(scoring_tasks, scores, strict=True):
+                per_prompt.setdefault(task_key(row), []).append((index, sample, score))
+                counters["generated"] += 1
+
+            finished_rows = []
+            finished_done = []
+            for key, (row, messages) in attempted.items():
+                counters["prompts_sampled"] += 1
+                kept = [
+                    (index, sample, score)
+                    for index, sample, score in per_prompt.get(key, [])
+                    if score >= args.min_score
+                ]
+                kept.sort(key=lambda item: (item[1]["response_tokens"], len(item[1]["response"])))
+                if args.max_per_prompt > 0:
+                    kept = kept[: args.max_per_prompt]
+                if not kept and round_index < empty_rounds:
+                    # Re-queue instead of dropping, and keep the prompt out of the
+                    # done markers: resume must not skip a prompt that is still
+                    # pending in a later round of this same run.
+                    counters["prompts_retried"] += 1
+                    retry_queue.append(row)
+                    continue
+                summary = dict(
+                    data_source=str(row.get("data_source") or ""),
+                    ability=str(row.get("ability") or ""),
+                    ground_truth=ground_truth_of(row),
+                    extra_info=row.get("extra_info") or {},
+                )
+                for index, sample, score in kept:
+                    finished_rows.append(
+                        {
+                            # Offset the rollout index by the round so a retried
+                            # prompt's samples never reuse a first-batch sample_id.
+                            "sample_id": make_sample_id(key, round_index * max(1, args.n) + index),
+                            "task_id": key,
+                            "gen_index": round_index * max(1, args.n) + index,
+                            "prompt": messages,
+                            "response": sample["response"],
+                            "score": float(score),
+                            "prompt_tokens": sample["prompt_tokens"],
+                            "response_tokens": sample["response_tokens"],
+                            "finish_reason": sample["finish_reason"],
+                            "gen_model": model_id,
+                            **summary,
+                        }
+                    )
+                counters["kept"] += len(kept)
+                counters["prompts_done"] += 1
+                if kept:
+                    if round_index:
+                        counters["prompts_rescued"] += 1
+                else:
+                    counters["prompts_without_correct_sample"] += 1
+                finished_done.append(key)
+
+            # Rows are only persisted once the whole prompt is finished, so a crash
+            # can never leave a half-written prompt behind that resume would skip.
+            append_jsonl(samples_path, finished_rows)
+            append_done(done_path, finished_done)
+
+            if counters["prompts_sampled"] - last_logged >= max(1, args.log_every):
+                last_logged = counters["prompts_sampled"]
+                elapsed = time.time() - started
+                rate = counters["prompts_sampled"] / max(elapsed, 1e-9)
+                logger.info(
+                    "[progress] round=%d sampled=%d finished=%d/%d kept=%d retried=%d rescued=%d "
+                    "generated=%d rate=%.2f prompt/s eta=%.1f min errors=%d",
+                    round_index,
+                    counters["prompts_sampled"],
+                    counters["prompts_done"],
+                    len(pending),
+                    counters["kept"],
+                    counters["prompts_retried"],
+                    counters["prompts_rescued"],
+                    counters["generated"],
+                    rate,
+                    (len(pending) - counters["prompts_done"]) / max(rate, 1e-9) / 60.0,
+                    counters["generation_errors"],
+                )
+        queue = retry_queue
 
     run_stats = dict(counters)
+    run_stats["empty_rounds"] = empty_rounds
     run_stats["correct_rate"] = counters["kept"] / max(1, counters["generated"])
     run_stats["elapsed_minutes"] = (time.time() - started) / 60.0
     stats_path = os.path.join(args.output_dir, f"a_run_stats.shard{args.shard_index}.json")
