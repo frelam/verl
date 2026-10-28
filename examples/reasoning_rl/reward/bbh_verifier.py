@@ -36,8 +36,11 @@ Both a ``\\boxed{...}`` answer and a bare final-line answer are accepted -- the
 BBH prompts themselves do not ask for ``\\boxed{}``, so a model that answers in
 the benchmark's native shape must not be punished.  For Dyck the bracket tokens
 are compared (whitespace is presentation); for multiple-choice rows the option
-letter is compared case-insensitively; for causal judgement the last yes/no in
-the visible response is compared.  Every other shape scores 0.
+letter is compared case-insensitively -- the explicitly stated verdict wins, a
+letter merely mentioned mid-sentence is never read, and a fragment that only
+ends with ``(B)`` is read as that choice; for causal judgement the stated
+verdict wins over an earlier polarity token, else the last yes/no in the
+visible response decides.  Every other shape scores 0.
 
 The verifier never raises: a malformed ground truth or an unparseable response
 is a 0, which is what the dispatcher's fail-closed contract expects.
@@ -75,9 +78,27 @@ _TRAILING_BRACKETS_RE = re.compile(r"[()\[\]{}<>][\s()\[\]{}<>]*$")
 #: A line that is just ``B`` / ``(B)`` / ``[B]`` / ``B.`` (after markdown noise
 #: is stripped).  Used both for a boxed payload and for the last line.
 _LETTER_LINE_RE = re.compile(r"^[\s(\[]*([A-Za-z])[\s)\]]*[.:]?$")
-_PAREN_LETTER_RE = re.compile(r"\(([A-Za-z])\)")
-_ANSWER_LETTER_RE = re.compile(r"(?:answer|option|choice)\s*(?:is|:)?\s*\(?([A-Za-z])\)?", re.IGNORECASE)
+#: The fragment ENDS with an option letter ("... therefore (B).").  A letter
+#: mentioned in the middle of prose is not read at all: "Option (A) is not
+#: correct" must not credit A.
+_TRAILING_PAREN_LETTER_RE = re.compile(r"\(([A-Za-z])\)\s*[.!。！]?\s*$")
+#: An explicitly stated answer letter ("the answer is (B)", "answer: C").
+#: Deliberately narrower than "option|choice": a first-match scan that accepts
+#: ``option (A)`` reads "Option (A) is wrong; the answer is (B)" as A -- i.e.
+#: it credits a letter the model just rejected.
+_ANSWER_LETTER_RE = re.compile(
+    r"\banswer\s*(?:is|:|=)\s*\**\s*\(?([A-Za-z])\)?(?![A-Za-z])", re.IGNORECASE
+)
+#: "option B is correct" / "choice (C) seems best": an affirmation that does
+#: not use the word "answer".  Requires the affirmation, so a rejected option
+#: ("option (A) is wrong") never matches.
+_CORRECT_OPTION_RE = re.compile(
+    r"\b(?:option|choice)\s*\(?([A-Za-z])\)?\s*(?:is|seems|appears)?\s*(?:the\s+)?(?:correct|right|best)\b",
+    re.IGNORECASE,
+)
 _YES_NO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
+#: An explicitly stated yes/no verdict ("... but the answer is no").
+_ANSWER_YES_NO_RE = re.compile(r"\b(?:answer|conclusion|verdict)\s*(?:is|:|=)\s*\**\s*(yes|no)\b", re.IGNORECASE)
 
 #: Presentation noise around a boxed / final-line payload.
 _MARKUP_STRIP_RE = re.compile(r"^[*`_\"'\s]+|[*`_\"'.\s]+$")
@@ -147,6 +168,30 @@ def _extract_dyck(text: str) -> list[str] | None:
     return None
 
 
+def _choice_from_text(text: str) -> str | None:
+    """One answer-bearing fragment -> option letter, or None when ambiguous.
+
+    Priority matters: the explicit verdict ("the answer is (B)") is read before
+    any parenthesised letter, a mid-sentence mention is never read at all (a
+    rejected option would otherwise be credited), and only a fragment that
+    ENDS with ``(B)`` counts as a bare choice.
+    """
+    candidate = _strip_markup(text)
+    match = _LETTER_LINE_RE.match(candidate)
+    if match:
+        return match.group(1).upper()
+    match = _ANSWER_LETTER_RE.search(candidate)
+    if match:
+        return match.group(1).upper()
+    match = _CORRECT_OPTION_RE.search(candidate)
+    if match:
+        return match.group(1).upper()
+    match = _TRAILING_PAREN_LETTER_RE.search(candidate)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
 def _extract_choice(text: str) -> str | None:
     """The predicted option letter, upper-cased, or None.
 
@@ -157,42 +202,44 @@ def _extract_choice(text: str) -> str | None:
     """
     boxed = _last_boxed(text)
     if boxed is not None:
-        candidate = _strip_markup(boxed)
-        match = _LETTER_LINE_RE.match(candidate)
-        if match:
-            return match.group(1).upper()
-        match = _PAREN_LETTER_RE.search(candidate)
-        if match:
-            return match.group(1).upper()
+        choice = _choice_from_text(boxed)
+        if choice is not None:
+            return choice
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for line in reversed(lines[-4:]):
-        candidate = _strip_markup(line)
-        match = _LETTER_LINE_RE.match(candidate)
-        if match:
-            return match.group(1).upper()
-        match = _PAREN_LETTER_RE.search(candidate)
-        if match:
-            return match.group(1).upper()
-        match = _ANSWER_LETTER_RE.search(candidate)
-        if match:
-            return match.group(1).upper()
+        choice = _choice_from_text(line)
+        if choice is not None:
+            return choice
     return None
+
+
+def _yes_no_from_text(text: str) -> str | None:
+    """One fragment -> "yes"/"no", or None.
+
+    The explicit verdict wins ("it might seem yes at first, but the answer is
+    no" is a NO); otherwise the LAST polarity token decides, because the final
+    clause is where the model states its conclusion.
+    """
+    match = _ANSWER_YES_NO_RE.search(text)
+    if match:
+        return match.group(1).lower()
+    matches = _YES_NO_RE.findall(text)
+    return matches[-1].lower() if matches else None
 
 
 def _extract_yes_no(text: str) -> str | None:
     boxed = _last_boxed(text)
     if boxed is not None:
-        match = _YES_NO_RE.search(boxed)
-        if match:
-            return match.group(1).lower()
+        verdict = _yes_no_from_text(boxed)
+        if verdict is not None:
+            return verdict
     line = _last_nonempty_line(text)
     if line:
-        match = _YES_NO_RE.search(line)
-        if match:
-            return match.group(1).lower()
-    matches = _YES_NO_RE.findall(text[-300:])
-    return matches[-1].lower() if matches else None
+        verdict = _yes_no_from_text(line)
+        if verdict is not None:
+            return verdict
+    return _yes_no_from_text(text[-300:])
 
 
 def _gold_choice(answer) -> str | None:

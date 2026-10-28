@@ -121,6 +121,11 @@ class TestLogicAnswerMatch:
     def test_numeric_mismatch(self):
         assert not logic_answer_match("41", "42")
 
+    def test_numeric_mismatch_is_not_hidden_by_a_relative_tolerance(self):
+        # Regression: rel_tol=1e-6 accepted 1000000.5 for a gold of 1000000.
+        assert not logic_answer_match("1000000.5", "1000000")
+        assert not logic_answer_match("0.0000005", "0")
+
     def test_grid_structural(self):
         # SynLogic arc_agi style: ground truth serialised via json.dumps.
         gt = json.dumps([[1, 9], [0, 1]])
@@ -131,6 +136,13 @@ class TestLogicAnswerMatch:
     def test_grid_numeric_tolerance(self):
         gt = json.dumps([[1.0, 2.0]])
         assert logic_answer_match("[[1, 2]]", gt)
+
+    def test_non_integral_grid_cell_is_not_truncated(self):
+        # Regression: int() turned [[1.7, 2]] into [[1, 2]] and matched; JSON
+        # booleans were read as 1/0.  Neither shape is an integer grid.
+        assert not logic_answer_match("[[1.7, 2]]", "[[1, 2]]")
+        assert not logic_answer_match("[[-1.9, 2]]", "[[-1, 2]]")
+        assert not logic_answer_match("[[true, false]]", "[[1, 0]]")
 
     def test_non_finite_grid_is_not_a_crash(self):
         # ``ast``/``json`` decode "1e999" and "Infinity" to inf; int(inf) used
@@ -714,6 +726,20 @@ class TestGtSegmentMatch:
         resp = think_wrap("The final answer is: $\\boxed{\\dfrac{W\\left( \\dfrac{ac}{b} \\right)}{b}}$.")
         assert not _gt_segment_match(resp, self.GT)
         assert not _math_last_resort(resp, self.GT)
+
+    def test_given_quantity_segment_not_credited(self):
+        """Regression: every segment used to be creditable, so boxing a given
+        quantity from the problem prose (``$5$ apples``) scored 1.0."""
+        pytest.importorskip("math_verify")
+        gt = "There are $5$ apples and $3$ pears, so the answer is $8$."
+        assert not _gt_segment_match(think_wrap("The answer is $\\boxed{5}$."), gt)
+        assert not _gt_segment_match(think_wrap("The answer is $\\boxed{3}$."), gt)
+        assert _gt_segment_match(think_wrap("The answer is $\\boxed{8}$."), gt)
+
+    def test_decoration_symbol_segment_not_credited(self):
+        pytest.importorskip("math_verify")
+        # The trailing ``$W$`` is decoration, not an answer candidate.
+        assert not _gt_segment_match(think_wrap("The answer is $\\boxed{W}$."), self.GT)
 
     def test_single_segment_gt_out_of_scope(self):
         pytest.importorskip("math_verify")

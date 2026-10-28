@@ -40,7 +40,9 @@ Routing (data_source prefix -> verifier):
                      language (``Выполнимо`` vs ``Yes``); each math segment of
                      a prose gt is retried as the gold (``... is given by
                      $x = ...$, where $W$ is ...`` -- the whole-sentence
-                     \boxed{} parse otherwise locks onto the trailing ``$W$``);
+                     \boxed{} parse otherwise locks onto the trailing ``$W$``;
+                     only the rightmost substantive segment is credited, so a
+                     given quantity from an earlier segment cannot score);
                      a single branch of an
                      explicit ``X or Y`` multi-solution gt is credited
                      (``-12 \text{ or } 4`` vs ``4`` -- the strict verifier
@@ -1034,13 +1036,15 @@ def _gt_segment_match(solution_str: str, ground_truth: str) -> bool:
     verl's math_verify wrapper wraps the WHOLE ground truth in ``\\boxed{...}``
     before parsing, and math_verify extracts rightmost-first, so when the last
     segment is decoration (``$W$``) the gold parses as that bare symbol and the
-    correct answer can never match.  Re-parse each embedded math segment as the
+    correct answer can never match.  Re-parse the embedded math segments as the
     gold and re-run math_verify's own ``verify`` against the response's
-    extracted expressions; any hit credits.  A single-segment (or segment-free)
-    ground truth is already the strict verifier's territory, and segments that
-    fail to parse are simply skipped, so a currency-``$`` or otherwise noisy
-    prose ground truth cannot produce spurious credit.  Bounded by
-    ``_GT_SEG_MAX``/``_GT_SEG_MAX_CHARS``.  Additive-only: it runs after the
+    extracted expressions; only the RIGHTMOST substantive segment is credited
+    (trailing bare-symbol decoration is skipped), so a response boxing a given
+    quantity from an earlier segment cannot score.  A single-segment (or
+    segment-free) ground truth is already the strict verifier's territory, and
+    segments that fail to parse are simply skipped, so a currency-``$`` or
+    otherwise noisy prose ground truth cannot produce spurious credit.  Bounded
+    by ``_GT_SEG_MAX``/``_GT_SEG_MAX_CHARS``.  Additive-only: it runs after the
     strict verifiers failed, so it can turn a 0 into a 1 but never a 1 into a 0.
     """
     segs = [s.strip() for s in _GT_LATEX_SEG_RE.findall(ground_truth)]
@@ -1048,6 +1052,7 @@ def _gt_segment_match(solution_str: str, ground_truth: str) -> bool:
     if not (2 <= len(segs) <= _GT_SEG_MAX):
         return False
     try:
+        import sympy as sp
         from math_verify.grader import verify
         from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
     except ImportError:
@@ -1063,26 +1068,46 @@ def _gt_segment_match(solution_str: str, ground_truth: str) -> bool:
         return False
     if not pred_exprs:
         return False
+    parsed_segs = []
     for seg in segs:
         try:
             golds = parse(f"${_normalise_gt_latex(seg)}$", (LatexExtractionConfig(),), parsing_timeout=None)
         except Exception:
             continue
-        for g in golds:
-            for p in pred_exprs:
+        exprs = [g if not isinstance(g, tuple) else g[0] for g in golds]
+        exprs = [g for g in exprs if hasattr(g, "free_symbols")]
+        if exprs:
+            parsed_segs.append(exprs)
+    # Only the RIGHTMOST substantive segment may be credited.  Prose ground
+    # truths list the given quantities in earlier ``$...$`` segments (``There
+    # are $5$ apples and $3$ pears, so the answer is $8$``); crediting any
+    # segment would award 1.0 to a response that boxes a given number instead
+    # of the answer.  A trailing bare symbol is decoration (``where $W$ is the
+    # Lambert W-function``), so it is skipped and the answer before it stays
+    # reachable.  A segment that fails to parse cannot outrank anything.
+    answer_exprs = None
+    for exprs in reversed(parsed_segs):
+        if all(isinstance(e, sp.Symbol) for e in exprs):
+            continue
+        answer_exprs = exprs
+        break
+    if answer_exprs is None:
+        return False
+    for g in answer_exprs:
+        for p in pred_exprs:
+            try:
                 try:
-                    try:
-                        # timeout_seconds=None: verify's default signal/process-
-                        # based timeout does not work in the reward thread pool
-                        # (signal.alarm is main-thread-only) -- inputs are
-                        # bounded, so an unbounded compare is safe here.
-                        hit = verify(g, p, timeout_seconds=None)
-                    except TypeError:  # older math_verify without timeout_seconds
-                        hit = verify(g, p)
-                except Exception:
-                    continue
-                if hit:
-                    return True
+                    # timeout_seconds=None: verify's default signal/process-
+                    # based timeout does not work in the reward thread pool
+                    # (signal.alarm is main-thread-only) -- inputs are
+                    # bounded, so an unbounded compare is safe here.
+                    hit = verify(g, p, timeout_seconds=None)
+                except TypeError:  # older math_verify without timeout_seconds
+                    hit = verify(g, p)
+            except Exception:
+                continue
+            if hit:
+                return True
     return False
 
 
@@ -1647,7 +1672,21 @@ def _parse_grid_matrix(text: str) -> list[list[int]] | None:
             return None
         rows = obj if all(isinstance(r, list | tuple) for r in obj) else [obj]
         try:
-            return [[int(x) for x in row] for row in rows]
+            # Cells must be INTEGRAL numbers.  ``int()`` alone truncates
+            # (``[[1.7, 2]]`` would become ``[[1, 2]]`` and match a gold grid)
+            # and would read JSON ``true``/``false`` as 1/0 -- both credit a
+            # wrong answer, so a non-integral or boolean cell is not a grid.
+            grid: list[list[int]] = []
+            for row in rows:
+                cells = []
+                for cell in row:
+                    if isinstance(cell, bool) or not isinstance(cell, int | float):
+                        raise ValueError("non-numeric grid cell")
+                    if isinstance(cell, float) and not cell.is_integer():
+                        raise ValueError("non-integral grid cell")
+                    cells.append(int(cell))
+                grid.append(cells)
+            return grid
         except (TypeError, ValueError, OverflowError):
             # ``ast``/``json`` decode ``1e999`` and ``Infinity`` to a non-finite
             # float, which is not a grid cell and which ``int()`` refuses with
@@ -1736,9 +1775,13 @@ def logic_answer_match(prediction: str | None, ground_truth: str, task: str | No
         return False
     if pred_norm == gt_norm:
         return True
-    # Numeric fast path (handles "42" vs "42.0").
+    # Numeric fast path (handles "42" vs "42.0").  The comparison is EXACT:
+    # a relative tolerance here would credit a wrong value whose magnitude is
+    # large enough to hide the difference (``1000000.5`` vs ``1000000`` under
+    # ``rel_tol=1e-6``), and every numeric answer in these domains is a single
+    # literal, not a computed float.  Non-numeric forms raise and fall through.
     try:
-        return math.isclose(float(pred_norm), float(gt_norm), rel_tol=1e-6, abs_tol=1e-6)
+        return float(pred_norm) == float(gt_norm)
     except (ValueError, OverflowError):
         pass
     # Structural path (grids / lists; SynLogic arc_agi answers are nested lists

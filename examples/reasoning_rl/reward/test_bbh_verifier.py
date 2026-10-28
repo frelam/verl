@@ -75,6 +75,33 @@ def test_mcq_rejects_the_wrong_letter():
     assert verify_bbh(_solution("(C)"), gt, "bbh_disambiguation_qa") == 1.0
 
 
+def test_mcq_reads_the_verdict_not_a_mentioned_option():
+    """Regression: a first parenthesised letter used to win, so a response that
+    named an option only to reject it scored as that option."""
+    b_gt = _gt("geometric_shapes", "B")
+    a_gt = _gt("geometric_shapes", "A")
+    assert verify_bbh(_solution("Between (A) and (B), the answer is (B)."), b_gt, "bbh_geometric_shapes") == 1.0
+    assert verify_bbh(_solution("Option (A) is wrong; the answer is (B)."), a_gt, "bbh_geometric_shapes") == 0.0
+    assert verify_bbh(_solution("Option (A) is wrong; the answer is (B)."), b_gt, "bbh_geometric_shapes") == 1.0
+
+
+def test_mcq_ambiguous_option_echo_is_not_guessed():
+    """An echoed option list has several letters; only a TRAILING choice is
+    read, so the gold is not credited by a letter mentioned mid-sentence."""
+    a_gt = _gt("geometric_shapes", "A")
+    b_gt = _gt("geometric_shapes", "B")
+    body = "The choices are (A) cone, (B) sphere. I pick (B)."
+    assert verify_bbh(_solution(body), a_gt, "bbh_geometric_shapes") == 0.0
+    assert verify_bbh(_solution(body), b_gt, "bbh_geometric_shapes") == 1.0
+    assert verify_bbh(_solution("Option (A) is not correct."), a_gt, "bbh_geometric_shapes") == 0.0
+
+
+def test_mcq_keeps_the_correct_option_phrasing():
+    b_gt = _gt("geometric_shapes", "B")
+    assert verify_bbh(_solution("Option B is correct."), b_gt, "bbh_geometric_shapes") == 1.0
+    assert verify_bbh(_solution("Option (A) is correct."), b_gt, "bbh_geometric_shapes") == 0.0
+
+
 def test_movie_uses_the_same_letter_contract():
     gt = _gt("movie_recommendation", "D")
     assert verify_bbh(_solution("\\boxed{D}"), gt, "bbh_movie_recommendation") == 1.0
@@ -91,6 +118,16 @@ def test_causal_accepts_yes_no_in_any_case():
     assert verify_bbh(_solution("Yes."), gt, "bbh_causal_judgement") == 1.0
     assert verify_bbh(_solution("\\boxed{yes}"), gt, "bbh_causal_judgement") == 1.0
     assert verify_bbh(_solution("No."), gt, "bbh_causal_judgement") == 0.0
+
+
+def test_causal_reads_the_stated_verdict_not_the_first_token():
+    """Regression: the first yes/no on the last line used to win, so "it might
+    seem yes ... but the answer is no" was scored as YES."""
+    yes_gt = _gt("causal_judgement", "Yes")
+    no_gt = _gt("causal_judgement", "No")
+    body = "It might seem yes at first, but the answer is no."
+    assert verify_bbh(_solution(body), no_gt, "bbh_causal_judgement") == 1.0
+    assert verify_bbh(_solution(body), yes_gt, "bbh_causal_judgement") == 0.0
 
 
 # ---------------------------------------------------------------------------
