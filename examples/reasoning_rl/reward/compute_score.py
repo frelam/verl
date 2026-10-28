@@ -1350,9 +1350,42 @@ def _align_callable_name(solution_str: str, ground_truth: str):
     return json.dumps({**payload, "fn_name": chosen})
 
 
+def _unverifiable_code_ground_truth(ground_truth) -> bool:
+    """True when a code test payload cannot actually prove correctness.
+
+    ``sandbox_fusion`` scores a case as passed whenever ``expected_output is
+    None`` (that branch exists for the ``assert_case`` protocol, where the
+    assertion appended to the solution is the real check).  A plain
+    ``inputs``/``outputs`` payload whose outputs are null therefore awards 1.0
+    to ANY solution that merely exits cleanly -- a pure "lucky guess" hole.
+    Fail closed for that shape instead of trusting the verifier's default.
+    """
+    try:
+        payload = json.loads(ground_truth) if isinstance(ground_truth, str) else ground_truth
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("assert_case"), list):
+        return False
+    outputs = payload.get("outputs")
+    if not isinstance(outputs, list):
+        return True
+    return any(output is None for output in outputs)
+
+
 def _code_score(
     solution_str: str, ground_truth: str, sandbox_fusion_url, concurrent_semaphore, memory_limit_mb
 ) -> float:
+    # ``continuous=False`` scores against EVERY stored test case.  The continuous
+    # mode only runs the first 10 cases and reports their pass rate, so a solution
+    # that is wrong on cases 11+ still scores 1.0 -- which lets a partially correct
+    # (or "lucky") implementation look fully correct and leak into fine-tuning
+    # data.  Dataset builders additionally gate on ``score >= 1.0``; that gate is
+    # only meaningful when every case must pass.
+    if _unverifiable_code_ground_truth(ground_truth):
+        logger.warning("[reasoning_rl] code row has no usable expected outputs; scoring 0")
+        return 0.0
     try:
         ground_truth = _align_callable_name(solution_str, ground_truth)
         if sandbox_fusion_url:
@@ -1364,12 +1397,12 @@ def _code_score(
                 memory_limit_mb,
                 solution_str,
                 ground_truth,
-                continuous=True,
+                continuous=False,
             )
         else:
             from verl.utils.reward_score import prime_code
 
-            res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+            res = prime_code.compute_score(solution_str, ground_truth, continuous=False)
         # Both return (score, metadata_list).
         return float(res[0])
     except Exception as e:

@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compute_score import (
     _REP_MIN_COUNT,
     _align_callable_name,
+    _code_score,
     _conditional_match,
     _dedupe_keep_order,
     _evaluated_gt_match,
@@ -37,6 +38,7 @@ from compute_score import (
     _numeric_literal_match,
     _or_branch_match,
     _repetition_penalty,
+    _unverifiable_code_ground_truth,
     _yes_no_match,
     compute_score,
     extract_logic_answer,
@@ -1127,6 +1129,44 @@ class TestCodeCallableNameAlignment:
         gt = json.dumps({"inputs": ["1\n"], "outputs": ["1\n"]})
         sol = think_wrap("```python\ndef anything():\n    pass\n```")
         assert _align_callable_name(sol, gt) == gt
+
+
+# ---------------------------------------------------------------------------
+# code strictness: a payload with no expected output must never pass
+# ---------------------------------------------------------------------------
+
+
+class TestCodeStrictScoring:
+    """``sandbox_fusion`` auto-passes a case whose expected output is ``None``.
+
+    That branch exists for the ``assert_case`` protocol; on a plain
+    ``inputs``/``outputs`` payload it lets any cleanly-exiting solution score
+    1.0, so the dispatcher has to fail closed before reaching the sandbox.
+    """
+
+    def test_null_expected_output_is_unverifiable(self):
+        gt = json.dumps({"inputs": ["1\n"], "outputs": [None]})
+        assert _unverifiable_code_ground_truth(gt) is True
+
+    def test_missing_outputs_is_unverifiable(self):
+        assert _unverifiable_code_ground_truth(json.dumps({"inputs": ["1\n"]})) is True
+
+    def test_regular_outputs_are_verifiable(self):
+        gt = json.dumps({"inputs": ["1\n"], "outputs": ["1\n"]})
+        assert _unverifiable_code_ground_truth(gt) is False
+
+    def test_assert_case_payload_is_left_to_the_assertion(self):
+        gt = json.dumps({"assert_case": ["assert solve(1) == 2"]})
+        assert _unverifiable_code_ground_truth(gt) is False
+
+    def test_non_json_payload_is_not_rejected_here(self):
+        assert _unverifiable_code_ground_truth("not json") is False
+
+    def test_code_score_fails_closed_without_expected_output(self):
+        sol = think_wrap("```python\nprint(1)\n```")
+        gt = json.dumps({"inputs": ["1\n"], "outputs": [None]})
+        # No sandbox is contacted: the guard returns before the verifier import.
+        assert _code_score(sol, gt, None, None, None) == 0.0
 
 
 # ---------------------------------------------------------------------------
