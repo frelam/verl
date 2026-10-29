@@ -1196,6 +1196,81 @@ class TestCodeStrictScoring:
 
 
 # ---------------------------------------------------------------------------
+# prime_code (local verifier) non-continuous verdict
+# ---------------------------------------------------------------------------
+
+
+def _load_prime_code(monkeypatch, res, metadata):
+    """Load the vendored prime_code wrapper with a stubbed executor.
+
+    ``verl/__init__.py`` imports ray, so the module is loaded straight from its
+    file and its ``.utils`` dependency is replaced by a stub returning ``res``.
+    """
+    import importlib.util
+    import types
+
+    pkg_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))),
+        "verl",
+        "utils",
+        "reward_score",
+        "prime_code",
+    )
+    fake_utils = types.ModuleType("prime_code_under_test.utils")
+    fake_utils.check_correctness = lambda in_outs, generation, timeout=5, debug=False: (res, metadata)
+    monkeypatch.setitem(sys.modules, "prime_code_under_test.utils", fake_utils)
+    spec = importlib.util.spec_from_file_location("prime_code_under_test", os.path.join(pkg_dir, "__init__.py"))
+    module = importlib.util.module_from_spec(spec)
+    module.__package__ = "prime_code_under_test"
+    module.__path__ = [pkg_dir]
+    monkeypatch.setitem(sys.modules, "prime_code_under_test", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestPrimeCodeNonContinuous:
+    """``continuous=False`` must return an all-or-nothing verdict.
+
+    The per-sample loop that binds ``metadata_list`` only runs in continuous
+    mode, so a failing solution used to fall through to the final return with
+    the name unbound (``UnboundLocalError``), which ``_code_score`` then
+    swallowed as a "code verify error" warning on every wrong rollout.
+    """
+
+    GT = json.dumps({"inputs": ['"ab"'], "outputs": ["AB"], "fn_name": "make_acronym"})
+    SOL = "```python\ndef make_acronym(s):\n    return s.upper()\n```"
+
+    def test_failing_case_returns_zero_without_crashing(self, monkeypatch):
+        mod = _load_prime_code(monkeypatch, [True, False], [{"error_message": "Wrong Answer"}])
+        success, metadata = mod.compute_score(self.SOL, self.GT, continuous=False)
+        assert success is False
+        assert metadata == [{"error_message": "Wrong Answer"}]
+
+    def test_all_cases_passing_scores_one(self, monkeypatch):
+        mod = _load_prime_code(monkeypatch, [True, True], [{}])
+        success, _ = mod.compute_score(self.SOL, self.GT, continuous=False)
+        assert success is True
+
+    def test_no_case_executed_is_not_a_pass(self, monkeypatch):
+        mod = _load_prime_code(monkeypatch, [], [{}])
+        success, _ = mod.compute_score(self.SOL, self.GT, continuous=False)
+        assert success is False
+
+    def test_verifier_crash_fails_closed(self, monkeypatch):
+        # The old fall-through reported this as ``UnboundLocalError: success``
+        # because the batch check raised before the name was ever assigned.
+        mod = _load_prime_code(monkeypatch, [True], [{}])
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("verifier crashed")
+
+        monkeypatch.setattr(mod, "apps_check_correctness", boom)
+        success, metadata = mod.compute_score(self.SOL, self.GT, continuous=False)
+        assert success is False
+        assert metadata == [{}]
+
+
+# ---------------------------------------------------------------------------
 # instruction-following grading modes (stage 4, D31)
 # ---------------------------------------------------------------------------
 

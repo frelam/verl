@@ -21,6 +21,10 @@ from .utils import check_correctness as apps_check_correctness
 def compute_score(completion, test_cases, continuous=False):
     # try to get code solution from completion. if the completion is pure code, this will not take effect.
     solution = completion.split("```python")[-1].split("```")[0]
+    # Fail closed by default: every path below must be able to reach the final
+    # ``return success, metadata_list`` even when the verifier itself blows up.
+    success = False
+    metadata_list = None
     try:
         try:
             if not isinstance(test_cases, dict):
@@ -32,11 +36,21 @@ def compute_score(completion, test_cases, continuous=False):
         try:
             res, metadata = apps_check_correctness(in_outs=test_cases, generation=solution, timeout=5, debug=False)
             metadata = dict(enumerate(metadata))[0]
-            success = all(map(lambda x: x is True, res))
-            if success:
-                return success, metadata
+            # An empty ``res`` means no case actually ran, which must not count as a pass.
+            success = bool(res) and all(map(lambda x: x is True, res))
         except Exception:
-            pass
+            success = False
+            metadata = {}
+
+        # With ``continuous=False`` the batch check above is the whole verdict
+        # (all-or-nothing over every stored case). The per-sample loop below only
+        # exists to build a partial pass rate for ``continuous=True`` and stops
+        # after 10 cases, so falling through used to hit the final
+        # ``return success, metadata_list`` with ``metadata_list`` never bound.
+        if not continuous:
+            return success, [metadata]
+        if success:
+            return success, metadata
 
         test_cases_list = []
         inputs = test_cases["inputs"]
