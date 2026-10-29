@@ -87,6 +87,11 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
+try:  # `datasets` already depends on tqdm; stay importable in minimal environments
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - fall back to the plain [progress] log
+    tqdm = None
+
 from common import (
     append_done,
     append_jsonl,
@@ -341,6 +346,18 @@ def main(argv: list[str] | None = None) -> int:
             _convert(args.output_dir)
         return 0
 
+    # One bar per process; disable=None keeps it off when stderr is not a TTY
+    # (e.g. nohup), so redirected logs do not fill up with carriage returns.
+    progress = None
+    if tqdm is not None:
+        progress = tqdm(
+            total=len(pending),
+            desc=f"dataset A shard {args.shard_index}/{args.num_shards}",
+            unit="prompt",
+            dynamic_ncols=True,
+            disable=None,
+        )
+
     model_id = resolve_model_id(args.base_url, args.api_key, args.model)
     logger.info("served model: %s", model_id)
     reward_fn = load_reward()
@@ -363,6 +380,11 @@ def main(argv: list[str] | None = None) -> int:
                 len(queue),
                 args.n,
             )
+            if progress is not None:
+                progress.set_description(
+                    f"dataset A shard {args.shard_index}/{args.num_shards} "
+                    f"resample {round_index}/{empty_rounds}"
+                )
         for start in range(0, len(queue), batch_size):
             batch = queue[start : start + batch_size]
             with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -458,6 +480,18 @@ def main(argv: list[str] | None = None) -> int:
             append_jsonl(samples_path, finished_rows)
             append_done(done_path, finished_done)
 
+            # Only prompts finalised in this batch advance the bar: a prompt that
+            # was re-queued moves forward in a later resample round, not twice.
+            if progress is not None:
+                progress.update(len(finished_done))
+                progress.set_postfix(
+                    round=round_index,
+                    kept=counters["kept"],
+                    retried=counters["prompts_retried"],
+                    errors=counters["generation_errors"],
+                    refresh=False,
+                )
+
             if counters["prompts_sampled"] - last_logged >= max(1, args.log_every):
                 last_logged = counters["prompts_sampled"]
                 elapsed = time.time() - started
@@ -478,6 +512,9 @@ def main(argv: list[str] | None = None) -> int:
                     counters["generation_errors"],
                 )
         queue = retry_queue
+
+    if progress is not None:
+        progress.close()
 
     run_stats = dict(counters)
     run_stats["empty_rounds"] = empty_rounds
