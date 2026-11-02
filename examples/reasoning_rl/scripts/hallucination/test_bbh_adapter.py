@@ -225,3 +225,48 @@ def test_load_movielens_and_build_movie_rows_from_csv(tmp_path):
         assert len(options) == 4
         assert len({option["text"] for option in options}) == 4
         assert row["extra_info"]["correct_option_id"] in {option["id"] for option in options}
+
+
+# ---------------------------------------------------------------------------
+# answer-format hint (stage 4)
+# ---------------------------------------------------------------------------
+
+
+def test_row_carries_the_task_answer_format_hint():
+    # Every BBH row tells the model which answer shape the verifier reads.  The
+    # generators keep the benchmark's own wording (their unit tests pin it), so
+    # the hint is added at row-assembly time instead.
+    for task, hint in adapter.ANSWER_FORMAT_HINT.items():
+        generated = adapter.Generated(prompt="Some problem?", answer="A")
+        row = adapter.make_row(task, generated, index=0, seed=0)
+        content = row["prompt"][0]["content"]
+        assert content.startswith("Some problem?")
+        assert content.endswith(hint)
+        assert content.count(hint) == 1
+        # The generated problem itself is untouched.
+        assert generated.prompt == "Some problem?"
+
+
+def test_answer_format_hint_is_not_duplicated():
+    for task, hint in adapter.ANSWER_FORMAT_HINT.items():
+        generated = adapter.Generated(prompt="Some problem? " + hint, answer="A")
+        row = adapter.make_row(task, generated, index=0, seed=0)
+        assert row["prompt"][0]["content"].count(hint) == 1
+
+
+def test_dyck_prompt_keeps_the_prefix_after_the_input_marker():
+    # The hint is appended on its own trailing line, so everything between
+    # "Input: " and that line must still be exactly the generated prefix (the
+    # generator test recovers the prefix by splitting on this marker).
+    generated = adapter.generate_dyck(random.Random(11), 0)
+    row = adapter.make_row(adapter.TASK_DYCK, generated, index=0, seed=0)
+    content = row["prompt"][0]["content"]
+    hint = adapter.ANSWER_FORMAT_HINT[adapter.TASK_DYCK]
+    assert content.endswith(hint)
+    body = content[: -len(hint)].rstrip()
+    prefix = body.split("Input: ", 1)[1].split()
+    assert prefix == generated.prompt.split("Input: ", 1)[1].split()
+    # The problem itself is unchanged once the hint line is removed.
+    assert adapter.prompt_key(row["prompt"]) == adapter.prompt_key(
+        [{"role": "user", "content": generated.prompt}]
+    )

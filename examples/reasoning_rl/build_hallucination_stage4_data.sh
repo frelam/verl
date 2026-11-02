@@ -103,8 +103,15 @@
 #                         STAGE3_ABILITY_PROFILE (D30 design counts).
 #   VAL_SIZE=700          hallucination-domain val rows
 #   IF_RATIO=0.15         instruction-following share of the final train set
-#   IF_GRADING_MODE=binary  IF reward mode written into the ground truth
-#                           (binary = NeMo-Gym all-or-nothing; fraction = passed/total)
+#   IF_GRADING_MODE=fraction  IF reward mode written into the ground truth
+#                           (fraction = passed/total; binary = NeMo-Gym
+#                           all-or-nothing).  Fraction is the stage-4 default:
+#                           an IF row carries up to five constraints, so the
+#                           all-or-nothing signal is ~0 for most groups, and the
+#                           fully-async trainer cannot filter uniform-reward
+#                           groups (no algorithm.filter_groups), which would
+#                           waste the 15% IF share.  Set binary for a strict
+#                           IFBench-comparable run.
 #   IF_QUOTA=0            cap on IF rows in the pool (0 = all admissible rows)
 #   IF_MINHASH_THRESHOLD=0  optional in-pool near-dedup for the IF pool
 #   IF_PATH               local jsonl/parquet override for the IF source
@@ -171,7 +178,7 @@ VAL_SIZE=${VAL_SIZE:-700}
 SEED=${SEED:-44}
 
 IF_RATIO=${IF_RATIO:-0.15}
-IF_GRADING_MODE=${IF_GRADING_MODE:-binary}
+IF_GRADING_MODE=${IF_GRADING_MODE:-fraction}
 IF_QUOTA=${IF_QUOTA:-0}
 IF_MINHASH_THRESHOLD=${IF_MINHASH_THRESHOLD:-0}
 IF_PATH=${IF_PATH:-}

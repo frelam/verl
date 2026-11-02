@@ -1145,3 +1145,37 @@ class TestLengthPenalty:
             targets={"a": 100}, coef=1.0, max_penalty=5.0,
         )
         assert score == pytest.approx(0.01)
+    def test_partial_credit_survives_a_saturating_penalty(self):
+        # IF ``grading_mode="fraction"``: a row that passed 2 of 5 constraints
+        # scores 0.4.  The 0.5-point penalty cap is calibrated for full-credit
+        # rows, so applying it additively would zero this row and destroy the
+        # partial credit the fraction mode exists to provide.
+        score, aux = apply_length_penalty(
+            "if_nemotron", {}, "x" * 1_000, 0.4,
+            targets={"if_nemotron": 100}, coef=0.2, max_penalty=0.5,
+        )
+        assert aux["length_penalty"] == pytest.approx(0.5)
+        # Floored at score * (1 - max_penalty) = 0.2, not 0.0.
+        assert score == pytest.approx(0.2)
+
+    def test_partial_credit_ordering_is_preserved(self):
+        # Same constraint score, different lengths: the shorter row must still
+        # win, and neither may fall below the floor.
+        longer, _ = apply_length_penalty(
+            "if_nemotron", {}, "x" * 1_000, 0.4,
+            targets={"if_nemotron": 100}, coef=0.2, max_penalty=0.5,
+        )
+        shorter, _ = apply_length_penalty(
+            "if_nemotron", {}, "x" * 150, 0.4,
+            targets={"if_nemotron": 100}, coef=0.2, max_penalty=0.5,
+        )
+        assert shorter >= longer
+        assert longer >= 0.4 * (1.0 - 0.5) - 1e-9
+
+    def test_full_credit_floor_is_unchanged(self):
+        # The original guarantee on a 1.0 row is unchanged: 1 - max_penalty.
+        score, _ = apply_length_penalty(
+            "a", {}, "x" * 10_000, 1.0,
+            targets={"a": 100}, coef=1.0, max_penalty=0.5,
+        )
+        assert score == pytest.approx(0.5)

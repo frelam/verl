@@ -113,6 +113,22 @@ DATA_SOURCES = {
 ABILITY = "bbh"
 DOMAIN = "bbh"
 
+#: Training-time answer-format hint per task (stage 4, D32).  The BBH verifier
+#: accepts both a boxed answer and a bare final line, but the benchmark prompts
+#: themselves never say which shape they want, so a model trained on a mix that
+#: otherwise always asks for \boxed{} drifts between shapes and loses parseable
+#: answers to the extractor rather than to its reasoning.  The hint is appended
+#: at row-assembly time (see make_row) so the generators keep emitting the
+#: benchmark's own wording and validate_generated still sees the raw problem.
+ANSWER_FORMAT_HINT: dict[str, str] = {
+    TASK_DYCK: "Reply with only the missing closing brackets.",
+    TASK_GEOMETRIC: "Reply with only the option letter, e.g. (B).",
+    TASK_DISAMBIGUATION: "Reply with only the option letter, e.g. (A).",
+    TASK_CAUSAL: "Reply with only Yes or No.",
+    TASK_MOVIE: "Reply with only the option letter, e.g. (C).",
+}
+
+
 DEFAULT_RAW_DIR = os.path.expanduser("~/data/reasoning_rl/halluc/raw/bbh")
 # Same convention as every other adapter: the default output lives in the
 # directory test_mix_halluc asserts against; the stage-4 build overrides it with
@@ -158,6 +174,12 @@ def prompt_key(prompt: list[dict]) -> str:
     brackets) onto one key.
     """
     text = " ".join(str(message.get("content", "")) for message in prompt or [])
+    # The answer-format hint is appended by make_row, not generated with the
+    # problem.  It must not enter the key: otherwise the same Dyck prefix (or the
+    # same option block) would look like a new prompt to --exclude-path and to
+    # the in-pool dedup, and a previously trained row would be re-drawn.
+    for hint in ANSWER_FORMAT_HINT.values():
+        text = text.replace(hint, " ")
     return " ".join(text.split()).casefold()
 
 
@@ -179,9 +201,14 @@ def make_row(task: str, generated: Generated, index: int, seed: int) -> dict:
             "correct_option_id": generated.correct_option_id,
         }
     )
+    content = generated.prompt
+    hint = ANSWER_FORMAT_HINT.get(task)
+    if hint and hint not in content:
+        # chr(10) rather than an escape so the literal is whole-file grep-able.
+        content = content + chr(10) + hint
     return {
         "data_source": DATA_SOURCES[task],
-        "prompt": [{"role": "user", "content": generated.prompt}],
+        "prompt": [{"role": "user", "content": content}],
         "ability": ABILITY,
         "reward_model": {
             "style": "rule",

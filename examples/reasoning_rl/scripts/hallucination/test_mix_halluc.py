@@ -1681,3 +1681,60 @@ class TestStage4HardMath:
                 "--val_size", "0",
                 "--hard_math_val_size", "0",
             ])
+    def test_hard_math_draw_is_stratified_by_pass_rate(self):
+        # The draw is balanced across measured pass-rate bands, so a pool that
+        # is mostly 1/8-pass cannot fill the domain with near-hopeless rows.
+        bands = mix_halluc.DEFAULT_HARD_MATH_PASS_RATE_WEIGHTS
+        assert bands == {0: 0.2, 1: 0.3, 2: 0.3, 3: 0.2}
+        rows = []
+        for band, rate in enumerate((0.05, 0.30, 0.60, 0.95)):
+            for i in range(400):
+                rows.append({"data_source": "only", "extra_info": {"pass_rate": rate}, "id": f"{band}-{i}"})
+        train, _val, report = mix_halluc.take_weighted_rows(
+            rows,
+            {"only": 1.0},
+            n_train=400,
+            n_val=0,
+            rng=random.Random(3),
+            strata_key=mix_halluc._pass_rate_band,
+            strata_weights=bands,
+        )
+        assert len(train) == 400
+        by_band = Counter(mix_halluc._pass_rate_band(row) for row in train)
+        # 20/30/30/20 over 400 rows -> 80/120/120/80.
+        assert by_band == {0: 80, 1: 120, 2: 120, 3: 80}
+        assert report["train_allocation"] == {"only": 400}
+
+    def test_stratified_draw_degrades_to_uniform_without_pass_rates(self):
+        # --skip-difficulty-filter leaves pass_rate at the -1 sentinel: every
+        # row lands in one band, and the draw must still fill the budget.
+        rows = [{"data_source": "only", "extra_info": {"pass_rate": -1.0}, "id": i} for i in range(400)]
+        train, _val, _report = mix_halluc.take_weighted_rows(
+            rows,
+            {"only": 1.0},
+            n_train=250,
+            n_val=0,
+            rng=random.Random(4),
+            strata_key=mix_halluc._pass_rate_band,
+            strata_weights=mix_halluc.DEFAULT_HARD_MATH_PASS_RATE_WEIGHTS,
+        )
+        assert len(train) == 250
+
+    def test_a_short_band_hands_its_share_to_the_others(self):
+        rows = []
+        for band, rate in enumerate((0.05, 0.30, 0.60, 0.95)):
+            supply = 5 if band == 0 else 400
+            for i in range(supply):
+                rows.append({"data_source": "only", "extra_info": {"pass_rate": rate}, "id": f"{band}-{i}"})
+        train, _val, _report = mix_halluc.take_weighted_rows(
+            rows,
+            {"only": 1.0},
+            n_train=300,
+            n_val=0,
+            rng=random.Random(5),
+            strata_key=mix_halluc._pass_rate_band,
+            strata_weights=mix_halluc.DEFAULT_HARD_MATH_PASS_RATE_WEIGHTS,
+        )
+        by_band = Counter(mix_halluc._pass_rate_band(row) for row in train)
+        assert len(train) == 300
+        assert by_band[0] == 5  # capped by supply, not by its 20% share

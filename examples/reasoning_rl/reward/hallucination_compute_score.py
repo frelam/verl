@@ -96,7 +96,10 @@ scored** row, subtracts::
 
 The penalty is applied only when the base score is > 0, so (a) ``-1`` keeps its
 single meaning (``judgment_only`` misrefusal), and (b) correctness ordering is
-preserved as long as ``length_penalty_max < 1``.  Rows whose ``data_source`` is
+preserved as long as ``length_penalty_max < 1`` -- on a *partial* base score
+(IF ``grading_mode="fraction"``) the result is additionally floored at
+``score * (1 - length_penalty_max)``, so the penalty never erases the whole
+partial credit.  Rows whose ``data_source`` is
 missing from the target file fall back to ``extra_info.domain`` and then to the
 file's ``__default__``.  With no target file the reward is byte-identical to the
 stage-2/3 behaviour.  Route: ``measure_length_targets.py`` -> ``length_targets.env``
@@ -787,7 +790,16 @@ def apply_length_penalty(
     penalty = 0.0
     if score > 0.0 and target is not None:
         penalty = _length_penalty(length, target, coef, max_penalty)
-        score = max(0.0, score - penalty)
+        # ``max_penalty`` is calibrated as points off a FULL-credit row.  A row
+        # whose base score is already partial -- IF ``grading_mode="fraction"``
+        # (passed / total), or any future graded branch -- must keep its own
+        # ordering, so the penalty may not remove the last ``max_penalty`` of
+        # the row's own score: an additive 0.5 would otherwise erase a 0.2
+        # point partial success and contradict the partial credit the fraction
+        # mode exists to provide.  On a 1.0 row the floor is exactly the
+        # documented ``1 - max_penalty`` ordering guarantee.
+        floor = score * (1.0 - max_penalty)
+        score = max(floor, score - penalty)
     return score, {
         "length_chars": length,
         "length_target": int(round(target)) if target is not None else 0,

@@ -1268,18 +1268,75 @@ def _apportion_with_supply(
     return allocation
 
 
+#: Stage 4 (D34): pass-rate bands for the hard-math draw.  ``pass_rate`` is
+#: measured on the stage-4 starting checkpoint over ``--difficulty-k`` samples, so
+#: it is the best available estimate of how much GRPO signal a row carries.
+PASS_RATE_BAND_COUNT = 4
+#: Share of the hard-math budget each band should receive.  The middle two bands
+#: (2-6 of 8 correct) dominate: that is where a group of ``rollout_n`` samples
+#: still has variance.  The lowest band is close to "always wrong" for a
+#: 16-sample group and the highest is close to "always right", and both kinds of
+#: group contribute no gradient in the fully-async trainer (it cannot filter
+#: uniform-reward groups).  Flattening the draw toward this profile stops a pool
+#: that is mostly 1/8-pass from filling the whole 15% domain.
+DEFAULT_HARD_MATH_PASS_RATE_WEIGHTS = {0: 0.20, 1: 0.30, 2: 0.30, 3: 0.20}
+
+
+def _pass_rate_band(row: dict) -> int:
+    """Band index of a row's measured pass rate, or -1 when unmeasured."""
+    try:
+        rate = float((row.get("extra_info") or {}).get("pass_rate"))
+    except (TypeError, ValueError):
+        return -1
+    if rate < 0.0:
+        return -1
+    return min(PASS_RATE_BAND_COUNT - 1, int(rate * PASS_RATE_BAND_COUNT))
+
+
+def _take_stratified(rows: list[dict], take: int, rng: random.Random, strata_key, strata_weights) -> list[dict]:
+    """Take ``take`` rows spread over ``strata_key`` bands instead of uniformly.
+
+    Bands are apportioned with the same ``_apportion_with_supply`` pass the
+    sources use, so a band whose supply is short hands its share to the other
+    bands rather than shrinking the domain.  A pool with no measured values
+    (``--skip-difficulty-filter``) falls back to one uniform stratum.
+    """
+    if take <= 0:
+        return []
+    bands: dict = defaultdict(list)
+    for row in rows:
+        bands[strata_key(row)].append(row)
+    for band_rows in bands.values():
+        rng.shuffle(band_rows)
+    weights = {band: float((strata_weights or {}).get(band, 0.0)) for band in bands}
+    if not any(weight > 0 for weight in weights.values()):
+        weights = {band: 1.0 for band in bands}
+    supply = {band: len(band_rows) for band, band_rows in bands.items()}
+    allocation = _apportion_with_supply(weights, take, supply)
+    chosen: list[dict] = []
+    for band in sorted(bands):
+        chosen.extend(bands[band][: allocation.get(band, 0)])
+    return chosen
+
+
 def take_weighted_rows(
     pool: list[dict],
     weights: dict[str, float],
     n_train: int,
     n_val: int,
     rng: random.Random,
+    strata_key=None,
+    strata_weights=None,
 ) -> tuple[list[dict], list[dict], dict]:
     """Split a weighted additive pool into train/val (BBH and hard math).
 
     Val is carved **before** train (the same rule as every other domain), and
     both allocations are capped by each source's supply.  A source without any
     rows is reported rather than silently disappearing from the weights.
+
+    ``strata_key`` / ``strata_weights`` optionally stratify the **train** draw
+    inside each source (the hard-math domain passes its measured pass-rate band
+    here); val stays a plain uniform carve so it keeps representing the domain.
     """
     buckets: dict[str, list[dict]] = defaultdict(list)
     for row in pool:
@@ -1300,7 +1357,11 @@ def take_weighted_rows(
     train_allocation = _apportion_with_supply(weights, n_train, train_supply)
     train_rows: list[dict] = []
     for source, rows in train_pools.items():
-        train_rows.extend(rows[: train_allocation.get(source, 0)])
+        take = train_allocation.get(source, 0)
+        if strata_key is not None and take:
+            train_rows.extend(_take_stratified(rows, take, rng, strata_key, strata_weights))
+        else:
+            train_rows.extend(rows[:take])
 
     report = {
         "weights": weights,
@@ -2042,7 +2103,16 @@ def main(argv: list[str] | None = None) -> int:
             n_hard_math_val = additive_targets(additive_ratios, additive_val_base)["hard_math"]
         desired_hard_math = additive_targets(additive_ratios, len(rows) + len(old_rows))["hard_math"]
         hard_math_rows, hard_math_val_rows, hard_math_counts = take_weighted_rows(
-            hard_math_pool, hard_math_weights, desired_hard_math, n_hard_math_val, rng
+            hard_math_pool,
+            hard_math_weights,
+            desired_hard_math,
+            n_hard_math_val,
+            rng,
+            # Balance the draw across measured pass-rate bands (D34): a pool
+            # that is mostly 1/8-pass would otherwise fill the domain with
+            # near-hopeless rows whose 16-sample groups are all-wrong.
+            strata_key=_pass_rate_band,
+            strata_weights=DEFAULT_HARD_MATH_PASS_RATE_WEIGHTS,
         )
         if len(hard_math_rows) < desired_hard_math:
             print(
@@ -2063,6 +2133,10 @@ def main(argv: list[str] | None = None) -> int:
             "dropped_already_trained": dropped_prev,
             "dropped_duplicate_of_reasoning_domains": dropped_dup,
             "dropped_duplicate_within_pool": dropped_self,
+            # Audit the stratified draw: the band profile the domain actually got.
+            "pass_rate_band_allocation": dict(
+                sorted(Counter(_pass_rate_band(row) for row in hard_math_rows).items())
+            ),
             **hard_math_counts,
         }
         print(

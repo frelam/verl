@@ -1068,9 +1068,9 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   > 最终 total 仍是 44,333，配比见 §7.8。
 - reward：仍是 `reward/hallucination_compute_score.py`；`if_nemotron` 行按 `data_source` 前缀
   委托给 `compute_score.py::_if_score`，约束只检查 `</think>` 之后的可见回答。
-  **注意**：binary 模式下 IF 组的正确率通常很低（最多 5 条约束全部通过），组内奖励容易全 0；
-  fully-async 不过滤零方差组，若 IF 组长期零方差，优先改用 `IF_GRADING_MODE=fraction` 或检查
-  约束覆盖率报告（`built_stage4/if_report.json`），而不是直接调大 `IF_RATIO`。
+  ​**注意**：binary 模式下 IF 组的正确率通常很低（最多 5 条约束全部通过），组内奖励容易全 0；
+  fully-async 不过滤零方差组，因此 **stage 4 构建默认改为 `IF_GRADING_MODE=fraction`**（通过约束数 / 总数），
+  使 15% 的 IF 份额在组内产生梯度；若需与 IFBench 严格对齐，再改回 `binary` 并检查约束覆盖率报告（`built_stage4/if_report.json`）。
 
 ### 7.6 阶段四 BBH 薄弱项补强（D32）
 
