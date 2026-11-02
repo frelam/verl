@@ -624,6 +624,48 @@ class TestStage1Pool:
         train = mix_halluc.read_parquet_rows(os.path.join(out, "train.parquet"))
         assert any(r["extra_info"]["task_id"].startswith("s1train-") for r in train)
 
+    def test_stage1_val_rows_are_excluded_from_the_replay_pool(self, build_dir, tmp_path):
+        # Stage 1 carved val out of the same raw pool the replay draws from; a
+        # held-out prompt must never come back into train.
+        stage1 = self.stage1_dir(tmp_path, n_train=60, n_val=5)
+        out = TestEndToEnd().run_mix(build_dir, tmp_path, halluc_total=200, val_size=20, stage1_path=stage1)
+        train = mix_halluc.read_parquet_rows(os.path.join(out, "train.parquet"))
+        val = mix_halluc.read_parquet_rows(os.path.join(out, "val.parquet"))
+        train_prompts = {mix_halluc._question_key(row) for row in train}
+        val_prompts = {mix_halluc._question_key(row) for row in val}
+        assert val_prompts
+        assert not train_prompts & val_prompts
+        stats = json.load(open(os.path.join(out, "mix_stats.json")))
+        assert "old_domain_held_out_val_rows_removed" in stats
+        assert "old_domain_duplicate_rows_removed" in stats
+
+    def test_duplicate_questions_in_the_old_pool_are_trained_once(self, build_dir, tmp_path):
+        stage1 = self.stage1_dir(tmp_path, n_train=20, n_val=5)
+        train_rows = mix_halluc.read_parquet_rows(os.path.join(stage1, "train.parquet"))
+        # Write the same prompts a second time as an extra raw pool: the two
+        # copies are one problem and must be drawn once.
+        pool = tmp_path / "dup_pool"
+        pool.mkdir()
+        schema.write_rows_parquet(train_rows, str(pool / "train_math.parquet"))
+        out = tmp_path / "final"
+        assert mix_halluc.main([
+            "--halluc_dir", build_dir,
+            "--output_dir", str(out),
+            "--halluc_total", "200",
+            "--val_size", "0",
+            "--stage1_path", stage1,
+            "--old_pool_path", str(pool),
+            "--seed", "5",
+        ]) == 0
+        train = mix_halluc.read_parquet_rows(os.path.join(out, "train.parquet"))
+        # No question (within an ability) may be trained twice.  The exact
+        # removal count is not pinned: the held-out-val filter also drops rows
+        # from this fixture, whose questions repeat across seeds.
+        keys = [(row["ability"], mix_halluc._question_key(row)) for row in train]
+        assert len(keys) == len(set(keys))
+        stats = json.load(open(os.path.join(out, "mix_stats.json")))
+        assert stats["old_domain_duplicate_rows_removed"] > 0
+
 
 class TestNearDedup:
     """Section 7.2's MinHash pass: reworded stage-1 duplicates must not survive."""

@@ -144,6 +144,7 @@ token CoT are not charged as loops.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import itertools
 import json
 import logging
@@ -154,6 +155,42 @@ from decimal import ROUND_HALF_UP, Decimal
 from fractions import Fraction
 
 logger = logging.getLogger(__name__)
+
+#: ``math_verify`` is an optional install: requirements.txt lists it, but
+#: requirements-npu.txt does not.  ``verl.utils.reward_score.math_verify`` wraps
+#: the package import in a try/except that only *prints*, so with the package
+#: missing its ``compute_score`` returns a plain ``0.0`` instead of raising --
+#: the ``except ImportError`` fallback below could never fire, and every
+#: ``math_*`` / ``stem_*`` row (plus the whole stage-4 hard-math domain) silently
+#: scored 0.  Probe the package once instead of trusting the wrapper's import.
+def _math_verify_available() -> bool:
+    """True when the optional ``math_verify`` package can actually be imported.
+
+    A lookup failure means "unavailable" on purpose: ``find_spec`` propagates
+    ``ImportError`` from a broken parent namespace and raises ``ValueError`` for a
+    partially imported module, and a reward worker that died at import time would
+    take the whole rollout with it.  Treating those as absent keeps the
+    math_dapo fallback in charge, which is what a missing package needs.
+    """
+    try:
+        return importlib.util.find_spec("math_verify") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+_MATH_VERIFY_AVAILABLE = _math_verify_available()
+_MATH_VERIFY_WARNED = False
+
+
+def _warn_math_verify_missing() -> None:
+    """Log once that the math verifier is absent and math_dapo is in charge."""
+    global _MATH_VERIFY_WARNED
+    if not _MATH_VERIFY_WARNED:
+        _MATH_VERIFY_WARNED = True
+        logger.warning(
+            "[reasoning_rl] the math_verify package is not installed; math/stem rows fall back to "
+            "math_dapo and the last-resort matchers only. Install math-verify for the full chain."
+        )
 
 try:
     from examples.reasoning_rl.reward.bbh_verifier import verify_bbh
@@ -266,19 +303,24 @@ def _math_score(solution_str: str, ground_truth: str) -> float:
     zeroes ``0.81a``).
     """
     ground_truth = str(ground_truth)
-    try:
-        from verl.utils.reward_score import math_verify
+    if _MATH_VERIFY_AVAILABLE:
+        try:
+            from verl.utils.reward_score import math_verify
 
-        score = float(math_verify.compute_score(solution_str, ground_truth))
-        if score:
-            return score
-        # Strict verifier said no -- the ground-truth-noise last resorts get
-        # their say before the miss is final.
-        return 1.0 if _math_last_resort(solution_str, ground_truth) else 0.0
-    except ImportError:
-        pass
-    except Exception as e:  # never let one bad sample kill the reward pass
-        logger.warning("[reasoning_rl] math_verify failed (%s); falling back to math_dapo", e)
+            score = float(math_verify.compute_score(solution_str, ground_truth))
+            if score:
+                return score
+            # Strict verifier said no -- the ground-truth-noise last resorts get
+            # their say before the miss is final.
+            return 1.0 if _math_last_resort(solution_str, ground_truth) else 0.0
+        except ImportError:
+            pass
+        except Exception as e:  # never let one bad sample kill the reward pass
+            logger.warning("[reasoning_rl] math_verify failed (%s); falling back to math_dapo", e)
+    else:
+        # The package itself is absent: the wrapper returns 0.0 for every sample
+        # rather than raising, so skip it and go straight to the fallback chain.
+        _warn_math_verify_missing()
     from verl.utils.reward_score import math_dapo
 
     # math_dapo returns {"score": ±1.0, "acc": bool, ...}; normalise to 0/1 so

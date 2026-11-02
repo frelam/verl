@@ -475,6 +475,54 @@ class TestComputeScore:
         res = compute_score("math_bigmath", think_wrap("$\\boxed{0.3115}$"), gt)
         assert res["score"] == 0.0
 
+    def test_missing_math_verify_package_falls_back_to_math_dapo(self, monkeypatch):
+        # verl's math_verify wrapper catches the package ImportError internally
+        # and returns 0.0, so a plain import probe is the only way to reach the
+        # fallback.  requirements-npu.txt omits math_verify, which made every
+        # math/stem row (and all of stage-4 hard math) a silent zero.
+        import sys
+        import types
+
+        import compute_score as reward
+
+        calls = []
+
+        def fake_compute_score(solution_str, ground_truth, strict_box_verify=False):
+            calls.append(strict_box_verify)
+            return {"acc": True}
+
+        package = types.ModuleType("verl")
+        package.__path__ = []
+        utils = types.ModuleType("verl.utils")
+        utils.__path__ = []
+        scores = types.ModuleType("verl.utils.reward_score")
+        scores.__path__ = []
+        scores.math_dapo = types.SimpleNamespace(compute_score=fake_compute_score)
+        monkeypatch.setitem(sys.modules, "verl", package)
+        monkeypatch.setitem(sys.modules, "verl.utils", utils)
+        monkeypatch.setitem(sys.modules, "verl.utils.reward_score", scores)
+        monkeypatch.setattr(reward, "_MATH_VERIFY_AVAILABLE", False)
+        monkeypatch.setattr(reward, "_MATH_VERIFY_WARNED", True)
+
+        res = compute_score("math_bigmath", think_wrap("The answer is $\\boxed{7}$."), "7")
+        assert res["score"] == 1.0
+        assert calls and calls[0] is True
+
+    def test_missing_math_verify_warns_only_once(self, monkeypatch):
+        import logging
+
+        import compute_score as reward
+
+        records = []
+        handler = logging.Handler()
+        handler.emit = lambda record: records.append(record.getMessage())
+        monkeypatch.setattr(reward, "_MATH_VERIFY_WARNED", False)
+        monkeypatch.setattr(reward.logger, "handlers", [handler])
+        monkeypatch.setattr(reward.logger, "propagate", False)
+        for _ in range(3):
+            reward._warn_math_verify_missing()
+        assert len([m for m in records if "math_verify package is not installed" in m]) == 1
+
 
 class TestNormalizedTextMatch:
     """Helper-level checks for the literal last resort (no math_verify needed)."""

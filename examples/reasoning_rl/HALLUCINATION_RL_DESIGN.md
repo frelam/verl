@@ -1051,6 +1051,11 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   2. `EXCLUDE_PATHS`（默认 `final` / `final_halluc` / `final_halluc_stage3`）用于老域回放池与 IF 池；
   3. `INCLUDE_OLD_POOLS=1` 时 `OLD_POOL_PATHS`（默认 `math/code/logic/stem` 的 `train_*.parquet`）
      并入回放供给，`--old_pool_path` 的 `val.parquet` 跳过；
+     回放供给在抽样前还会做两道清洗（2026-11 修复）：**剔除 stage-1 留出的 val 题面**
+     （stage-1 的 val 正是从这些原始池里切出来的，否则回放会把同一题重新训进 train，
+     直接废掉老域自己的 eval 信号），以及按 `(ability, 题面)` **去重**（原始池与 stage-1 train
+     同源，重复题会被训两遍）。两项计数写入 `mix_stats.json` 的
+     `old_domain_held_out_val_rows_removed` / `old_domain_duplicate_rows_removed`；
   4. `mix_halluc.py --stage3_mix --strict_cells --if_ratio 0.15 --if_path … --exclude_path …
      --old_pool_path …` → `final_halluc_stage4/`。IF 是增量域：`if = 0.15/0.85 × (幻觉 train + 老域)`，
      所以 stage-3 幻觉域绝对规模与 60/40 结构不变，`--code_share 0.24` 按**最终**总量计算；

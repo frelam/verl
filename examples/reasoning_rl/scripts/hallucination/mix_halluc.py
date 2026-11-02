@@ -1654,6 +1654,41 @@ def main(argv: list[str] | None = None) -> int:
             f"row(s) removed, {len(stage1_rows)} unseen row(s) remain"
         )
 
+    # Val hygiene, applied in the same place as the freshness filter: stage 1
+    # carved its own val split *out of these raw pools* (``mix.py`` samples the
+    # pool, it does not rewrite it), so without this a replay draw could re-train
+    # a prompt that this artifact ships in its own val split -- an exact
+    # train/val leak that defeats the old-domain eval signal.
+    held_out_val_removed = 0
+    if old_val_rows:
+        held_out = {_question_key(row) for row in old_val_rows}
+        before = len(stage1_rows)
+        stage1_rows = [row for row in stage1_rows if _question_key(row) not in held_out]
+        held_out_val_removed = before - len(stage1_rows)
+        print(
+            f"[mix_halluc] old-domain held-out val: {held_out_val_removed} row(s) removed from the "
+            f"replay pool ({len(held_out)} stage-1 val prompt(s) protected)"
+        )
+
+    # A raw pool repeats problems the stage-1 train split already carries (they
+    # are the same source whenever --exclude_path is not supplied), and a
+    # duplicate would be trained twice.  The key is (ability, question): two
+    # copies of one problem belong to the same ability, while identical wording
+    # under different abilities is a distinct row the ability mix counts
+    # separately.  Keep the first occurrence, deterministically.
+    deduped_old_rows: list[dict] = []
+    seen_old: set[tuple[str, str]] = set()
+    for row in stage1_rows:
+        key = (str(row.get("ability", "")), _question_key(row))
+        if key in seen_old:
+            continue
+        seen_old.add(key)
+        deduped_old_rows.append(row)
+    old_duplicate_removed = len(stage1_rows) - len(deduped_old_rows)
+    if old_duplicate_removed:
+        print(f"[mix_halluc] old-domain dedup: -{old_duplicate_removed} duplicate question(s)")
+    stage1_rows = deduped_old_rows
+
     # Stage 3 samples the old domain *before* the dedup: those rows are the
     # reference the hallucination domain must not duplicate (a stage-1 row that
     # is never sampled cannot leak into training, so anchoring on the whole pool
@@ -2271,6 +2306,8 @@ def main(argv: list[str] | None = None) -> int:
         "hard_math_by_source": dict(Counter(row["data_source"] for row in hard_math_rows)),
         "ability_match": ability_match,
         "old_domain_rows_excluded": excluded_old_removed,
+        "old_domain_held_out_val_rows_removed": held_out_val_removed,
+        "old_domain_duplicate_rows_removed": old_duplicate_removed,
         "halluc_rows_in_train": len(rows),
         "halluc_rows_in_val": halluc_rows_in_val,
         "halluc_target_vs_filled": {
