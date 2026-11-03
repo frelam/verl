@@ -14,15 +14,16 @@
 # limitations under the License.
 """Shared helpers for the reasoning-efficiency DPO data pipeline.
 
-Pipeline (three scripts, one purpose: build preference pairs where a *shorter,
-just as correct* chain of thought is preferred over the original one)::
+Pipeline (one purpose: build preference pairs where a *shorter, just as correct*
+chain of thought is preferred over the original one)::
 
     collect_dataset_a.py   stage-3 rows -> vLLM (n samples) -> reward == 1 -> A
     build_dataset_b.py     A -> judge picks the best correct rollout -> judge
                               rewrites its <think> block -> reward re-check -> B
-    build_dpo_pairs.py     A + B -> (prompt, chosen=B, rejected=A) -> DPO parquet
+    filter_dataset_b.py    B -> re-check the stored label + reward -> filtered B
+    build_dpo_pairs.py     A + filtered B -> (prompt, chosen=B, rejected=A) -> DPO parquet
 
-The three scripts must agree on three things, which is why they live here:
+The pipeline scripts must agree on three things, which is why they live here:
 
 * how a verl parquet row's ``prompt`` becomes the chat messages sent to vLLM
   (``normalise_messages`` + ``inject_system_prompt``),

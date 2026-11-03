@@ -1300,6 +1300,8 @@ examples/reasoning_rl/
 └── scripts/distill/
     ├── common.py                                  # DPO 流水线公共 helper（vLLM HTTP / think 拆分 / resume / 统计）
     ├── collect_dataset_a.py / build_dataset_b.py / build_dpo_pairs.py  # reasoning-efficiency DPO（stage 4 起点权重）
+    ├── filter_dataset_b.py                        # B 后处理：重算最终答案标签 + reward，只保留两者都通过的样本
+    ├── test_filter_dataset_b.py                   # B 后处理的单元测试（tail/body boxed/logic 标签变化、reward 重算）
     └── measure_length_targets.py                  # D33 理想长度统计（DPO ckpt 逐 data_source 平均字符长度 → length_targets.json/env）
 ```
 
