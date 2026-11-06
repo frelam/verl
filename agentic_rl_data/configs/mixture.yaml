@@ -1,0 +1,512 @@
+# =============================================================================
+# agentic_rl_data/configs/mixture.yaml
+#
+# Mixture configuration for the Agentic RL phase-1 dataset.
+#   input : data/raw_unified/{source}.jsonl   (plan section 3 step 1, built by T1)
+#   output: data/mixture_v1/{train,heldout}.jsonl + mixture_stats.json
+#
+# Authoritative spec: C:\Users\Administrator\Downloads\agentic_rl_data_plan.md
+#   section 6  mixture (20/30/25/15/10)
+#   section 7  curriculum max_turns 5 -> 10 -> 15, small-scale first
+#   section 8  acceptance #1 (one command, reproducible), #2 (0 contamination hits)
+# Rationale, numbers and ablations: reports/mixture_analysis.md
+#
+# Tag conventions used below:
+#   [SUGGEST] = empirical default from plan or repo evidence; MUST be ablated.
+#   [CONFIRM] = dataset id / license / row count not yet verified; T1 owns the check
+#               (reports/data_sources.md). Caps are sized so a row-count change only
+#               shrinks the source, never invalidates the build.
+#
+# All values are configurable; the build is byte-reproducible for a fixed config
+# (seed + stable hash ranking, no timestamps in outputs).
+# =============================================================================
+
+version: 1
+
+# Fixed seed for deterministic selection. Selection rank:
+#   sha256(seed \x1f salt \x1f task_id) -> 256-bit int, smaller rank wins.
+# [SUGGEST] do not randomise between runs: ablation runs must differ only in the
+# variable under test, otherwise mixture drift masquerades as an effect.
+seed: 20251105
+
+# Pilot scale, plan section 7 ("small-scale per class ~500 first"). 8000 train rows
+# keeps single-turn downsampled to 1600/16947 = 9.4% of the existing pool.
+# `total_train` (or --total-train) can be changed for a smoke run (2500) or a full
+# run; per-source `cap`s below are absolute row counts **at this baseline** and are
+# scaled linearly with total_train by build_mixture (stats record cap_declared vs
+# cap_scaled), so the configured source mix is preserved at every scale.
+total_train: 8000
+
+paths:
+  # {source}.jsonl files are produced by scripts/build_raw.py (T1). build_mixture
+  # reads them directly; if a file is absent it may fall back to the loader registry
+  # (soft dependency on T1, --use-loaders) and otherwise fails with a clear error.
+  raw_dir: data/raw_unified
+
+output:
+  dir: data/mixture_v1
+  train: train.jsonl
+  heldout: heldout.jsonl
+  # Deterministic JSON summary: per-category/per-source counts, drop reasons,
+  # effective shares, output sha256. No timestamps (byte-reproducible).
+  stats: mixture_stats.json
+  # When true, also write curriculum/train_max_turns{5,10,15}.jsonl derived from
+  # the final train split (approximate turn estimate, see plan section 7).
+  emit_curriculum: false
+
+# -----------------------------------------------------------------------------
+# Pass-rate filtering (plan section 3 step 6; scripts/filter_by_passrate.py, T2)
+# -----------------------------------------------------------------------------
+passrate:
+  enabled: true
+  # Mandatory rule: observed pass_rate must be strictly inside (0, 1); tasks that
+  # were all-correct / all-wrong are always dropped. The band below is the stricter
+  # [SUGGEST] recommendation: with N=8 the observed grid is {0, .125, ..., 1}, so
+  # [1/N, 1-1/N] is exactly "not all-correct and not all-wrong" on the observed
+  # values; the real effect is the P(k=0 | p) false-drop cost (see report section 6).
+  band:
+    min: 0.125
+    max: 0.875
+  # [SUGGEST] rollout samples per prompt (plan section 3 "N=8"). N=8 only reliably
+  # separates p~0 / p~1 (P(all fail | p=0.05) = 0.663); use N=16/32 for difficulty
+  # banding ablations or a two-stage re-sample of border tasks.
+  n_samples: 8
+  # keep | drop when meta.pass_rate is null. "keep" is the phase-1 default because
+  # the rollout backend is not wired yet (TEAM_BOARD Q2); set to "drop" for the
+  # strict production pipeline.
+  missing: keep
+  # false => meta.pass_rate = raw k/N (observable, reproducible);
+  # true  => meta.pass_rate = Jeffreys smoothing (k+0.5)/(N+1), extras carry raw.
+  smoothed: false
+  # true => build_mixture refuses to run if the filter report is missing.
+  require_report: false
+
+# -----------------------------------------------------------------------------
+# Held-out split (plan section 3 step 7). Must never overlap train, including at
+# the session/group level when loaders expose meta.group_id.
+# -----------------------------------------------------------------------------
+heldout:
+  # Plan asks >=200 per class. The held-out unit here is the five plan-section-6
+  # mixture categories (single/multi/search/math/code), NOT the seven task_types:
+  # 5 * 300 = 1500 held-out rows total. 300 buys a worst-case 95% CI of +-5.7 pt
+  # at p=0.5 (SE=0.0289); >=200 would be +-6.9 pt. Held-out is fixed across builds
+  # so that ablation runs stay comparable.
+  per_category: 300
+  # true: whole sessions (meta.group_id, or id when absent) land on one side only.
+  # Evidence: examples/tool_rl/DESIGN.md section 2.5 (session-group split).
+  # [NO-GROUP] meta.group_id / meta.group_size are NOT part of schema v2 yet (they
+  # are tolerated extra meta keys). Until loaders stamp them + group_size, the
+  # session-level guarantee is best-effort: groups are built from id, partial
+  # groups are skipped and counted, and the report flags the limitation.
+  group_aware: true
+  # extra candidate rows kept per source before train selection, so group-aware
+  # held-out packing cannot starve the train quota. This is an absolute row count
+  # (added to the source's held-out target), NOT a multiplier.
+  oversample: 4
+
+# -----------------------------------------------------------------------------
+# Upstream filters. The switches below are executed by T1 scripts; build_mixture
+# only enforces the ones it can check locally (exact dedup, turn cap, schema,
+# pass-rate guard, replay-quality guard) and records the declared switches in
+# mixture_stats.json.
+# -----------------------------------------------------------------------------
+filters:
+  # plan section 0/3: single task solvable in <=15 assistant turns (ASearcher
+  # trajectories can exceed 40 and must be filtered aggressively).
+  max_gt_turns: 15
+  # drop | error: what build_mixture does with schema-invalid rows. Never silent:
+  # drops are counted per source with the first validation errors attached.
+  invalid_schema: drop
+
+  dedup:
+    # exact dedup = schema.task_dedup_key (normalised user text + tools signature);
+    # enforced by build_mixture within every source pool and across the final split.
+    exact: true
+    # approximate dedup is T1's scripts/dedup.py; recorded here as the single
+    # source of truth for thresholds, not re-implemented in build_mixture.
+    approximate:
+      enabled: true
+      method: minhash
+      # [SUGGEST] Jaccard threshold and permutations; ToolMind overlaps xlam/ToolACE.
+      jaccard: 0.85
+      num_perm: 64
+      priority_sources:
+        - toolmind
+        - toolace
+        - apigen
+
+  decontam:
+    # T1 scripts/decontam.py. plan section 8 acceptance #2: 0 hits in the final
+    # train set against the BFCL v3/v4 test data (hits dropped and logged).
+    # T1 verified the current package: bfcl-eval==2026.3.23 on PyPI (the version
+    # quoted in the plan is outdated); pin it in the real run.
+    enabled: true
+    bfcl_v3: true
+    bfcl_v4: true
+    ngram: 5
+    jaccard: 0.90
+    hit_policy: drop
+    # true => hard fail if no decontamination report; keep false for phase 1
+    # (no network / no bfcl-eval data yet), flip true for the real build.
+    report_required: false
+
+  mt_fc:
+    # CONTRACTS.md C6 / T1 D11: replay-based mt_fc is degraded when gt tool
+    # returns are placeholders; the B-form 0.8 result term is then meaningless.
+    # T1 loaders statically stamp meta["gt_returns_source"] in
+    # {config, reference, gt_turns, placeholder}; build_mixture honours that
+    # declaration without running any env (fallback inference for un-stamped rows:
+    # env.config.gt_returns -> config; reference.tool_returns -> reference;
+    # gt_turns[*].tool_results/results/return -> gt_turns; else placeholder).
+    #   drop  = exclude placeholder rows and count them (default; T1: placeholders
+    #           must not enter training silently)
+    #   keep  = keep placeholder rows up to placeholder_keep_share of the mt_fc
+    #           train target and record the down-weight factor. Use only to protect
+    #           the 30% quota when first-run placeholder ratios are high; report the
+    #           kept row count and share (C6).
+    placeholder_gt_returns: drop
+    # Max fraction of the mt_fc category train target that may be placeholder under
+    # "keep". 0.0 => equivalent to drop. [SUGGEST] sensitivity knob: try 0.2/0.35.
+    placeholder_keep_share: 0.0
+    # Down-weight recorded for the kept placeholder rows (trainer-side loss weight
+    # / sampling weight). Only a recorded number here; build does not rescale losses.
+    placeholder_weight: 0.5
+
+# -----------------------------------------------------------------------------
+# Curriculum (plan section 7 [SUGGEST], AgentGym-RL style short-to-long).
+# The trainer calls env.reset(max_turns=stage.max_turns); env applies
+# min(task.meta.max_turns, stage, env.config cap) per CONTRACTS.md C1.
+# Search env additionally caps at 8 rounds (env-builder frozen: max_rounds=8,
+# top_k=3, Search-R1 setting), so stage-2/stage-3 search tasks are bounded by 8.
+# -----------------------------------------------------------------------------
+curriculum:
+  enabled: true
+  # tasks whose estimated gt turns exceed this never enter the mixture (plan 15).
+  filter_gt_turns: 15
+  stages:
+    - max_turns: 5
+      start_fraction: 0.0
+      end_fraction: 0.2
+    - max_turns: 10
+      start_fraction: 0.2
+      end_fraction: 0.5
+    - max_turns: 15
+      start_fraction: 0.5
+      end_fraction: 1.0
+  # [SUGGEST] fractions/stage lengths and whether curriculum helps at all are
+  # ablation items (report section 7). Transition rule to evaluate: advance when
+  # stage-subset held-out pass rate plateaus (>0.6 and <+0.03 over 3 evals).
+
+# -----------------------------------------------------------------------------
+# Sources. file = name under paths.raw_dir. required=true means the build aborts
+# when the file is missing or empty (no silent quota loss); required=false means
+# the category may absorb the gap or drop the quota (see categories.on_unavailable).
+# cap = absolute max rows contributed to TRAIN by that source in this build
+# (held-out rows are counted separately); null = no explicit cap.
+# subsample = optional hard cap on rows the build considers (plan: Toucan subset).
+# license: null until T1 confirms; never guess a license in a training artifact.
+# -----------------------------------------------------------------------------
+sources:
+
+  # --- existing single-turn sources (plan section 0; exact row counts) ----------
+  apigen:
+    file: apigen.jsonl
+    task_type: st_fc
+    required: true
+    license: null
+    note: "plan section 0: 4900 existing rows, Salesforce/xlam-function-calling-60k"
+
+  sealtools:
+    file: sealtools.jsonl
+    task_type: st_fc
+    required: true
+    license: null
+    note: "plan section 0: 4873 existing rows, Seal-Tools"
+
+  toolace:
+    file: toolace.jsonl
+    task_type: st_fc
+    required: true
+    license: null
+    note: "plan section 0: 4033 existing rows, Team-ACE/ToolACE"
+
+  apibank:
+    file: apibank.jsonl
+    task_type: st_fc
+    required: true
+    license: null
+    note: "plan section 0: 161 existing rows, API-Bank with 5 distractor tools"
+
+  hammer:
+    file: hammer.jsonl
+    task_type: irrelevance
+    required: true
+    license: null
+    note: "plan section 0: 2980 existing rows, MadeAgents/xlam-irrelevance-7.5k"
+
+  # --- multi-turn tool calling (plan section 1.1 / 6) --------------------------
+  funreason_mt:
+    file: funreason_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: null
+    note: "plan section 1.1: ~16k BFCL-style synthetic multi-turn; placeholder share high per T1 [EST]; strict decontamination needed"
+
+  apigen_mt:
+    file: apigen_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: null
+    note: "plan section 1.1: Salesforce/APIGen-MT-5k (T1 loader name apigen_mt); mostly placeholder gt returns per T1 [EST]"
+
+  tau_bench_train:
+    file: tau_bench_train.jsonl
+    task_type: mt_fc
+    required: false
+    # T1 (2026-11-05): tau-bench ships no ready trajectories (needs synthesis),
+    # so it is OUT of mixture v1 instead of silently contributing 0 rows.
+    enabled: false
+    license: null
+    note: "plan section 1.1: tau-bench has no ready train trajectories, needs synthesis; re-enable after synthesis"
+
+  toucan:
+    file: toucan.jsonl
+    task_type: mt_fc
+    required: false
+    license: null
+    note: "plan section 1.1: Agent-Ark/Toucan-1.5M (T1 loader name toucan); real MCP tool returns; T1: main source of non-placeholder mt_fc returns in phase 1"
+    # Toucan is 1.5M rows; only a deterministic subsample is materialised (rank
+    # based) and the category cap bounds what actually enters train.
+    subsample: 4000
+
+  # ToolMind (~110k, plan section 1.1) is deliberately OUT of mixture v1: it is
+  # not listed in plan section 6, overlaps xlam/ToolACE (plan section 3 step 3),
+  # and must clear approximate dedup + BFCL contamination first. Enable only after
+  # T1's dedup/decontam report shows overlap is small; move weight from
+  # funreason_mt/apigen_mt (ablation item, report section 7).
+  toolmind:
+    file: toolmind.jsonl
+    task_type: mt_fc
+    required: false
+    enabled: false
+    license: null
+    subsample: 4000
+    note: "plan section 1.1: ~110k trajectories with CoT; heavy overlap with xlam/ToolACE [CONFIRM]"
+
+  # --- search / multi-hop QA (plan section 1.2 / 6) ---------------------------
+  search_r1:
+    file: search_r1.jsonl
+    task_type: search_qa
+    required: true
+    license: null
+    note: "plan section 1.2: Search-R1 NQ+HotpotQA train; T1: real data is HF RUC-NLPIR/FlashRAG_datasets config=nq (does not match the plan ID); 1-2 hop, <=8 tool rounds [EST rows]"
+
+  asearcher:
+    file: asearcher.jsonl
+    task_type: search_qa
+    required: false
+    # T1: ASearcher original trajectories are 128 rounds; after the <=15 round
+    # filter the usable pool is much smaller than the plan assumed (do not estimate
+    # with 40 rounds). Optional so an all-filtered pool cannot abort the build.
+    license: null
+    note: "plan section 1.2: ASearcher hard multi-hop; 128-round trajectories, <=15 filter is a hard gate; usable pool [EST] unknown"
+
+  a2search:
+    file: a2search.jsonl
+    task_type: search_qa
+    required: false
+    enabled: false
+    license: null
+    note: "plan section 1.2: optional multi-answer HotpotQA/MuSiQue supplements; needs Answer-F1 reward"
+
+  # --- math + code interpreter (plan section 1.3 / 6) -------------------------
+  reasoning_math:
+    file: reasoning_math.jsonl
+    task_type: math_ci
+    required: true
+    license: null
+    note: "plan section 1.3: reuse the existing reasoning-RL math prompt pool, only attach the python tool; row count user-side [CONFIRM]"
+
+  simplerl_math3_5:
+    file: simplerl_math3_5.jsonl
+    task_type: math_ci
+    required: false
+    license: null
+    note: "plan section 1.3: supplementary math, small share only"
+
+  retool:
+    file: retool.jsonl
+    task_type: math_ci
+    required: false
+    enabled: false
+    license: null
+    note: "plan section 1.3: ~2k ReTool-SFT (T1 loader name retool); cold-start / format reference only, not an RL backbone"
+
+  # --- code execution (plan section 1.4 / 6, [SUGGEST] whole category) --------
+  # T1 ships ONE registry loader `code_exec` (cfg["kind"] selects
+  # apps / codecontests / taco) and build_raw writes code_exec.jsonl, so the
+  # mixture treats the whole [SUGGEST] category as a single source; the per-dataset
+  # provenance is recorded by the loader and can be split later once build_raw
+  # emits per-kind files.
+  code_exec:
+    file: code_exec.jsonl
+    task_type: code_exec
+    required: false
+    license: null
+    loader: code_exec
+    note: "plan section 1.4: APPS/CodeContests/TACO aggregated by T1 loader code_exec; license and unit-test quality [CONFIRM]; Q4 open"
+
+  # --- abstain / clarification (plan section 1.5, optional) -------------------
+  when2call:
+    file: when2call.jsonl
+    task_type: abstain
+    required: false
+    enabled: false
+    license: null
+    note: "plan section 1.5: nvidia/When2Call; T1: train split only (test derives from BFCL v2 Live and must never enter training); complements hammer irrelevance; optional"
+
+# -----------------------------------------------------------------------------
+# Categories = plan section 6 buckets. weight = target share *inside* the
+# category (must sum to <=1 per category; remaining sources are disabled/optional
+# and their weight is 0). cap = train-row limit for that source in that category.
+# on_unavailable: fail | skip | redistribute when the category has zero usable
+# rows. code_exec is [SUGGEST] and Q4 is open, so it redistributes instead of
+# blocking; everything that maps to BFCL stays fail-fast.
+# turn_cap: per-category estimated-turn cap; search is bounded by the frozen
+# search env (max_rounds=8, env-builder) rather than the generic 15.
+# -----------------------------------------------------------------------------
+categories:
+
+  single_turn:
+    # plan section 6: single-turn tool calling + abstention, ~20%
+    # Numeric basis: 20% of 8000 = 1600 rows; hammer irrelevance at 25% of the
+    # category mirrors examples/tool_rl/DESIGN.md section 2.4 (negatives target
+    # 25%); apibank stays small because only 161 rows exist.
+    #
+    # ABSTAIN DECISION (critic T2-03, answered to Lead): phase 1 declares
+    # "single-turn + abstain" covered by hammer irrelevance (25% of this category);
+    # type `abstain` (+ When2Call) stays OUT of training (only reward/env unit tests,
+    # and When2Call only has a train split while its test derives from BFCL v2 Live
+    # and must not leak). Re-enable when2call below with weight 0.10 taken from
+    # st_fc rows if a real abstain subset is needed after T1 verifies the license.
+    share: 0.20
+    heldout: 300
+    turn_cap: 15
+    on_unavailable: fail
+    sources:
+      - name: apigen
+        weight: 0.27
+        cap: 550
+      - name: sealtools
+        weight: 0.27
+        cap: 550
+      - name: toolace
+        weight: 0.165
+        cap: 400
+      - name: apibank
+        weight: 0.045
+        cap: 100
+      - name: hammer
+        weight: 0.25
+        cap: 500
+      # when2call (abstain) is disabled; if enabled, take weight from st_fc rows
+      # (e.g. when2call 0.10, apigen 0.24, sealtools 0.24, toolace 0.145,
+      # apibank 0.025, hammer 0.25) so the category total stays 1.0.
+
+  multi_turn:
+    # plan section 6: multi-turn tool calling, ~30%. Maps 1:1 to BFCL v4
+    # multi-turn 30%; 30% of 8000 = 2400 rows.
+    #
+    # T1 (2026-11-05) reality check: phase-1 non-placeholder gt returns mainly come
+    # from the Toucan subset; FunReason-MT / APIGen-MT are mostly placeholder.
+    # Therefore weights are tilted towards Toucan, tau-bench is out (needs
+    # synthesis), and the placeholder policy above decides whether the 30% quota is
+    # protected by down-weighted placeholder rows (sensitivity in the report).
+    # Effective mt share = 0.30 * (1 - dropped_placeholder_share - placeholder_budget
+    # / 0.30) once the real placeholder ratio is known from the first build.
+    share: 0.30
+    heldout: 300
+    turn_cap: 15
+    on_unavailable: fail
+    sources:
+      - name: funreason_mt
+        weight: 0.40
+        cap: 1200
+      - name: apigen_mt
+        weight: 0.25
+        cap: 700
+      - name: toucan
+        weight: 0.35
+        cap: 900
+      # tau_bench_train (disabled): no ready trajectories in phase 1 (needs
+      # synthesis); re-enable with weight ~0.10 after synthesis lands.
+      # toolmind (disabled) would take weight from funreason_mt/apigen_mt only
+      # after approximate dedup shows low overlap with the single-turn pool.
+
+  search_qa:
+    # plan section 6: search / multi-hop QA, ~25%. Maps to the web-search half of
+    # BFCL v4 Agentic (40%); memory (the other half) has no phase-1 data, so the
+    # nominal 20% is deliberately over-weighted by 1.25x. 25% of 8000 = 2000 rows.
+    #
+    # Env constraints frozen by env-builder (v1 defaults, not measured on this
+    # machine): SearchEnv max_rounds=8 hard cap, top_k=3, per-call timeout 5s,
+    # retry 2 (0.5s -> 1.0s), snippet <=1000 chars, observation <=4096 chars,
+    # local E5+faiss ~10-30ms/query (GPU), target >=64 QPS per worker and
+    # p99 < 100ms / QPS >= 200 for the service. If QPS is short, first lower top_k
+    # (3 -> 2) or lower this share; never relax max_rounds (that breeds brute-force
+    # search trajectories).
+    #
+    # T1 (data_sources.md section 3): ASearcher's data is QA pairs without per-task
+    # turn labels, so the <=15 static filter cannot bind there; the runtime search
+    # env caps at 8 rounds and truncates the original up-to-128-round trajectories.
+    # That makes ASearcher long-horizon samples lower quality than the plan assumed,
+    # so its weight is 0.25 (not 0.40) and cap 600; Search-R1 (FlashRAG_datasets nq)
+    # carries the quota. The category turn_cap below (8) matches the env hard cap and
+    # logs >8-round rows as over_max_turns. Monitor the truncation ratio (timeout) in
+    # the first run and lower this weight further if truncation > 20%.
+    share: 0.25
+    heldout: 300
+    # Search-R1 uses at most ~8 retrieval rounds (plan section 1.2); env-builder
+    # froze max_rounds=8. Anything beyond 8 is untrainable in the env.
+    turn_cap: 8
+    on_unavailable: fail
+    sources:
+      - name: search_r1
+        weight: 0.75
+        cap: 1500
+      - name: asearcher
+        weight: 0.25
+        cap: 600
+      # a2search (disabled): optional multi-answer subset, needs Answer-F1 reward.
+
+  math_ci:
+    # plan section 6: math + code interpreter, ~15%. Not a BFCL dimension; buys
+    # reasoning retention / offset control (plan section 7) and multi-step tool
+    # decisions. 15% of 8000 = 1200 rows; mostly the existing reasoning math pool.
+    share: 0.15
+    heldout: 300
+    turn_cap: 15
+    on_unavailable: fail
+    sources:
+      - name: reasoning_math
+        weight: 0.90
+        cap: 1400
+      - name: simplerl_math3_5
+        weight: 0.10
+        cap: 300
+      # retool (disabled): cold start only, not a training backbone (plan 1.3).
+
+  code_exec:
+    # plan section 6: code execution, ~10% [SUGGEST] + Q4 open. No direct BFCL
+    # weight; transfers the write-run-observe-fix loop shared with agentic tasks.
+    # 10% of 8000 = 800 rows. If the category is unavailable the quota is
+    # redistributed (keeps total_train stable) and recorded as an effective-share
+    # deviation; switch to fail once T1 confirms licenses/unit-test quality.
+    share: 0.10
+    heldout: 300
+    turn_cap: 15
+    on_unavailable: redistribute
+    sources:
+      - name: code_exec
+        weight: 1.0
+        cap: 800

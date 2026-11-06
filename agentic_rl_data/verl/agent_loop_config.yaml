@@ -1,0 +1,8 @@
+# Custom agent-loop registration for the agentic_rl_data multi-turn tasks.
+# Usage (verl async rollout, not slime):
+#   actor_rollout_ref.rollout.mode=async
+#   actor_rollout_ref.rollout.agent.default_agent_loop=agentic_agent
+#   actor_rollout_ref.rollout.agent.agent_loop_config_path=agentic_rl_data/verl/agent_loop_config.yaml
+#   actor_rollout_ref.rollout.multi_turn.format=hermes   # parser must match the served model
+- name: agentic_agent
+  _target_: agentic_rl_data.verl.agent_loop_agentic.AgenticAgentLoop

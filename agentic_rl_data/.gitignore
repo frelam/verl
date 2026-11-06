@@ -1,0 +1,14 @@
+# Generated pipeline artifacts (never commit datasets or their reports)
+data/
+reports/data_report.md
+reports/data_report.json
+reports/data_report.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local env files
+*.local
+.env

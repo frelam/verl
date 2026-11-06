@@ -1,0 +1,48 @@
+{
+  "_comment": "Example for agentic_rl_data/configs/pipeline.json -> build_raw.cfg_json. Shape: {source_name: loader_cfg}. Each loader accepts `records` (inline list), `path`/`raw_path`/`file`/`dir` (local file or directory), or `hf_dataset`/`dataset` (+ optional `hf_config`, `split`, `streaming`). Sources omitted here fall back to the loader's default HuggingFace id (needs `datasets` + network). Paths are resolved relative to the repo root.",
+  "apigen": {
+    "path": "data/raw/apigen/xlam_function_calling_60k.json",
+    "license": "apigen/xlam: see datasets/data_sources.md [UNVERIFIED]"
+  },
+  "sealtools": {
+    "path": "data/raw/sealtools/",
+    "license": "Apache-2.0 (verified in reports/data_sources.md)"
+  },
+  "toolace": {
+    "path": "data/raw/toolace/",
+    "license": "toolace: see reports/data_sources.md [UNVERIFIED]"
+  },
+  "hammer": {
+    "path": "data/raw/hammer/xlam_irrelevance_7.5k.json",
+    "license": "hammer: see reports/data_sources.md [UNVERIFIED]"
+  },
+  "apibank": {
+    "path": "data/raw/apibank/",
+    "license": "MIT (verified in reports/data_sources.md)"
+  },
+  "search_r1": {
+    "hf_dataset": "RUC-NLPIR/FlashRAG_datasets",
+    "hf_config": "nq",
+    "split": "train",
+    "license": "Search-R1: see reports/data_sources.md [UNVERIFIED]"
+  },
+  "asearcher": {
+    "path": "data/raw/asearcher/",
+    "license": "ASearcher: see reports/data_sources.md [UNVERIFIED]"
+  },
+  "funreason_mt": {
+    "hf_dataset": "Bingguang/FunReason-MT",
+    "split": "train",
+    "license": "[UNVERIFIED] HF card unreachable; verify before training"
+  },
+  "toucan": {
+    "hf_dataset": "Agent-Ark/Toucan-1.5M",
+    "split": "train",
+    "license": "MIT (GitHub repo); HF card [UNVERIFIED]"
+  },
+  "toolmind": {
+    "hf_dataset": "Nanbeige/ToolMind",
+    "split": "train",
+    "license": "[UNVERIFIED] HF card unreachable; verify before training"
+  }
+}

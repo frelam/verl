@@ -1,0 +1,73 @@
+{
+  "_comment": "pipeline config for agentic_rl_data.scripts.run_pipeline (plan §3 steps 1-8). Relative paths are resolved from the repo root. Optional steps (decontam/passrate) are skipped with an explicit reason when their inputs are not configured; they are never silently skipped.",
+  "paths": {
+    "raw_dir": "agentic_rl_data/data/raw_unified",
+    "filtered_dir": "agentic_rl_data/data/filtered_rounds",
+    "deduped_dir": "agentic_rl_data/data/deduped",
+    "decontaminated_dir": "agentic_rl_data/data/decontaminated",
+    "passrated_dir": "agentic_rl_data/data/passrated",
+    "mixture_dir": "agentic_rl_data/data/mixture_v1",
+    "reports_dir": "agentic_rl_data/reports",
+    "mixture_config": "agentic_rl_data/configs/mixture.yaml",
+    "verl_dir": "agentic_rl_data/data/verl"
+  },
+  "build_raw": {
+    "_comment": "sources empty => --all registered loaders; cfg_json points at {source: {path|hf_dataset|...}} (see configs/raw_sources.example.json); max_samples for smoke runs.",
+    "sources": [],
+    "cfg_json": null,
+    "max_samples": null
+  },
+  "rounds": {
+    "max_turns": 15,
+    "asearcher_max_turns": 15
+  },
+  "dedup": {
+    "threshold": 0.85,
+    "num_perm": 64,
+    "bands": 16,
+    "k": 5,
+    "against": []
+  },
+  "decontam": {
+    "_comment": "bfcl_path: bfcl-eval data dir / gorilla BFCL dir / JSONL dump. null => step skipped ([NOT RUN] in data_report).",
+    "bfcl_path": null,
+    "extra_paths": [],
+    "k": 13,
+    "min_hits": 1,
+    "jaccard_threshold": 0.9
+  },
+  "replay": {
+    "enabled": true,
+    "limit": 10,
+    "task_types": "mt_fc",
+    "allow_tool_errors": false,
+    "fail_on_error": false
+  },
+  "passrate": {
+    "_comment": "needs a (task_id, pass_rate) file produced by the rollout side; disabled until plan §9 is wired.",
+    "enabled": false,
+    "rates": null,
+    "band": "0.125,0.875",
+    "n_samples": 8,
+    "missing": "keep",
+    "smoothed": false
+  },
+  "mixture": {
+    "total_train": null,
+    "seed": null,
+    "emit_curriculum": false,
+    "use_loaders": false
+  },
+  "report": {
+    "_comment": "strict=false for iteration; set true (or pass --strict-report) for plan §8 acceptance.",
+    "strict": false,
+    "allow_missing_steps": ["passrate"],
+    "auto_allow_passrate": true,
+    "require_provenance": false
+  },
+  "export": {
+    "_comment": "verl RLHFDataset parquet export (plan §9 -> verl). Needs pyarrow in the training env.",
+    "enabled": true,
+    "allow_invalid": false
+  }
+}
