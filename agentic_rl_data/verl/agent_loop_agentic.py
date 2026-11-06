@@ -116,6 +116,25 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
+_TOOL_CALL_MARKERS = ("<tool_call>", "</tool_call>")
+
+
+def _looks_like_broken_tool_call(content: Any) -> bool:
+    """True when the text carries tool-call markup that the parser rejected."""
+    return isinstance(content, str) and any(marker in content for marker in _TOOL_CALL_MARKERS)
+
+
+def format_error_message(errors: list[str] | None = None) -> str:
+    """Observation returned for an unparseable tool call (policy-visible)."""
+    detail = "; ".join(errors or [])[:300]
+    message = (
+        "Error: your tool call could not be parsed. Emit each call as "
+        '<tool_call>{"name": "<tool name>", "arguments": {...}}</tool_call> '
+        "with valid JSON and a declared tool name."
+    )
+    return f"{message} Details: {detail}" if detail else message
+
+
 @register("agentic_agent")
 class AgenticAgentLoop(AgentLoopBase):
     """Multi-turn agent loop backed by ``agentic_rl_data`` environments."""
@@ -125,6 +144,9 @@ class AgenticAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
         self.full_determinism = bool(getattr(self.rollout_config, "full_determinism", False))
+        # Per-assistant-turn generation cap (0 = only the global budget).  Read
+        # from the env so the recipe can set it without a hydra schema change.
+        self.max_tokens_per_turn = _as_int(os.getenv("AGENTIC_MAX_TOKENS_PER_TURN", "0"), 0)
 
         # The tool parser must match the served model's tool-call format; the
         # agentic task types only need the parser (per-sample tools are parsed
@@ -209,6 +231,7 @@ class AgenticAgentLoop(AgentLoopBase):
         env_done = False
         timeout = False
         assistant_turns = 0
+        parse_errors = 0
 
         try:
             while True:
@@ -255,6 +278,30 @@ class AgenticAgentLoop(AgentLoopBase):
                     turns.append(make_turn(assistant_turns, content, trajectory_calls, []))
                     final_answer = final_answer_from_turns(turns)
                     break
+
+                raw_text = ""
+                if not action_calls:
+                    # hermes strips <tool_call> blocks from ``content`` even when
+                    # their JSON is invalid, so check the raw decoded text.
+                    raw_text = await self._decode(token_ids)
+                if not action_calls and _looks_like_broken_tool_call(raw_text):
+                    content = raw_text
+                    # The policy *tried* to call a tool but the call did not
+                    # parse (bad JSON / missing name).  Ending the episode here
+                    # would treat it as a final answer; instead feed a format
+                    # error back so the policy can learn to repair the call
+                    # (tool-call error recovery).  The turn still counts
+                    # against max_turns and is recorded as a call-less turn.
+                    parse_errors += 1
+                    turns.append(make_turn(assistant_turns, content, [], []))
+                    error_messages = [
+                        {"role": "tool", "content": format_error_message(call_errors)}
+                    ]
+                    if not await self._append_observation(
+                        error_messages, prompt_ids, response_mask, response_logprobs
+                    ):
+                        break
+                    continue
 
                 action = {"content": content, "tool_calls": action_calls}
                 try:
@@ -306,15 +353,11 @@ class AgenticAgentLoop(AgentLoopBase):
                     )
                     final_answer = final_answer_from_turns(turns)
                     break
-                tool_tokens = await self.apply_chat_template(tool_messages, remove_system_prompt=True)
-                tool_tokens = list(self.turn_separator) + list(tool_tokens)
-                if len(response_mask) + len(tool_tokens) >= self.response_length:
+                if not await self._append_observation(
+                    tool_messages, prompt_ids, response_mask, response_logprobs
+                ):
                     # Tool-response tokens do not fit in the response budget.
                     break
-                prompt_ids.extend(tool_tokens)
-                response_mask.extend([0] * len(tool_tokens))
-                if response_logprobs:
-                    response_logprobs.extend([0.0] * len(tool_tokens))
         finally:
             if env is not None:
                 await self._close_env(env)
@@ -387,6 +430,7 @@ class AgenticAgentLoop(AgentLoopBase):
             "agentic/task_type": task_type,
             "agentic/env_type": env_type,
             "agentic/env_error": env_error,
+            "agentic/parse_errors": parse_errors,
         }
         # Keep the same extras schema as ToolAgentLoop (turn-level shaping hooks
         # are unused here, but downstream batch concat expects the keys).
@@ -422,6 +466,37 @@ class AgenticAgentLoop(AgentLoopBase):
             logger.debug("[agentic_agent] tool schema is not OpenAIFunctionToolSchema-valid, using dicts")
             return list(sample_tools)
 
+    async def _decode(self, token_ids: list[int]) -> str:
+        try:
+            return await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(token_ids, skip_special_tokens=False)
+            )
+        except Exception:  # pragma: no cover - defensive
+            return ""
+
+    async def _append_observation(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_ids: list[int],
+        response_mask: list[int],
+        response_logprobs: list[float],
+    ) -> bool:
+        """Encode tool/env messages as the next prompt segment (mask 0).
+
+        Same pattern as ``ToolAgentLoop``: ``remove_system_prompt`` + turn
+        separator.  Returns ``False`` (nothing appended) when the segment does
+        not fit in the response budget.
+        """
+        tool_tokens = await self.apply_chat_template(messages, remove_system_prompt=True)
+        tool_tokens = list(self.turn_separator) + list(tool_tokens)
+        if len(response_mask) + len(tool_tokens) >= self.response_length:
+            return False
+        prompt_ids.extend(tool_tokens)
+        response_mask.extend([0] * len(tool_tokens))
+        if response_logprobs:
+            response_logprobs.extend([0.0] * len(tool_tokens))
+        return True
+
     def _stop_token_sampling_params(self, sampling_params: dict[str, Any]) -> dict[str, Any]:
         """Add the parser's stop tokens so generation halts after a tool call."""
         stop_token_ids = list(self.tool_parser.stop_token_ids or [])
@@ -439,6 +514,9 @@ class AgenticAgentLoop(AgentLoopBase):
         metrics: dict[str, Any],
     ) -> TokenOutput:
         sampling_params = self._stop_token_sampling_params(dict(sampling_params))
+        if self.max_tokens_per_turn > 0 and "max_tokens" not in sampling_params:
+            # One runaway <think> must not eat the whole multi-turn budget.
+            sampling_params["max_tokens"] = self.max_tokens_per_turn
         with simple_timer("generate_sequences", metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=request_id,

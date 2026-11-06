@@ -43,6 +43,8 @@ RESULT_WEIGHT = 0.8
 TURN_MATCH_WEIGHT = 0.1
 FORMAT_WEIGHT = 0.1
 MAX_SCORE = 1.0
+#: turns beyond the reference plan that still earn the full efficiency term
+EFFICIENCY_FREE_TURNS = 2
 
 _RESULT_BASES = ("goal_satisfied", "final_state", "final_answer", "replay", "timeout")
 
@@ -138,9 +140,52 @@ def _turn_match(task: dict, trajectory: dict) -> dict:
     }
 
 
+def process_mode(task: dict) -> str:
+    """``"turn_match"`` (default) or ``"efficiency"`` (``env.config.process_term``)."""
+    config = base.as_mapping(base.as_mapping(base.as_mapping(task).get("env")).get("config"))
+    mode = config.get("process_term")
+    return "efficiency" if mode == "efficiency" else "turn_match"
+
+
+def _efficiency(task: dict, trajectory: dict, result_ok: bool) -> dict:
+    """0.1 process term for outcome-verified (stateful) tasks.
+
+    Matching the emitted calls against *one* reference plan punishes valid
+    alternative plans and pays for imitation, so procedural stateful tasks
+    opt into an efficiency term instead (``env.config.process_term =
+    "efficiency"``):
+
+    * it is **paid only on success** - a failed or idle trajectory can never
+      collect it (otherwise "stop early" would be a free 0.1);
+    * ``num_turns <= expected_turns + 2`` earns the full term (retries and a
+      verification read are free), then it decays linearly to 0 at
+      ``meta.max_turns``.
+
+    There is deliberately no "recovery bonus": rewarding recovered errors
+    would pay the policy for causing errors first.  Recovery is learned
+    because injected faults block the goal until the call is retried.
+    """
+    meta = base.as_mapping(base.as_mapping(task).get("meta"))
+    num_turns = len(base.iter_turns(trajectory))
+    expected = meta.get("expected_turns")
+    max_turns = meta.get("max_turns")
+    info = {"num_turns": num_turns, "expected_turns": expected, "max_turns": max_turns,
+            "source": "efficiency"}
+    if not result_ok:
+        return {**info, "fraction": 0.0, "reason": "paid_only_on_success"}
+    if not (base._is_int(expected) and base._is_int(max_turns)):
+        return {**info, "fraction": 1.0, "reason": "no_turn_budget"}
+    free = expected + EFFICIENCY_FREE_TURNS
+    if num_turns <= free or max_turns <= free:
+        return {**info, "fraction": 1.0}
+    fraction = max(0.0, min(1.0, (max_turns - num_turns) / float(max_turns - free)))
+    return {**info, "fraction": fraction}
+
+
 def reward(task: dict, trajectory: dict) -> dict:
     """Pure reward for one ``mt_fc`` task/trajectory pair."""
     format_score, format_info = base.format_report(task, trajectory)
+    mode = process_mode(task)
     turn = _turn_match(task, trajectory)
     env = base.env_state(trajectory)
     env_present = base.has_env_state(trajectory)
@@ -184,6 +229,15 @@ def reward(task: dict, trajectory: dict) -> dict:
     else:
         result_value = 1.0 if raw_result_ok else 0.0
 
+    idle_without_calls = False
+    if mode == "efficiency":
+        turn = {**_efficiency(task, trajectory, result_value >= 1.0), "turn_match_reference": turn}
+        # A trajectory that never calls a tool on a task that needs tools must
+        # not out-score an honest failed attempt through the format term alone.
+        if result_value < 1.0 and not base.all_calls(trajectory) and base.flatten_gt_calls(task):
+            format_score = 0.0
+            idle_without_calls = True
+
     score = base.weighted_sum(
         [
             (RESULT_WEIGHT, result_value),
@@ -203,6 +257,8 @@ def reward(task: dict, trajectory: dict) -> dict:
         "raw_result": 1.0 if raw_result_ok else 0.0,
         "result_suppressed": result_suppressed,
         "turn_match": turn["fraction"],
+        "process_term": mode,
+        "idle_without_calls": idle_without_calls,
         "format": format_score,
         "components": {
             "result": result_value,

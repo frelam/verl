@@ -46,6 +46,48 @@ DOMAINS: dict[str, type] = {}
 #: GT-return sources in priority order (CONTRACTS.md C6).
 GT_RETURNS_SOURCES = ("config", "reference", "gt_turns", "placeholder")
 
+#: Transient error returned by an injected fault (env.config.faults).
+DEFAULT_FAULT_MESSAGE = (
+    "Error: 503 Service Unavailable - the backend timed out, nothing was changed. "
+    "Please retry the call."
+)
+
+_ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+_NUMBER_RE = re.compile(r"^[-+]?\$?\s*\d[\d,]*(?:\.\d+)?%?$")
+
+
+def _as_number(text: str) -> float | None:
+    value = text.strip()
+    if not _NUMBER_RE.match(value):
+        return None
+    try:
+        return float(value.replace("$", "").replace(",", "").replace("%", "").strip())
+    except ValueError:
+        return None
+
+
+def answer_tag_matches(actual: Any, expected: Any) -> bool:
+    """Strict final-answer check: last ``<answer>...</answer>`` must equal ``expected``.
+
+    Numbers compare with a 0.005 absolute tolerance (money / counts), text
+    with :func:`normalize_query`.  Requiring the tag (instead of searching the
+    whole reply) blocks the "dump every candidate value" hack.
+    """
+    if not isinstance(actual, str) or expected is None:
+        return False
+    matches = _ANSWER_TAG_RE.findall(actual)
+    if not matches:
+        return False
+    predicted = matches[-1].strip()
+    gold = str(expected).strip()
+    if not predicted:
+        return False
+    predicted_number, gold_number = _as_number(predicted), _as_number(gold)
+    if predicted_number is not None and gold_number is not None:
+        return abs(predicted_number - gold_number) <= 0.005
+    return normalize_query(predicted) == normalize_query(gold)
+
+
 #: Content prefix for a GT tool return that could not be injected (T4-02).
 #: The replay env returns ``ok=False`` and records the count instead of silently
 #: fabricating a success payload; replay_check treats these as degraded, not as
@@ -942,10 +984,156 @@ class TradingDomain(BaseDomain):
         return self._ok({"history": list(history)[-10:]})
 
 
+class RetailDomain(BaseDomain):
+    """tau-bench style retail back office (users / orders / products).
+
+    Lookup-before-write is enforced by the data, not the handlers: order ids
+    and item ids are only discoverable through ``find_user_by_email`` ->
+    ``get_user_details`` -> ``get_order_details`` / ``get_product_details``,
+    so a policy has to chain reads before it can issue the right write.
+    """
+
+    name = "retail"
+    HANDLERS = {
+        "find_user_by_email": "_find_user_by_email",
+        "get_user_details": "_get_user_details",
+        "get_order_details": "_get_order_details",
+        "get_product_details": "_get_product_details",
+        "cancel_pending_order": "_cancel_pending_order",
+        "modify_order_address": "_modify_order_address",
+        "return_delivered_items": "_return_delivered_items",
+        "exchange_delivered_items": "_exchange_delivered_items",
+    }
+
+    def default_state(self) -> dict[str, Any]:
+        return {"users": {}, "orders": {}, "products": {}}
+
+    def _user(self, user_id: Any) -> dict[str, Any]:
+        users = self.state.setdefault("users", {})
+        if not isinstance(user_id, str) or user_id not in users:
+            raise ValueError(f"user not found: {user_id!r}")
+        return users[user_id]
+
+    def _order(self, order_id: Any) -> dict[str, Any]:
+        orders = self.state.setdefault("orders", {})
+        if not isinstance(order_id, str) or order_id not in orders:
+            raise ValueError(f"order not found: {order_id!r}")
+        return orders[order_id]
+
+    def _variant(self, item_id: Any) -> tuple[str, dict[str, Any]]:
+        for product_id, product in self.state.setdefault("products", {}).items():
+            variants = product.get("variants") or {}
+            if isinstance(item_id, str) and item_id in variants:
+                return product_id, variants[item_id]
+        raise ValueError(f"item not found: {item_id!r}")
+
+    @staticmethod
+    def _item_ids(arguments: Mapping[str, Any]) -> list[str]:
+        raw = _get_arg(arguments, "item_ids", "items")
+        if not isinstance(raw, list) or not raw or not all(isinstance(i, str) for i in raw):
+            raise ValueError("item_ids must be a non-empty list of item id strings")
+        return list(raw)
+
+    def _find_user_by_email(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        email = _get_arg(arguments, "email")
+        if not isinstance(email, str) or not email.strip():
+            raise ValueError("email must be a non-empty string")
+        for user_id, user in self.state.setdefault("users", {}).items():
+            if str(user.get("email", "")).lower() == email.strip().lower():
+                return self._ok({"user_id": user_id})
+        raise ValueError(f"no user with email {email!r}")
+
+    def _get_user_details(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        user = self._user(_get_arg(arguments, "user_id"))
+        return self._ok(
+            {
+                "name": user.get("name"),
+                "email": user.get("email"),
+                "address": user.get("address"),
+                "orders": list(user.get("orders", [])),
+            }
+        )
+
+    def _get_order_details(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        order_id = _get_arg(arguments, "order_id")
+        order = self._order(order_id)
+        return self._ok({"order_id": order_id, **copy.deepcopy(order)})
+
+    def _get_product_details(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        product_id = _get_arg(arguments, "product_id")
+        products = self.state.setdefault("products", {})
+        if not isinstance(product_id, str) or product_id not in products:
+            raise ValueError(f"product not found: {product_id!r}")
+        return self._ok({"product_id": product_id, **copy.deepcopy(products[product_id])})
+
+    def _cancel_pending_order(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        order_id = _get_arg(arguments, "order_id")
+        order = self._order(order_id)
+        reason = _get_arg(arguments, "reason")
+        if reason not in ("no longer needed", "ordered by mistake"):
+            raise ValueError("reason must be 'no longer needed' or 'ordered by mistake'")
+        if order.get("status") != "pending":
+            raise ValueError(f"order {order_id} is {order.get('status')!r}, only pending orders can be cancelled")
+        order["status"] = "cancelled"
+        order["cancel_reason"] = reason
+        return self._ok({"order_id": order_id, "status": "cancelled"})
+
+    def _modify_order_address(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        order_id = _get_arg(arguments, "order_id")
+        order = self._order(order_id)
+        address = _get_arg(arguments, "address")
+        if not isinstance(address, str) or not address.strip():
+            raise ValueError("address must be a non-empty string")
+        if order.get("status") != "pending":
+            raise ValueError(f"order {order_id} is {order.get('status')!r}, only pending orders can be modified")
+        order["address"] = address.strip()
+        return self._ok({"order_id": order_id, "address": order["address"]})
+
+    def _check_delivered_items(self, order_id: Any, item_ids: list[str]) -> dict[str, Any]:
+        order = self._order(order_id)
+        if order.get("status") != "delivered":
+            raise ValueError(f"order {order_id} is {order.get('status')!r}, only delivered orders accept this")
+        owned = [item.get("item_id") for item in order.get("items", [])]
+        missing = [item for item in item_ids if item not in owned]
+        if missing:
+            raise ValueError(f"items {missing} are not part of order {order_id}")
+        return order
+
+    def _return_delivered_items(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        order_id = _get_arg(arguments, "order_id")
+        item_ids = self._item_ids(arguments)
+        order = self._check_delivered_items(order_id, item_ids)
+        refund = round(
+            sum(float(i.get("price", 0)) for i in order.get("items", []) if i.get("item_id") in item_ids), 2
+        )
+        order["status"] = "return requested"
+        order["return_items"] = sorted(item_ids)
+        return self._ok({"order_id": order_id, "status": order["status"], "refund": refund})
+
+    def _exchange_delivered_items(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        order_id = _get_arg(arguments, "order_id")
+        item_ids = self._item_ids(arguments)
+        new_ids = _get_arg(arguments, "new_item_ids")
+        if not isinstance(new_ids, list) or len(new_ids) != len(item_ids):
+            raise ValueError("new_item_ids must be a list with one new item per exchanged item")
+        order = self._check_delivered_items(order_id, item_ids)
+        for old, new in zip(item_ids, new_ids):
+            old_product, _ = self._variant(old)
+            new_product, variant = self._variant(new)
+            if old_product != new_product:
+                raise ValueError(f"{new} is not a variant of the same product as {old}")
+            if not variant.get("available", False):
+                raise ValueError(f"item {new} is out of stock")
+        order["status"] = "exchange requested"
+        order["exchange"] = {old: new for old, new in zip(item_ids, new_ids)}
+        return self._ok({"order_id": order_id, "status": order["status"]})
+
+
 DOMAINS = {
     FilesystemDomain.name: FilesystemDomain,
     SocialDomain.name: SocialDomain,
     TradingDomain.name: TradingDomain,
+    RetailDomain.name: RetailDomain,
 }
 
 
@@ -1031,7 +1219,39 @@ class MockFCEnv(BaseEnv):
         ).strip().lower()
         if self._final_answer_mode in ("", "off"):
             self._final_answer_mode = "none"
+        # require_final_answer: the terminal verdict additionally needs the
+        # reported answer to match reference.final_answer (state-only goals
+        # cannot score "look it up and tell me" sub-tasks).
+        self._require_final_answer = bool(config.get("require_final_answer", False))
+        if self._require_final_answer and self._final_answer_mode == "none":
+            self._final_answer_mode = "answer_tag"
         self._tool_call_count = 0
+
+        # Fault injection (error-recovery training): the first ``count`` calls
+        # to ``tool`` fail with a transient error and do NOT touch the state,
+        # so the only way to the goal is to notice the error and retry.
+        self._faults: dict[str, dict[str, Any]] = {}
+        raw_faults = config.get("faults") or []
+        if isinstance(raw_faults, Mapping):
+            raw_faults = [raw_faults]
+        if not isinstance(raw_faults, list):
+            raise EnvError("env.config.faults must be a list of {tool, count, message}")
+        for fault in raw_faults:
+            if not isinstance(fault, Mapping) or not isinstance(fault.get("tool"), str):
+                raise EnvError("each env.config.faults entry needs a string 'tool'")
+            count = fault.get("count", 1)
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise EnvError("env.config.faults[*].count must be a non-negative int")
+            self._faults[fault["tool"]] = {
+                "remaining": count,
+                "message": str(fault.get("message") or DEFAULT_FAULT_MESSAGE),
+            }
+        self._faults_injected = 0
+        self._tool_errors = 0
+        self._invalid_calls = 0
+        # tools that failed at least once and later succeeded (recovery signal)
+        self._failed_tools: set[str] = set()
+        self._recovered_tools: set[str] = set()
 
     def _handle_tool_calls(
         self,
@@ -1041,14 +1261,26 @@ class MockFCEnv(BaseEnv):
         call_info: list[dict[str, Any]] = []
         for call in calls:
             declared = call["name"]
+            fault = self._faults.get(declared)
             if self._declared_tools and declared not in self._declared_tools:
                 outcome = {
                     "ok": False,
                     "content": f"Error: tool {declared!r} is not declared in this task",
                 }
+                self._invalid_calls += 1
+            elif fault is not None and fault["remaining"] > 0:
+                fault["remaining"] -= 1
+                self._faults_injected += 1
+                outcome = {"ok": False, "content": fault["message"]}
             else:
                 handler_name = self._aliases.get(declared, declared)
                 outcome = self._domain.call(handler_name, call["arguments"])
+            if outcome["ok"]:
+                if declared in self._failed_tools:
+                    self._recovered_tools.add(declared)
+            else:
+                self._tool_errors += 1
+                self._failed_tools.add(declared)
             results.append(
                 make_tool_result(
                     declared,
@@ -1063,12 +1295,20 @@ class MockFCEnv(BaseEnv):
 
     def _env_state_fields(self) -> dict[str, Any]:
         checks = evaluate_goal(self._goal, self._domain.state)
+        final_answer_matches = self._match_final_answer()
+        if self._require_final_answer:
+            checks.append(
+                {
+                    "name": "final_answer",
+                    "ok": final_answer_matches is True,
+                    "detail": f"mode={self._final_answer_mode} matched={final_answer_matches}",
+                }
+            )
         goal_satisfied = all(item["ok"] for item in checks) if checks else None
         if self._timeout:
             # T4-01: a max_turns timeout is a failure; terminal assertions may
             # coincidentally pass, but must never award the result term.
             goal_satisfied = False
-        final_answer_matches = self._match_final_answer()
         return {
             "goal_satisfied": goal_satisfied,
             "checks": checks,
@@ -1080,7 +1320,12 @@ class MockFCEnv(BaseEnv):
                 "domain": self._domain.name,
                 "final_answer_matches": final_answer_matches,
                 "final_answer_mode": self._final_answer_mode,
+                "require_final_answer": self._require_final_answer,
                 "tool_call_count": self._tool_call_count,
+                "tool_errors": self._tool_errors,
+                "invalid_calls": self._invalid_calls,
+                "faults_injected": self._faults_injected,
+                "recovered_tools": sorted(self._recovered_tools),
             },
         }
 
@@ -1103,6 +1348,8 @@ class MockFCEnv(BaseEnv):
                 return re.search(expected, actual) is not None
             except re.error:
                 return None
+        if mode == "answer_tag":
+            return answer_tag_matches(actual, expected)
         return None
 
 
@@ -1407,8 +1654,10 @@ __all__ = [
     "MISSING_RETURN_PREFIX",
     "MockFCEnv",
     "ReplayMockFCEnv",
+    "RetailDomain",
     "SocialDomain",
     "TradingDomain",
+    "answer_tag_matches",
     "deep_equal",
     "evaluate_goal",
     "match_call_group",

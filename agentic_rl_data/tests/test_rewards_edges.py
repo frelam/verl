@@ -68,6 +68,10 @@ def score_of(task_payload: dict, trajectory_payload: dict) -> float:
     return check_result(dispatch_reward(task_payload, trajectory_payload))["score"]
 
 
+def score_of_search(task_payload: dict, trajectory_payload: dict) -> float:
+    return check_result(search_qa.reward(task_payload, trajectory_payload))["score"]
+
+
 # ---------------------------------------------------------------------------
 # search_qa
 # ---------------------------------------------------------------------------
@@ -103,17 +107,32 @@ class TestSearchQa:
         task_payload = task("search_qa", final_answer="New York")
         trajectory_payload = self._trajectory("New York City")
         result = check_result(search_qa.reward(task_payload, trajectory_payload))
-        # answer_score = 0.8, format = 1.0 -> 0.9 * 0.8 + 0.1 * 1.0
-        assert math_isclose(result["score"], 0.82)
+        # f1 = 0.8, partial credit = 0.8 * f1 = 0.64, format = 1.0
+        # -> 0.9 * 0.64 + 0.1 * 1.0
+        assert math_isclose(result["score"], 0.676)
         assert 0.0 < result["info"]["f1"] < 1.0
         assert result["info"]["em"] == 0.0
 
-    def test_wrong_answer_keeps_only_format_credit(self) -> None:
+    def test_wrong_answer_earns_no_format_credit(self) -> None:
         task_payload = task("search_qa", final_answer="Paris")
         trajectory_payload = self._trajectory("London")
         result = check_result(search_qa.reward(task_payload, trajectory_payload))
-        assert math_isclose(result["score"], 0.1)
+        # format credit is gated on a non-zero answer score (no 0.1 floor)
+        assert result["score"] == 0.0
         assert result["info"]["answer_score"] == 0.0
+
+    def test_answer_stuffing_earns_no_partial_credit(self) -> None:
+        task_payload = task("search_qa", final_answer="Paris")
+        stuffed = "Paris or London or Berlin or Rome or Madrid or Vienna or Prague"
+        result = check_result(search_qa.reward(task_payload, self._trajectory(stuffed)))
+        assert result["info"]["answer_too_long"] is True
+        assert result["score"] == 0.0
+
+    def test_exact_match_beats_partial_match(self) -> None:
+        task_payload = task("search_qa", final_answer="New York")
+        exact = score_of_search(task_payload, self._trajectory("New York"))
+        partial = score_of_search(task_payload, self._trajectory("New York City"))
+        assert exact == 1.0 and partial < 0.7
 
     def test_empty_prediction_scores_zero(self) -> None:
         task_payload = task("search_qa", final_answer="Paris")

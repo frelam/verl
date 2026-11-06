@@ -733,6 +733,9 @@ def _turn_format_issues(
         raw_calls = turn_calls(turn)
     if not raw_calls and not content.strip():
         issues.append("empty_turn")
+    if not raw_calls and "<tool_call>" in content:
+        # tool-call markup that did not parse into a call (bad JSON / name)
+        issues.append("unparsed_tool_call")
 
     calls: list[dict] = []
     for call_index, raw_call in enumerate(raw_calls):

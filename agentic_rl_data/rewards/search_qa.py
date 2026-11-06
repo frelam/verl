@@ -31,6 +31,11 @@ TASK_TYPE = "search_qa"
 ANSWER_WEIGHT = 0.9
 FORMAT_WEIGHT = 0.1
 MAX_SCORE = 1.0
+#: weight of the token-F1 partial credit relative to an exact match
+F1_WEIGHT = 0.8
+#: predictions longer than max(FLOOR, RATIO x longest gold) tokens earn no F1 credit
+MAX_ANSWER_LENGTH_RATIO = 3
+MAX_ANSWER_TOKENS_FLOOR = 6
 
 _ARTICLES_RE = re.compile(r"\b(a|an|the)\b", re.IGNORECASE)
 _ANSWER_TAG_RE = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
@@ -146,7 +151,22 @@ def reward(task: dict, trajectory: dict) -> dict:
             -candidate["index"],
         ),
     )
-    answer_score = best["answer_score"]
+    # Anti-hacking (answer stuffing): F1 rewards recall, so a long answer that
+    # lists several candidates still collects partial credit.  Partial (F1)
+    # credit is (a) scaled by F1_WEIGHT and (b) withheld when the prediction is
+    # much longer than the longest gold answer.  EM is never affected.
+    n_pred = len(normalize_answer(prediction).split())
+    n_gold = max(len(normalize_answer(gold).split()) for gold in golds)
+    too_long = n_pred > max(MAX_ANSWER_TOKENS_FLOOR, MAX_ANSWER_LENGTH_RATIO * n_gold)
+    partial = 0.0 if too_long else F1_WEIGHT * best["f1"]
+    answer_score = best["em"] if best["em"] >= 1.0 else partial
+    info["answer_too_long"] = too_long
+    info["n_prediction_tokens"] = n_pred
+    # The format term is paid only when the answer earns something: a wrong
+    # answer must not out-score "no answer" just by being well formed, and a
+    # constant 0.1 floor shrinks GRPO advantages for nothing.
+    if answer_score <= 0.0:
+        format_score = 0.0
     score = base.weighted_sum(
         [(ANSWER_WEIGHT, answer_score), (FORMAT_WEIGHT, format_score)]
     )

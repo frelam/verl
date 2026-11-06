@@ -66,7 +66,12 @@ DEFAULT_MAX_BACKOFF_S = 2.0
 #: after the budget is spent instead of stalling the rollout.
 DEFAULT_TASK_DEADLINE_S = 30.0
 #: Search-R1 setting: at most 8 search rounds per question (plan §1.2).
+#: This stays the *default*; ``env.config.max_rounds`` may raise it up to
+#: :data:`SEARCH_HARD_MAX_ROUNDS` for long-horizon multi-hop (MuSiQue 3-4 hop
+#: with reflection / re-query needs 10-12 rounds).
 SEARCH_R1_MAX_ROUNDS = 8
+#: Absolute ceiling for ``max_rounds`` (anything larger breeds brute-force search).
+SEARCH_HARD_MAX_ROUNDS = 12
 #: Environment-variable prefix for the uvicorn factory entry point.
 ENV_PREFIX = "ARD_SEARCH_"
 
@@ -1040,7 +1045,7 @@ class SearchEnv(BaseEnv):
          "own_backend": bool}
 
     Turn cap = ``min(task.meta.max_turns, reset override, config.max_rounds,
-    8)`` — Search-R1's hard limit.  A **task-level deadline** (default 30s,
+    12)`` (default 8 = Search-R1; up to 12 for long multi-hop).  A **task-level deadline** (default 30s,
     ``task_deadline_s <= 0`` disables) bounds total backend wall-clock time:
     once spent, further tool calls return ``ok=False`` and
     ``info["backend_error"]=True`` instead of stalling the rollout.  Backend
@@ -1060,7 +1065,7 @@ class SearchEnv(BaseEnv):
         )
         self._max_rounds = min(
             _coerce_positive_int(config.get("max_rounds"), SEARCH_R1_MAX_ROUNDS),
-            SEARCH_R1_MAX_ROUNDS,
+            SEARCH_HARD_MAX_ROUNDS,
         )
         self._search_tools = {
             str(name)
@@ -1108,7 +1113,7 @@ class SearchEnv(BaseEnv):
         config = normalise_search_config(config)
         return min(
             _coerce_positive_int(config.get("max_rounds"), SEARCH_R1_MAX_ROUNDS),
-            SEARCH_R1_MAX_ROUNDS,
+            SEARCH_HARD_MAX_ROUNDS,
         )
 
     def _handle_tool_calls(
@@ -1630,6 +1635,7 @@ __all__ = [
     "E5FaissBackend",
     "FASTAPI_AVAILABLE",
     "InMemorySearchBackend",
+    "SEARCH_HARD_MAX_ROUNDS",
     "SEARCH_R1_MAX_ROUNDS",
     "SearchBackendError",
     "SearchClient",

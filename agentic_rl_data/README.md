@@ -10,6 +10,11 @@
 > `custom_reward_function` 桥接、工具格式 → `multi_turn.format`。详见
 > [`reports/VERL_INTEGRATION.md`](reports/VERL_INTEGRATION.md)。
 
+> **v2（Qwen3-4B，10–15 轮 agentic RL）**：设计见 [`reports/AGENTIC_RL_V2.md`](reports/AGENTIC_RL_V2.md)。
+> 数据 `bash agentic_rl_data/scripts/build_data_v2.sh`（配比 `configs/mixture_v2.yaml`，
+> 自检的程序化 stateful 任务 `generators/stateful_tasks.py` + 本地语料多跳检索 `loaders/multihop_local.py`）；
+> 训练 `STAGE=1|2|3 bash agentic_rl_data/scripts/run_qwen3_4b_agentic_v2.sh`。
+
 ## 目录与归属（Lead 维护，改动请走任务卡）
 
 ```

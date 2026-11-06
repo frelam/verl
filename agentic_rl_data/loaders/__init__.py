@@ -35,14 +35,18 @@ SOURCE_REGISTRY: dict[str, str] = {
     "search_r1": "search_r1",
     "asearcher": "asearcher",
     "a2search": "a2search",
+    "multihop_local": "multihop_local",
     # Multi-turn function calling (SFT traces -> replay env).
     "funreason_mt": "funreason_mt",
     "apigen_mt": "apigen_mt",
     "toolmind": "toolmind",
     "toucan": "toucan",
+    # Procedural, self-verified stateful tasks (no raw input).
+    "procedural_mt": "procedural_mt",
     # Other task types.
     "when2call": "when2call",
     "retool": "retool",
+    "reasoning_math": "reasoning_math",
     "code_exec": "code_exec",
 }
 
@@ -56,12 +60,15 @@ SOURCE_TASK_TYPE: dict[str, str] = {
     "search_r1": "search_qa",
     "asearcher": "search_qa",
     "a2search": "search_qa",
+    "multihop_local": "search_qa",
+    "procedural_mt": "mt_fc",
     "funreason_mt": "mt_fc",
     "apigen_mt": "mt_fc",
     "toolmind": "mt_fc",
     "toucan": "mt_fc",
     "when2call": "st_fc|abstain",
     "retool": "math_ci",
+    "reasoning_math": "math_ci",
     "code_exec": "code_exec",
 }
 

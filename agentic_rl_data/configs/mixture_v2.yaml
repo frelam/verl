@@ -1,0 +1,210 @@
+# =============================================================================
+# agentic_rl_data/configs/mixture_v2.yaml  --  Qwen3-4B agentic RL, 10-15 turns
+#
+# Goal: tool-call accuracy + long-horizon agentic skills (planning, reflection,
+# multi-turn format, recovery from tool errors). Rationale and numbers:
+# reports/AGENTIC_RL_V2.md.  Differences vs mixture.yaml (v1):
+#
+#   * multi-turn is now OUTCOME-verified: 75% of the mt bucket is the
+#     procedural stateful generator (filesystem / trading / retail, 4-15 GT
+#     calls, 25-30% with an injected transient fault).  Replay sources
+#     (FunReason-MT / APIGen-MT / Toucan) can only check "did you reproduce
+#     the reference calls"; they stay as a minority (style/diversity only).
+#   * search moves from Search-R1 NQ (1-2 hop, needs a Wikipedia E5 index
+#     server) to multi-hop QA with a per-task local corpus (HotpotQA /
+#     2Wiki / MuSiQue, in-memory BM25, 0 services).
+#   * single-turn function calling is kept at 20% as an anti-forgetting
+#     anchor for tool-call accuracy (the stage-0 tool_rl skills).
+#   * code_exec is dropped (heavy sandbox, weak transfer to tool use);
+#     math+python is kept small for reasoning retention.
+#
+# Size: 6000 train rows ~ 47 steps/epoch at batch 128; the recipe trains
+# ~2-3 epochs with DAPO filtering, i.e. 120-150 effective steps, which is the
+# usual saturation point for a 4B model on rule rewards.  Every source
+# below is either generated (unbounded) or has >20k rows, so the mixture
+# can be scaled with --total-train without changing shares.
+# =============================================================================
+
+version: 2
+seed: 20251106
+total_train: 6000
+
+paths:
+  raw_dir: data/raw_unified
+
+output:
+  dir: data/mixture_v2
+  train: train.jsonl
+  heldout: heldout.jsonl
+  stats: mixture_stats.json
+  emit_curriculum: true
+
+passrate:
+  enabled: true
+  band:
+    min: 0.125
+    max: 0.875
+  n_samples: 8
+  # Pass-rate files come from scripts/estimate_passrate (one vLLM pass of the
+  # base model, N=8). Missing rows are kept: DAPO filtering in the recipe
+  # removes all-0 / all-1 groups online anyway.
+  missing: keep
+  smoothed: false
+  require_report: false
+
+heldout:
+  per_category: 200
+  group_aware: true
+  oversample: 4
+
+filters:
+  max_gt_turns: 15
+  invalid_schema: drop
+  dedup:
+    exact: true
+    approximate:
+      enabled: true
+      method: minhash
+      jaccard: 0.85
+      num_perm: 64
+      priority_sources:
+        - toolace
+        - apigen
+  decontam:
+    enabled: true
+    bfcl_v3: true
+    bfcl_v4: true
+    ngram: 5
+    jaccard: 0.90
+    hit_policy: drop
+    report_required: false
+  mt_fc:
+    # replay rows without real tool returns are never trained on
+    placeholder_gt_returns: drop
+    placeholder_keep_share: 0.0
+    placeholder_weight: 0.5
+
+curriculum:
+  enabled: true
+  filter_gt_turns: 15
+  # short-to-long; the recipe trains stage files in order (see run script)
+  stages:
+    - max_turns: 8
+      start_fraction: 0.0
+      end_fraction: 0.3
+    - max_turns: 12
+      start_fraction: 0.3
+      end_fraction: 0.6
+    - max_turns: 15
+      start_fraction: 0.6
+      end_fraction: 1.0
+
+sources:
+  # --- single-turn anchor (stage-0 data, exact counts) ------------------------
+  apigen:
+    file: apigen.jsonl
+    task_type: st_fc
+    required: true
+  toolace:
+    file: toolace.jsonl
+    task_type: st_fc
+    required: true
+  sealtools:
+    file: sealtools.jsonl
+    task_type: st_fc
+    required: false
+  hammer:
+    file: hammer.jsonl
+    task_type: irrelevance
+    required: true
+
+  # --- outcome-verified multi-turn (generated, unbounded) ---------------------
+  procedural_mt:
+    file: procedural_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: "generated (repo-internal)"
+    note: "generators/stateful_tasks.py: 3 domains x 13 templates, self-verified"
+
+  # --- replay multi-turn (style / tool-schema diversity only) -----------------
+  toucan:
+    file: toucan.jsonl
+    task_type: mt_fc
+    required: false
+    subsample: 6000
+  apigen_mt:
+    file: apigen_mt.jsonl
+    task_type: mt_fc
+    required: false
+
+  # --- multi-hop search with a local per-task corpus ---------------------------
+  multihop_local:
+    file: multihop_local.jsonl
+    task_type: search_qa
+    required: true
+    note: "HotpotQA-distractor + 2Wiki + MuSiQue-ans, 2-4 hops, in-memory BM25"
+
+  # --- math + python (reasoning retention) -------------------------------------
+  reasoning_math:
+    file: reasoning_math.jsonl
+    task_type: math_ci
+    required: false
+
+categories:
+  single_turn:
+    # anti-forgetting for tool-call accuracy; 25% of it is "no tool needed"
+    share: 0.20
+    heldout: 200
+    turn_cap: 15
+    on_unavailable: fail
+    sources:
+      - name: apigen
+        weight: 0.35
+        cap: 600
+      - name: toolace
+        weight: 0.25
+        cap: 450
+      - name: sealtools
+        weight: 0.15
+        cap: 300
+      - name: hammer
+        weight: 0.25
+        cap: 450
+
+  multi_turn:
+    # the core bucket: planning, long horizon, error recovery
+    share: 0.45
+    heldout: 300
+    turn_cap: 15
+    on_unavailable: fail
+    sources:
+      - name: procedural_mt
+        weight: 0.75
+        cap: 2400
+      - name: toucan
+        weight: 0.15
+        cap: 450
+      - name: apigen_mt
+        weight: 0.10
+        cap: 300
+
+  search_qa:
+    # multi-hop retrieval: query planning, reformulation, evidence chaining
+    share: 0.25
+    heldout: 200
+    turn_cap: 12
+    on_unavailable: fail
+    sources:
+      - name: multihop_local
+        weight: 1.0
+        cap: 1800
+
+  math_ci:
+    share: 0.10
+    heldout: 200
+    turn_cap: 15
+    on_unavailable: redistribute
+    sources:
+      - name: reasoning_math
+        weight: 1.0
+        cap: 700
