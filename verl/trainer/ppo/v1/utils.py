@@ -47,10 +47,22 @@ class MetricsAggregator:
                 "validation/filter_groups/discarded_surplus_samples",
                 "training/rollout_failure/evicted_samples",
                 "validation/rollout_failure/evicted_samples",
+                "rollout/aborted_discarded",
+                "rollout/capacity_dropped_groups",
+                "rollout/dispatch_skipped_steps",
             ],
             "last": [
                 "training/global_step",
                 "training/rollout_probs_diff_valid",
+                "training/off_policy/over_threshold_groups",
+                "rollout/outstanding_groups",
+                "rollout/pending_groups",
+                "rollout/running_groups",
+                "rollout/finished_groups",
+                "rollout/failure_groups",
+                "rollout/oldest_running_age",
+                "rollout/watermark/high",
+                "rollout/watermark/low",
             ],
         }
 

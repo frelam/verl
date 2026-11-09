@@ -32,6 +32,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from contextlib import AsyncExitStack
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -661,7 +662,13 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            async with AsyncExitStack() as stack:
+                if hasattr(self.llm_client, "trajectory_lease"):
+                    lease_context = self.llm_client.trajectory_lease(
+                        uid=kwargs["uid"], session_id=kwargs.get("session_id", 0)
+                    )
+                    await stack.enter_async_context(lease_context)
+                output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(

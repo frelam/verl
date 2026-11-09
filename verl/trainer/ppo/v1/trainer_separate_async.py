@@ -47,6 +47,9 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     2. Partial rollout is enabled.
     """
 
+    # Lightweight subclasses/tests that bypass __init__ retain the legacy global-push path.
+    weight_sync_mode = "global_push"
+
     def __init__(self, config: DictConfig):
         train_batch_size = config.data.train_batch_size
         ppo_mini_batch_size = config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -70,6 +73,10 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 "Use standalone mode (reward.reward_model.enable_resource_pool=True) instead."
             )
 
+        self.weight_sync_mode = config.trainer.v1.separate_async.get("weight_sync", {}).get("mode", "global_push")
+        config.actor_rollout_ref.rollout.checkpoint_engine.cache_versions = config.trainer.v1.separate_async.get(
+            "weight_sync", {}
+        ).get("cache_versions", 2)
         super().__init__(config)
         self.hybrid_rollout_config: HybridRolloutSwitchConfig = omega_conf_to_dataclass(
             self.config.trainer.v1.separate_async.hybrid_rollout
@@ -146,6 +153,11 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             actor_wg=self.actor_rollout_wg,
             replicas=self.standalone_server_manager.get_replicas(),
         )
+        if self.weight_sync_mode == "per_replica_pull":
+            self.standalone_server_manager.start_per_replica_pull(
+                checkpoint_engine_config=checkpoint_engine_config,
+                actor_wg=self.actor_rollout_wg,
+            )
 
         # hybrid engine is in rollout mode after initialization
         self.current_mode = HybridEngineMode.ROLLOUT
@@ -190,7 +202,10 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
     def on_init_end(self):
         # update weights after loading checkpoint
-        self.standalone_checkpoint_manager.update_weights(self.global_steps)
+        if self.weight_sync_mode == "per_replica_pull":
+            self.standalone_server_manager.publish_weight_version(self.global_steps)
+        else:
+            self.standalone_checkpoint_manager.update_weights(self.global_steps)
         self.checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
@@ -349,9 +364,18 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             prepare_seconds = time.perf_counter() - prepare_start
 
         with marked_timer("update_weights", self.timing_raw, color="red"):
-            self._pending_sync_metrics = dict(
-                self.standalone_checkpoint_manager.update_weights(self.global_steps) or {}
-            )
+            if self.weight_sync_mode == "per_replica_pull":
+                self._pending_sync_metrics = dict(
+                    self.standalone_server_manager.publish_weight_version(self.global_steps) or {}
+                )
+            else:
+                self.standalone_server_manager.set_weight_syncing(True)
+                try:
+                    self._pending_sync_metrics = dict(
+                        self.standalone_checkpoint_manager.update_weights(self.global_steps) or {}
+                    )
+                finally:
+                    self.standalone_server_manager.set_weight_syncing(False)
 
         if config.enable_switch:
             self._pending_sync_metrics.update(decision_metrics)

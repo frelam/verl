@@ -36,12 +36,14 @@ from verl.experimental.fully_async_policy.dynamic_schedule.base import (
     register_policy,
 )
 from verl.experimental.fully_async_policy.dynamic_schedule.default_policy import DefaultDynamicSchedulePolicy
+from verl.experimental.fully_async_policy.dynamic_schedule.kv_idle_policy import KVIdleDynamicSchedulePolicy
 from verl.experimental.fully_async_policy.dynamic_schedule.static_fully_async_policy import StaticFullyAsyncPolicy
 
 __all__ = [
     "DynamicResourceController",
     "DynamicSchedulePolicyBase",
     "DefaultDynamicSchedulePolicy",
+    "KVIdleDynamicSchedulePolicy",
     "StaticFullyAsyncPolicy",
     "build_policy",
     "register_policy",

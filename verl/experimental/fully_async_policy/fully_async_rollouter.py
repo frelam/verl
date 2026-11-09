@@ -61,6 +61,8 @@ class FullyAsyncLLMServerManager(LLMServerManager):
         rollout_resource_pool: RayResourcePool = None,
     ):
         super().__init__(config, worker_group, rollout_resource_pool)
+        # This manager owns a standalone pool even when hybrid replicas are also registered.
+        self._standalone = True
         # Pre-registered hybrid replicas: bound at init time but still sleeping.
         # Keyed by resource_id; populated during _initialize_llm_servers().
         self.hybrid_replicas: dict[str, RolloutReplica] = {}
@@ -1107,6 +1109,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             # Wait for the task to complete
             await asyncio.gather(generation_task, monitor_task, return_exceptions=True)
+            await self.llm_server_manager.stop_repack()
 
         print("[FullyAsyncRollouter] Rollouter fit completed")
 
@@ -1304,6 +1307,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     # -------------------------------------------------------------------------
     # Statistics / introspection – delegate to llm_server_manager
     # -------------------------------------------------------------------------
+    async def get_repack_snapshot(self) -> dict:
+        return await self.llm_server_manager.get_repack_snapshot()
+
+    def set_repack_weight_syncing(self, active: bool) -> None:
+        self.llm_server_manager.set_weight_syncing(active)
+
     async def get_hybrid_statistics(self) -> dict:
         """Combined rollout + hybrid statistics."""
         base_stats = await self.get_statistics()

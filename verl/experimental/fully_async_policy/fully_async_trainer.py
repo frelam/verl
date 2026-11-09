@@ -558,6 +558,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("step", self.timing_raw):
             ctrl = self.dynamic_resource_controller
+            if self.dynamic_schedule_enabled and self._dynamic_schedule_policy_name == "kv_idle":
+                snapshot = ray.get(self.rollouter.get_repack_snapshot.remote())
+                self.dynamic_schedule_ctx.replica_metrics = snapshot.get("snapshots", {})
+                self.dynamic_schedule_ctx.idle_replicas = set(snapshot.get("idle_replicas", []))
             if self.dynamic_schedule_enabled and ctrl.policy.should_deactivate(
                 global_steps=self.current_param_version,
                 is_hybrid_active=ctrl.is_hybrid_active,
@@ -720,6 +724,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             ctx.buffer_samples = _buffer_sampels
             ctx.step_wait_times = list(self._step_wait_times)
             ctx.step_wait_samples = list(self._step_wait_samples)
+            if self._dynamic_schedule_policy_name == "kv_idle":
+                snapshot = ray.get(self.rollouter.get_repack_snapshot.remote())
+                ctx.replica_metrics = snapshot.get("snapshots", {})
+                ctx.idle_replicas = set(snapshot.get("idle_replicas", []))
             should_activate = ctrl.policy.should_activate_after_step(
                 global_steps=self.current_param_version,
                 is_hybrid_active=ctrl.is_hybrid_active,
@@ -731,9 +739,13 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # Skipped when there are no standalone replicas (e.g. rollout.nnodes=0,
             # all rollout is hybrid) -- there is nothing to sync weights to.
             if not self.only_hybrid:
-                await self.checkpoint_manager.update_weights(
-                    global_steps=self.current_param_version,
-                )
+                self.rollouter.set_repack_weight_syncing.remote(True)
+                try:
+                    await self.checkpoint_manager.update_weights(
+                        global_steps=self.current_param_version,
+                    )
+                finally:
+                    self.rollouter.set_repack_weight_syncing.remote(False)
             # Step 2: When dynamic resource scheduling is enabled, the Trainer GPUs
             # also co-host hybrid rollout replicas.  Push weights to them via
             # a separate naive sync (same mechanism as colocated training).

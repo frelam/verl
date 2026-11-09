@@ -164,6 +164,7 @@ class vLLMHttpServer:
         self.nnodes = nnodes
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self._abort_reasons: dict[str, str] = {}
         self._warned_missing_spec_decode_stats = False
 
         # vLLM's pause stops requests being scheduled but still accepts them, and a request
@@ -237,6 +238,25 @@ class vLLMHttpServer:
         ``get_server_address``.
         """
         return self.config
+
+    async def get_metrics_snapshot(self, timeout_s: float = 2.0):
+        """Return a fresh structured snapshot, or ``None`` when stats are unavailable."""
+        if self.config.disable_log_stats or self.node_rank != 0:
+            return None
+        from verl.workers.rollout.repack import fetch_prometheus_snapshot
+
+        address = (
+            f"[{self._server_address}]:{self._server_port}"
+            if is_valid_ipv6_address(self._server_address)
+            else f"{self._server_address}:{self._server_port}"
+        )
+        return await fetch_prometheus_snapshot(
+            address,
+            weight_version=self.global_steps if self.global_steps is not None else 0,
+            role=self._disaggregation_role if self._disaggregation_role != "null" else "default",
+            request_budget=self.config.max_inflight_requests_per_replica or self.config.max_num_seqs,
+            timeout_s=timeout_s,
+        )
 
     @property
     def lora_as_adapter(self) -> bool:
@@ -673,8 +693,11 @@ class vLLMHttpServer:
                 priority=priority,
             )
 
-            # Get final response
+            # Keep the last non-empty cumulative frame. A migration/weight-sync abort can
+            # append an empty terminal frame, which must not erase the resumable prefix.
             final_res: Optional[RequestOutput] = None
+            partial_res: Optional[RequestOutput] = None
+            saw_empty_abort = False
             admitted = False
             try:
                 async for output in generator:
@@ -682,23 +705,28 @@ class vLLMHttpServer:
                         admitted = True
                         self._admitting -= 1
                     final_res = output
+                    if output.outputs and output.outputs[0].token_ids:
+                        partial_res = output
+                    finish_reason = output.outputs[0].finish_reason if output.outputs else "abort"
+                    if finish_reason == "abort" and (not output.outputs or not output.outputs[0].token_ids):
+                        saw_empty_abort = True
             finally:
                 if not admitted:
                     self._admitting -= 1
             assert final_res is not None
 
         extra_fields = {"global_steps": self.global_steps}
-        # Handle abort case: when the request is aborted by pause_generation(abort),
-        # outputs may be empty. Return empty results with stop_reason="aborted"
-        # instead of crashing with "IndexError: list index out of range".
-        if not final_res.outputs:
-            return TokenOutput(
-                token_ids=[],
-                log_probs=None,
-                routed_experts=None,
-                stop_reason="aborted",
-                extra_fields=extra_fields,
-            )
+        if saw_empty_abort or not final_res.outputs:
+            extra_fields["abort_reason"] = self._abort_reasons.pop(request_id, "weight_sync")
+            if partial_res is None:
+                return TokenOutput(
+                    token_ids=[],
+                    log_probs=None,
+                    routed_experts=None,
+                    stop_reason="aborted",
+                    extra_fields=extra_fields,
+                )
+            final_res = partial_res
 
         # Prefix-cache hit count for this request; consumers surface it as
         # OpenAI usage.prompt_tokens_details.cached_tokens.
@@ -711,14 +739,22 @@ class vLLMHttpServer:
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
-            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+            output_logprobs = final_res.outputs[0].logprobs
+            if token_ids and output_logprobs is None:
+                raise RuntimeError(f"Request {request_id} is missing requested response logprobs")
+            if output_logprobs is not None and len(output_logprobs) != len(token_ids):
+                raise RuntimeError(
+                    f"Request {request_id} returned {len(token_ids)} tokens but "
+                    f"{len(output_logprobs)} logprob entries; migration is unsafe"
+                )
+            log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(output_logprobs or [])]
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
             routed_experts = final_res.outputs[0].routed_experts
 
         # Determine stop reason from finish_reason
-        finish_reason = final_res.outputs[0].finish_reason
+        finish_reason = "abort" if saw_empty_abort else final_res.outputs[0].finish_reason
         if finish_reason == "abort":
             stop_reason = "aborted"
         elif finish_reason in ("stop", "length"):
@@ -1002,7 +1038,9 @@ class vLLMHttpServer:
             return
         await self.engine.resume_generation()
 
-    async def abort_request(self, request_id: str, reset_prefix_cache: bool = True) -> dict[str, Any]:
+    async def abort_request(
+        self, request_id: str, reset_prefix_cache: bool = True, reason: str = "weight_sync"
+    ) -> dict[str, Any]:
         """Abort a specific generation request.
 
         Args:
@@ -1021,7 +1059,9 @@ class vLLMHttpServer:
             if req_state is None:
                 return {"aborted": False, "error": f"Request {request_id} not found"}
 
-            # Create abort output and put it to the queue
+            self._abort_reasons[request_id] = reason
+            # Create abort output and put it to the queue. generate() retains the
+            # last non-empty frame so this sentinel cannot erase a migration prefix.
             from vllm.v1.engine import FinishReason
 
             request_output = req_state.make_request_output(
@@ -1039,9 +1079,10 @@ class vLLMHttpServer:
                 logger.info(f"Prefix cache reset after abort request {request_id}")
 
             logger.info(f"Aborted request: {request_id}")
-            return {"aborted": True, "request_id": request_id}
+            return {"aborted": True, "request_id": request_id, "abort_reason": reason}
 
         except Exception as e:
+            self._abort_reasons.pop(request_id, None)
             logger.error(f"Error aborting request {request_id}: {e}")
             return {"aborted": False, "request_id": request_id, "error": str(e)}
 
@@ -1403,7 +1444,9 @@ class vLLMReplica(RolloutReplica):
         """Resume generation on all servers after abort_all_requests."""
         await asyncio.gather(*[server.resume_generation.remote() for server in self.servers])
 
-    async def abort_request(self, request_id: str) -> dict[str, Any]:
+    async def abort_request(
+        self, request_id: str, reset_prefix_cache: bool = False, reason: str = "migration"
+    ) -> dict[str, Any]:
         """Abort a specific request. Tries all servers since we don't know which one has it.
 
         Args:
@@ -1413,7 +1456,12 @@ class vLLMReplica(RolloutReplica):
             dict[str, Any]: Abort result.
         """
         # TODO(petersh6): we should only abort on the server that has the request.
-        results = await asyncio.gather(*[server.abort_request.remote(request_id) for server in self.servers])
+        results = await asyncio.gather(
+            *[
+                server.abort_request.remote(request_id, reset_prefix_cache=reset_prefix_cache, reason=reason)
+                for server in self.servers
+            ]
+        )
 
         for r in results:
             if r.get("aborted", False):

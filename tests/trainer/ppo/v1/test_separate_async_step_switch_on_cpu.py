@@ -117,6 +117,8 @@ def _trainer(
     trainer.events: list[str] = []
     trainer.checkpoint_manager = _RecordingCheckpointManager("hybrid", trainer.events)
     trainer.standalone_checkpoint_manager = _RecordingCheckpointManager("standalone", trainer.events)
+    trainer.weight_sync_mode = "global_push"
+    trainer.standalone_server_manager = SimpleNamespace(set_weight_syncing=lambda _active: None)
     trainer.balancer_calls: list[str] = []
 
     def add_replicas():
@@ -193,6 +195,40 @@ def _run_step(trainer: PPOTrainerSeparateAsync, *, sample_wait_seconds: float) -
     trainer._wait_for_sampleable_and_switch()
     trainer._step_sample_wait_seconds = sample_wait_seconds
     trainer.on_step_end()
+
+
+@pytest.mark.parametrize(
+    ("bypass_mode", "local_trigger_step", "expected_events"),
+    [
+        (False, 0, ["save:0", "compute"]),
+        (False, 1, ["save:1", "restore:0", "compute", "restore:1", "clear:1"]),
+        (True, 1, ["compute"]),
+    ],
+)
+def test_old_log_prob_preserves_pi_old_call_order(monkeypatch, bypass_mode, local_trigger_step, expected_events):
+    trainer = object.__new__(PPOTrainerSeparateAsync)
+    trainer.config = OmegaConf.create({"algorithm": {"rollout_correction": {"bypass_mode": bypass_mode}}})
+    trainer.local_trigger_step = local_trigger_step
+    events = []
+    trainer.actor_rollout_wg = SimpleNamespace(
+        save_model_to_cpu=lambda step: events.append(f"save:{step}"),
+        restore_model_from_cpu=lambda step: events.append(f"restore:{step}"),
+        clear_cpu_model=lambda step: events.append(f"clear:{step}"),
+    )
+    batch = object()
+    metrics = {}
+
+    def compute_old_log_prob(self, received_batch, received_metrics):
+        assert self is trainer
+        assert received_batch is batch
+        assert received_metrics is metrics
+        events.append("compute")
+        return received_batch
+
+    monkeypatch.setattr(trainer_module.PPOTrainer, "_compute_old_log_prob", compute_old_log_prob)
+
+    assert trainer._compute_old_log_prob(batch, metrics) is batch
+    assert events == expected_events
 
 
 def test_hybrid_rollout_switch_config_target_instantiates_dataclass():

@@ -53,6 +53,11 @@ def _accumulate_eviction_metrics(acc: dict, new: dict, stale_count: int) -> None
             merged = Counter(acc.get(key, {}))
             merged.update(value)
             acc[key] = dict(merged)
+        elif key != "rollout/capacity_dropped_groups" and (
+            key.endswith("/over_threshold_groups") or key.endswith("_groups") or key.endswith("_age")
+        ):
+            # State gauges describe the latest TQ snapshot, not an interval delta.
+            acc[key] = value
         else:
             acc[key] = acc.get(key, 0) + value
 
@@ -144,6 +149,11 @@ class ReplayBuffer:
         gen_batch_size: int | None = None,
         max_inflight_gen_batches: int = 1,
         sync_refill_failed_groups: bool = False,
+        max_outstanding_groups: int | None = None,
+        capacity_policy: str = "hybrid",
+        high_watermark_ratio: float = 0.8,
+        low_watermark_ratio: float = 0.5,
+        gap_based_refill: bool = False,
     ):
         self.trainer_mode = trainer_mode
         self.trainer_config = trainer_config
@@ -157,13 +167,27 @@ class ReplayBuffer:
         self.gen_batch_size = gen_batch_size
         self.max_inflight_gen_batches = max_inflight_gen_batches
         self.sync_refill_failed_groups = sync_refill_failed_groups
+        self.max_outstanding_groups = max_outstanding_groups
+        self.capacity_policy = capacity_policy
+        self.high_watermark_ratio = high_watermark_ratio
+        self.low_watermark_ratio = low_watermark_ratio
+        self.gap_based_refill = gap_based_refill
 
         assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
             f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
         )
-        assert self.max_off_policy_strategy in ["drop", "wait"], (
-            f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait']"
+        assert self.max_off_policy_strategy in ["drop", "wait", "observe"], (
+            f"Invalid max off policy strategy: {self.max_off_policy_strategy}, "
+            "must be one of ['drop', 'wait', 'observe']"
         )
+        if max_outstanding_groups is not None and (
+            not isinstance(max_outstanding_groups, int) or max_outstanding_groups <= 0
+        ):
+            raise ValueError("max_outstanding_groups must be null or a positive integer")
+        if capacity_policy not in {"hybrid", "backpressure", "drop_oldest"}:
+            raise ValueError(f"Unknown capacity_policy: {capacity_policy}")
+        if not 0 <= low_watermark_ratio < high_watermark_ratio <= 1:
+            raise ValueError("Require 0 <= low_watermark_ratio < high_watermark_ratio <= 1")
         if self.filter_groups_metric is not None and self.refill_fn is None:
             raise ValueError("Group filtering (filter_groups_metric) requires refill_fn to replace evicted groups")
         if self.sync_refill_failed_groups and self.refill_fn is None:
@@ -177,8 +201,10 @@ class ReplayBuffer:
         self.failure_keys: dict[str, set] = defaultdict(set)
         # partition_id => {prompt_key: global_steps}, used to prioritize older samples.
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
+        self.prompt_failure_reasons: dict[str, dict[str, str]] = defaultdict(dict)
         # Finished groups are immutable, so their DAPO classification can be reused across polling iterations.
         self._dapo_classification_cache: dict[str, dict[str, float | None]] = defaultdict(dict)
+        self._reward_values_cache: dict[str, dict[str, dict[str, list[float]]]] = defaultdict(lambda: defaultdict(dict))
 
     def _validate_mode_config(self) -> None:
         if self.filter_groups_metric is not None:
@@ -195,6 +221,7 @@ class ReplayBuffer:
         self.finished_keys.clear()
         self.failure_keys.clear()
         self.prompt_global_steps.clear()
+        self.prompt_failure_reasons.clear()
 
         data = tq.kv_list()
         if data is None:
@@ -206,6 +233,8 @@ class ReplayBuffer:
                 if tag.get("is_prompt", False):
                     # see: [GRPO group sampling control]
                     self.prompt_global_steps[partition_id][key] = tag["global_steps"]
+                    if "failure_reason" in tag:
+                        self.prompt_failure_reasons[partition_id][key] = tag["failure_reason"]
                     match tag["status"]:
                         case "pending":
                             self.pending_keys[partition_id].add(key)
@@ -245,7 +274,10 @@ class ReplayBuffer:
             status_keys[partition_id].difference_update(uids)
         for uid in uids:
             self.prompt_global_steps[partition_id].pop(uid, None)
+            self.prompt_failure_reasons[partition_id].pop(uid, None)
             self._dapo_classification_cache[partition_id].pop(uid, None)
+            for cache in self._reward_values_cache[partition_id].values():
+                cache.pop(uid, None)
 
     def _dapo_filtered_keys(self, partition_id: str) -> tuple[set[str], Counter]:
         """Finished groups whose configured DAPO metric is identical across all trajectories.
@@ -302,6 +334,110 @@ class ReplayBuffer:
 
         filtered_rewards = {uid: reward for uid, reward in classification_cache.items() if reward is not None}
         return set(filtered_rewards), Counter(filtered_rewards.values())
+
+    def _reward_values_by_uid(
+        self, partition_id: str, uids: set[str], reward_metric: str | None = None
+    ) -> dict[str, list[float]]:
+        """Return canonical or extra reward values with an immutable-group cache.
+
+        This cache is intentionally independent of DAPO's zero-variance classification cache.
+        """
+        metric = reward_metric or FILTER_GROUPS_REWARD_METRIC
+        cache = self._reward_values_cache[partition_id][metric]
+        new_uids = set(uids) - cache.keys()
+        if not new_uids:
+            return {uid: list(cache[uid]) for uid in uids}
+
+        use_canonical_reward = metric == FILTER_GROUPS_REWARD_METRIC
+        trajectory_keys = [key for key in self.partitions[partition_id] if key.split("_")[0] in new_uids]
+        values_by_uid: dict[str, list[float]] = defaultdict(list)
+        missing_uids = new_uids - {key.split("_")[0] for key in trajectory_keys}
+        if trajectory_keys:
+            data = tq.kv_batch_get(
+                keys=trajectory_keys,
+                partition_id=partition_id,
+                select_fields=["rm_scores"] if use_canonical_reward else ["extra_fields"],
+            )
+            metric_data = list(data["rm_scores"] if use_canonical_reward else data["extra_fields"])
+            for key, value in zip(trajectory_keys, metric_data, strict=True):
+                uid = key.split("_")[0]
+                if use_canonical_reward:
+                    values_by_uid[uid].append(float(value.sum().item()))
+                    continue
+                extra_fields = getattr(value, "data", value)
+                reward_extra_info = extra_fields.get("reward_extra_info", {}) if isinstance(extra_fields, dict) else {}
+                if metric not in reward_extra_info:
+                    missing_uids.add(uid)
+                else:
+                    values_by_uid[uid].append(float(reward_extra_info[metric]))
+        missing_uids.update(uid for uid in new_uids if not values_by_uid[uid])
+        if missing_uids:
+            raise RuntimeError(
+                f"Reward metric {metric!r} is unavailable for groups {sorted(missing_uids)[:5]}; "
+                "use rule-based reward or an independent reward resource pool"
+            )
+        for uid in new_uids:
+            cache[uid] = list(values_by_uid[uid])
+        return {uid: list(cache[uid]) for uid in uids}
+
+    def outstanding_keys(self, partition_id: str = "train") -> set[str]:
+        """All scheduling-depth groups, including terminal failures."""
+        return (
+            self.pending_keys[partition_id]
+            | self.running_keys[partition_id]
+            | self.finished_keys[partition_id]
+            | self.failure_keys[partition_id]
+        )
+
+    def get_outstanding_count(self, partition_id: str = "train", sync_metadata: bool = True) -> int:
+        if sync_metadata:
+            self._sync_metadata_from_transfer_queue()
+        return len(self.outstanding_keys(partition_id))
+
+    def remaining_capacity(self, partition_id: str = "train") -> int | None:
+        if self.max_outstanding_groups is None:
+            return None
+        return max(0, self.max_outstanding_groups - len(self.outstanding_keys(partition_id)))
+
+    def get_dispatch_metrics(self, global_steps: int, partition_id: str = "train") -> dict[str, float]:
+        outstanding = self.outstanding_keys(partition_id)
+        prompt_steps = self.prompt_global_steps[partition_id]
+        running = self.running_keys[partition_id]
+        return {
+            "rollout/outstanding_groups": float(len(outstanding)),
+            "rollout/pending_groups": float(len(self.pending_keys[partition_id])),
+            "rollout/running_groups": float(len(running)),
+            "rollout/finished_groups": float(len(self.finished_keys[partition_id])),
+            "rollout/failure_groups": float(len(self.failure_keys[partition_id])),
+            "rollout/oldest_running_age": float(
+                max((global_steps - prompt_steps.get(uid, global_steps) + 1 for uid in running), default=0)
+            ),
+            "training/off_policy/over_threshold_groups": float(
+                sum(
+                    global_steps - prompt_steps.get(uid, global_steps) + 1 > self.max_off_policy_threshold
+                    for uid in outstanding
+                )
+            ),
+        }
+
+    def enforce_capacity(self, global_steps: int, partition_id: str = "train") -> dict[str, float]:
+        """Synchronize TQ and drop only whole oldest terminal groups if configured."""
+        self._sync_metadata_from_transfer_queue()
+        metrics = self.get_dispatch_metrics(global_steps, partition_id)
+        if self.max_outstanding_groups is None or self.capacity_policy == "backpressure":
+            return metrics
+        overflow = len(self.outstanding_keys(partition_id)) - self.max_outstanding_groups
+        if overflow <= 0:
+            return metrics
+        prompt_steps = self.prompt_global_steps[partition_id]
+        terminal = self.finished_keys[partition_id] | self.failure_keys[partition_id]
+        oldest = sorted(terminal, key=lambda uid: (prompt_steps.get(uid, 0), uid))
+        dropped = set(oldest[:overflow])
+        if dropped:
+            self._clear_groups(partition_id, dropped)
+            metrics["rollout/capacity_dropped_groups"] = float(len(dropped))
+            metrics.update(self.get_dispatch_metrics(global_steps, partition_id))
+        return metrics
 
     def _terminal_eviction_reasons(
         self, global_steps: int, partition_id: str
@@ -365,6 +501,9 @@ class ReplayBuffer:
             metrics[DAPO_FILTERED_REWARD_COUNTS_KEY] = dict(dapo_counts)
         if failed_uids:
             metrics[f"{prefix}/rollout_failure/evicted_samples"] = len(failed_uids)
+            aborted = sum(self.prompt_failure_reasons[partition_id].get(uid) == "abort_discard" for uid in failed_uids)
+            if aborted:
+                metrics["rollout/aborted_discarded"] = aborted
 
         self._clear_groups(partition_id, evicted_uids)
         return evicted_uids, len(stale_uids), len(dapo_uids), metrics
@@ -376,7 +515,7 @@ class ReplayBuffer:
         partition_snapshot = dict(self.partitions[partition_id])
         ordered_keys = sorted(
             sampleable_keys,
-            key=lambda key: prompt_global_steps_snapshot.get(key, 0),
+            key=lambda key: (prompt_global_steps_snapshot.get(key, 0), key),
         )
         return ordered_keys[:batch_size], partition_snapshot, prompt_global_steps_snapshot
 
@@ -550,6 +689,13 @@ class ReplayBufferAsync(ReplayBuffer):
         eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
         return len(self._sampleable_terminal_keys(partition_id, eviction_reasons))
 
+    def get_potential_sampleable_count(self, global_steps: int, partition_id: str = "train") -> int:
+        """Count eligible terminal plus in-flight groups for required-refill decisions."""
+        self._sync_metadata_from_transfer_queue()
+        eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
+        sampleable = self._sampleable_terminal_keys(partition_id, eviction_reasons)
+        return len(sampleable) + len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
+
     def wait_for_sampleable(self, global_steps: int, partition_id: str, target_count: int) -> tuple[set[str], dict]:
         """Poll until ``target_count`` groups are sampleable, evicting and refilling meanwhile.
 
@@ -561,6 +707,10 @@ class ReplayBufferAsync(ReplayBuffer):
         while True:
             # Eviction and selection share one snapshot so newly terminal stale groups wait for the next eviction pass.
             self._sync_metadata_from_transfer_queue()
+            if self.gap_based_refill or self.max_off_policy_strategy == "observe":
+                _accumulate_eviction_metrics(
+                    eviction_metrics, self.get_dispatch_metrics(global_steps, partition_id), stale_count=0
+                )
 
             eviction_reasons = self._terminal_eviction_reasons(global_steps, partition_id)
             evicted_uids, stale_count, _dapo_count, metrics = self._evict_terminal_groups(
@@ -568,11 +718,26 @@ class ReplayBufferAsync(ReplayBuffer):
             )
             if evicted_uids:
                 _accumulate_eviction_metrics(eviction_metrics, metrics, stale_count)
-                if self.refill_fn is not None:
-                    self.refill_fn(len(evicted_uids))
-                continue
+                if not self.gap_based_refill:
+                    if self.refill_fn is not None:
+                        self.refill_fn(len(evicted_uids))
+                    continue
 
             sampleable_keys = self._sampleable_terminal_keys(partition_id, eviction_reasons)
+            if self.gap_based_refill and self.refill_fn is not None:
+                potential_count = (
+                    len(sampleable_keys) + len(self.pending_keys[partition_id]) + len(self.running_keys[partition_id])
+                )
+                missing = max(0, target_count - potential_count)
+                if missing:
+                    gen_batch_size = self.gen_batch_size or 1
+                    dispatch_count = ((missing + gen_batch_size - 1) // gen_batch_size) * gen_batch_size
+                    dispatched = self.refill_fn(dispatch_count)
+                    if dispatched is None:
+                        dispatched = dispatch_count
+                    if dispatched:
+                        continue
+
             if self._has_enough_samples(global_steps, partition_id, target_count, sampleable_keys):
                 return sampleable_keys, eviction_metrics
 

@@ -17,7 +17,16 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["CheckpointConfig", "ProfileConfig", "HybridRolloutSwitchConfig", "BaseModelConfig"]
+__all__ = [
+    "AsyncTrajectoryConfig",
+    "BaseModelConfig",
+    "CheckpointConfig",
+    "HybridRolloutSwitchConfig",
+    "ProfileConfig",
+    "RepackConfig",
+    "RepackMigrationConfig",
+    "WeightSyncConfig",
+]
 
 
 @dataclass
@@ -87,6 +96,67 @@ class HybridRolloutSwitchConfig(BaseConfig):
             raise ValueError(f"switch_threshold_ratio must be in (0, 1], got {self.switch_threshold_ratio}")
         if self.switch_cost_window_size <= 0:
             raise ValueError("switch_cost_window_size must be positive")
+
+
+@dataclass
+class RepackMigrationConfig(BaseConfig):
+    enable: bool = False
+    timeout_s: float = 30.0
+    fallback_to_lb: bool = False
+
+    def __post_init__(self):
+        if self.timeout_s <= 0:
+            raise ValueError("repack migration timeout_s must be positive")
+
+
+@dataclass
+class RepackConfig(BaseConfig):
+    enable: bool = False
+    interval_s: float = 5.0
+    kv_cache_threshold: float = 0.99
+    roofline_batch_size: Optional[int] = None
+    migration: RepackMigrationConfig = field(default_factory=RepackMigrationConfig)
+
+    def __post_init__(self):
+        if self.interval_s <= 0:
+            raise ValueError("repack interval_s must be positive")
+        if not 0 < self.kv_cache_threshold <= 1:
+            raise ValueError("repack kv_cache_threshold must be in (0, 1]")
+        if self.roofline_batch_size is not None and self.roofline_batch_size <= 0:
+            raise ValueError("repack roofline_batch_size must be null or positive")
+
+
+@dataclass
+class AsyncTrajectoryConfig(BaseConfig):
+    single_version_per_trajectory: bool = False
+    max_outstanding_groups: Optional[int] = None
+    capacity_policy: str = "hybrid"
+    high_watermark_ratio: float = 0.8
+    low_watermark_ratio: float = 0.5
+    repack: RepackConfig = field(default_factory=RepackConfig)
+
+    def __post_init__(self):
+        if self.max_outstanding_groups is not None and self.max_outstanding_groups <= 0:
+            raise ValueError("max_outstanding_groups must be null or a positive integer")
+        if self.capacity_policy not in {"hybrid", "backpressure", "drop_oldest"}:
+            raise ValueError(f"Unknown capacity_policy: {self.capacity_policy}")
+        if not 0 <= self.low_watermark_ratio < self.high_watermark_ratio <= 1:
+            raise ValueError("Require 0 <= low_watermark_ratio < high_watermark_ratio <= 1")
+
+
+@dataclass
+class WeightSyncConfig(BaseConfig):
+    mode: str = "global_push"
+    cache_versions: int = 2
+    retry_interval_s: float = 5.0
+
+    def __post_init__(self):
+        if self.mode not in {"global_push", "per_replica_pull"}:
+            raise ValueError(f"Unknown weight sync mode: {self.mode}")
+        if self.cache_versions < 2:
+            raise ValueError("weight_sync.cache_versions must be at least 2")
+        if self.retry_interval_s <= 0:
+            raise ValueError("weight_sync.retry_interval_s must be positive")
 
 
 @dataclass

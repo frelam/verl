@@ -103,6 +103,93 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
+class DispatchLedger:
+    """Account for prompt ownership across dataloader epochs and checkpoints."""
+
+    def __init__(self) -> None:
+        self.current_epoch = 0
+        self.epoch_exhausted = False
+        self.epochs: dict[int, dict[str, int | bool]] = {}
+        self.uid_epochs: dict[str, int] = {}
+
+    def record(self, epoch: int) -> dict[str, int | bool]:
+        return self.epochs.setdefault(
+            epoch,
+            {
+                "dispatched": 0,
+                "trained": 0,
+                "prefetched": 0,
+                "borrowed": 0,
+                "optional_skipped": 0,
+                "borrow_mode": False,
+                "optional_started": False,
+            },
+        )
+
+    def consume_borrowed(self, num_prompts: int) -> int:
+        """Return the optional fetch count after deducting required-refill pre-borrowing."""
+        record = self.record(self.current_epoch)
+        debt = max(0, int(record["borrowed"]) - int(record["optional_skipped"]))
+        skipped = min(num_prompts, debt)
+        record["optional_skipped"] = int(record["optional_skipped"]) + skipped
+        return num_prompts - skipped
+
+    def mark_exhausted(self) -> None:
+        self.current_epoch += 1
+        self.epoch_exhausted = True
+
+    def begin_epoch(self, *, required: bool) -> bool:
+        """Leave the exhausted state; return whether this is a required cross-epoch borrow."""
+        if not self.epoch_exhausted:
+            return False
+        self.epoch_exhausted = False
+        if required:
+            self.record(self.current_epoch)["borrow_mode"] = True
+        return required
+
+    def record_fetch(self, epoch: int, *, required: bool, crossed_epoch: bool) -> bool:
+        record = self.record(epoch)
+        borrowed = required and (crossed_epoch or (record["borrow_mode"] and not record["optional_started"]))
+        if borrowed:
+            record["borrow_mode"] = True
+        return borrowed
+
+    def record_dispatch(self, uids: list[str], epochs: list[int], borrowed: list[bool], *, optional: bool) -> None:
+        for uid, epoch, is_borrowed in zip(uids, epochs, borrowed, strict=True):
+            record = self.record(epoch)
+            record["dispatched"] = int(record["dispatched"]) + 1
+            if optional:
+                record["prefetched"] = int(record["prefetched"]) + 1
+                record["optional_started"] = True
+            if is_borrowed:
+                record["borrowed"] = int(record["borrowed"]) + 1
+            self.uid_epochs[uid] = epoch
+
+    def record_trained(self, uids: set[str]) -> None:
+        for uid in uids:
+            epoch = self.uid_epochs.pop(uid, None)
+            if epoch is not None:
+                record = self.record(epoch)
+                record["trained"] = int(record["trained"]) + 1
+
+    def reconcile(self, outstanding_uids: set[str]) -> None:
+        self.uid_epochs = {uid: epoch for uid, epoch in self.uid_epochs.items() if uid in outstanding_uids}
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "current_epoch": self.current_epoch,
+            "epoch_exhausted": self.epoch_exhausted,
+            "epochs": self.epochs,
+            "uid_epochs": self.uid_epochs,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        self.current_epoch = state["current_epoch"]
+        self.epoch_exhausted = state["epoch_exhausted"]
+        self.epochs = {int(epoch): dict(record) for epoch, record in state["epochs"].items()}
+        self.uid_epochs = dict(state["uid_epochs"])
+
+
 def _tq_supports_checkpoint() -> bool:
     """Whether the installed TransferQueue can snapshot/restore its state for checkpoint consistency."""
     try:
@@ -134,6 +221,12 @@ class PPOTrainer(ABC):
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
+        self.async_trajectory_config = self.config.trainer.v1.get("async_trajectory", {})
+        self._dispatch_ledger = (
+            DispatchLedger() if self.async_trajectory_config.get("max_outstanding_groups") is not None else None
+        )
+        self._dispatch_paused = False
+        self._dispatch_step_metrics = {}
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
             model_config=self.config.actor_rollout_ref.model
@@ -152,7 +245,28 @@ class PPOTrainer(ABC):
         has_custom_sampler = bool(
             custom_sampler is not None and custom_sampler.get("path") and custom_sampler.get("name")
         )
-        if has_custom_sampler:
+        builtin_sampler = False
+        if has_custom_sampler and custom_sampler.path == "verl.trainer.ppo.v1.samplers":
+            from verl.trainer.ppo.v1.samplers import BUILTIN_SAMPLERS
+
+            if custom_sampler.name in BUILTIN_SAMPLERS:
+                builtin_sampler = True
+                base_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
+                sampler_cls = type(
+                    f"{custom_sampler.name}{base_cls.__name__}",
+                    (BUILTIN_SAMPLERS[custom_sampler.name], base_cls),
+                    {},
+                )
+                if custom_sampler.name in {"RewardVariance", "Mixed"}:
+                    reward_model = self.config.reward.reward_model
+                    if reward_model.enable and not reward_model.enable_resource_pool:
+                        raise ValueError(
+                            f"{custom_sampler.name} requires reward before sampling; colocated reward models "
+                            "compute it only after replay-buffer sampling"
+                        )
+        if builtin_sampler:
+            has_custom_sampler = False
+        elif has_custom_sampler:
             sampler_cls = load_extern_type(custom_sampler.path, custom_sampler.name)
         else:
             sampler_cls = ReplayBuffer if self.trainer_mode == "sync" else ReplayBufferAsync
@@ -173,8 +287,20 @@ class PPOTrainer(ABC):
             replay_buffer_kwargs.update(
                 filter_groups_metric=filter_groups_metric,
                 sync_refill_failed_groups=sync_refill_failed_groups,
+                max_outstanding_groups=self.async_trajectory_config.get("max_outstanding_groups"),
+                capacity_policy=self.async_trajectory_config.get("capacity_policy", "hybrid"),
+                high_watermark_ratio=self.async_trajectory_config.get("high_watermark_ratio", 0.8),
+                low_watermark_ratio=self.async_trajectory_config.get("low_watermark_ratio", 0.5),
+                gap_based_refill=(
+                    self.async_trajectory_config.get("max_outstanding_groups") is not None
+                    or self.async_trajectory_config.get("single_version_per_trajectory", False)
+                ),
             )
-            if sampler_cls is ReplayBuffer:
+            if self.trainer_mode != "sync" and replay_buffer_kwargs["gap_based_refill"]:
+                replay_buffer_kwargs["gen_batch_size"] = self.config.data.get("gen_batch_size", None) or (
+                    self.config.data.train_batch_size
+                )
+            if self.trainer_mode == "sync":
                 filter_groups = self.config.algorithm.get("filter_groups", None)
                 max_inflight_gen_batches = 1
                 if filter_groups_metric is not None:
@@ -547,6 +673,8 @@ class PPOTrainer(ABC):
                 partition_id="train",
                 batch_size=sample_batch_size,
             )
+            if getattr(self, "_dispatch_ledger", None) is not None:
+                self._dispatch_ledger.record_trained({key.split("_")[0] for key in batch.keys})
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
@@ -601,7 +729,10 @@ class PPOTrainer(ABC):
 
     def on_train_end(self):
         """Called after the training loop ends."""
-        return
+        for manager in self._rollout_server_managers():
+            stop_repack = getattr(manager, "stop_repack", None)
+            if stop_repack is not None:
+                stop_repack()
 
     def on_validate_begin(self):
         """Called before the validation loop starts."""
@@ -624,6 +755,10 @@ class PPOTrainer(ABC):
         """Weight-sync stats stashed by ``on_step_end`` (e.g. the delta engines'
         changed ratio / wire payload), merged into this step's logged metrics."""
         metrics = getattr(self, "_pending_sync_metrics", None) or {}
+        for manager in self._rollout_server_managers():
+            get_laminar_metrics = getattr(manager, "get_laminar_metrics", None)
+            if get_laminar_metrics is not None:
+                metrics.update(get_laminar_metrics())
         self._pending_sync_metrics = {}
         return metrics
 
@@ -840,6 +975,14 @@ class PPOTrainer(ABC):
         else:
             logger.warning(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
+        if getattr(self, "_dispatch_ledger", None) is not None:
+            ledger_path = os.path.join(global_step_folder, "dispatch_ledger.pt")
+            if not os.path.exists(ledger_path):
+                raise FileNotFoundError(
+                    f"Bounded dispatch is enabled but the checkpoint has no dispatch ledger: {ledger_path}"
+                )
+            self._dispatch_ledger.load_state_dict(torch.load(ledger_path, weights_only=False))
+
         # 5. restore TransferQueue state (async modes). Re-issuing the restored in-flight prompts is
         # deferred to fit() to use the agent_loop_manager.
         if self.trainer_mode != "sync" and _tq_supports_checkpoint():
@@ -938,6 +1081,8 @@ class PPOTrainer(ABC):
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        if getattr(self, "_dispatch_ledger", None) is not None:
+            torch.save(self._dispatch_ledger.state_dict(), os.path.join(local_global_step_folder, "dispatch_ledger.pt"))
 
         # save TransferQueue state for async modes so in-flight prompts (already fetched from the
         # dataloader but not yet trained into this checkpoint's weights) survive a restart:
@@ -1374,21 +1519,43 @@ class PPOTrainer(ABC):
                 seen.add(id(self.critic_wg))
                 self.critic_wg.stop_profile(run_command=run_command)
 
-    def _fetch_one_gen_batch(self) -> TensorDict:
-        """Fetch one ``gen_batch_size`` chunk from the dataloader."""
+    def _fetch_one_gen_batch(self, allow_epoch_wrap: bool = True, required: bool = True) -> TensorDict:
+        """Fetch one chunk, optionally stopping instead of crossing the dataloader epoch."""
+        ledger = getattr(self, "_dispatch_ledger", None)
+        crossed_epoch = False
+        if ledger is not None and ledger.epoch_exhausted:
+            if not allow_epoch_wrap:
+                raise StopIteration
+            crossed_epoch = ledger.begin_epoch(required=required)
+            self.train_dataloader_it = None
         try:
             if self.train_dataloader_it is None:
                 self.train_dataloader_it = iter(self.train_dataloader)
             batch_dict = next(self.train_dataloader_it)
         except StopIteration:
-            self.train_dataloader_it = iter(self.train_dataloader)
-            batch_dict = next(self.train_dataloader_it)
+            if ledger is None:
+                self.train_dataloader_it = iter(self.train_dataloader)
+                batch_dict = next(self.train_dataloader_it)
+            else:
+                ledger.mark_exhausted()
+                if not allow_epoch_wrap:
+                    raise
+                crossed_epoch = ledger.begin_epoch(required=required)
+                self.train_dataloader_it = iter(self.train_dataloader)
+                batch_dict = next(self.train_dataloader_it)
 
+        if ledger is not None:
+            self._last_fetch_epoch = ledger.current_epoch
+            self._last_fetch_borrowed = ledger.record_fetch(
+                ledger.current_epoch, required=required, crossed_epoch=crossed_epoch
+            )
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         return tu.get_tensordict(batch_dict)
 
-    def _next_train_batch(self, num_prompts: int | None = None) -> TensorDict:
-        """Fetch and coalesce the requested number of prompts."""
+    def _next_train_batch(
+        self, num_prompts: int | None = None, allow_epoch_wrap: bool = True, required: bool = True
+    ) -> TensorDict | None:
+        """Fetch and coalesce prompts, returning actual optional-prefetch depth."""
         train_batch_size = self.config.data.train_batch_size
         if num_prompts is None:
             num_prompts = train_batch_size
@@ -1398,13 +1565,37 @@ class PPOTrainer(ABC):
                 f"num_prompts ({num_prompts}) must be a positive multiple of gen_batch_size "
                 f"({gen_batch_size}); it is submitted in whole gen_batch_size dataloader fetches."
             )
+        ledger = getattr(self, "_dispatch_ledger", None)
+        if ledger is not None and not required:
+            num_prompts = ledger.consume_borrowed(num_prompts)
+            if num_prompts == 0:
+                return None
 
-        chunks = [self._fetch_one_gen_batch() for _ in range(num_prompts // gen_batch_size)]
+        chunks = []
+        epochs: list[int] = []
+        borrowed: list[bool] = []
+        for _ in range(num_prompts // gen_batch_size):
+            try:
+                if ledger is None:
+                    chunk = self._fetch_one_gen_batch()
+                else:
+                    chunk = self._fetch_one_gen_batch(allow_epoch_wrap=allow_epoch_wrap, required=required)
+            except StopIteration:
+                break
+            chunks.append(chunk)
+            if ledger is not None:
+                epochs.extend([self._last_fetch_epoch] * len(chunk))
+                borrowed.extend([self._last_fetch_borrowed] * len(chunk))
+        if not chunks:
+            return None
         batch = chunks[0] if len(chunks) == 1 else tu.concat_tensordict(chunks)
+        if ledger is not None:
+            self._last_batch_epochs = epochs
+            self._last_batch_borrowed = borrowed
         tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
         return batch
 
-    def _submit_batch_to_rollout(self, batch: TensorDict) -> int:
+    def _submit_batch_to_rollout(self, batch: TensorDict, *, optional: bool = False) -> int:
         """Register prompts in TransferQueue and dispatch them for generation."""
         tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))]
         if self.trainer_mode != "sync":
@@ -1420,22 +1611,95 @@ class PPOTrainer(ABC):
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
         self.agent_loop_manager.generate_sequences(batch)
+        if getattr(self, "_dispatch_ledger", None) is not None:
+            self._dispatch_ledger.record_dispatch(
+                list(batch["uid"]), self._last_batch_epochs, self._last_batch_borrowed, optional=optional
+            )
         return len(batch)
 
-    def _add_prompts_to_generate(self, num_prompts: int) -> int:
-        """Add an exact number of prompts to the AgentLoopManager."""
-        batch = self._next_train_batch(num_prompts)
-        return self._submit_batch_to_rollout(batch)
+    @staticmethod
+    def _merge_dispatch_metrics(target: dict, new: dict) -> None:
+        counters = {"rollout/capacity_dropped_groups", "rollout/dispatch_skipped_steps"}
+        for key, value in new.items():
+            if key in counters:
+                target[key] = target.get(key, 0) + value
+            else:
+                target[key] = value
+
+    def _add_prompts_to_generate(self, num_prompts: int, required: bool = True) -> int:
+        """Dispatch required refill or optional prefetch within the hard group cap."""
+        if getattr(self, "_dispatch_ledger", None) is None:
+            batch = self._next_train_batch(num_prompts)
+            return self._submit_batch_to_rollout(batch)
+        metrics = self.replay_buffer.enforce_capacity(self.global_steps, "train")
+        self._merge_dispatch_metrics(getattr(self, "_dispatch_step_metrics", {}), metrics)
+        self._dispatch_ledger.reconcile(self.replay_buffer.outstanding_keys("train"))
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        available = self.replay_buffer.remaining_capacity("train") or 0
+        dispatch_count = min(num_prompts, available)
+        dispatch_count -= dispatch_count % gen_batch_size
+        if dispatch_count <= 0:
+            return 0
+        batch = self._next_train_batch(dispatch_count, allow_epoch_wrap=required, required=required)
+        if batch is None:
+            return 0
+        return self._submit_batch_to_rollout(batch, optional=not required)
 
     @SkipManager.annotate_tq(role="rollout_tq", phase="submit")
     def _add_batch_to_generate(self):
-        """Add one training batch to the AgentLoopManager."""
-        batch = self._next_train_batch()
-        self._submit_batch_to_rollout(batch)
+        """Add legacy one batch or budgeted multi-batch optional prefetch."""
+        if getattr(self, "_dispatch_ledger", None) is None:
+            batch = self._next_train_batch()
+            self._submit_batch_to_rollout(batch)
+            return None
+
+        metrics = self.replay_buffer.enforce_capacity(self.global_steps, "train")
+        self._dispatch_ledger.reconcile(self.replay_buffer.outstanding_keys("train"))
+        outstanding = self.replay_buffer.get_outstanding_count("train", sync_metadata=False)
+        max_outstanding = self.replay_buffer.max_outstanding_groups
+        high = math.ceil(max_outstanding * self.replay_buffer.high_watermark_ratio)
+        low = math.floor(max_outstanding * self.replay_buffer.low_watermark_ratio)
+        metrics["rollout/watermark/high"] = float(high)
+        metrics["rollout/watermark/low"] = float(low)
+        policy = self.replay_buffer.capacity_policy
+        if policy != "drop_oldest":
+            if self._dispatch_paused:
+                if outstanding <= low:
+                    self._dispatch_paused = False
+            elif outstanding >= high:
+                self._dispatch_paused = True
+            if self._dispatch_paused:
+                metrics["rollout/dispatch_skipped_steps"] = 1
+                self._merge_dispatch_metrics(getattr(self, "_dispatch_step_metrics", {}), metrics)
+                return metrics
+
+        available = self.replay_buffer.remaining_capacity("train") or 0
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        dispatch_count = available - available % gen_batch_size
+        if dispatch_count > 0:
+            self._add_prompts_to_generate(dispatch_count, required=False)
+        self.replay_buffer.get_outstanding_count("train", sync_metadata=True)
+        metrics.update(self.replay_buffer.get_dispatch_metrics(self.global_steps, "train"))
+        self._merge_dispatch_metrics(getattr(self, "_dispatch_step_metrics", {}), metrics)
+        return metrics
 
     def prepare_step(self) -> dict:
-        self._add_batch_to_generate()
-        return {}
+        if getattr(self, "_dispatch_ledger", None) is None:
+            self._add_batch_to_generate()
+            return {}
+        self._dispatch_step_metrics = {}
+        metrics = self.replay_buffer.enforce_capacity(self.global_steps, "train")
+        self._merge_dispatch_metrics(self._dispatch_step_metrics, metrics)
+        potential = self.replay_buffer.get_potential_sampleable_count(self.global_steps, "train")
+        missing = max(0, self.config.data.train_batch_size - potential)
+        gen_batch_size = self.config.data.get("gen_batch_size", None) or self.config.data.train_batch_size
+        if missing:
+            required = ((missing + gen_batch_size - 1) // gen_batch_size) * gen_batch_size
+            self._add_prompts_to_generate(required, required=True)
+        optional_metrics = self._add_batch_to_generate()
+        if optional_metrics:
+            self._merge_dispatch_metrics(self._dispatch_step_metrics, optional_metrics)
+        return self._dispatch_step_metrics
 
     def _compute_reward_colocate(self, batch: KVBatchMeta, metrics: dict | None = None) -> KVBatchMeta:
         """Compute the reward score with a colocated reward model."""

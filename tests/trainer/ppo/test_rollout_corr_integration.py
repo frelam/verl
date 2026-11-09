@@ -15,14 +15,18 @@
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
+from verl.protocol import DataProto
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
-from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+from verl.trainer.ppo.core_algos import compute_policy_loss_bypass_mode, compute_policy_loss_vanilla
 from verl.trainer.ppo.rollout_corr_helper import (
+    apply_bypass_mode,
     compute_offpolicy_metrics,
+    compute_rollout_correction_and_add_to_batch,
     compute_rollout_correction_and_rejection_mask,
 )
-from verl.workers.config.actor import ActorConfig
+from verl.workers.config.actor import ActorConfig, PolicyLossConfig
 
 
 class TestRolloutISIntegration:
@@ -105,8 +109,6 @@ class TestRolloutISIntegration:
         )
 
         # Check weights
-        from verl.protocol import DataProto
-
         assert isinstance(weights_proto, DataProto)
         weights = weights_proto.batch["rollout_is_weights"]
         assert isinstance(weights, torch.Tensor)
@@ -267,6 +269,104 @@ class TestRolloutISIntegration:
         assert metrics["rollout_corr/rollout_is_oob_ratio"] == pytest.approx(1.0 / 3.0, abs=1e-6)
         torch.testing.assert_close(rollout_is_weights, expected_weights, atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(pg_loss, expected_loss, atol=1e-6, rtol=1e-6)
+
+    def test_mixed_policy_versions_preserve_logprob_correction(self):
+        """Version labels must not alter the logprob-driven IS/RS contract."""
+        old_log_probs = torch.tensor([[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]])
+        rollout_log_probs = torch.tensor([[-1.1, -0.9, -1.0], [-2.0, -2.0, -2.0]])
+        response_mask = torch.ones_like(old_log_probs)
+        config = RolloutCorrectionConfig.decoupled_geo_rs_token_tis(
+            is_threshold=2.0,
+            rs_threshold="0.5_2.0",
+        )
+
+        def run_correction(min_versions, max_versions):
+            batch = DataProto.from_dict(
+                tensors={
+                    "old_log_probs": old_log_probs.clone(),
+                    "rollout_log_probs": rollout_log_probs.clone(),
+                    "response_mask": response_mask.clone(),
+                },
+                non_tensors={"min_global_steps": min_versions, "max_global_steps": max_versions},
+            )
+            return compute_rollout_correction_and_add_to_batch(batch, config)
+
+        reference_batch, reference_metrics = run_correction([4, 4], [4, 4])
+        mixed_batch, mixed_metrics = run_correction([1, 4], [3, 7])
+
+        torch.testing.assert_close(mixed_batch.batch["rollout_is_weights"], reference_batch.batch["rollout_is_weights"])
+        torch.testing.assert_close(mixed_batch.batch["response_mask"], reference_batch.batch["response_mask"])
+        assert mixed_metrics == pytest.approx(reference_metrics)
+        assert mixed_batch.non_tensor_batch["min_global_steps"].tolist() == [1, 4]
+        assert mixed_batch.non_tensor_batch["max_global_steps"].tolist() == [3, 7]
+        # The second sequence is rejected, so this comparison also exercises a non-trivial RS mask.
+        assert mixed_batch.batch["response_mask"][1].sum() == 0
+
+    def test_bypass_mode_reuses_rollout_logprobs_without_double_is(self):
+        """Bypass PPO uses the behavior ratio once while retaining IS metrics and RS masking."""
+        rollout_log_probs = torch.tensor([[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]])
+        log_probs = torch.tensor([[-1.1, -0.9, -1.0], [-2.0, -2.0, -2.0]])
+        advantages = torch.tensor([[1.0, -1.0, 0.5], [0.25, -0.75, 1.0]])
+        response_mask = torch.ones_like(rollout_log_probs)
+        rollout_corr_config = RolloutCorrectionConfig(
+            rollout_is="token",
+            rollout_is_threshold=2.0,
+            rollout_rs="seq_mean_k1",
+            rollout_rs_threshold="0.5_2.0",
+            bypass_mode=True,
+            loss_type="ppo_clip",
+        )
+        actor_config = ActorConfig(
+            strategy="fsdp",
+            rollout_n=1,
+            ppo_micro_batch_size=2,
+            clip_ratio=0.2,
+            policy_loss=PolicyLossConfig(loss_mode="bypass_mode", rollout_correction=rollout_corr_config),
+        )
+        batch = DataProto.from_dict(
+            tensors={"old_log_probs": torch.zeros_like(rollout_log_probs), "rollout_log_probs": rollout_log_probs}
+        )
+        policy_loss_config = OmegaConf.create({"loss_mode": "vanilla"})
+
+        apply_bypass_mode(batch, rollout_corr_config, policy_loss_config)
+
+        assert torch.equal(batch.batch["old_log_probs"], rollout_log_probs)
+        assert policy_loss_config.loss_mode == "bypass_mode"
+        assert policy_loss_config.rollout_correction.bypass_mode is True
+
+        weights_proto, effective_mask, _ = compute_rollout_correction_and_rejection_mask(
+            old_log_prob=log_probs,
+            rollout_log_prob=rollout_log_probs,
+            response_mask=response_mask,
+            rollout_is=rollout_corr_config.rollout_is,
+            rollout_is_threshold=rollout_corr_config.rollout_is_threshold,
+            rollout_rs=rollout_corr_config.rollout_rs,
+            rollout_rs_threshold=rollout_corr_config.rollout_rs_threshold,
+        )
+        actual_loss, actual_metrics = compute_policy_loss_bypass_mode(
+            old_log_prob=batch.batch["old_log_probs"],
+            log_prob=log_probs,
+            advantages=advantages,
+            response_mask=response_mask,
+            loss_agg_mode="token-mean",
+            config=actor_config,
+            rollout_is_weights=weights_proto.batch["rollout_is_weights"],
+        )
+        expected_loss, expected_metrics = compute_policy_loss_vanilla(
+            old_log_prob=rollout_log_probs,
+            log_prob=log_probs,
+            advantages=advantages,
+            response_mask=effective_mask,
+            loss_agg_mode="token-mean",
+            config=actor_config,
+            rollout_is_weights=None,
+        )
+
+        torch.testing.assert_close(actual_loss, expected_loss)
+        for key, value in expected_metrics.items():
+            assert actual_metrics[key] == pytest.approx(value)
+        assert effective_mask[1].sum() == 0
+        assert actual_metrics["rollout_corr/rollout_rs_masked_fraction"] == pytest.approx(0.5)
 
 
 class TestRolloutCorrectionConfigNormalization:

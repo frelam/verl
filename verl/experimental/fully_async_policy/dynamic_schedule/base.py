@@ -32,6 +32,7 @@ Then set ``async_training.dynamic_schedule_policy: "my_policy"`` in the training
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 
 _policy_registry: dict[str, type["DynamicSchedulePolicyBase"]] = {}
 
@@ -98,6 +99,10 @@ class DynamicScheduleContext:
     # Activation / deactivation timing (seconds)
     last_activate_duration_s: float = 0.0
     last_deactivate_duration_s: float = 0.0
+
+    # Optional structured KV snapshots used only by the kv_idle policy.
+    replica_metrics: dict[str, Any] = field(default_factory=dict)
+    idle_replicas: set[str] = field(default_factory=set)
 
     # Derived field, computed once in __post_init__ (not passed to the constructor).
     step_required_samples: int = field(init=False)

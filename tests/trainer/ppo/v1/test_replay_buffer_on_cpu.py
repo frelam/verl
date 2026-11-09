@@ -60,6 +60,9 @@ def _make_rb(
     gen_batch_size: int = 1,
     max_inflight_gen_batches: int = 1,
     sync_refill_failed_groups: bool = False,
+    max_outstanding_groups: int | None = None,
+    capacity_policy: str = "hybrid",
+    gap_based_refill: bool = False,
 ) -> ReplayBuffer:
     """Construct a ReplayBuffer with defaults that keep generic samples on-policy."""
     replay_buffer_cls = ReplayBuffer if trainer_mode == "sync" else ReplayBufferAsync
@@ -76,6 +79,9 @@ def _make_rb(
         gen_batch_size=gen_batch_size,
         max_inflight_gen_batches=max_inflight_gen_batches,
         sync_refill_failed_groups=sync_refill_failed_groups,
+        max_outstanding_groups=max_outstanding_groups,
+        capacity_policy=capacity_policy,
+        gap_based_refill=gap_based_refill,
     )
 
 
@@ -147,6 +153,7 @@ class PromptSpec:
     global_steps: int = 0
     rewards: list[float] | None = None
     canonical_rewards: list[float | list[float]] | None = None
+    failure_reason: str | None = None
     trajectory_keys: list[str] = field(default_factory=list)
 
 
@@ -180,10 +187,13 @@ class RolloutProducer(threading.Thread):
                         tag=tag,
                     )
                     spec.trajectory_keys.append(key)
+                prompt_tag = {"is_prompt": True, "status": spec.status, "global_steps": spec.global_steps}
+                if spec.failure_reason is not None:
+                    prompt_tag["failure_reason"] = spec.failure_reason
                 tq.kv_put(
                     key=spec.uid,
                     partition_id=self.partition_id,
-                    tag={"is_prompt": True, "status": spec.status, "global_steps": spec.global_steps},
+                    tag=prompt_tag,
                 )
         except Exception as e:  # surfaced to the test via join_and_check()
             self.error = e
@@ -1284,5 +1294,187 @@ def test_wait_for_sampleable_replaces_groups_sample_would_have_evicted(tq_init, 
         # The replacement, not the evicted group, is what the following sample() sees.
         batch = _sample(rb, partition_id, batch_size=1, global_steps=5)
         assert _uids_of(batch.keys) == {refiller.produced_uids[0]}
+    finally:
+        _clear_partition(partition_id)
+
+
+# --------------------------------------------------------------------------- #
+# Laminar: observational staleness and bounded dispatch accounting.
+# --------------------------------------------------------------------------- #
+
+
+def test_observe_keeps_stale_groups_and_reports_without_blocking(tq_init, partition_id):
+    stale_finished = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=0)
+    stale_running = PromptSpec(uid=_uid(), status="running", sessions=1, global_steps=0)
+    fresh = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=100)
+    _produce(partition_id, [stale_finished, stale_running, fresh]).join_and_check()
+
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        max_off_policy_strategy="observe",
+        max_off_policy_threshold=2,
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=100, partition_id=partition_id, batch_size=2)
+
+        assert _uids_of(batch.keys) == {stale_finished.uid, fresh.uid}
+        assert metrics["rollout/outstanding_groups"] == 3
+        assert metrics["rollout/running_groups"] == 1
+        assert metrics["rollout/oldest_running_age"] == 101
+        assert metrics["training/off_policy/over_threshold_groups"] == 2
+        assert not any(key.endswith("off_policy/evicted_samples") for key in metrics)
+        remaining = tq.kv_list(partition_id=partition_id)[partition_id]
+        assert stale_running.uid in remaining
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_dispatch_metrics_count_all_four_states_and_failure_capacity(tq_init, partition_id):
+    specs = [
+        PromptSpec(uid=_uid(), status="pending", sessions=0, global_steps=8),
+        PromptSpec(uid=_uid(), status="running", sessions=1, global_steps=7),
+        PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=9),
+        PromptSpec(uid=_uid(), status="failure", sessions=0, global_steps=9),
+    ]
+    _produce(partition_id, specs).join_and_check()
+
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        max_off_policy_threshold=3,
+        max_outstanding_groups=4,
+    )
+    try:
+        rb._sync_metadata_from_transfer_queue()
+        metrics = rb.get_dispatch_metrics(global_steps=10, partition_id=partition_id)
+
+        assert rb.get_outstanding_count(partition_id, sync_metadata=False) == 4
+        assert rb.remaining_capacity(partition_id) == 0
+        assert metrics["rollout/outstanding_groups"] == 4
+        assert metrics["rollout/pending_groups"] == 1
+        assert metrics["rollout/running_groups"] == 1
+        assert metrics["rollout/finished_groups"] == 1
+        assert metrics["rollout/failure_groups"] == 1
+        assert metrics["rollout/oldest_running_age"] == 4
+        assert metrics["training/off_policy/over_threshold_groups"] == 1
+    finally:
+        _clear_partition(partition_id)
+
+
+@pytest.mark.parametrize("capacity_policy", ["hybrid", "drop_oldest"])
+def test_capacity_drops_only_oldest_complete_terminal_groups(tq_init, partition_id, capacity_policy):
+    running = PromptSpec(uid=_uid(), status="running", sessions=2, global_steps=0)
+    pending = PromptSpec(uid=_uid(), status="pending", sessions=0, global_steps=1)
+    old_finished = PromptSpec(uid=_uid(), status="finished", sessions=2, global_steps=2)
+    old_failure = PromptSpec(uid=_uid(), status="failure", sessions=2, global_steps=3)
+    new_finished = PromptSpec(uid=_uid(), status="finished", sessions=2, global_steps=4)
+    specs = [running, pending, old_finished, old_failure, new_finished]
+    _produce(partition_id, specs).join_and_check()
+
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        max_outstanding_groups=3,
+        capacity_policy=capacity_policy,
+    )
+    try:
+        metrics = rb.enforce_capacity(global_steps=4, partition_id=partition_id)
+
+        assert metrics["rollout/capacity_dropped_groups"] == 2
+        assert metrics["rollout/outstanding_groups"] == 3
+        remaining = tq.kv_list(partition_id=partition_id)[partition_id]
+        for dropped in (old_finished, old_failure):
+            assert dropped.uid not in remaining
+            assert not (set(dropped.trajectory_keys) & remaining.keys())
+        for kept in (running, pending, new_finished):
+            assert kept.uid in remaining
+            assert set(kept.trajectory_keys) <= remaining.keys()
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_capacity_backpressure_never_drops_terminal_groups(tq_init, partition_id):
+    specs = [PromptSpec(uid=_uid(), status="finished", sessions=1) for _ in range(2)]
+    _produce(partition_id, specs).join_and_check()
+
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        max_outstanding_groups=1,
+        capacity_policy="backpressure",
+    )
+    try:
+        metrics = rb.enforce_capacity(global_steps=0, partition_id=partition_id)
+
+        assert metrics["rollout/outstanding_groups"] == 2
+        assert "rollout/capacity_dropped_groups" not in metrics
+        assert {spec.uid for spec in specs} <= tq.kv_list(partition_id=partition_id)[partition_id].keys()
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_gap_refill_does_not_replace_evicted_group_when_inflight_covers_target(tq_init, partition_id):
+    stale = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=0)
+    fresh = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=5)
+    running = PromptSpec(uid=_uid(), status="running", sessions=1, global_steps=5)
+    _produce(partition_id, [stale, fresh, running]).join_and_check()
+
+    refiller = FakeRefiller(partition_id, global_steps=5)
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        max_off_policy_strategy="drop",
+        max_off_policy_threshold=1,
+        refill_fn=refiller,
+        gap_based_refill=True,
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=5, partition_id=partition_id, batch_size=1)
+
+        assert _uids_of(batch.keys) == {fresh.uid}
+        assert refiller.calls == []
+        assert metrics["validation/off_policy/evicted_samples"] == 1
+        assert metrics["rollout/running_groups"] == 1
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_gap_refill_rounds_actual_missing_count_to_gen_batch(tq_init, partition_id):
+    stale = PromptSpec(uid=_uid(), status="finished", sessions=1, global_steps=0)
+    _produce(partition_id, [stale]).join_and_check()
+
+    refiller = FakeRefiller(partition_id, global_steps=5)
+    rb = _make_rb(
+        trainer_mode="colocate_async",
+        max_off_policy_strategy="drop",
+        max_off_policy_threshold=1,
+        refill_fn=refiller,
+        gen_batch_size=2,
+        gap_based_refill=True,
+    )
+    try:
+        batch, metrics = rb.sample(global_steps=5, partition_id=partition_id, batch_size=1)
+
+        assert len(_uids_of(batch.keys)) == 1
+        assert _uids_of(batch.keys) <= set(refiller.produced_uids)
+        assert refiller.calls == [2]
+        assert metrics["validation/off_policy/evicted_samples"] == 1
+    finally:
+        _clear_partition(partition_id)
+
+
+def test_abort_discard_has_dedicated_metric(tq_init, partition_id):
+    aborted = PromptSpec(
+        uid=_uid(),
+        status="failure",
+        sessions=0,
+        failure_reason="abort_discard",
+    )
+    _produce(partition_id, [aborted]).join_and_check()
+
+    refiller = FakeRefiller(partition_id, global_steps=1)
+    rb = _make_rb(trainer_mode="colocate_async", refill_fn=refiller)
+    try:
+        batch, metrics = rb.sample(global_steps=1, partition_id=partition_id, batch_size=1)
+
+        assert _uids_of(batch.keys) == {refiller.produced_uids[0]}
+        assert metrics["validation/rollout_failure/evicted_samples"] == 1
+        assert metrics["rollout/aborted_discarded"] == 1
     finally:
         _clear_partition(partition_id)

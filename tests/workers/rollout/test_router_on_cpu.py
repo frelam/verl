@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,7 +27,13 @@ from omegaconf import OmegaConf
 
 from verl.utils.import_utils import resolve_config_path
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
-from verl.workers.rollout.router import GlobalRequestLoadBalancer, get_router_handle
+from verl.workers.rollout.router import (
+    GlobalRequestLoadBalancer,
+    MigrationConflictError,
+    ServerBusyError,
+    TrajectoryLeaseError,
+    get_router_handle,
+)
 
 MOCK_PLUGIN_FQN = __name__ + "._MockPluginLoadBalancer"
 
@@ -137,6 +144,30 @@ def _plugin_lb(servers, tmp_path, **kwargs):
     """Router handle backed by _MockPluginLoadBalancer, loaded from a temp YAML."""
     yaml_path = _write_router_yaml(tmp_path, MOCK_PLUGIN_FQN, **kwargs)
     return get_router_handle(servers=servers, router_config_path=yaml_path)
+
+
+class _ImmediateAwaitable:
+    def __init__(self, value):
+        self.value = value
+
+    def __await__(self):
+        async def result():
+            return self.value
+
+        return result().__await__()
+
+
+class _LocalActorHandle:
+    """Execute a plain router synchronously while preserving Ray's awaitable call shape."""
+
+    def __init__(self, actor):
+        self.actor = actor
+
+    def __getattr__(self, name):
+        def remote(*args, **kwargs):
+            return _ImmediateAwaitable(getattr(self.actor, name)(*args, **kwargs))
+
+        return SimpleNamespace(remote=remote)
 
 
 class TestGetRouterHandleDefault:
@@ -377,3 +408,158 @@ class TestGetRouterHandlePrecedence:
 
         status = ray.get(manager.global_load_balancer.get_status.remote())
         assert status["active_servers"] == 2
+
+
+class TestLaminarRouting:
+    def test_sticky_full_reselects_same_version_neighbor(self):
+        lb = GlobalRequestLoadBalancer(servers={"s0": None, "s1": None}, max_inflight_requests_per_replica=1)
+        source, _ = lb.acquire_server("sticky", engine_request_id="engine-0")
+        destination = "s1" if source == "s0" else "s0"
+        other, _ = lb.acquire_server("other")
+        assert other == destination
+        lb.release_server(destination, request_id="other")
+
+        selected, _ = lb.acquire_server("sticky", engine_request_id="engine-1")
+        assert selected == destination
+        assert lb.get_inflight_count(source) == 1
+        assert lb.get_inflight_count(destination) == 1
+
+    def test_all_full_raises_busy_without_actor_sleep(self):
+        lb = GlobalRequestLoadBalancer(servers={"s0": None}, max_inflight_requests_per_replica=1)
+        lb.acquire_server("a")
+        started = time.monotonic()
+        with pytest.raises(ServerBusyError):
+            lb.acquire_server("b")
+        assert time.monotonic() - started < 0.1
+
+    def test_full_determinism_rejects_admission_cap(self):
+        with pytest.raises(ValueError, match="full_determinism"):
+            GlobalRequestLoadBalancer(servers={"s0": None}, full_determinism=True, max_inflight_requests_per_replica=1)
+
+    def test_lease_drains_across_turns_before_update(self):
+        lb = GlobalRequestLoadBalancer(servers={"s0": None, "s1": None}, laminar_routing_enabled=True)
+        lease = lb.acquire_trajectory_lease("uid:0")
+        server_id = lease["server_id"]
+        lb.set_latest_weight_version(1)
+        assert lb.get_weight_versions()["state"][server_id] == "draining"
+
+        # Existing turns keep affinity even while draining; new leases cannot enter stale replicas.
+        selected, _ = lb.acquire_server(
+            "uid-request",
+            trajectory_id="uid:0",
+            lease_token=lease["token"],
+            engine_request_id="turn-0",
+        )
+        assert selected == server_id
+        with pytest.raises(TrajectoryLeaseError):
+            lb.acquire_server("bad", trajectory_id="other", lease_token=lease["token"])
+        lb.release_server(server_id, request_id="uid-request")
+        assert server_id not in lb.servers_pending_update()
+        lb.release_trajectory_lease("uid:0", lease["token"])
+        assert server_id in lb.servers_pending_update()
+
+        version = lb.mark_server_updating(server_id)
+        lb.complete_server_update(server_id, version, success=True)
+        assert lb.get_weight_versions()["state"][server_id] == "serving"
+        assert lb.get_weight_versions()["local"][server_id] == 1
+
+    def test_migration_reservation_is_single_slot_and_attempt_cas(self):
+        lb = GlobalRequestLoadBalancer(
+            servers={"s0": None, "s1": None},
+            max_inflight_requests_per_replica=1,
+            laminar_routing_enabled=True,
+        )
+        source, _ = lb.acquire_server("req", engine_request_id="engine-0")
+        destination = "s1" if source == "s0" else "s0"
+        reservation = lb.prepare_migration("req", destination, expected_attempt=0)
+        assert reservation["attempt"] == 1
+        assert lb.get_inflight_count(destination) == 1
+
+        selected, _ = lb.acquire_server("req", engine_request_id="engine-1")
+        assert selected == destination
+        assert lb.get_inflight_count(destination) == 1  # reservation consumed, not double-counted
+        resume = lb.consume_migration_resume("req")
+        assert resume["source"] == source
+        lb.release_server(source, request_id="req")
+        assert lb.list_inflight(source) == []
+        lb.release_server(destination, request_id="req")
+        assert lb.get_total_inflight() == 0
+
+    def test_completed_source_cancels_without_stale_registry(self):
+        lb = GlobalRequestLoadBalancer(servers={"s0": None, "s1": None}, laminar_routing_enabled=True)
+        source, _ = lb.acquire_server("req", engine_request_id="engine-0")
+        destination = "s1" if source == "s0" else "s0"
+        lb.prepare_migration("req", destination)
+        lb.cancel_migration("req", request_completed=True)
+        assert lb.list_inflight(source) == []
+        assert lb.list_inflight(destination) == []
+        with pytest.raises(MigrationConflictError):
+            lb.prepare_migration("req", destination)
+
+    @pytest.mark.asyncio
+    async def test_client_retries_busy_on_client_side(self, monkeypatch):
+        class BusyTwiceBalancer(GlobalRequestLoadBalancer):
+            def __init__(self):
+                super().__init__(servers={"s0": None})
+                self.busy_calls = 0
+
+            def acquire_server(self, request_id, **kwargs):
+                if request_id == "retry" and self.busy_calls < 2:
+                    self.busy_calls += 1
+                    raise ServerBusyError("test busy")
+                return super().acquire_server(request_id, **kwargs)
+
+        lb = BusyTwiceBalancer()
+        client = LLMServerClient(config=OmegaConf.create({}), load_balancer_handle=_LocalActorHandle(lb))
+        sleeps = []
+
+        async def no_wait(attempt):
+            sleeps.append(attempt)
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(client, "_admission_sleep", no_wait)
+        server_id, _ = await client._acquire_server("retry")
+
+        assert server_id == "s0"
+        assert sleeps == [0, 1]
+        assert lb.get_metrics()["counters"]["admission_wait_count"] == 1
+        lb.release_server(server_id, request_id="retry")
+
+    @pytest.mark.asyncio
+    async def test_client_busy_wait_is_cancellable_without_slot_leak(self):
+        lb = GlobalRequestLoadBalancer(servers={"s0": None}, max_inflight_requests_per_replica=1)
+        lb.acquire_server("occupied")
+        client = LLMServerClient(config=OmegaConf.create({}), load_balancer_handle=_LocalActorHandle(lb))
+        sleeping = asyncio.Event()
+
+        async def block_until_cancelled(_attempt):
+            sleeping.set()
+            await asyncio.sleep(60)
+
+        client._admission_sleep = block_until_cancelled
+        task = asyncio.create_task(client._acquire_server("cancelled"))
+        await asyncio.wait_for(sleeping.wait(), timeout=1)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert lb.get_total_inflight() == 1
+        assert lb.list_inflight("s0")[0]["request_id"] == "occupied"
+
+    @pytest.mark.asyncio
+    async def test_trajectory_lease_releases_after_exception(self):
+        lb = GlobalRequestLoadBalancer(servers={"s0": None}, laminar_routing_enabled=True)
+        config = OmegaConf.create(
+            {"trainer": {"v1": {"separate_async": {"weight_sync": {"mode": "per_replica_pull"}}}}}
+        )
+        client = LLMServerClient(config=config, load_balancer_handle=_LocalActorHandle(lb))
+
+        with pytest.raises(RuntimeError, match="turn failed"):
+            async with client.trajectory_lease("uid", 0) as lease:
+                assert lb.get_weight_versions()["active_leases"] == 1
+                assert client._lease_context.get()["token"] == lease["token"]
+                raise RuntimeError("turn failed")
+
+        assert lb.get_weight_versions()["active_leases"] == 0
+        assert client._lease_context.get() is None
+        assert lb.servers_pending_update() == []

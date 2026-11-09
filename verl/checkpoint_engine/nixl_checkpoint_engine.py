@@ -32,8 +32,8 @@ import zmq
 import zmq.asyncio
 
 from verl.checkpoint_engine.base import (
-    CheckpointEngine,
     CheckpointEngineRegistry,
+    CheckpointEngineWithCache,
     TensorMeta,
     merge_weight_chunks,
     split_weight_chunks,
@@ -236,7 +236,7 @@ class ReadOperation:
 
 
 @CheckpointEngineRegistry.register("nixl")
-class NIXLCheckpointEngine(CheckpointEngine):
+class NIXLCheckpointEngine(CheckpointEngineWithCache):
     """NIXL checkpoint engine with p2p communication, support various backends: ucx, uccl, mooncacke, etc.
 
     For UCX backend, some environment variables need to be set: UCX_TLS, UCX_IB_GID_INDEX, UCX_IB_DEVICES, etc.
@@ -255,12 +255,14 @@ class NIXLCheckpointEngine(CheckpointEngine):
         device: str = "cuda",
         rollout_dtype: torch.dtype = torch.bfloat16,
         is_master: bool = False,
+        cache_versions: int = 2,
     ):
         self.bucket_size = bucket_size
         self.device = device
         self.rollout_dtype = rollout_dtype
         self.agent = NixlAgent()
         self.is_master = is_master
+        self._ensure_snapshot_store(cache_versions)
 
     def prepare(self) -> NixlAgentMetadata:
         """Prepare send and recv bucket.

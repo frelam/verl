@@ -133,6 +133,8 @@ class CheckpointEngineConfig(BaseConfig):
     backend: Optional[str] = "naive"
     # Bucket size in MB to transfer multiple weights at one time
     update_weights_bucket_megabytes: int = 2048
+    # Number of immutable weight snapshots retained for per-replica pull
+    cache_versions: int = 2
     # Additional keyword arguments for checkpoint engine
     engine_kwargs: dict = field(default_factory=dict)
     # If set, this Python module is imported on every worker process before the
@@ -204,6 +206,8 @@ class RolloutConfig(BaseConfig):
 
     max_model_len: Optional[int] = None
     max_num_seqs: int = 1024
+    # Global scheduling admission cap per replica; independent of engine decode max_num_seqs.
+    max_inflight_requests_per_replica: Optional[int] = None
 
     # note that the logprob computation should belong to the actor
     log_prob_micro_batch_size: Optional[int] = None
@@ -212,6 +216,8 @@ class RolloutConfig(BaseConfig):
     log_prob_max_token_len_per_gpu: int = 16384
 
     disable_log_stats: bool = True
+    enable_stats: bool = False
+    stats_interval_s: float = 5.0
 
     multi_stage_wake_up: bool = False
     engine_kwargs: dict = field(default_factory=dict)

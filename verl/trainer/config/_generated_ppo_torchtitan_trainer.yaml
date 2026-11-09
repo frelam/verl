@@ -273,6 +273,7 @@ actor_rollout_ref:
     max_num_batched_tokens: 8192
     max_model_len: null
     max_num_seqs: 256
+    max_inflight_requests_per_replica: null
     enable_chunked_prefill: true
     enable_prefix_caching: true
     logprobs_mode: processed_logprobs
@@ -284,6 +285,8 @@ actor_rollout_ref:
     log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,false}
     log_prob_max_token_len_per_gpu: ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
     disable_log_stats: true
+    enable_stats: false
+    stats_interval_s: 5
     do_sample: true
     'n': 1
     over_sample_rate: 0
@@ -328,6 +331,7 @@ actor_rollout_ref:
       _target_: verl.workers.config.CheckpointEngineConfig
       backend: naive
       update_weights_bucket_megabytes: 2048
+      cache_versions: 2
       engine_kwargs: {}
       custom_backend_module: null
     trace:
@@ -916,6 +920,11 @@ trainer:
     separate_async:
       num_warmup_batches: 1
       parameter_sync_step: 4
+      weight_sync:
+        _target_: verl.trainer.config.WeightSyncConfig
+        mode: global_push
+        cache_versions: 2
+        retry_interval_s: 5
       hybrid_rollout:
         _target_: verl.trainer.config.HybridRolloutSwitchConfig
         enable_switch: false
@@ -925,6 +934,24 @@ trainer:
         switch_threshold_step_down: 0.03
         switch_threshold_release_steps: 2
         switch_cost_window_size: 3
+    async_trajectory:
+      _target_: verl.trainer.config.AsyncTrajectoryConfig
+      single_version_per_trajectory: false
+      max_outstanding_groups: null
+      capacity_policy: hybrid
+      high_watermark_ratio: 0.8
+      low_watermark_ratio: 0.5
+      repack:
+        _target_: verl.trainer.config.RepackConfig
+        enable: false
+        interval_s: 5
+        kv_cache_threshold: 0.99
+        roofline_batch_size: null
+        migration:
+          _target_: verl.trainer.config.RepackMigrationConfig
+          enable: false
+          timeout_s: 30
+          fallback_to_lb: false
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
@@ -932,7 +959,11 @@ trainer:
       custom_sampler:
         path: null
         name: null
-      sampler_kwargs: {}
+      sampler_kwargs:
+        fifo_ratio: 0.5
+        age_bonus: 0.1
+        short_first: true
+        reward_metric: null
 global_profiler:
   _target_: verl.utils.profiler.ProfilerConfig
   tool: null

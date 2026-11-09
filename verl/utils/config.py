@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import is_dataclass
 from typing import Any, Optional
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
-__all__ = ["omega_conf_to_dataclass", "validate_config"]
+__all__ = ["omega_conf_to_dataclass", "validate_config", "validate_laminar_config"]
+
+logger = logging.getLogger(__name__)
 
 
 def omega_conf_to_dataclass(config: DictConfig | dict, dataclass_type: Optional[type[Any]] = None) -> Any:
@@ -71,6 +74,108 @@ def update_dict_with_config(dictionary: dict, config: DictConfig):
             dictionary[key] = getattr(config, key)
 
 
+def validate_laminar_config(config: DictConfig) -> None:
+    """Fail fast on unsupported Laminar feature combinations before actors start."""
+    trainer_v1 = config.trainer.get("v1", None)
+    if trainer_v1 is None:
+        return
+    mode = trainer_v1.get("trainer_mode", "sync")
+    async_cfg = trainer_v1.get("async_trajectory", {})
+    sampler = trainer_v1.get("sampler", {})
+    rollout = config.actor_rollout_ref.rollout
+    full_determinism = rollout.get("full_determinism", False)
+
+    strategy = sampler.get("max_off_policy_strategy", "drop")
+    if strategy not in {"drop", "wait", "observe"}:
+        raise ValueError("trainer.v1.sampler.max_off_policy_strategy must be drop, wait, or observe")
+    if strategy == "observe" and mode == "sync":
+        logger.warning("max_off_policy_strategy=observe has no effect in sync trainer mode")
+
+    max_outstanding = async_cfg.get("max_outstanding_groups", None)
+    if max_outstanding is not None:
+        if not isinstance(max_outstanding, int) or max_outstanding <= 0:
+            raise ValueError("max_outstanding_groups must be null or a positive integer")
+        if mode == "sync":
+            raise ValueError("max_outstanding_groups is only valid for asynchronous trainer modes")
+        if max_outstanding < config.data.train_batch_size:
+            raise ValueError("max_outstanding_groups must be at least data.train_batch_size")
+    if async_cfg.get("capacity_policy", "hybrid") not in {"hybrid", "backpressure", "drop_oldest"}:
+        raise ValueError("Unknown async_trajectory.capacity_policy")
+    high = async_cfg.get("high_watermark_ratio", 0.8)
+    low = async_cfg.get("low_watermark_ratio", 0.5)
+    if not 0 <= low < high <= 1:
+        raise ValueError("Require 0 <= low_watermark_ratio < high_watermark_ratio <= 1")
+
+    custom = sampler.get("custom_sampler", {}) or {}
+    if custom.get("path") == "verl.trainer.ppo.v1.samplers":
+        name = custom.get("name")
+        if name not in {"FIFO", "RewardVariance", "Mixed", "Length"}:
+            raise ValueError(f"Unknown built-in replay sampler: {name}")
+        kwargs = sampler.get("sampler_kwargs", {})
+        fifo_ratio = kwargs.get("fifo_ratio", 0.5)
+        age_bonus = kwargs.get("age_bonus", 0.1)
+        if not 0 <= fifo_ratio <= 1:
+            raise ValueError("sampler fifo_ratio must be in [0, 1]")
+        if age_bonus < 0:
+            raise ValueError("sampler age_bonus must be non-negative")
+        if name in {"RewardVariance", "Mixed"}:
+            reward_model = config.reward.reward_model
+            if reward_model.enable and not reward_model.enable_resource_pool:
+                raise ValueError(f"{name} requires rule-based reward or an independent reward resource pool")
+
+    admission_cap = rollout.get("max_inflight_requests_per_replica", None)
+    if admission_cap is not None and (not isinstance(admission_cap, int) or admission_cap <= 0):
+        raise ValueError("max_inflight_requests_per_replica must be null or a positive integer")
+
+    separate = trainer_v1.get("separate_async", {})
+    weight_sync = separate.get("weight_sync", {})
+    weight_mode = weight_sync.get("mode", "global_push")
+    if weight_mode not in {"global_push", "per_replica_pull"}:
+        raise ValueError("weight_sync.mode must be global_push or per_replica_pull")
+    if weight_sync.get("cache_versions", 2) < 2:
+        raise ValueError("weight_sync.cache_versions must be at least 2")
+    if weight_sync.get("retry_interval_s", 5) <= 0:
+        raise ValueError("weight_sync.retry_interval_s must be positive")
+    per_replica_pull = weight_mode == "per_replica_pull"
+    if per_replica_pull:
+        if mode != "separate_async":
+            raise ValueError("per_replica_pull is only supported by separate_async standalone rollout")
+        if rollout.checkpoint_engine.backend not in {"nixl", "kimi_ckpt_engine"}:
+            raise ValueError("per_replica_pull requires the NIXL or KIMI checkpoint backend")
+        if rollout.name not in {"vllm", "sglang"}:
+            raise ValueError("per_replica_pull requires a validated vLLM or SGLang rollout adapter")
+        if separate.get("hybrid_rollout", {}).get("enable_switch", False):
+            raise ValueError("per_replica_pull cannot be combined with hybrid_rollout.enable_switch")
+
+    repack = async_cfg.get("repack", {})
+    migration = repack.get("migration", {})
+    migration_enabled = migration.get("enable", False)
+    if migration_enabled and not repack.get("enable", False):
+        raise ValueError("repack.migration.enable requires repack.enable=true")
+    if repack.get("enable", False):
+        if mode == "colocate_async":
+            logger.warning("repack is a no-op in colocate_async mode")
+        elif mode != "separate_async":
+            raise ValueError("V1 repack is only supported by separate_async")
+        if not rollout.get("enable_stats", False):
+            raise ValueError("repack requires actor_rollout_ref.rollout.enable_stats=true")
+    if migration_enabled and rollout.name == "trtllm":
+        raise ValueError("TRT-LLM does not support per-request trajectory migration")
+    if migration_enabled and rollout.name not in {"vllm", "sglang"}:
+        raise ValueError("Trajectory migration requires a validated vLLM or SGLang adapter")
+    if full_determinism and (admission_cap is not None or per_replica_pull or migration_enabled):
+        raise ValueError("V1 full_determinism cannot be combined with admission caps, per-replica pull, or migration")
+    if rollout.get("enable_stats", False):
+        if rollout.get("stats_interval_s", 5) <= 0:
+            raise ValueError("rollout.stats_interval_s must be positive")
+        if rollout.get("disable_log_stats", True):
+            raise ValueError("rollout.enable_stats requires disable_log_stats=false")
+    if async_cfg.get("single_version_per_trajectory", False) and mode != "sync" and not per_replica_pull:
+        logger.warning(
+            "single_version_per_trajectory with global push discards aborted trajectories; expect resampling cost"
+        )
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -83,6 +188,8 @@ def validate_config(
         use_reference_policy (bool): is ref policy needed
         use_critic (bool): is critic needed
     """
+    validate_laminar_config(config)
+
     # number of GPUs total
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 

@@ -51,6 +51,19 @@ class TokenOutput(BaseModel):
     """Extra fields for dynamic addition."""
 
 
+class TrajectoryAbortedError(RuntimeError):
+    """A non-migration abort invalidated a single-version trajectory."""
+
+    def __init__(self, request_id: str, generated_tokens: int, abort_reason: str = "weight_sync"):
+        self.request_id = request_id
+        self.generated_tokens = generated_tokens
+        self.abort_reason = abort_reason
+        super().__init__(
+            f"Trajectory request {request_id!r} was aborted for {abort_reason!r} "
+            f"after {generated_tokens} generated tokens"
+        )
+
+
 class RolloutMode(Enum):
     # Rollout engine and training engine(fsdp/megatron) fused in same process
     # Rollout and trainer share GPUs, switch context with weight synchronization.

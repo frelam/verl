@@ -19,6 +19,7 @@ from typing import Any, AsyncGenerator, Generator
 import ray
 import torch
 
+from verl.checkpoint_engine.weight_snapshot_store import WeightSnapshotStore
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
@@ -233,14 +234,47 @@ class CheckpointEngineWithCache(CheckpointEngine):
     Laminar: https://arxiv.org/abs/2510.12633
     """
 
-    @abstractmethod
-    async def get_weights(self) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get the weights of the model from local cache.
+    def _ensure_snapshot_store(self, cache_versions: int = 2) -> WeightSnapshotStore:
+        if not hasattr(self, "_snapshot_store"):
+            self._snapshot_store = WeightSnapshotStore(cache_versions=cache_versions)
+        return self._snapshot_store
 
-        Yields:
-            A tuple of the name of the weight tensor and the tensor itself.
-        """
-        raise NotImplementedError
+    async def publish_snapshot(
+        self,
+        weights: Generator[tuple[str, torch.Tensor], None, None],
+        global_steps: int,
+        cache_versions: int = 2,
+    ) -> dict[str, Any]:
+        """Atomically publish one actor export; failed versions remain invisible."""
+        if global_steps is None:
+            raise ValueError("global_steps is required for immutable weight publication")
+        if not getattr(self, "is_master", False):
+            for _name, _weight in weights:
+                pass
+            return {}
+        store = self._ensure_snapshot_store(cache_versions)
+        store.publish(global_steps, weights)
+        return {"latest_weight_version": store.latest_version}
+
+    async def send_snapshot(self, global_steps: int) -> None:
+        """Send a committed snapshot without invoking the actor export again."""
+        if not getattr(self, "is_master", False):
+            return
+        with self._ensure_snapshot_store().get(global_steps) as snapshot:
+            await self.send_weights(iter(snapshot), global_steps=global_steps)
+
+    def get_snapshot_weights(self, global_steps: int) -> dict[str, torch.Tensor]:
+        """Direct CPU/Ray read used by KIMI's non-collective single-replica pull."""
+        if not getattr(self, "is_master", False):
+            return {}
+        with self._ensure_snapshot_store().get(global_steps) as snapshot:
+            return {name: tensor for name, tensor in snapshot}
+
+    async def get_weights(self, version: int) -> AsyncGenerator[tuple[str, torch.Tensor], None]:
+        """Read one pinned immutable version and release it after consumption."""
+        with self._ensure_snapshot_store().get(version) as snapshot:
+            for name, tensor in snapshot:
+                yield name, tensor
 
 
 @CheckpointEngineRegistry.register("naive")
@@ -330,8 +364,10 @@ class CheckpointEngineWorker(Worker):
                 f"rollout.name={self.rollout_config.name!r}; use sglang or vllm"
             )
         bucket_size = self.rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
-        engine_kwargs = self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
-        # If custom_backend_module is set, import it so plugins can register
+        engine_kwargs = dict(self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {}))
+        if backend in {"nixl", "kimi_ckpt_engine"}:
+            engine_kwargs.setdefault("cache_versions", self.rollout_config.checkpoint_engine.cache_versions)
+        # If custom_backend_module is set, import it so plugins can register themselves
         # in CheckpointEngineRegistry before the backend is instantiated.
         import_external_libs(self.rollout_config.checkpoint_engine.custom_backend_module or None)
         self.checkpoint_engine: CheckpointEngine = CheckpointEngineRegistry.new(
@@ -357,6 +393,20 @@ class CheckpointEngineWorker(Worker):
             weights,
             global_steps=global_steps,
             wire_format=getattr(self.checkpoint_engine, "wire_format", "named_tensors"),
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights_from_snapshot(self, weights: dict[str, torch.Tensor], global_steps: int):
+        """Install a KIMI CPU snapshot without a collective group or broadcast."""
+
+        async def iterate():
+            for name, tensor in weights.items():
+                yield name, tensor
+
+        await self.server_adapter.update_weights(
+            iterate(),
+            global_steps=global_steps,
+            wire_format="named_tensors",
         )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
@@ -418,6 +468,7 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.actor_wg = actor_wg
         self.replicas = replicas
+        self._published_versions: set[int] = set()
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for actor worker group and rollout replicas."""
@@ -462,6 +513,57 @@ class CheckpointEngineManager:
         """
         replicas_set = set(replicas)
         self.replicas = [r for r in self.replicas if r not in replicas_set]
+
+    @auto_await
+    async def publish_weights(self, global_steps: int) -> dict[str, Any]:
+        """Export and atomically publish a version at most once per manager."""
+        if self.backend not in {"nixl", "kimi_ckpt_engine"}:
+            raise NotImplementedError("Immutable snapshot publication requires NIXL or KIMI")
+        if global_steps in self._published_versions:
+            return {"latest_weight_version": global_steps, "already_published": True}
+        results = ray.get(self.actor_wg.update_weights(global_steps=global_steps, mode="snapshot"))
+        latest = [result.get("latest_weight_version") for result in results if isinstance(result, dict)]
+        if global_steps not in latest:
+            raise RuntimeError(f"Weight snapshot version {global_steps} did not reach the publication barrier")
+        self._published_versions.add(global_steps)
+        return {"latest_weight_version": global_steps, "already_published": False}
+
+    @auto_await
+    async def pull_replica(self, replica: RolloutReplica, global_steps: int) -> dict[str, Any]:
+        """Install one committed version on one drained standalone replica."""
+        if global_steps not in self._published_versions:
+            raise KeyError(f"Weight snapshot version {global_steps} has not been published")
+        rollout = RayWorkerGroup(
+            worker_handles=list(replica.workers), ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls)
+        )
+        started = asyncio.get_running_loop().time()
+        if self.backend == "nixl":
+            self.build_process_group(rollout)
+            try:
+                ray.get(
+                    self.actor_wg.update_weights(global_steps=global_steps, mode="snapshot_send")
+                    + rollout.update_weights(global_steps=global_steps)
+                )
+            finally:
+                ray.get(
+                    self.actor_wg.execute_checkpoint_engine(["finalize"] * self.actor_wg.world_size)
+                    + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
+                )
+        elif self.backend == "kimi_ckpt_engine":
+            snapshots = ray.get(
+                self.actor_wg.execute_checkpoint_engine(
+                    method=["get_snapshot_weights"] * self.actor_wg.world_size,
+                    global_steps=[global_steps] * self.actor_wg.world_size,
+                )
+            )
+            weights = next((snapshot for snapshot in snapshots if snapshot), None)
+            if not weights:
+                raise RuntimeError(f"No committed KIMI snapshot found for version {global_steps}")
+            # Direct CPU RPC: no group barrier, ring, or broadcast is created.
+            ray.get(rollout.update_weights_from_snapshot(weights=weights, global_steps=global_steps))
+        else:
+            raise NotImplementedError("Per-replica pull requires NIXL or KIMI")
+        return {"version": global_steps, "duration_seconds": asyncio.get_running_loop().time() - started}
 
     @auto_await
     async def sleep_replicas(self):

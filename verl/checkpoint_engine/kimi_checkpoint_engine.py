@@ -26,7 +26,7 @@ import ray
 import torch
 from checkpoint_engine.ps import H2DBucket, ParameterMeta, ParameterServer, _gen_h2d_buckets, _to_named_tensor
 
-from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
+from verl.checkpoint_engine.base import CheckpointEngineRegistry, CheckpointEngineWithCache
 from verl.utils.device import get_nccl_backend, get_torch_device
 from verl.utils.net_utils import get_free_port
 
@@ -220,7 +220,7 @@ class BroadcastOperation:
 
 
 @CheckpointEngineRegistry.register("kimi_ckpt_engine")
-class KIMICheckpointEngine(CheckpointEngine):
+class KIMICheckpointEngine(CheckpointEngineWithCache):
     """kimi checkpoint engine with collective communication.
 
     Args:
@@ -237,11 +237,13 @@ class KIMICheckpointEngine(CheckpointEngine):
         rebuild_group: bool = False,
         is_master: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
+        cache_versions: int = 2,
     ) -> None:
         self.bucket_size = bucket_size
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
         self.is_master = is_master
+        self._ensure_snapshot_store(cache_versions)
         self.initialized = False
         self.checkpoint_name = "kimi_checkpoint_engine"
 

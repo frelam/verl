@@ -33,6 +33,7 @@ from verl.experimental.agent_loop import (
 )
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+from verl.workers.rollout.replica import TrajectoryAbortedError
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -131,16 +132,24 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             # Publish a terminal status only after every session settles, so no sibling can write after
             # ReplayBuffer clears a failed group.
             session_errors = await _settle_session_tasks(tasks)
+            failure_reason = None
             if session_errors:
                 for error in session_errors:
-                    logger.error(
+                    log = logger.warning if isinstance(error, TrajectoryAbortedError) else logger.error
+                    log(
                         f"Error in _run_prompt for uid={uid}",
                         exc_info=(type(error), error, error.__traceback__),
                     )
                 status = "failure"
+                if any(isinstance(error, TrajectoryAbortedError) for error in session_errors):
+                    failure_reason = "abort_discard"
+                    logger.warning(f"Discarded aborted trajectory group for uid={uid}")
             else:
                 status = "finished"
-            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+            tag = {"status": status}
+            if failure_reason is not None:
+                tag["failure_reason"] = failure_reason
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag=tag)
         except Exception as e:
             logger.exception(f"Error in _run_prompt: {e}")
             if tasks:

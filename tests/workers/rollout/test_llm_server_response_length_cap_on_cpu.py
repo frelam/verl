@@ -40,7 +40,7 @@ from omegaconf import OmegaConf
 
 from verl.workers.rollout import llm_server
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
-from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.replica import TokenOutput, TrajectoryAbortedError
 
 PROMPT_LENGTH = 2048
 RESPONSE_LENGTH = 8192
@@ -56,6 +56,7 @@ class FakeRolloutServer:
 
     def __init__(self, abort_every: int):
         self.abort_every = abort_every
+        self.abort_reason = "weight_sync"
         self.grants: list[tuple[int, int]] = []
 
     async def generate(self, request_id, *, prompt_ids, sampling_params, **kwargs):
@@ -79,6 +80,7 @@ class FakeRolloutServer:
             token_ids=[7] * generated,
             log_probs=None,
             stop_reason="length" if generated == max_tokens else "aborted",
+            extra_fields={"abort_reason": self.abort_reason},
         )
 
 
@@ -170,3 +172,27 @@ async def test_config_without_rollout_section_is_tolerated(server):
     output = await _generate(SimpleNamespace(), 136, {"temperature": 1.0})
 
     assert len(output.token_ids) > 0
+
+
+@pytest.mark.asyncio
+async def test_single_version_discards_non_migration_abort_before_length(server):
+    config = _config(include_async_training=False)
+    config.trainer = OmegaConf.create({"v1": {"async_trajectory": {"single_version_per_trajectory": True}}})
+
+    with pytest.raises(TrajectoryAbortedError, match="weight_sync") as error:
+        await _generate(config, 136, {"temperature": 1.0, "max_tokens": 4000})
+    assert error.value.generated_tokens == 2000
+    assert len(server.grants) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_version_preserves_legacy_and_migration_resume(server):
+    legacy = await _generate(_config(), 136, {"temperature": 1.0, "max_tokens": 4000})
+    assert len(legacy.token_ids) == 4000
+
+    server.abort_reason = "migration"
+    config = _config(include_async_training=False)
+    config.trainer = OmegaConf.create({"v1": {"async_trajectory": {"single_version_per_trajectory": True}}})
+    migrated = await _generate(config, 136, {"temperature": 1.0, "max_tokens": 4000})
+    assert len(migrated.token_ids) == 4000
+    assert migrated.stop_reason == "length"

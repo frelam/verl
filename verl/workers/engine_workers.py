@@ -678,8 +678,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
             backend = checkpoint_engine_config.backend
             bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
-            engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
-            # If custom_backend_module is set, import it so plugins can register
+            engine_kwargs = dict(checkpoint_engine_config.engine_kwargs.get(backend, {}))
+            if backend in {"nixl", "kimi_ckpt_engine"}:
+                engine_kwargs.setdefault("cache_versions", checkpoint_engine_config.cache_versions)
+            # If custom_backend_module is set, import it so plugins can register themselves
             # in CheckpointEngineRegistry before the backend is instantiated.
             import_external_libs(checkpoint_engine_config.custom_backend_module or None)
             self.checkpoint_engine = CheckpointEngineRegistry.new(
@@ -752,6 +754,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+
+        if effective_mode in {"snapshot", "snapshot_send"}:
+            if effective_mode == "snapshot":
+                per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
+                return await self.checkpoint_engine.publish_snapshot(
+                    per_tensor_param,
+                    global_steps=global_steps,
+                    cache_versions=self.config.rollout.checkpoint_engine.cache_versions,
+                )
+            await self.checkpoint_engine.send_snapshot(global_steps=global_steps)
+            return {}
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":

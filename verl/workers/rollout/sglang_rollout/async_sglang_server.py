@@ -181,6 +181,7 @@ class SGLangHttpServer:
         self.base_gpu_id = base_gpu_id
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
+        self._abort_reasons: dict[str, str] = {}
 
         # PD peer linkage populated post-launch by SGLangPDReplica.set_pd_peer.
         self._pd_decode_peers: list[ActorHandle] = []
@@ -236,6 +237,25 @@ class SGLangHttpServer:
         """Get http server address and port."""
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
+
+    async def get_metrics_snapshot(self, timeout_s: float = 2.0):
+        """Return a fresh structured snapshot, or ``None`` when stats are unavailable."""
+        if self.config.disable_log_stats or self.node_rank != 0:
+            return None
+        from verl.workers.rollout.repack import fetch_prometheus_snapshot
+
+        address = (
+            f"[{self._server_address}]:{self._server_port}"
+            if is_valid_ipv6_address(self._server_address)
+            else f"{self._server_address}:{self._server_port}"
+        )
+        return await fetch_prometheus_snapshot(
+            address,
+            weight_version=self.global_steps if self.global_steps is not None else 0,
+            role=self._disaggregation_role if self._disaggregation_role != "null" else "default",
+            request_budget=self.config.max_inflight_requests_per_replica or self.config.max_num_seqs,
+            timeout_s=timeout_s,
+        )
 
     async def set_pd_peer(self, decode_peers: list, bootstrap_host: str):
         assert isinstance(decode_peers, list) and decode_peers
@@ -656,10 +676,13 @@ class SGLangHttpServer:
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
+        abort_reason = (
+            self._abort_reasons.pop(request_id, "weight_sync") if finish_reason in ("abort", "aborted") else None
+        )
         if return_logprob:
             token_ids = list(output.get("output_ids", []))
             output_token_logprobs = meta_info.get("output_token_logprobs") or []
-            if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
+            if len(output_token_logprobs) == len(token_ids):
                 log_probs = [float(log_prob) for log_prob, _, _ in output_token_logprobs]
             else:
                 # SGLang may return mismatched lengths (e.g. max_new_tokens=0
@@ -670,8 +693,14 @@ class SGLangHttpServer:
                         f"output_token_logprobs length ({len(output_token_logprobs)}) != "
                         f"output_ids length ({len(token_ids)}) for request {request_id}"
                     )
-                token_ids = []
-                log_probs = []
+                if abort_reason == "migration":
+                    raise RuntimeError(
+                        f"Migration request {request_id} lost token/logprob alignment; refusing to resume"
+                    )
+                raise RuntimeError(
+                    f"Request {request_id} returned {len(token_ids)} tokens but "
+                    f"{len(output_token_logprobs)} logprob entries; refusing misaligned output"
+                )
         else:
             token_ids = output["output_ids"]
             log_probs = None
@@ -697,6 +726,8 @@ class SGLangHttpServer:
                 )
 
         extra_fields = {"global_steps": self.global_steps}
+        if abort_reason is not None:
+            extra_fields["abort_reason"] = abort_reason
         if prompt_logprobs is not None:
             _extract_prompt_logprobs_sglang(
                 meta_info=meta_info,
@@ -724,6 +755,22 @@ class SGLangHttpServer:
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
         self.global_steps = global_steps
+
+    async def abort_request(
+        self, request_id: str, reset_prefix_cache: bool = False, reason: str = "migration"
+    ) -> dict[str, Any]:
+        """Abort one request while preserving its partial output for same-version resume."""
+        if self.node_rank != 0:
+            return {"aborted": False, "request_id": request_id}
+        self._abort_reasons[request_id] = reason
+        try:
+            await self.tokenizer_manager.abort_request(rid=request_id)
+            if reset_prefix_cache:
+                await self.tokenizer_manager.flush_cache()
+            return {"aborted": True, "request_id": request_id, "abort_reason": reason}
+        except Exception as exc:
+            self._abort_reasons.pop(request_id, None)
+            return {"aborted": False, "request_id": request_id, "error": str(exc)}
 
     async def abort_all_requests(self):
         if self.node_rank != 0:

@@ -20,20 +20,29 @@ Utility classes for manage and request LLM servers:
 import asyncio
 import logging
 import os
+import random
+import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 from uuid import uuid4
 
 import numpy as np
 import ray
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
 from verl.utils import normalize_token_ids
 from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import RLInsightLogger
-from verl.workers.rollout.replica import RolloutReplica, TokenOutput, get_rollout_replica_class
-from verl.workers.rollout.router import GlobalRequestLoadBalancer  # noqa: F401
+from verl.workers.rollout.replica import (
+    RolloutReplica,
+    TokenOutput,
+    TrajectoryAbortedError,
+    get_rollout_replica_class,
+)
+from verl.workers.rollout.router import GlobalRequestLoadBalancer, ServerBusyError  # noqa: F401
 from verl.workers.rollout.utils import update_prometheus_config
 
 logger = logging.getLogger(__file__)
@@ -66,6 +75,25 @@ class LLMServerClient:
         # Balancer field declarations, queried lazily once.
         self._lb_require_acquire_fields: list[str] | None = None
         self._lb_require_release_fields: list[str] | None = None
+        self._lease_context: ContextVar[dict[str, Any] | None] = ContextVar(
+            f"trajectory_lease_{id(self)}", default=None
+        )
+        trainer_v1 = getattr(getattr(config, "trainer", None), "v1", None)
+        separate_config = getattr(trainer_v1, "separate_async", None)
+        weight_sync = getattr(separate_config, "weight_sync", None)
+        self._per_replica_pull = getattr(weight_sync, "mode", "global_push") == "per_replica_pull"
+        async_trajectory = getattr(trainer_v1, "async_trajectory", None)
+        repack = getattr(async_trajectory, "repack", None)
+        if trainer_v1 is None:
+            repack = getattr(getattr(config, "async_training", None), "repack", None)
+        migration = getattr(repack, "migration", None)
+        self._migration_enabled = getattr(migration, "enable", False)
+        self._migration_resume_info: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    async def _admission_sleep(attempt: int) -> None:
+        delay = min(1.0, 0.05 * (2 ** min(attempt, 5))) * random.uniform(0.5, 1.0)
+        await asyncio.sleep(delay)
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -78,7 +106,44 @@ class LLMServerClient:
             self._lb_require_acquire_fields = list(acquire_fields)
             self._lb_require_release_fields = list(release_fields)
         fields = {name: extra[name] for name in self._lb_require_acquire_fields if name in extra}
-        return await self._load_balancer.acquire_server.remote(request_id=request_id, **fields)
+        attempt = 0
+        wait_start = time.monotonic()
+        while True:
+            try:
+                result = await self._load_balancer.acquire_server.remote(request_id=request_id, **fields)
+                if attempt:
+                    self._load_balancer.record_admission_wait.remote(time.monotonic() - wait_start)
+                if self._migration_enabled:
+                    resume_info = await self._load_balancer.consume_migration_resume.remote(request_id)
+                    if resume_info is not None:
+                        self._migration_resume_info[request_id] = resume_info
+                return result
+            except ServerBusyError:
+                # The LB actor never sleeps. Cancellation propagates from this client-side await.
+                await self._admission_sleep(attempt)
+                attempt += 1
+
+    @asynccontextmanager
+    async def trajectory_lease(self, uid: str, session_id: int):
+        """Hold replica/version affinity across every turn of one trajectory."""
+        if not self._per_replica_pull:
+            yield
+            return
+        trajectory_id = f"{uid}:{session_id}"
+        attempt = 0
+        while True:
+            try:
+                lease = await self._load_balancer.acquire_trajectory_lease.remote(trajectory_id)
+                break
+            except ServerBusyError:
+                await self._admission_sleep(attempt)
+                attempt += 1
+        token = self._lease_context.set(lease)
+        try:
+            yield lease
+        finally:
+            self._lease_context.reset(token)
+            await self._load_balancer.release_trajectory_lease.remote(trajectory_id, lease["token"])
 
     def _release_server(self, server_id: str, request_id: str | None = None) -> None:
         # Fire-and-forget: release is just a counter decrement, no need to await.
@@ -118,6 +183,10 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        lease = self._lease_context.get()
+        if lease is not None:
+            kwargs.update(trajectory_id=lease["trajectory_id"], lease_token=lease["token"])
+        engine_request_id = self._vllm_request_id(request_id)
         server_id, server = await self._acquire_server(
             request_id,
             prompt_ids=prompt_ids,
@@ -126,8 +195,12 @@ class LLMServerClient:
             video_data=video_data,
             audio_data=audio_data,
             mm_processor_kwargs=mm_processor_kwargs,
+            engine_request_id=engine_request_id,
             **kwargs,
         )
+        for routing_key in ("target_server_id", "trajectory_id", "lease_token", "engine_request_id", "attempt"):
+            kwargs.pop(routing_key, None)
+        output = None
         try:
             multimodal_kwargs = {}
             if audio_data is not None:
@@ -140,7 +213,7 @@ class LLMServerClient:
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
             output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+                request_id=engine_request_id,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -158,6 +231,13 @@ class LLMServerClient:
                 server_id,
                 request_id=request_id,
             )
+            resume_info = self._migration_resume_info.pop(request_id, None)
+            if resume_info is not None:
+                self._load_balancer.record_migration_result.remote(
+                    success=output is not None,
+                    reprefill_tokens=len(prompt_ids),
+                    duration_seconds=max(0.0, time.monotonic() - resume_info["started_at"]),
+                )
 
 
 class FullyAsyncLLMServerClient(LLMServerClient):
@@ -185,6 +265,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         """
         super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
         self._only_hybrid = only_hybrid
+        trainer_v1 = getattr(getattr(config, "trainer", None), "v1", None)
+        async_trajectory = getattr(trainer_v1, "async_trajectory", None)
+        self._single_version_per_trajectory = getattr(async_trajectory, "single_version_per_trajectory", False)
 
     async def _acquire_server(self, request_id: str, **extra) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -291,6 +374,18 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 **kwargs,
             )
 
+            abort_reason = output.extra_fields.get("abort_reason", "weight_sync")
+            if (
+                self._single_version_per_trajectory
+                and output.stop_reason in ("aborted", "abort")
+                and abort_reason != "migration"
+            ):
+                raise TrajectoryAbortedError(
+                    request_id=request_id,
+                    generated_tokens=len(final_output.token_ids) + len(output.token_ids),
+                    abort_reason=abort_reason,
+                )
+
             # 2. merge output into final_output
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
@@ -307,6 +402,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason
+            for key in ("abort_reason", "target_server_id", "migration_id"):
+                if key in output.extra_fields:
+                    final_output.extra_fields[key] = output.extra_fields[key]
 
             # carry the initial prefill's prefix-cache hit count forward
             if num_cached_tokens is None:
@@ -336,6 +434,8 @@ class FullyAsyncLLMServerClient(LLMServerClient):
 
             await asyncio.sleep(1)
 
+        if final_output.log_probs and len(final_output.log_probs) != len(final_output.token_ids):
+            raise RuntimeError("Partial rollout produced response logprobs misaligned with response tokens")
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
         final_output.extra_fields["max_global_steps"] = max_global_steps
@@ -377,6 +477,11 @@ class LLMServerManager:
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
         self._load_balancer_cls = load_balancer_cls
+        self._standalone = worker_group is None
+        self.repack_coordinator = None
+        self.weight_sync_coordinator = None
+        self._laminar_metrics_enabled = False
+        self._laminar_counter_baseline: dict[str, float] = {}
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -462,7 +567,11 @@ class LLMServerManager:
         print(f"LLMServerManager: {self.server_addresses}")
 
         # Update Prometheus / rl-insight metrics with server addresses
-        needs_metrics = self.rollout_config.prometheus.enable or RLInsightLogger.enabled()
+        needs_metrics = (
+            self.rollout_config.prometheus.enable
+            or RLInsightLogger.enabled()
+            or getattr(self.rollout_config, "enable_stats", False)
+        )
         if self.rollout_config.disable_log_stats:
             if needs_metrics:
                 raise ValueError("Metrics monitoring requires disable_log_stats=False, but it is currently True.")
@@ -481,12 +590,43 @@ class LLMServerManager:
     async def _init_global_load_balancer(self) -> None:
         from verl.workers.rollout.router import get_router_handle
 
+        trainer_v1 = getattr(getattr(getattr(self, "config", None), "trainer", None), "v1", None)
+        async_trajectory = getattr(trainer_v1, "async_trajectory", None)
+        repack = getattr(async_trajectory, "repack", None)
+        if trainer_v1 is None:
+            repack = getattr(getattr(getattr(self, "config", None), "async_training", None), "repack", None)
+        migration = getattr(repack, "migration", None)
+        separate = getattr(trainer_v1, "separate_async", None)
+        weight_sync = getattr(separate, "weight_sync", None)
+        required_capabilities = []
+        if getattr(weight_sync, "mode", "global_push") == "per_replica_pull":
+            required_capabilities.extend(["version_registry", "trajectory_lease"])
+        if getattr(migration, "enable", False):
+            required_capabilities.append("migration")
+        max_inflight = getattr(self.rollout_config, "max_inflight_requests_per_replica", None)
+        if max_inflight is not None and getattr(self.rollout_config, "full_determinism", False):
+            raise ValueError("V1 full_determinism does not support per-replica admission control")
         self.global_load_balancer = get_router_handle(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             router_config_path=getattr(self.rollout_config, "router_config_path", None),
             full_determinism=getattr(self.rollout_config, "full_determinism", False),
             load_balancer_cls=self._load_balancer_cls,
+            max_inflight_requests_per_replica=max_inflight,
+            required_capabilities=required_capabilities,
         )
+        repack_enabled = getattr(repack, "enable", False)
+        self._laminar_metrics_enabled = bool(max_inflight is not None or required_capabilities or repack_enabled)
+        if repack_enabled and self._standalone:
+            from verl.workers.rollout.repack_coordinator import RepackCoordinatorActor
+
+            self.repack_coordinator = RepackCoordinatorActor.remote(
+                servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
+                load_balancer=self.global_load_balancer,
+                repack_config=OmegaConf.to_container(repack, resolve=True),
+                request_budget=max_inflight or self.rollout_config.max_num_seqs,
+                stats_interval_s=getattr(self.rollout_config, "stats_interval_s", 5),
+            )
+            await self.repack_coordinator.start.remote()
 
     def get_client(self, client_cls: type[LLMServerClient] | None = None, **kwargs) -> LLMServerClient:
         """Get the LLMServerClient to request LLM server replicas.
@@ -513,6 +653,143 @@ class LLMServerManager:
     def get_replicas(self) -> list[RolloutReplica]:
         """Get the LLM server replicas."""
         return self.rollout_replicas
+
+    @auto_await
+    async def start_per_replica_pull(self, checkpoint_engine_config, actor_wg) -> None:
+        """Start standalone drain/pull updates without sharing a temporary event loop."""
+        if self.weight_sync_coordinator is not None:
+            return
+        if not self._standalone:
+            raise ValueError("per_replica_pull requires a standalone rollout pool")
+        from verl.workers.rollout.weight_sync_coordinator import WeightUpdateCoordinatorActor
+
+        trainer_v1 = self.config.trainer.v1
+        weight_sync = trainer_v1.separate_async.weight_sync
+        self.weight_sync_coordinator = WeightUpdateCoordinatorActor.remote(
+            checkpoint_engine_config=checkpoint_engine_config,
+            actor_wg=actor_wg,
+            replica_workers={replica._server_address: replica.workers for replica in self.rollout_replicas},
+            load_balancer=self.global_load_balancer,
+            retry_interval_s=weight_sync.retry_interval_s,
+        )
+        await self.weight_sync_coordinator.start.remote()
+        self._laminar_metrics_enabled = True
+
+    @auto_await
+    async def publish_weight_version(self, version: int) -> dict[str, Any]:
+        if self.weight_sync_coordinator is None:
+            raise RuntimeError("per-replica weight coordinator is not running")
+        return await self.weight_sync_coordinator.publish.remote(version)
+
+    @auto_await
+    async def stop_repack(self) -> None:
+        if self.repack_coordinator is not None:
+            await self.repack_coordinator.stop.remote()
+            self.repack_coordinator = None
+        if self.weight_sync_coordinator is not None:
+            await self.weight_sync_coordinator.stop.remote()
+            self.weight_sync_coordinator = None
+
+    def set_weight_syncing(self, active: bool) -> None:
+        if self.repack_coordinator is not None:
+            self.repack_coordinator.set_weight_syncing.remote(active)
+
+    def _counter_delta(self, name: str, value: float) -> float:
+        previous = self._laminar_counter_baseline.get(name, 0.0)
+        self._laminar_counter_baseline[name] = value
+        return max(0.0, value - previous)
+
+    @auto_await
+    async def get_laminar_metrics(self) -> dict[str, float]:
+        """Aggregate gauges, interval counters, and duration sum/count values."""
+        if not self._laminar_metrics_enabled:
+            return {}
+        if self.repack_coordinator is not None:
+            data = await self.repack_coordinator.get_metrics.remote()
+            lb = data["load_balancer"]
+        else:
+            data = {}
+            lb = await self.global_load_balancer.get_metrics.remote()
+        metrics: dict[str, float] = {}
+        for name, value in lb["counters"].items():
+            metric_name = (
+                f"rollout/migration/{name.removeprefix('migration_')}"
+                if name.startswith("migration_")
+                else (f"rollout/{name}")
+            )
+            metrics[metric_name] = self._counter_delta(metric_name, float(value))
+        for server_id, value in lb["gauges"]["inflight_requests"].items():
+            metrics[f"rollout/inflight_requests/{server_id}"] = float(value)
+        for name in ("draining_servers", "updating_servers", "active_trajectory_leases"):
+            metrics[f"rollout/{name}"] = float(lb["gauges"][name])
+        lags = list(lb["gauges"]["version_lag"].values())
+        if lags:
+            metrics["rollout/version_lag/mean"] = float(np.mean(lags))
+            metrics["rollout/version_lag/max"] = float(max(lags))
+        if self.weight_sync_coordinator is not None:
+            update_metrics = await self.weight_sync_coordinator.get_metrics.remote()
+            for name, value in update_metrics.items():
+                metric_name = f"rollout/{name}"
+                metrics[metric_name] = self._counter_delta(metric_name, float(value))
+
+        snapshots = data.get("snapshots", {})
+        complete = [snapshot for snapshot in snapshots.values() if snapshot is not None]
+        if complete:
+            kv_values = [snapshot.kv_cache_usage for snapshot in complete]
+            metrics["rollout/kv_cache_util/mean"] = float(np.mean(kv_values))
+            metrics["rollout/kv_cache_util/max"] = float(max(kv_values))
+            metrics["rollout/num_running_reqs"] = float(sum(s.num_running_reqs for s in complete))
+            metrics["rollout/num_waiting_reqs"] = float(sum(s.num_waiting_reqs for s in complete))
+            metrics["rollout/stats_age_seconds"] = max(0.0, time.time() - min(s.timestamp for s in complete))
+        idle = set(data.get("idle_replicas", []))
+        metrics["rollout/idle_replicas"] = float(len(idle))
+        idle_snapshots = [snapshots[server_id] for server_id in idle if snapshots.get(server_id) is not None]
+        if idle_snapshots:
+            metrics["rollout/idle_kv_cache_util"] = float(np.mean([s.kv_cache_usage for s in idle_snapshots]))
+            metrics["rollout/idle_req_count"] = float(sum(s.num_running_reqs for s in idle_snapshots))
+
+        coordinator = data.get("coordinator")
+        if coordinator:
+            direct_names = (
+                "trigger_count",
+                "skipped_overlap",
+                "plan_empty_count",
+                "backoff_active",
+                "planned_sources",
+                "planned_destinations",
+                "planned_moves",
+                "estimated_released_replicas",
+                "migration_attempts",
+                "migration_successes",
+                "migration_failures",
+                "last_run_age_s",
+            )
+            for name in direct_names:
+                value = coordinator.get(name)
+                if value is not None:
+                    metric_name = "plan_empty" if name == "plan_empty_count" else name
+                    metric_name = "last_run_age_seconds" if name == "last_run_age_s" else metric_name
+                    key = f"rollout/repack/{metric_name}"
+                    metrics[key] = (
+                        float(value)
+                        if name in {"backoff_active", "last_run_age_s"}
+                        else self._counter_delta(key, float(value))
+                    )
+            for stage in ("collect", "plan", "migration", "tick"):
+                duration = coordinator[f"{stage}_duration"]
+                sum_key = f"rollout/repack/{stage}_duration_seconds/sum"
+                count_key = f"rollout/repack/{stage}_duration_seconds/count"
+                metrics[sum_key] = self._counter_delta(sum_key, duration["total_s"])
+                metrics[count_key] = self._counter_delta(count_key, duration["count"])
+                metrics[f"rollout/repack/{stage}_duration_seconds/last"] = duration["last_s"]
+            metrics["rollout/repack/plan_duration_ms"] = coordinator["plan_duration"]["last_s"] * 1000
+        return metrics
+
+    @auto_await
+    async def get_repack_snapshot(self) -> dict[str, Any]:
+        if self.repack_coordinator is None:
+            return {}
+        return await self.repack_coordinator.get_metrics.remote()
 
     @auto_await
     async def start_profile(self, **kwargs):
