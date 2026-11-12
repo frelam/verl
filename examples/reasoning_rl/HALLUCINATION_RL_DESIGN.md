@@ -1160,8 +1160,10 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   `LENGTH_PENALTY_MAX`，以 `++reward.custom_reward_function.reward_kwargs.*` 注入
   （reward-loop 的 worker 不一定继承启动 shell 的环境变量，走配置最稳）；
   `length_targets.env` 就是给 `source` 用的。targets 文件必须对 **rollouter 节点**可读。
-- **关闭即回到 stage 3**：不传 targets 时 reward 的输出与 stage 2/3 逐字节一致（不新增 aux 键）。
-  开启后每行固定返回 `length_chars` / `length_target` / `length_penalty`，供 §10 监控使用。
+  **默认开启**：未显式给路径时取 `$DATA_DIR/length_targets.json`，文件缺失直接中止启动
+  （fail-closed，绝不静默退回无惩罚训练）；只有显式 `LENGTH_PENALTY_ENABLED=0` 才关闭。
+- **关闭即回到 stage 3**：`LENGTH_PENALTY_ENABLED=0` 时 reward 的输出与 stage 2/3 逐字节一致
+  （不新增 aux 键）。开启后每行固定返回 `length_chars` / `length_target` / `length_penalty`，供 §10 监控使用。
 - **val 口径**：验证也用同一 reward，开启惩罚后 `reward/mean` 不再等于准确率（含长度扣分）。
   与 stage 3 横向对比时用 `score + length_penalty` 还原未罚分（长度项只在正分行非零）；
   分域准确率仍按 §10 的判分分支单独统计。

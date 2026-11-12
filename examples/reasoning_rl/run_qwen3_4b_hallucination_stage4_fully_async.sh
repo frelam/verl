@@ -34,21 +34,26 @@
 # response length on this mix, then feed the targets back here:
 #
 #   python examples/reasoning_rl/scripts/distill/measure_length_targets.py \
-#       --input $DATA_DIR/train.parquet --output_dir <targets_dir> \
+#       --input $DATA_DIR/train.parquet --output_dir $DATA_DIR \
 #       --base_url http://127.0.0.1:8000/v1 --model <dpo_served_name>
-#   source <targets_dir>/length_targets.env
+#   source $DATA_DIR/length_targets.env
 #
 # `--target_scale` (stats-script default 0.6) multiplies the measured per-source
 # mean before it becomes the target, i.e. the reward asks for a further 40% cut
 # below the DPO checkpoint's own length; pass 1.0 to anchor at that length.
 #
-# `length_targets.env` exports the three knobs below; the wrapper forwards them as
+# `length_targets.env` exports the knobs below; the wrapper forwards them as
 # `reward.custom_reward_function.reward_kwargs.*` (the reward consumes them and
-# never forwards them to the stage-1 dispatcher).  Without a targets file the
-# reward is byte-identical to stage 3.
-#   LENGTH_PENALTY_TARGETS_PATH   length_targets.json emitted by the stats script
-#                                 (must be readable on the rollouter node; empty
-#                                 = no penalty)
+# never forwards them to the stage-1 dispatcher).
+#   LENGTH_PENALTY_ENABLED=1      the penalty is ON BY DEFAULT.  Set to 0 only for
+#                                 a stage-3-parity ablation; the reward is then
+#                                 byte-identical to stage 3.
+#   LENGTH_PENALTY_TARGETS_PATH   length_targets.json emitted by the stats script;
+#                                 defaults to $DATA_DIR/length_targets.json (must
+#                                 be readable on the rollouter node).  An exported
+#                                 path -- e.g. from `source length_targets.env` --
+#                                 always wins.  A missing file aborts the launch
+#                                 (fail-closed: never train silently without it).
 #   LENGTH_PENALTY_COEF=0.2       penalty slope: coef * (len/target - 1)
 #   LENGTH_PENALTY_MAX=0.5        penalty cap in points (< 1 keeps correct-long
 #                                 above wrong; applied to positively scored rows only)
@@ -62,7 +67,11 @@ DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final_halluc_stage4}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_hallucination_stage4_$(date +%Y%m%d_%H%M)}
 export DATA_DIR EXPERIMENT_NAME
 
-LENGTH_PENALTY_TARGETS_PATH=${LENGTH_PENALTY_TARGETS_PATH:-}
+LENGTH_PENALTY_ENABLED=${LENGTH_PENALTY_ENABLED:-1}
+# Default-on (D33): the target file produced by measure_length_targets.py lives
+# next to the stage-4 data.  An exported LENGTH_PENALTY_TARGETS_PATH (e.g. from
+# `source length_targets.env`) still takes precedence.
+LENGTH_PENALTY_TARGETS_PATH=${LENGTH_PENALTY_TARGETS_PATH:-$DATA_DIR/length_targets.json}
 LENGTH_PENALTY_COEF=${LENGTH_PENALTY_COEF:-0.2}
 LENGTH_PENALTY_MAX=${LENGTH_PENALTY_MAX:-0.5}
 
@@ -76,9 +85,14 @@ if [ ! -f "$DATA_DIR/train.parquet" ]; then
 fi
 
 LENGTH_OVERRIDES=()
-if [ -n "$LENGTH_PENALTY_TARGETS_PATH" ]; then
+if [ "$LENGTH_PENALTY_ENABLED" != "0" ]; then
     if [ ! -f "$LENGTH_PENALTY_TARGETS_PATH" ]; then
-        echo "ERROR: LENGTH_PENALTY_TARGETS_PATH=$LENGTH_PENALTY_TARGETS_PATH does not exist" >&2
+        echo "ERROR: length penalty is on by default but $LENGTH_PENALTY_TARGETS_PATH is missing." >&2
+        echo "       Measure the DPO checkpoint's lengths first (D33), then rerun:" >&2
+        echo "         python examples/reasoning_rl/scripts/distill/measure_length_targets.py \\" >&2
+        echo "             --input $DATA_DIR/train.parquet --output_dir $DATA_DIR \\" >&2
+        echo "             --base_url http://127.0.0.1:8000/v1 --model <dpo_served_name>" >&2
+        echo "       Set LENGTH_PENALTY_ENABLED=0 for a stage-3-parity run without the penalty." >&2
         exit 1
     fi
     # The reward worker may run with a different cwd; hand it an absolute path.
