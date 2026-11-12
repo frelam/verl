@@ -1138,6 +1138,11 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
   4. 产物：`length_stats.json`（逐源/逐域/全局的 count/mean/p50/p90）、
      `length_targets.json`（reward 读取的 `unit/targets/by_domain`）、
      `length_targets.env`（三个训练环境变量）。
+  5. **目标缩放**：`--target_scale`（默认 **0.6**）在写入 target 前把所选统计量乘以该系数，
+     即 `target = 0.6 × mean`——在 DPO 已精简的均值上再要求压缩 40%；`1.0` 恢复
+     "target = 模型自身均值"的原始口径。系数写入 `length_stats.json → config.target_scale`、
+     `length_targets.json → target_scale` 与 `length_targets.env` 的注释行，可随产物审计。
+     该系数同时作用于源/域/`__default__` 三级 target，回退链不会破坏比例。
 - **reward 公式**（`hallucination_compute_score.py`，分支打分之后）：
   ```
   excess  = max(0, length_chars / target - 1)

@@ -38,6 +38,10 @@
 #       --base_url http://127.0.0.1:8000/v1 --model <dpo_served_name>
 #   source <targets_dir>/length_targets.env
 #
+# `--target_scale` (stats-script default 0.6) multiplies the measured per-source
+# mean before it becomes the target, i.e. the reward asks for a further 40% cut
+# below the DPO checkpoint's own length; pass 1.0 to anchor at that length.
+#
 # `length_targets.env` exports the three knobs below; the wrapper forwards them as
 # `reward.custom_reward_function.reward_kwargs.*` (the reward consumes them and
 # never forwards them to the stage-1 dispatcher).  Without a targets file the

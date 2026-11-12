@@ -19,8 +19,11 @@ chain of thought.  This script measures that habit on the stage-4 training mix:
 every prompt is generated once by the DPO checkpoint served through vLLM, and
 the response character length is aggregated per subtask (``data_source``).
 
-The aggregated means become the per-subtask length targets of the reward's
-over-length penalty (``reward/hallucination_compute_score.py``).  Outputs (all
+The aggregated statistic (``--target_metric``, default mean) times
+``--target_scale`` (default 0.6) becomes the per-subtask length target of the
+reward's over-length penalty (``reward/hallucination_compute_score.py``).  The
+scale is the "compress further than the DPO checkpoint" knob: 1.0 asks the model
+to stay at its own measured length, 0.6 asks for a 40% further cut.  Outputs (all
 under ``--output_dir``)::
 
     length_samples.jsonl   one line per generated response (lengths only)
@@ -151,6 +154,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="statistic written as the ideal length (default: mean, as specified for D33)",
     )
     parser.add_argument(
+        "--target_scale",
+        type=float,
+        default=0.6,
+        help="multiplier applied to the chosen statistic before writing the targets "
+        "(default: 0.6 = ask for a 40%% cut below the checkpoint's own mean); "
+        "1.0 keeps the measured length",
+    )
+    parser.add_argument(
         "--keep_truncated",
         action="store_true",
         help="count responses that hit --max_tokens (default: drop them; their true length "
@@ -253,6 +264,11 @@ def _pick(stats: dict, metric: str) -> float:
     return float(stats["mean"] if metric == "mean" else stats[metric])
 
 
+def _scaled_target(stats: dict, metric: str, scale: float) -> int:
+    """``metric × scale`` in whole characters; never below 1 (the reward ignores 0)."""
+    return max(1, int(round(_pick(stats, metric) * scale)))
+
+
 def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dict]:
     """Raw statistics + the reward-ready target payload."""
     by_source: dict[str, list[int]] = defaultdict(list)
@@ -276,10 +292,10 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
     if overall["count"] == 0:
         raise SystemExit("no usable responses to aggregate (everything truncated or empty?)")
 
-    default_target = int(round(_pick(overall, args.target_metric)))
+    default_target = _scaled_target(overall, args.target_metric, args.target_scale)
     domain_stats = {domain: summarise(values) for domain, values in sorted(by_domain.items())}
     domain_targets = {
-        domain: int(round(_pick(stats, args.target_metric)))
+        domain: _scaled_target(stats, args.target_metric, args.target_scale)
         for domain, stats in domain_stats.items()
         if stats["count"] >= args.min_samples
     }
@@ -290,7 +306,7 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
         stats = summarise(values)
         domain = source_domain.get(source, "")
         if stats["count"] >= args.min_samples:
-            target, target_from = int(round(_pick(stats, args.target_metric))), "source"
+            target, target_from = _scaled_target(stats, args.target_metric, args.target_scale), "source"
         elif domain in domain_targets:
             target, target_from = domain_targets[domain], "domain"
         else:
@@ -308,6 +324,7 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
             "max_tokens": args.max_tokens,
             "keep_truncated": bool(args.keep_truncated),
             "target_metric": args.target_metric,
+            "target_scale": args.target_scale,
             "min_samples": args.min_samples,
             "unit": "chars",
         },
@@ -324,6 +341,7 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
     targets_payload = {
         "unit": "chars",
         "metric": args.target_metric,
+        "target_scale": args.target_scale,
         "drop_truncated": not args.keep_truncated,
         "n": args.n,
         "input": args.input,
@@ -360,6 +378,7 @@ def _write_artifacts(args: argparse.Namespace, samples_path: str, model_id: str)
         json.dump(targets_payload, handle, ensure_ascii=False, indent=2)
     with open(env_path, "w", encoding="utf-8") as handle:
         handle.write("# Stage-4 ideal-length targets (HALLUCINATION_RL_DESIGN.md D33).\n")
+        handle.write(f"# target = {args.target_metric} x target_scale = {args.target_scale}\n")
         handle.write("# source this file, then launch the stage-4 recipe.\n")
         handle.write(f"export LENGTH_PENALTY_TARGETS_PATH={shlex.quote(os.path.abspath(targets_path))}\n")
         handle.write(f"export LENGTH_PENALTY_COEF={args.coef}\n")
