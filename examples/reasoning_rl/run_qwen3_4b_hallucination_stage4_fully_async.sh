@@ -26,6 +26,11 @@
 # All knobs of the stage-3 recipe (TOTAL_STEPS, TRAIN_FILES, VAL_FILES,
 # STALENESS_THRESHOLD, ...) are still available; DATA_DIR / EXPERIMENT_NAME
 # default to the stage-4 values and can be overridden from the environment.
+# ROLLOUT_N defaults to 8 here (the stage-3 recipe uses 16).  Batch accounting is
+# prompt-based in fully async:
+#   one mini-batch   = 256 prompts -> PPO_MINI_BATCH_SIZE=256
+#   one param version/batch = 4 mini-batches = 1024 prompts (require_batches=4,
+#   the stage-3 default).  In sequences that is 2048 and 8192 respectively.
 #
 # Stage-4 length penalty (HALLUCINATION_RL_DESIGN.md D33)
 # -------------------------------------------------------
@@ -65,7 +70,13 @@ STAGE4_SCRIPT="$REPO_ROOT/examples/reasoning_rl/run_qwen3_4b_hallucination_stage
 
 DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final_halluc_stage4}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_hallucination_stage4_$(date +%Y%m%d_%H%M)}
-export DATA_DIR EXPERIMENT_NAME
+# Stage-4 rollout group size: 8 samples per prompt (stage-3 default is 16).
+ROLLOUT_N=${ROLLOUT_N:-8}
+# Prompt-level mini-batch: 256 prompts (trainer multiplies it by ROLLOUT_N, i.e.
+# 2048 sequences); require_batches=4 (stage-3 default) then gives 1024 prompts =
+# 8192 sequences per parameter version.
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
+export DATA_DIR EXPERIMENT_NAME ROLLOUT_N PPO_MINI_BATCH_SIZE
 
 LENGTH_PENALTY_ENABLED=${LENGTH_PENALTY_ENABLED:-1}
 # Default-on (D33): the target file produced by measure_length_targets.py lives
