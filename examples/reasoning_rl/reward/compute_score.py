@@ -340,6 +340,64 @@ def _math_score(solution_str: str, ground_truth: str) -> float:
 _DECIMAL_GT_RE = re.compile(r"^[+-]?\d+\.(\d+)$")
 
 
+# evalf of a huge integer power (``10**(10**10)``) runs for hours inside
+# mpmath, and the reward runs in a worker-thread pool where the signal-based
+# parse timeout cannot fire -- one such completion stalls the whole batch.
+# Refuse the expression before ``float()`` can start evaluating it.
+_MAX_POW_EXPONENT = 1000
+_MAX_INT_LITERAL_BITS = 4096
+
+
+def _safe_float_expr(expr) -> float | None:
+    """``float(expr)`` that returns None instead of an unbounded sympy evalf.
+
+    Rejects powers whose exponent is a large literal or an unevaluated
+    integer-valued expression (``10**(10**10)``, whose exponent is itself a
+    ``Pow`` rather than an ``Integer``), and integer literals beyond
+    ``_MAX_INT_LITERAL_BITS`` bits; every other input (strings from
+    ``fallback_mode="first_match"`` included) is handed to ``float()``
+    unchanged.
+    """
+    try:
+        import sympy
+        from sympy import Integer, Pow
+
+        for node in sympy.preorder_traversal(expr):
+            if isinstance(node, Pow):
+                exp = node.exp
+                if isinstance(exp, Integer):
+                    try:
+                        if abs(int(exp)) > _MAX_POW_EXPONENT:
+                            return None
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                elif isinstance(exp, (sympy.Float, sympy.Rational)):
+                    try:
+                        if abs(float(exp)) > _MAX_POW_EXPONENT:
+                            return None
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                elif getattr(exp, "is_integer", False):
+                    # sympy leaves a tower like ``10**(10**10)`` unevaluated, so
+                    # the exponent is a Pow, not an Integer (its ``is_Integer``
+                    # is None).  int()/evalf on that exponent would itself
+                    # evaluate the tower -- refuse the node outright.
+                    return None
+            elif isinstance(node, Integer):
+                try:
+                    if abs(int(node)) >> _MAX_INT_LITERAL_BITS:
+                        return None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+    except Exception:  # non-sympy input; float() is cheap for those
+        pass
+    try:
+        value = float(expr)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def _math_pred_values(solution_str: str) -> list[float]:
     """Numeric values math_verify's parser extracts from the solution's boxed answer.
 
@@ -370,11 +428,8 @@ def _math_pred_values(solution_str: str) -> list[float]:
     for expr in extracted:
         if isinstance(expr, tuple):  # some math_verify versions return (expr, str)
             expr = expr[0]
-        try:
-            value = float(expr)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if math.isfinite(value):
+        value = _safe_float_expr(expr)
+        if value is not None:
             values.append(value)
     return values
 
@@ -528,14 +583,12 @@ def _point_decimal_buckets(boxed: str) -> list:
     for expr in extracted:
         if isinstance(expr, tuple):  # some math_verify versions return (expr, str)
             expr = expr[0]
-        try:
-            value = float(expr)
-        except (TypeError, ValueError, OverflowError):
+        value = _safe_float_expr(expr)
+        if value is None:
             continue
-        if math.isfinite(value):
-            # k = -1: an exact point value, not a written-precision numeral;
-            # _coarser_pred_plausible skips point buckets via is_point anyway.
-            points.append((Decimal(str(value)),) * 2 + (True, Decimal(str(value)), -1))
+        # k = -1: an exact point value, not a written-precision numeral;
+        # _coarser_pred_plausible skips point buckets via is_point anyway.
+        points.append((Decimal(str(value)),) * 2 + (True, Decimal(str(value)), -1))
     return points
 
 
@@ -1037,18 +1090,22 @@ def _evaluated_gt_match(solution_str: str, ground_truth: str) -> bool:
         syms = sorted(g.free_symbols | p.free_symbols, key=str) if syms is None else syms
         if not syms:
             try:
-                return math.isclose(float(g.evalf()), float(p.evalf()), rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL)
+                gv = _safe_float_expr(g)
+                pv = _safe_float_expr(p)
             except Exception:
                 return False
+            if gv is None or pv is None:
+                return False
+            return math.isclose(gv, pv, rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL)
         hits = 0
         for point in _EVAL_ROUNDS:
             subs = dict(zip(syms, point[: len(syms)]))
             try:
-                gv = float(g.subs(subs).evalf())
-                pv = float(p.subs(subs).evalf())
+                gv = _safe_float_expr(g.subs(subs))
+                pv = _safe_float_expr(p.subs(subs))
             except Exception:
                 continue  # singular point / non-numeric; next round
-            if not (math.isfinite(gv) and math.isfinite(pv)):
+            if gv is None or pv is None:
                 continue
             if not math.isclose(gv, pv, rel_tol=_EVAL_RTOL, abs_tol=_EVAL_ATOL):
                 return False  # provably different at a real point

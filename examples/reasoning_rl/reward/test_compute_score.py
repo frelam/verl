@@ -34,10 +34,12 @@ from compute_score import (
     _gt_segment_match,
     _labeled_decimal_match,
     _math_last_resort,
+    _math_pred_values,
     _normalized_text_match,
     _numeric_literal_match,
     _or_branch_match,
     _repetition_penalty,
+    _safe_float_expr,
     _unverifiable_code_ground_truth,
     _yes_no_match,
     compute_score,
@@ -740,6 +742,42 @@ class TestEvaluatedGtMatch:
         assert not _evaluated_gt_match(
             think_wrap("\\boxed{\\frac{n(n+1)(2n+1)}{6}}"), "\\sum_{k=1}^{n} k^2"
         )
+
+
+class TestSafeFloatExpr:
+    """Guard against unbounded sympy evalf in the reward worker threads.
+
+    Production regression: ``\\boxed{\\left(10^{10^{10}}\\right)^{10^{10^{10}}}}``
+    parses to a Pow tower whose exponents are themselves unevaluated ``Pow``
+    nodes, and ``float()`` on it never returns -- the stage-4 difficulty gate
+    stalled for 14.5 h on one such completion.  Rewards run in a worker-thread
+    pool where math_verify's signal-based parse timeout cannot fire, so the
+    conversion itself has to refuse the expression.
+    """
+
+    def test_unevaluated_pow_exponent_refused(self):
+        import sympy
+
+        tower = sympy.Pow(
+            sympy.Pow(10, 10**10, evaluate=False),
+            sympy.Pow(10, 10, evaluate=False),
+            evaluate=False,
+        )
+        assert _safe_float_expr(tower) is None
+        assert _safe_float_expr(sympy.Pow(10, 10**10, evaluate=False)) is None
+
+    def test_boxed_pow_tower_refused_without_hanging(self):
+        pytest.importorskip("math_verify")
+        resp = think_wrap("The answer is $\\boxed{\\left(10^{10^{10}}\\right)^{10^{10^{10}}}}$.")
+        assert _math_pred_values(resp) == []
+
+    def test_plain_numbers_still_convert(self):
+        import sympy
+
+        assert _safe_float_expr("0.25") == 0.25
+        assert _safe_float_expr(sympy.Rational(1, 3)) == pytest.approx(1 / 3)
+        assert _safe_float_expr(sympy.sqrt(2)) == pytest.approx(2**0.5)
+        assert _safe_float_expr(sympy.Pow(2, 10)) == 1024.0
 
 
 class TestGtSegmentMatch:
