@@ -23,8 +23,16 @@ The aggregated statistic (``--target_metric``, default mean) times
 ``--target_scale`` (default 0.6) becomes the per-subtask length target of the
 reward's over-length penalty (``reward/hallucination_compute_score.py``).  The
 scale is the "compress further than the DPO checkpoint" knob: 1.0 asks the model
-to stay at its own measured length, 0.6 asks for a 40% further cut.  Outputs (all
-under ``--output_dir``)::
+to stay at its own measured length, 0.6 asks for a 40% further cut.
+
+Long-CoT sources (``--long_cot_prefixes``, default ``math_hard_``/``code_``) do
+not use that mean: they get ``--long_cot_metric`` (default p90) times
+``--long_cot_scale`` (default 1.0), i.e. a *ceiling* instead of a target.  A mean
+target charges half of the naturally long correct answers from step 0, and in
+all-correct groups the penalty is the only signal, so RL keeps compressing the
+derivation until accuracy falls on exactly these domains.
+
+Outputs (all under ``--output_dir``)::
 
     length_samples.jsonl   one line per generated response (lengths only)
     done.txt               task keys already generated (resume skips them)
@@ -99,6 +107,15 @@ logger = logging.getLogger("measure_length_targets")
 DEFAULT_COEF = 0.2
 DEFAULT_MAX_PENALTY = 0.5
 
+#: Long-CoT families keep a *ceiling* instead of the mean.  A mean target puts
+#: half of the checkpoint's own correct answers over budget from step 0, and in
+#: all-correct groups the penalty is the only remaining signal, so RL keeps
+#: shortening the derivation until accuracy drops on exactly these domains.
+#: p90 at scale 1.0 charges only the tail of the checkpoint's own distribution.
+DEFAULT_LONG_COT_PREFIXES = "math_hard_,code_"
+DEFAULT_LONG_COT_METRIC = "p90"
+DEFAULT_LONG_COT_SCALE = 1.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -160,6 +177,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="multiplier applied to the chosen statistic before writing the targets "
         "(default: 0.6 = ask for a 40%% cut below the checkpoint's own mean); "
         "1.0 keeps the measured length",
+    )
+    parser.add_argument(
+        "--long_cot_prefixes",
+        default=DEFAULT_LONG_COT_PREFIXES,
+        help="comma-separated data_source prefixes that use the long-CoT ceiling "
+        f"(default: {DEFAULT_LONG_COT_PREFIXES}; empty disables the ceiling)",
+    )
+    parser.add_argument(
+        "--long_cot_metric",
+        choices=("mean", "p50", "p90"),
+        default=DEFAULT_LONG_COT_METRIC,
+        help="statistic for --long_cot_prefixes (default: p90 -- a ceiling, not a mean, "
+        "so the naturally long correct answers are not charged from step 0)",
+    )
+    parser.add_argument(
+        "--long_cot_scale",
+        type=float,
+        default=DEFAULT_LONG_COT_SCALE,
+        help="multiplier for --long_cot_prefixes (default: 1.0; a ceiling is not "
+        "compressed further, unlike --target_scale)",
     )
     parser.add_argument(
         "--keep_truncated",
@@ -269,6 +306,17 @@ def _scaled_target(stats: dict, metric: str, scale: float) -> int:
     return max(1, int(round(_pick(stats, metric) * scale)))
 
 
+def _parse_prefixes(raw: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in str(raw or "").split(",") if item.strip())
+
+
+def _long_cot_settings(source: str, prefixes: tuple[str, ...], args: argparse.Namespace) -> tuple[str, float]:
+    """``(metric, scale)`` for one data_source: the ceiling pair for long-CoT families."""
+    if prefixes and source.startswith(prefixes):
+        return args.long_cot_metric, args.long_cot_scale
+    return args.target_metric, args.target_scale
+
+
 def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dict]:
     """Raw statistics + the reward-ready target payload."""
     by_source: dict[str, list[int]] = defaultdict(list)
@@ -300,19 +348,28 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
         if stats["count"] >= args.min_samples
     }
 
+    prefixes = _parse_prefixes(args.long_cot_prefixes)
     source_stats = {}
     targets = {}
     for source, values in sorted(by_source.items()):
         stats = summarise(values)
         domain = source_domain.get(source, "")
+        metric, scale = _long_cot_settings(source, prefixes, args)
         if stats["count"] >= args.min_samples:
-            target, target_from = _scaled_target(stats, args.target_metric, args.target_scale), "source"
+            target, target_from = _scaled_target(stats, metric, scale), "source"
         elif domain in domain_targets:
             target, target_from = domain_targets[domain], "domain"
         else:
             target, target_from = default_target, "default"
         targets[source] = target
-        source_stats[source] = {**stats, "target": target, "target_from": target_from, "domain": domain}
+        source_stats[source] = {
+            **stats,
+            "target": target,
+            "target_from": target_from,
+            "target_metric": metric,
+            "target_scale": scale,
+            "domain": domain,
+        }
 
     targets["__default__"] = default_target
     stats_payload = {
@@ -325,6 +382,9 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
             "keep_truncated": bool(args.keep_truncated),
             "target_metric": args.target_metric,
             "target_scale": args.target_scale,
+            "long_cot_prefixes": list(_parse_prefixes(args.long_cot_prefixes)),
+            "long_cot_metric": args.long_cot_metric,
+            "long_cot_scale": args.long_cot_scale,
             "min_samples": args.min_samples,
             "unit": "chars",
         },
@@ -342,6 +402,9 @@ def _aggregate(samples: list[dict], args: argparse.Namespace) -> tuple[dict, dic
         "unit": "chars",
         "metric": args.target_metric,
         "target_scale": args.target_scale,
+        "long_cot_prefixes": list(_parse_prefixes(args.long_cot_prefixes)),
+        "long_cot_metric": args.long_cot_metric,
+        "long_cot_scale": args.long_cot_scale,
         "drop_truncated": not args.keep_truncated,
         "n": args.n,
         "input": args.input,
@@ -379,6 +442,10 @@ def _write_artifacts(args: argparse.Namespace, samples_path: str, model_id: str)
     with open(env_path, "w", encoding="utf-8") as handle:
         handle.write("# Stage-4 ideal-length targets (HALLUCINATION_RL_DESIGN.md D33).\n")
         handle.write(f"# target = {args.target_metric} x target_scale = {args.target_scale}\n")
+        handle.write(
+            f"# long-CoT sources ({args.long_cot_prefixes}) use a ceiling: "
+            f"{args.long_cot_metric} x {args.long_cot_scale}\n"
+        )
         handle.write("# source this file, then launch the stage-4 recipe.\n")
         handle.write(f"export LENGTH_PENALTY_TARGETS_PATH={shlex.quote(os.path.abspath(targets_path))}\n")
         handle.write(f"export LENGTH_PENALTY_COEF={args.coef}\n")
@@ -397,9 +464,10 @@ def _write_artifacts(args: argparse.Namespace, samples_path: str, model_id: str)
             continue
         info = stats_payload["by_source"][source]
         logger.info(
-            "[targets] %-28s target=%6d chars (from %-7s, n=%d, mean=%.0f, p90=%.0f)",
+            "[targets] %-28s target=%6d chars (metric=%-4s from %-7s, n=%d, mean=%.0f, p90=%.0f)",
             source,
             target,
+            info["target_metric"],
             info["target_from"],
             info["count"],
             info["mean"],

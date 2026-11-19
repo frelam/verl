@@ -47,6 +47,13 @@
 # mean before it becomes the target, i.e. the reward asks for a further 40% cut
 # below the DPO checkpoint's own length; pass 1.0 to anchor at that length.
 #
+# Long-CoT sources (`math_hard_*`, `code_*`) are exempt from that mean: the stats
+# script gives them a *ceiling* by default (`--long_cot_metric p90`,
+# `--long_cot_scale 1.0`).  A mean target keeps charging the naturally long
+# correct answers from step 0, and in all-correct groups the penalty becomes the
+# only signal, so RL shortens the derivation until accuracy drops there.
+# Override with `--long_cot_prefixes ""` to apply the mean uniformly again.
+#
 # `length_targets.env` exports the knobs below; the wrapper forwards them as
 # `reward.custom_reward_function.reward_kwargs.*` (the reward consumes them and
 # never forwards them to the stage-1 dispatcher).

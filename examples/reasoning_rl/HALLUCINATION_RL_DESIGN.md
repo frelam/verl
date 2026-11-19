@@ -1143,6 +1143,13 @@ built parquet。输出：阶段二 `final_halluc/train.parquet` + `val.parquet` 
      "target = 模型自身均值"的原始口径。系数写入 `length_stats.json → config.target_scale`、
      `length_targets.json → target_scale` 与 `length_targets.env` 的注释行，可随产物审计。
      该系数同时作用于源/域/`__default__` 三级 target，回退链不会破坏比例。
+  6. **长 CoT 域用天花板，不用均值**：`math_hard_*` 与 `code_*` 默认改走
+     `--long_cot_metric p90` × `--long_cot_scale 1.0`（前缀由 `--long_cot_prefixes`
+     控制，置空则退回全局 mean）。理由：mean 目标会让该 ckpt 自己一半的正确长回答
+     从第一步就超预算；全对组里惩罚成为唯一组内信号，RL 会持续压缩推导，直到
+     code / hard math 的 acc 随长度一起下降（2026-11 训练观察）。p90 只罚分布尾部，
+     其余源仍按 `--target_metric × --target_scale`。选择口径写入
+     `length_stats.json → by_source[*].target_metric/target_scale`。
 - **reward 公式**（`hallucination_compute_score.py`，分支打分之后）：
   ```
   excess  = max(0, length_chars / target - 1)
