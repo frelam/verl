@@ -216,6 +216,19 @@ math 532`` while keeping 13,300 replay rows and 44,333 train rows.  The achieved
 mix is written to ``mix_stats.json -> achieved_ratios.ability_share_of_reasoning``
 and cross-checked by the build script (≤1pt deviation from stage 3).
 
+Stage 5: small hallucination slice + ``--code_share`` (D35)
+-----------------------------------------------------------
+
+Stage 5 turns the ability match off and rebalances the budget: hallucination
+5% (internal 20/20/60 math/logic/commonsense), old replay 35%, hard math 26%,
+IF 10%, BBH 10%, logic 10%, stem 4%.  ``--code_share 0.30`` pins code at 30% of
+the *final* train set; the rest of the replay is split over the remaining
+abilities in proportion to the raw pool.  The logic and stem domains are
+additive shares (``--logic_ratio`` / ``--stem_ratio``) drawn from the same raw
+pools and exact-deduped against the replay rows.  ``--fail_on_code_shortfall``
+makes a short code pool a hard error, because silently missing the code target
+would undo the rebalance.
+
 """
 
 from __future__ import annotations
@@ -1091,6 +1104,153 @@ def sample_old_domain_by_ability(
     }
 
 
+def parse_domain_weights(spec: str | None) -> dict[str, float]:
+    """Parse ``math=0.2,logic=0.2,commonsense=0.6`` for the hallucination quota."""
+    if not spec:
+        return {}
+    weights: dict[str, float] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"--halluc_domain_weights expects domain=weight, got {part!r}")
+        domain, value = part.split("=", 1)
+        try:
+            weight = float(value)
+        except ValueError as exc:
+            raise ValueError(f"--halluc_domain_weights has a non-numeric weight: {part!r}") from exc
+        if weight < 0:
+            raise ValueError(f"--halluc_domain_weights got a negative weight: {part!r}")
+        weights[domain.strip()] = weight
+    if not weights or sum(weights.values()) <= 0:
+        raise ValueError("--halluc_domain_weights must contain at least one positive weight")
+    return weights
+
+
+def scale_quota_domains(
+    base: dict[tuple[str, str], int],
+    weights: dict[str, float],
+    total: int | None = None,
+) -> dict[tuple[str, str], int]:
+    """Rebuild ``base`` with per-domain row shares.
+
+    The hallucination domains carry the same 25/75 solvable/unsolvable side
+    ratio at the stage-3 base, so re-weighting the domains preserves the
+    artifact's global side balance.  Cells inside a domain keep their base
+    proportions; only the domain totals move.
+    """
+    total = total if total is not None else sum(base.values())
+    groups: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for cell in base:
+        domain = schema.SOURCES[cell[1]][0]
+        groups[domain].append(cell)
+    unknown = set(weights) - set(groups)
+    if unknown:
+        raise ValueError(
+            f"--halluc_domain_weights has unknown domain(s) {sorted(unknown)}; "
+            f"available: {sorted(groups)}"
+        )
+    missing = set(groups) - set(weights)
+    if missing:
+        raise ValueError(
+            f"--halluc_domain_weights must name every domain; missing {sorted(missing)}"
+        )
+    weight_sum = sum(weights[domain] for domain in groups)
+    if weight_sum <= 0:
+        raise ValueError("--halluc_domain_weights must have a positive total")
+    scaled: dict[tuple[str, str], int] = {}
+    for domain, cells in groups.items():
+        weight = weights[domain]
+        if weight <= 0:
+            continue
+        domain_total = round(total * weight / weight_sum)
+        scaled.update(_largest_remainder({cell: base[cell] for cell in cells}, domain_total))
+    return scaled
+
+
+def take_extra_domain(
+    name: str,
+    path: str,
+    desired_train: int,
+    n_val: int,
+    excluded_keys: set[str],
+    in_artifact_keys: set[str],
+    held_out_keys: set[str],
+    rng: random.Random,
+) -> tuple[list[dict], list[dict], dict]:
+    """Read, filter, dedup and sample one additive pool (logic / stem).
+
+    Returns ``(train_rows, val_rows, report)``.  The pool is filtered by
+    previously trained prompts, the stage-1 held-out val, and every prompt
+    already in the artifact; duplicates inside the pool are removed before the
+    val carve.
+    """
+    path = os.path.expanduser(path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"--{name}_path does not exist: {path}")
+    pool = read_parquet_rows(path)
+    pool_rows = len(pool)
+
+    dropped_prev = 0
+    if excluded_keys:
+        before = len(pool)
+        pool = [row for row in pool if _question_key(row) not in excluded_keys]
+        dropped_prev = before - len(pool)
+
+    dropped_held_out = 0
+    if held_out_keys:
+        before = len(pool)
+        pool = [row for row in pool if _question_key(row) not in held_out_keys]
+        dropped_held_out = before - len(pool)
+
+    before = len(pool)
+    pool = [row for row in pool if _question_key(row) not in in_artifact_keys]
+    dropped_dup = before - len(pool)
+
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for row in pool:
+        key = _question_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    dropped_self = len(pool) - len(unique)
+    pool = unique
+
+    n_val = min(n_val, len(pool))
+    rng.shuffle(pool)
+    val_rows = pool[:n_val]
+    train_pool = pool[n_val:]
+
+    n_train = min(desired_train, len(train_pool))
+    if n_train < desired_train:
+        print(
+            f"[mix_halluc] WARNING: {name} pool can only supply {n_train} row(s) after dedup; "
+            f"the {name} share will come out below the request"
+        )
+    train_rows = train_pool[:n_train]
+    report = {
+        "path": path,
+        "pool_rows": pool_rows,
+        "dropped_already_trained": dropped_prev,
+        "dropped_held_out_val": dropped_held_out,
+        "dropped_duplicate_of_reasoning_domains": dropped_dup,
+        "dropped_duplicate_within_pool": dropped_self,
+        "target_train": desired_train,
+        "sampled_train": len(train_rows),
+        "sampled_val": len(val_rows),
+    }
+    print(
+        f"[mix_halluc] {name} domain: pool {pool_rows}, -{dropped_prev} already trained, "
+        f"-{dropped_held_out} held-out val, -{dropped_dup} duplicate, "
+        f"-{dropped_self} internal duplicate, train {len(train_rows)}, val {len(val_rows)}; "
+        f"by source {dict(Counter(row['data_source'] for row in train_rows))}"
+    )
+    return train_rows, val_rows, report
+
+
 #: Stage 4 (D32): per-source share of the BBH-gap domain.  The keys are the
 #: ``data_source`` values ``bbh_adapter.py`` writes.  Dyck gets the largest share
 #: because it is both the weakest subtask (40%) and the cheapest to generate.
@@ -1395,6 +1555,13 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: 0.6, or 0.75 with --stage3_mix)",
     )
     parser.add_argument(
+        "--halluc_domain_weights",
+        default=None,
+        help="Reorder the hallucination domains without changing the total or the 25/75 side "
+        "balance, e.g. math=0.2,logic=0.2,commonsense=0.6.  Cells inside a domain keep their "
+        "stage-3 proportions; only the domain totals move (stage 5 uses 20/20/60).",
+    )
+    parser.add_argument(
         "--stage3_mix",
         action="store_true",
         help="Stage 3 (D30): build the domain-balanced mix from STAGE3_QUOTA instead "
@@ -1444,7 +1611,14 @@ def build_parser() -> argparse.ArgumentParser:
         "hallucination domain has no code source, so without this a uniform replay "
         "dilutes code to ~0.6 * its stage-1 share.  Ignored when "
         "--match_stage3_abilities/--ability_reference_path is set: the replay is then "
-        "allocated per ability instead.",
+        "allocated per ability instead.  Stage 5 passes 0.30.",
+    )
+    parser.add_argument(
+        "--fail_on_code_shortfall",
+        action="store_true",
+        help="Stage 5: turn a code-pool shortfall into a build error instead of a warning.  "
+        "The code share is a headline target of stage 5, so a silently under-filled replay "
+        "would quietly undo the rebalance; only meaningful with --code_share.",
     )
     parser.add_argument(
         "--match_stage3_abilities",
@@ -1546,6 +1720,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stage 4 (D34): comma-separated data_source=weight overrides for the hard-math domain "
         "(default: ace_reason 0.40 / deepscaler 0.35 / deepmath 0.25).",
     )
+    parser.add_argument(
+        "--logic_path",
+        default=None,
+        help="Stage 5 (D35): logic pool (parquet/dir), usually $DATA_ROOT/logic/train_logic.parquet.  "
+        "Drawn from the same raw pool as the old-domain replay, so the exact-dedup against the "
+        "replay rows is what keeps a prompt from training twice.",
+    )
+    parser.add_argument(
+        "--logic_ratio",
+        type=float,
+        default=0.0,
+        help="Stage 5 (D35): logic-domain share of the FINAL train set (0 disables).  The row "
+        "count is logic_ratio/(1-if-bbh-hard_math-logic) * (halluc_train + old_domain), so the "
+        "other additive domains keep their absolute size.",
+    )
+    parser.add_argument(
+        "--logic_val_size",
+        type=int,
+        default=None,
+        help="Logic val rows carved out of --logic_path before the train sample "
+        "(default: the same additive formula applied to the non-additive val rows).",
+    )
+    parser.add_argument(
+        "--stem_path",
+        default=None,
+        help="Stage 5 (D35): stem pool (parquet/dir), usually $DATA_ROOT/stem/train_stem.parquet.  "
+        "Same freshness and exact-dedup rules as --logic_path.",
+    )
+    parser.add_argument(
+        "--stem_ratio",
+        type=float,
+        default=0.0,
+        help="Stage 5 (D35): stem-domain share of the FINAL train set (0 disables).",
+    )
+    parser.add_argument(
+        "--stem_val_size",
+        type=int,
+        default=None,
+        help="Stem val rows carved out of --stem_path before the train sample "
+        "(default: the same additive formula applied to the non-additive val rows).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -1602,6 +1817,43 @@ def main(argv: list[str] | None = None) -> int:
         print("[mix_halluc] WARNING: --hard_math_path given but --hard_math_ratio is 0; the hard-math pool is ignored")
     hard_math_weights = parse_hard_math_weights(args.hard_math_weights)
 
+    # Stage 5 (D35): the logic domain is the fourth additive share.
+    if not 0.0 <= args.logic_ratio < 1.0:
+        raise ValueError(f"--logic_ratio must be in [0, 1), got {args.logic_ratio}")
+    # Stage 5 (D35): the stem domain is the fifth additive share.
+    if not 0.0 <= args.stem_ratio < 1.0:
+        raise ValueError(f"--stem_ratio must be in [0, 1), got {args.stem_ratio}")
+    additive_sum = (
+        args.if_ratio
+        + args.bbh_ratio
+        + args.hard_math_ratio
+        + args.logic_ratio
+        + args.stem_ratio
+    )
+    if additive_sum >= 1.0:
+        raise ValueError(
+            f"--if_ratio ({args.if_ratio}) + --bbh_ratio ({args.bbh_ratio}) + "
+            f"--hard_math_ratio ({args.hard_math_ratio}) + --logic_ratio ({args.logic_ratio}) + "
+            f"--stem_ratio ({args.stem_ratio}) must stay below 1.0"
+        )
+    if args.logic_ratio > 0 and not args.logic_path:
+        raise ValueError("--logic_ratio > 0 requires --logic_path (usually $DATA_ROOT/logic/train_logic.parquet)")
+    if args.logic_path and args.logic_ratio == 0:
+        print("[mix_halluc] WARNING: --logic_path given but --logic_ratio is 0; the logic pool is ignored")
+    if args.stem_ratio > 0 and not args.stem_path:
+        raise ValueError("--stem_ratio > 0 requires --stem_path (usually $DATA_ROOT/stem/train_stem.parquet)")
+    if args.stem_path and args.stem_ratio == 0:
+        print("[mix_halluc] WARNING: --stem_path given but --stem_ratio is 0; the stem pool is ignored")
+    if (args.logic_ratio > 0 or args.stem_ratio > 0) and (
+        args.match_stage3_abilities or args.ability_reference_path
+    ):
+        raise ValueError(
+            "--logic_ratio/--stem_ratio cannot be combined with --match_stage3_abilities/"
+            "--ability_reference_path: these are additive capability domains, "
+            "not part of the stage-3 reasoning-part match"
+        )
+    halluc_domain_weights = parse_domain_weights(args.halluc_domain_weights)
+
     # Stage 4 (D34 follow-up): the ability reference only makes sense on top of
     # the stage-3 table (it is the reasoning part that is matched).
     if (args.match_stage3_abilities or args.ability_reference_path) and not args.stage3_mix:
@@ -1610,11 +1862,13 @@ def main(argv: list[str] | None = None) -> int:
         raise FileNotFoundError(f"--ability_reference_path does not exist: {args.ability_reference_path}")
 
     # The additive ratios share one denominator; computing them together is what
-    # keeps every requested share exact when a third domain is added.
+    # keeps every requested share exact when a fourth domain is added.
     additive_ratios = {
         "if": args.if_ratio,
         "bbh": args.bbh_ratio,
         "hard_math": args.hard_math_ratio,
+        "logic": args.logic_ratio,
+        "stem": args.stem_ratio,
     }
 
     files = resolve_parquet_files(halluc_dir)
@@ -1624,6 +1878,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[mix_halluc] {len(halluc_rows)} rows from {len(files)} adapter parquet(s)")
 
     base = STAGE3_QUOTA if args.stage3_mix else DEFAULT_QUOTA
+    if halluc_domain_weights:
+        base = scale_quota_domains(base, halluc_domain_weights)
+        print(f"[mix_halluc] hallucination domain weights: {halluc_domain_weights}")
     quota = scaled_quota(args.halluc_total, unsolvable_ratio, base=base)
 
     # --- stage-1 pool (section 7.1), read up front ------------------------------
@@ -1707,6 +1964,8 @@ def main(argv: list[str] | None = None) -> int:
     target_if_train = 0
     target_bbh_train = 0
     target_hard_math_train = 0
+    target_logic_train = 0
+    target_stem_train = 0
     if (args.stage1_path or args.old_pool_path) and args.stage3_mix:
         target_halluc_train = max(args.halluc_total - args.val_size, 0)
         n_old = round(target_halluc_train * old_domain_ratio / (1.0 - old_domain_ratio))
@@ -1717,6 +1976,8 @@ def main(argv: list[str] | None = None) -> int:
         target_if_train = additive["if"]
         target_bbh_train = additive["bbh"]
         target_hard_math_train = additive["hard_math"]
+        target_logic_train = additive["logic"]
+        target_stem_train = additive["stem"]
         ability_match = None
         if args.match_stage3_abilities or args.ability_reference_path:
             # D34 follow-up: keep the stage-3 ability mix inside the reasoning
@@ -1755,7 +2016,9 @@ def main(argv: list[str] | None = None) -> int:
                 + n_old
                 + target_if_train
                 + target_bbh_train
-                + target_hard_math_train,
+                + target_hard_math_train
+                + target_logic_train
+                + target_stem_train,
                 code_share,
                 rng,
             )
@@ -1764,10 +2027,13 @@ def main(argv: list[str] | None = None) -> int:
             f"code {old_report['code_rows']}/{old_report['code_target']})"
         )
         if old_report["shortfall"] > 0 and ability_match is None:
-            print(
-                f"[mix_halluc] WARNING: code pool short by {old_report['shortfall']} row(s); "
+            message = (
+                f"code pool short by {old_report['shortfall']} row(s); "
                 f"the whole train set will miss the {code_share:.0%} code target"
             )
+            if args.fail_on_code_shortfall:
+                raise ValueError(f"--fail_on_code_shortfall: {message}")
+            print(f"[mix_halluc] WARNING: {message}")
 
     dropped_old = dropped_self = 0
     minhash_dropped = minhash_twins = 0
@@ -2182,7 +2448,58 @@ def main(argv: list[str] | None = None) -> int:
         )
         val_rows = list(val_rows) + hard_math_val_rows
 
-    all_train = rows + old_rows + if_rows + bbh_rows + hard_math_rows
+    # --- stage 5: additive logic and stem domains (D35) ------------------------
+    # Both are drawn from the same raw pools the old-domain replay uses, so the
+    # exact-dedup against every row already in the artifact is what keeps a
+    # prompt from training twice.  Sampling is uniform within each pool, matching
+    # mix.py's stage-1 draw.
+    held_out_keys = {_question_key(row) for row in old_val_rows}
+    logic_rows: list[dict] = []
+    logic_val_rows: list[dict] = []
+    logic_report: dict = {}
+    if args.logic_ratio > 0:
+        n_logic_val = args.logic_val_size
+        if n_logic_val is None:
+            n_logic_val = additive_targets(additive_ratios, additive_val_base)["logic"]
+        desired_logic = additive_targets(additive_ratios, len(rows) + len(old_rows))["logic"]
+        logic_rows, logic_val_rows, logic_report = take_extra_domain(
+            "logic",
+            args.logic_path,
+            desired_logic,
+            n_logic_val,
+            excluded_keys,
+            {_question_key(row) for row in rows + old_rows + if_rows + bbh_rows + hard_math_rows},
+            held_out_keys,
+            rng,
+        )
+        val_rows = list(val_rows) + logic_val_rows
+
+    stem_rows: list[dict] = []
+    stem_val_rows: list[dict] = []
+    stem_report: dict = {}
+    if args.stem_ratio > 0:
+        n_stem_val = args.stem_val_size
+        if n_stem_val is None:
+            n_stem_val = additive_targets(additive_ratios, additive_val_base)["stem"]
+        desired_stem = additive_targets(additive_ratios, len(rows) + len(old_rows))["stem"]
+        stem_rows, stem_val_rows, stem_report = take_extra_domain(
+            "stem",
+            args.stem_path,
+            desired_stem,
+            n_stem_val,
+            excluded_keys,
+            {
+                _question_key(row)
+                for row in rows + old_rows + if_rows + bbh_rows + hard_math_rows + logic_rows
+            },
+            held_out_keys,
+            rng,
+        )
+        val_rows = list(val_rows) + stem_val_rows
+
+    all_train = (
+        rows + old_rows + if_rows + bbh_rows + hard_math_rows + logic_rows + stem_rows
+    )
     rng.shuffle(all_train)
     rng.shuffle(val_rows)
     for i, row in enumerate(all_train):
@@ -2230,6 +2547,11 @@ def main(argv: list[str] | None = None) -> int:
         # Stage 4 (D34): the hard-math domain is the third additive share.
         "hard_math_share_of_train": len(hard_math_rows) / len(all_train) if all_train else 0.0,
         "hard_math_share_of_val": len(hard_math_val_rows) / len(val_rows) if val_rows else 0.0,
+        # Stage 5 (D35): the logic and stem domains are the fourth/fifth additive shares.
+        "logic_share_of_train": len(logic_rows) / len(all_train) if all_train else 0.0,
+        "logic_share_of_val": len(logic_val_rows) / len(val_rows) if val_rows else 0.0,
+        "stem_share_of_train": len(stem_rows) / len(all_train) if all_train else 0.0,
+        "stem_share_of_val": len(stem_val_rows) / len(val_rows) if val_rows else 0.0,
         "hallucination_share_of_train": len(rows) / len(all_train) if all_train else 0.0,
     }
     # Stage 4 (D34 follow-up): the stage-3 ability mix is preserved inside the
@@ -2249,6 +2571,8 @@ def main(argv: list[str] | None = None) -> int:
         - len(if_val_rows)
         - len(bbh_val_rows)
         - len(hard_math_val_rows)
+        - len(logic_val_rows)
+        - len(stem_val_rows)
     )
     schema.normalise_extra_info(all_train + val_rows)
 
@@ -2284,6 +2608,14 @@ def main(argv: list[str] | None = None) -> int:
             "hard_math_path": args.hard_math_path,
             "hard_math_val_size": args.hard_math_val_size,
             "hard_math_weights": hard_math_weights,
+            # Stage 5 (D35): additive logic / stem domains.
+            "logic_ratio": args.logic_ratio,
+            "logic_path": args.logic_path,
+            "logic_val_size": args.logic_val_size,
+            "stem_ratio": args.stem_ratio,
+            "stem_path": args.stem_path,
+            "stem_val_size": args.stem_val_size,
+            "halluc_domain_weights": halluc_domain_weights or None,
             # Stage 4 (D34 follow-up): ability-matched replay.
             "match_stage3_abilities": bool(args.match_stage3_abilities or args.ability_reference_path),
             "ability_reference_path": args.ability_reference_path,
@@ -2304,6 +2636,14 @@ def main(argv: list[str] | None = None) -> int:
         "hard_math_rows_in_val": len(hard_math_val_rows),
         "hard_math_domain": hard_math_report,
         "hard_math_by_source": dict(Counter(row["data_source"] for row in hard_math_rows)),
+        "logic_rows_in_train": len(logic_rows),
+        "logic_rows_in_val": len(logic_val_rows),
+        "logic_domain": logic_report,
+        "logic_by_source": dict(Counter(row["data_source"] for row in logic_rows)),
+        "stem_rows_in_train": len(stem_rows),
+        "stem_rows_in_val": len(stem_val_rows),
+        "stem_domain": stem_report,
+        "stem_by_source": dict(Counter(row["data_source"] for row in stem_rows)),
         "ability_match": ability_match,
         "old_domain_rows_excluded": excluded_old_removed,
         "old_domain_held_out_val_rows_removed": held_out_val_removed,
@@ -2390,6 +2730,20 @@ def main(argv: list[str] | None = None) -> int:
             f"({achieved_ratios['hard_math_share_of_train']:.1%}), "
             f"val={len(hard_math_val_rows)} ({achieved_ratios['hard_math_share_of_val']:.1%}), "
             f"by source={stats['hard_math_by_source']}"
+        )
+    if args.logic_ratio > 0:
+        print(
+            f"[done] logic domain: train={len(logic_rows)} "
+            f"({achieved_ratios['logic_share_of_train']:.1%}), "
+            f"val={len(logic_val_rows)} ({achieved_ratios['logic_share_of_val']:.1%}), "
+            f"by source={stats['logic_by_source']}"
+        )
+    if args.stem_ratio > 0:
+        print(
+            f"[done] stem domain: train={len(stem_rows)} "
+            f"({achieved_ratios['stem_share_of_train']:.1%}), "
+            f"val={len(stem_val_rows)} ({achieved_ratios['stem_share_of_val']:.1%}), "
+            f"by source={stats['stem_by_source']}"
         )
     print(f"[done] template balance: {templates}")
     short = [c for c in cell_report if c["shortfall"] - c["redistributed"] > 0]

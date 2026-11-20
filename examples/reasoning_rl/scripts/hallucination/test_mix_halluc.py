@@ -1780,3 +1780,141 @@ class TestStage4HardMath:
         by_band = Counter(mix_halluc._pass_rate_band(row) for row in train)
         assert len(train) == 300
         assert by_band[0] == 5  # capped by supply, not by its 20% share
+
+
+class TestStage5Mix:
+    """Stage 5 (D35): 5% hallucination, 26% hard math, 30% code, 10% logic/stem.
+
+    The ability match is deliberately off, so ``--code_share`` is the knob that
+    pins code while the new additive logic/stem domains take the IF/hard-math
+    cuts and the hallucination domain is re-weighted to 20/20/60.
+    """
+
+    def _pools(self, tmp_path, code_rows=8000):
+        helper = TestStage4InstructionFollowing()
+        build = helper._stage3_build(tmp_path)
+        stage1, _ = helper._stage1_pool(
+            tmp_path,
+            counts=(("code", code_rows), ("math", 6000), ("logic", 2000), ("stem", 2000)),
+        )
+        if_pool = tmp_path / "if"
+        if_pool.mkdir()
+        schema.write_rows_parquet(make_if_rows(3000), str(if_pool / "if.parquet"))
+        bbh_pool = tmp_path / "bbh"
+        bbh_pool.mkdir()
+        schema.write_rows_parquet(
+            TestStage4BbhGap()._bbh_rows(), str(bbh_pool / "bbh.parquet")
+        )
+        hard_pool = tmp_path / "hard_math"
+        hard_pool.mkdir()
+        schema.write_rows_parquet(
+            TestStage4HardMath()._hard_math_rows(n_per_source=1000),
+            str(hard_pool / "hard_math.parquet"),
+        )
+        logic_pool, _ = helper._stage1_pool(
+            tmp_path, name="logic_pool", counts=(("logic", 3000),)
+        )
+        stem_pool, _ = helper._stage1_pool(
+            tmp_path, name="stem_pool", counts=(("stem", 1000),)
+        )
+        return build, stage1, if_pool, bbh_pool, hard_pool, logic_pool, stem_pool
+
+    def _args(
+        self, tmp_path, build, stage1, if_pool, bbh_pool, hard_pool, logic_pool, stem_pool
+    ):
+        return [
+            "--stage3_mix",
+            "--strict_cells",
+            "--halluc_domain_weights", "math=0.2,logic=0.2,commonsense=0.6",
+            "--halluc_dir", build,
+            "--stage1_path", stage1,
+            "--if_path", str(if_pool),
+            "--if_ratio", "0.10",
+            "--bbh_path", str(bbh_pool),
+            "--bbh_ratio", "0.10",
+            "--hard_math_path", str(hard_pool),
+            "--hard_math_ratio", "0.26",
+            "--logic_path", logic_pool,
+            "--logic_ratio", "0.10",
+            "--stem_path", stem_pool,
+            "--stem_ratio", "0.04",
+            "--old_domain_ratio", "0.875",
+            "--code_share", "0.30",
+            "--fail_on_code_shortfall",
+            "--output_dir", str(tmp_path / "stage5"),
+            "--halluc_total", "500",
+            "--val_size", "30",
+            "--seed", "45",
+        ]
+
+    def test_stage5_mix_hits_the_five_thirty_thirty_targets(self, tmp_path):
+        (
+            build,
+            stage1,
+            if_pool,
+            bbh_pool,
+            hard_pool,
+            logic_pool,
+            stem_pool,
+        ) = self._pools(tmp_path)
+        assert mix_halluc.main(
+            self._args(
+                tmp_path,
+                build,
+                stage1,
+                if_pool,
+                bbh_pool,
+                hard_pool,
+                logic_pool,
+                stem_pool,
+            )
+        ) == 0
+
+        stats = json.load(open(os.path.join(str(tmp_path / "stage5"), "mix_stats.json")))
+        # halluc 470 + old 3,290 + hard 2,444 + IF 940 + BBH 940 + logic 940
+        # + stem 376 = 9,400 (a cell can come up one row short, so allow slack).
+        assert stats["total_train"] == pytest.approx(9400, abs=10)
+        assert stats["halluc_rows_in_train"] / stats["total_train"] == pytest.approx(0.05, abs=0.005)
+        assert stats["achieved_ratios"]["old_domain_share_of_train"] == pytest.approx(0.35, abs=0.005)
+        assert stats["achieved_ratios"]["hard_math_share_of_train"] == pytest.approx(0.26, abs=0.005)
+        assert stats["achieved_ratios"]["if_share_of_train"] == pytest.approx(0.10, abs=0.005)
+        assert stats["achieved_ratios"]["bbh_share_of_train"] == pytest.approx(0.10, abs=0.005)
+        assert stats["achieved_ratios"]["logic_share_of_train"] == pytest.approx(0.10, abs=0.005)
+        assert stats["achieved_ratios"]["stem_share_of_train"] == pytest.approx(0.04, abs=0.005)
+        assert stats["achieved_ratios"]["overall_code_share"] == pytest.approx(0.30, abs=0.005)
+        # The hallucination re-weighting gives commonsense 60% of the 5% slice.
+        assert stats["halluc_by_domain"]["commonsense"] / stats["total_train"] == pytest.approx(0.03, abs=0.005)
+        assert stats["halluc_by_domain"]["math"] / stats["total_train"] == pytest.approx(0.01, abs=0.005)
+        assert stats["logic_rows_in_train"] == 940
+        assert stats["stem_rows_in_train"] == pytest.approx(376, abs=2)
+        assert stats["config"]["logic_ratio"] == pytest.approx(0.10)
+        assert stats["config"]["stem_ratio"] == pytest.approx(0.04)
+        assert stats["config"]["halluc_domain_weights"] == pytest.approx(
+            {"math": 0.2, "logic": 0.2, "commonsense": 0.6}
+        )
+        assert stats["config"]["code_share"] == pytest.approx(0.30)
+        assert not stats.get("ability_match")
+
+    def test_fail_on_code_shortfall_rejects_a_short_code_pool(self, tmp_path):
+        (
+            build,
+            stage1,
+            if_pool,
+            bbh_pool,
+            hard_pool,
+            logic_pool,
+            stem_pool,
+        ) = self._pools(tmp_path, code_rows=50)
+        with pytest.raises(ValueError, match="code pool short"):
+            mix_halluc.main(
+                self._args(
+                    tmp_path,
+                    build,
+                    stage1,
+                    if_pool,
+                    bbh_pool,
+                    hard_pool,
+                    logic_pool,
+                    stem_pool,
+                )
+            )

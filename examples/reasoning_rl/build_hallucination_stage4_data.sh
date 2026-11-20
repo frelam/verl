@@ -69,6 +69,12 @@
 # Training is a separate step: use run_qwen3_4b_hallucination_stage4_fully_async.sh
 # with RESUME_PATH=<stage-3 ckpt> (the stage-3 recipe with DATA_DIR=$STAGE4_DIR).
 #
+# Stage 5 (D35) reuses this builder through build_hallucination_stage5_data.sh:
+# that wrapper overrides BUILT_DIR / STAGE4_DIR / HALLUC_TOTAL /
+# OLD_DOMAIN_RATIO / HARD_MATH_RATIO / LOGIC_RATIO / IF_RATIO / BBH_RATIO /
+# CODE_SHARE / MATCH_STAGE3_ABILITIES=0.  The mechanics are identical; only the
+# mix knobs differ (stage 5 adds the logic domain and drops IF/old a little).
+#
 # Usage:
 #   HARD_MATH_DIFFICULTY_BASE_URL=http://127.0.0.1:8000/v1 \
 #   HARD_MATH_DIFFICULTY_MODEL=<served stage-4 start ckpt> \
@@ -84,6 +90,8 @@
 #                         (default $DATA_ROOT/final); supplies the old-domain val
 #                         rows and the D17 distractor base pool
 #   STAGE4_DIR            stage-4 output dir (default $DATA_ROOT/final_halluc_stage4)
+#   BUILT_DIR             adapter output dir (default $DATA_ROOT/halluc/built_stage4;
+#                         the stage-5 wrapper points it at built_stage5)
 #   HALLUC_TOTAL=14000    hallucination-domain row quota, train + val
 #   OLD_DOMAIN_RATIO=0.5  stage-1 share of the *non-additive* part; 0.5 puts the
 #                         old domain at 30% of the final train set (was 0.6/45%)
@@ -91,7 +99,11 @@
 #                         ability "code" when MATCH_STAGE3_ABILITIES=0.  With the
 #                         ability match on, the replay is allocated per ability
 #                         (math/code/logic/stem) to reproduce the stage-3 mix, so
-#                         this knob is ignored.
+#                         this knob is ignored.  Stage 5 sets 0.30.
+#   FAIL_ON_CODE_SHORTFALL=0  Stage 5: fail the build instead of warning when the
+#                         code pool cannot supply CODE_SHARE.  The stage-5 wrapper
+#                         turns this on so a silent under-fill cannot undo the
+#                         rebalance.
 #   MATCH_STAGE3_ABILITIES=1  make the reasoning part (everything except the IF
 #                         and BBH domains) reproduce the stage-3 ability mix.
 #                         Hard math counts inside the math budget, so it replaces
@@ -144,6 +156,16 @@
 #   HARD_MATH_NUM_SHARDS=1  generation shards; run the adapter once more with
 #                         HARD_MATH_NUM_SHARDS=1 afterwards to assemble all caches
 #   HARD_MATH_RAW_DIR     default $RAW_ROOT/hard_math (local <source>.parquet wins)
+#   LOGIC_RATIO=0         stage 5: logic-domain share of the final train set
+#                         (0 disables; stage 5 sets 0.10)
+#   LOGIC_PATH            stage 5 logic pool (default $DATA_ROOT/logic/train_logic.parquet);
+#                         it is the same raw pool the old-domain replay uses, so the
+#                         mixer exact-dedups it against the replay rows
+#   STEM_RATIO=0          stage 5: stem-domain share of the final train set
+#                         (0 disables; stage 5 sets 0.04)
+#   STEM_PATH             stage 5 stem pool (default $DATA_ROOT/stem/train_stem.parquet)
+#   HALLUC_DOMAIN_WEIGHTS stage 5: hallucination-domain re-weighting, e.g.
+#                         math=0.2,logic=0.2,commonsense=0.6 (default: stage-3 60/20/20)
 #   DECONTAMINATE_PATHS   held-out problem files (default the four AIME files under
 #                         $DATA_ROOT/val that exist).  The build FAILS CLOSED when
 #                         none exists: AIME 2024/2025 must be removed first.
@@ -167,11 +189,12 @@ DATA_ROOT=${DATA_ROOT:-$HOME/data/reasoning_rl}
 STAGE1_DATA_DIR=${STAGE1_DATA_DIR:-$DATA_ROOT/final}
 STAGE4_DIR=${STAGE4_DIR:-$DATA_ROOT/final_halluc_stage4}
 RAW_ROOT=$DATA_ROOT/halluc/raw
-BUILT_DIR=$DATA_ROOT/halluc/built_stage4
+BUILT_DIR=${BUILT_DIR:-$DATA_ROOT/halluc/built_stage4}
 
 HALLUC_TOTAL=${HALLUC_TOTAL:-14000}
 OLD_DOMAIN_RATIO=${OLD_DOMAIN_RATIO:-0.5}
 CODE_SHARE=${CODE_SHARE:-0.16}
+FAIL_ON_CODE_SHORTFALL=${FAIL_ON_CODE_SHORTFALL:-0}
 MATCH_STAGE3_ABILITIES=${MATCH_STAGE3_ABILITIES:-1}
 ABILITY_MIX_REFERENCE=${ABILITY_MIX_REFERENCE:-$DATA_ROOT/final_halluc_stage3/mix_stats.json}
 VAL_SIZE=${VAL_SIZE:-700}
@@ -209,6 +232,14 @@ HARD_MATH_DIFFICULTY_BASE_URL=${HARD_MATH_DIFFICULTY_BASE_URL:-}
 HARD_MATH_DIFFICULTY_MODEL=${HARD_MATH_DIFFICULTY_MODEL:-}
 SKIP_HARD_MATH_DIFFICULTY=${SKIP_HARD_MATH_DIFFICULTY:-0}
 ALLOW_NO_DECONTAMINATION=${ALLOW_NO_DECONTAMINATION:-0}
+
+# Logic / stem domains (D35): additive slices drawn from the raw domain pools.
+# They are off for stage 4; the stage-5 wrapper turns them on.
+LOGIC_RATIO=${LOGIC_RATIO:-0}
+LOGIC_PATH=${LOGIC_PATH:-$DATA_ROOT/logic/train_logic.parquet}
+STEM_RATIO=${STEM_RATIO:-0}
+STEM_PATH=${STEM_PATH:-$DATA_ROOT/stem/train_stem.parquet}
+HALLUC_DOMAIN_WEIGHTS=${HALLUC_DOMAIN_WEIGHTS:-}
 
 # Held-out AIME files (decontamination is fail-closed unless explicitly waived).
 DECONTAMINATE_PATHS=${DECONTAMINATE_PATHS:-"$DATA_ROOT/val/aime_2024_2025.parquet $DATA_ROOT/val/aime_2024.parquet $DATA_ROOT/val/aime_2025.parquet $DATA_ROOT/val/aime.parquet"}
@@ -407,7 +438,31 @@ fi
 #     BBH and hard-math domains are additive (--if_ratio / --bbh_ratio /
 #     --hard_math_ratio), so the stage-3 cells keep their absolute size and only
 #     the total grows.  --strict_cells stays on: a short halluc cell must fail
-#     the build rather than silently shift the domain weights.
+#     the build rather than silently shift the domain weights.  Stage 5 adds the
+#     additive logic/stem domains (--logic_ratio / --stem_ratio) and can re-weight
+#     the hallucination domains (--halluc_domain_weights).
+LOGIC_ENABLED=0
+case "$LOGIC_RATIO" in
+    0|0.0|"") ;;
+    *)
+        LOGIC_ENABLED=1
+        if [ ! -f "$LOGIC_PATH" ]; then
+            echo "ERROR: LOGIC_RATIO=$LOGIC_RATIO but LOGIC_PATH does not exist: $LOGIC_PATH" >&2
+            exit 1
+        fi
+        ;;
+esac
+STEM_ENABLED=0
+case "$STEM_RATIO" in
+    0|0.0|"") ;;
+    *)
+        STEM_ENABLED=1
+        if [ ! -f "$STEM_PATH" ]; then
+            echo "ERROR: STEM_RATIO=$STEM_RATIO but STEM_PATH does not exist: $STEM_PATH" >&2
+            exit 1
+        fi
+        ;;
+esac
 MIX_ARGS=(
     --stage3_mix
     --strict_cells
@@ -429,6 +484,18 @@ MIX_ARGS=(
     --val_size "$VAL_SIZE"
     --seed "$SEED"
 )
+if [ "$LOGIC_ENABLED" = "1" ]; then
+    MIX_ARGS+=(--logic_path "$LOGIC_PATH" --logic_ratio "$LOGIC_RATIO")
+fi
+if [ "$STEM_ENABLED" = "1" ]; then
+    MIX_ARGS+=(--stem_path "$STEM_PATH" --stem_ratio "$STEM_RATIO")
+fi
+if [ -n "$HALLUC_DOMAIN_WEIGHTS" ]; then
+    MIX_ARGS+=(--halluc_domain_weights "$HALLUC_DOMAIN_WEIGHTS")
+fi
+if [ "$FAIL_ON_CODE_SHORTFALL" = "1" ]; then
+    MIX_ARGS+=(--fail_on_code_shortfall)
+fi
 if [ ${#OLD_POOL_ARGS[@]} -gt 0 ]; then
     MIX_ARGS+=("${OLD_POOL_ARGS[@]}")
 fi
@@ -465,6 +532,8 @@ for name, share_key, want_key, rows_key in (
     ('IF', 'if_share_of_train', 'if_ratio', 'if_rows_in_train'),
     ('BBH', 'bbh_share_of_train', 'bbh_ratio', 'bbh_rows_in_train'),
     ('hard-math', 'hard_math_share_of_train', 'hard_math_ratio', 'hard_math_rows_in_train'),
+    ('logic', 'logic_share_of_train', 'logic_ratio', 'logic_rows_in_train'),
+    ('stem', 'stem_share_of_train', 'stem_ratio', 'stem_rows_in_train'),
 ):
     share = s['achieved_ratios'][share_key]
     want = s['config'][want_key]
@@ -483,13 +552,31 @@ print('[stage4] old-domain share of train: %.4f, code share: %.4f' % (
 # The old-domain replay is the other half of the stage-4 rebalance: with
 # OLD_DOMAIN_RATIO=0.5 it must land at 30% of the final train set. A short
 # old-pool supply is what silently pushes it below that, so fail here.
-additive_sum = s['config']['if_ratio'] + s['config']['bbh_ratio'] + s['config']['hard_math_ratio']
+additive_sum = (
+    s['config']['if_ratio']
+    + s['config']['bbh_ratio']
+    + s['config']['hard_math_ratio']
+    + s['config'].get('logic_ratio', 0.0)
+    + s['config'].get('stem_ratio', 0.0)
+)
 want_old = s['config']['old_domain_ratio'] * (1.0 - additive_sum)
 old_share = s['achieved_ratios']['old_domain_share_of_train']
 print('[stage4] old-domain share target: %.4f' % want_old)
 if old_share < want_old - 0.01:
     print('[stage4] ERROR: old-domain share is more than 1pt below the target; the replay pool is short', file=sys.stderr)
     sys.exit(1)
+# Stage 5 (D35) makes code a headline target and turns the ability match off.
+# A short code pool is the one failure mode that silently undoes the rebalance,
+# so assert the achieved share here (the mixer already fails earlier when
+# FAIL_ON_CODE_SHORTFALL=1; this is the post-build belt-and-braces check).
+if not s.get('ability_match'):
+    want_code = s['config']['code_share']
+    got_code = s['achieved_ratios']['overall_code_share']
+    print('[stage4] code share target: %.4f, achieved: %.4f' % (want_code, got_code))
+    if want_code > 0 and got_code < want_code - 0.01:
+        print('[stage4] ERROR: code share is more than 1pt below the target; the code pool is short',
+              file=sys.stderr)
+        sys.exit(1)
 # Ability match: the reasoning part (everything except IF/BBH) must reproduce
 # the stage-3 mix.  Hard math counts inside math, so a mismatch here means the
 # replay allocation or its supply is wrong.
