@@ -15,7 +15,9 @@
 #     the final train instead of 1%;
 #   * hard math drops from 30% to 26% (still far above stage 4's 15%): the D34
 #     pool is rebuilt by hard_math_adapter.py and re-difficulty-filtered on the
-#     stage-4 starting checkpoint; the candidate quota stays at 55k;
+#     stage-4 starting checkpoint; the candidate quota stays at 55k and the
+#     pass@k filter now generates with max_tokens=20000 so it sees the same
+#     response budget as the stage-5 rollout;
 #   * code rises from 18% to 30% via --code_share 0.30, drawn from the fresh
 #     old-domain replay pool (stages 1-4 artifacts are excluded);
 #   * IF drops from 15% to 10% and the old replay from 40% to 35%; the freed
@@ -60,6 +62,7 @@
 #   MATCH_STAGE3_ABILITIES=0
 #   HARD_MATH_RATIO=0.26
 #   HARD_MATH_CANDIDATES=55000
+#   HARD_MATH_DIFFICULTY_MAX_TOKENS=20000  pass@k filter response budget
 #   IF_RATIO=0.10
 #   BBH_RATIO=0.10
 #   LOGIC_RATIO=0.10
@@ -91,6 +94,7 @@ export FAIL_ON_CODE_SHORTFALL=${FAIL_ON_CODE_SHORTFALL:-1}
 export MATCH_STAGE3_ABILITIES=${MATCH_STAGE3_ABILITIES:-0}
 export HARD_MATH_RATIO=${HARD_MATH_RATIO:-0.26}
 export HARD_MATH_CANDIDATES=${HARD_MATH_CANDIDATES:-55000}
+export HARD_MATH_DIFFICULTY_MAX_TOKENS=${HARD_MATH_DIFFICULTY_MAX_TOKENS:-20000}
 export IF_RATIO=${IF_RATIO:-0.10}
 export BBH_RATIO=${BBH_RATIO:-0.10}
 export LOGIC_RATIO=${LOGIC_RATIO:-0.10}

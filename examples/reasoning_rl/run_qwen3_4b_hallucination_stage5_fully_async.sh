@@ -33,6 +33,8 @@
 #   one mini-batch   = 256 prompts -> PPO_MINI_BATCH_SIZE=256
 #   one param version/batch = 4 mini-batches = 1024 prompts (require_batches=4,
 #   the stage-3 default).  In sequences that is 2048 and 8192 respectively.
+# Trainer sequence parallelism is fixed at SP_SIZE=4 (Ulysses) for the actor and
+# the optional ref policy; the vLLM rollout TP is unchanged.
 #
 # Stage-5 length penalty (HALLUCINATION_RL_DESIGN.md D33)
 # -------------------------------------------------------
@@ -41,8 +43,13 @@
 #
 #   python examples/reasoning_rl/scripts/distill/measure_length_targets.py \
 #       --input $DATA_DIR/train.parquet --output_dir $DATA_DIR \
+#       --max_tokens 20000 \
 #       --base_url http://127.0.0.1:8000/v1 --model <stage-4_served_name>
 #   source $DATA_DIR/length_targets.env
+#
+# `--max_tokens 20000` matches the stage-5 rollout budget; the script default
+# (8192) would truncate long hard-math/code answers and understate their length
+# targets.
 #
 # `--target_scale` (stats-script default 0.6) multiplies the measured per-source
 # mean before it becomes the target, i.e. the reward asks for a further 40% cut
@@ -78,13 +85,27 @@ STAGE3_SCRIPT="$REPO_ROOT/examples/reasoning_rl/run_qwen3_4b_hallucination_stage
 
 DATA_DIR=${DATA_DIR:-$HOME/data/reasoning_rl/final_halluc_stage5}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_hallucination_stage5_$(date +%Y%m%d_%H%M)}
+# Stage-5 response budget: 20k tokens for the rollout, matching the data-side
+# hard-math pass@k filter (HARD_MATH_DIFFICULTY_MAX_TOKENS=20000).  The stage-3
+# recipe derives ppo_max_token_len_per_gpu and rollout.max_num_batched_tokens
+# from max_prompt_length + max_response_length, so no further override is needed.
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-20000}
 # Stage-5 rollout group size: 8 samples per prompt (stage-3 default is 16).
 ROLLOUT_N=${ROLLOUT_N:-8}
 # Prompt-level mini-batch: 256 prompts (trainer multiplies it by ROLLOUT_N, i.e.
 # 2048 sequences); require_batches=4 (stage-3 default) then gives 1024 prompts =
 # 8192 sequences per parameter version.
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
-export DATA_DIR EXPERIMENT_NAME ROLLOUT_N PPO_MINI_BATCH_SIZE
+# Trainer sequence parallelism (Ulysses). Stage 5 uses SP=4 so the 20k-token
+# response fits the per-GPU activation budget; the optional KL anchor gets the
+# same SP setting. This is the trainer-side SP, not the vLLM rollout TP.
+SP_SIZE=${SP_SIZE:-4}
+export DATA_DIR EXPERIMENT_NAME MAX_RESPONSE_LENGTH ROLLOUT_N PPO_MINI_BATCH_SIZE SP_SIZE
+
+SP_OVERRIDES=(
+    "actor_rollout_ref.actor.ulysses_sequence_parallel_size=$SP_SIZE"
+    "actor_rollout_ref.ref.ulysses_sequence_parallel_size=$SP_SIZE"
+)
 
 LENGTH_PENALTY_ENABLED=${LENGTH_PENALTY_ENABLED:-1}
 # Default-on (D33): the target file produced by measure_length_targets.py lives
@@ -127,5 +148,5 @@ if [ "$LENGTH_PENALTY_ENABLED" != "0" ]; then
     )
 fi
 
-# ${arr[@]+"${arr[@]}"} keeps `set -u` happy when the array is empty.
-exec bash "$STAGE3_SCRIPT" ${LENGTH_OVERRIDES[@]+"${LENGTH_OVERRIDES[@]}"} "$@"
+# ${arr[@]+"${arr[@]}"} keeps `set -u` happy when an array is empty.
+exec bash "$STAGE3_SCRIPT" "${SP_OVERRIDES[@]}" ${LENGTH_OVERRIDES[@]+"${LENGTH_OVERRIDES[@]}"} "$@"

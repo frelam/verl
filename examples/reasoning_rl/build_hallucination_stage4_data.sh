@@ -148,6 +148,9 @@
 #                         Empty URL keeps only the n-gram MinHash dedup.
 #   HARD_MATH_MIN_DIFFICULTY=6  DeepMath-103K difficulty floor
 #   HARD_MATH_K=8         samples per problem for the pass-rate filter (8-16)
+#   HARD_MATH_DIFFICULTY_MAX_TOKENS=8192  max output tokens per pass@k sample;
+#                         stage 5 raises this to 20000 so the filter sees the
+#                         same response budget as training
 #   HARD_MATH_MIN_PASS=0.1 / HARD_MATH_MAX_PASS=0.9
 #   HARD_MATH_DIFFICULTY_BASE_URL / HARD_MATH_DIFFICULTY_MODEL
 #                         the served stage-4 starting checkpoint (REQUIRED unless
@@ -224,6 +227,7 @@ HARD_MATH_EMBEDDING_MODEL=${HARD_MATH_EMBEDDING_MODEL:-Qwen/Qwen3-Embedding-8B}
 HARD_MATH_EMBEDDING_THRESHOLD=${HARD_MATH_EMBEDDING_THRESHOLD:-0.95}
 HARD_MATH_MIN_DIFFICULTY=${HARD_MATH_MIN_DIFFICULTY:-6}
 HARD_MATH_K=${HARD_MATH_K:-8}
+HARD_MATH_DIFFICULTY_MAX_TOKENS=${HARD_MATH_DIFFICULTY_MAX_TOKENS:-8192}
 HARD_MATH_MIN_PASS=${HARD_MATH_MIN_PASS:-0.1}
 HARD_MATH_MAX_PASS=${HARD_MATH_MAX_PASS:-0.9}
 HARD_MATH_NUM_SHARDS=${HARD_MATH_NUM_SHARDS:-1}
@@ -363,6 +367,7 @@ HARD_MATH_ARGS=(
     --deepmath-min-difficulty "$HARD_MATH_MIN_DIFFICULTY"
     --candidate-quota "$HARD_MATH_CANDIDATES"
     --difficulty-k "$HARD_MATH_K"
+    --difficulty-max-tokens "$HARD_MATH_DIFFICULTY_MAX_TOKENS"
     --min-pass "$HARD_MATH_MIN_PASS"
     --max-pass "$HARD_MATH_MAX_PASS"
     --num-shards "$HARD_MATH_NUM_SHARDS"
