@@ -75,6 +75,19 @@ SEARCH_HARD_MAX_ROUNDS = 12
 #: Environment-variable prefix for the uvicorn factory entry point.
 ENV_PREFIX = "ARD_SEARCH_"
 
+try:  # pydantic ships with fastapi; the env itself must import without either
+    from pydantic import BaseModel as _PydanticBaseModel
+
+    class SearchRequest(_PydanticBaseModel):
+        """Body of ``POST /search`` (module level: FastAPI resolves the
+        annotation string through module globals, not the factory closure)."""
+
+        query: str
+        top_k: int = DEFAULT_TOP_K
+
+except Exception:  # pragma: no cover - fastapi/pydantic not installed
+    SearchRequest = None  # type: ignore[assignment,misc]
+
 #: Transitional backend aliases (CONTRACTS C11 / D12): T1 used to emit
 #: ``local_wikipedia_e5`` before the canonical ``e5`` form was agreed.
 BACKEND_ALIASES = {
@@ -839,16 +852,11 @@ def create_app(
     """
     _require_fastapi()
     from fastapi import FastAPI, HTTPException, Query  # type: ignore
-    from pydantic import BaseModel  # type: ignore
 
     app = FastAPI(title="agentic_rl_data search server", version="1.0")
     executor = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
     app.state.backend = backend
     app.state.executor = executor
-
-    class SearchRequest(BaseModel):
-        query: str
-        top_k: int = DEFAULT_TOP_K
 
     def _run(function: Callable[[], Any]) -> Any:
         future = executor.submit(function)

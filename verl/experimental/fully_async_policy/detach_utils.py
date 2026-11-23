@@ -150,6 +150,11 @@ def assemble_batch_from_rollout_samples(
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
+    # A server that has not received a weight update yet reports no version
+    # (``global_steps=None``).  Treat that as version 0 instead of crashing the
+    # trainer on `None - None`; every real sync afterwards carries an int.
+    param_version_start = [0 if v is None else int(v) for v in param_version_start]
+    param_version_end = [0 if v is None else int(v) for v in param_version_end]
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {

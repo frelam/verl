@@ -170,6 +170,12 @@ def _child_environment(config: SandboxConfig, extra: Mapping[str, str] | None) -
         }
     environment.setdefault("PYTHONIOENCODING", "utf-8")
     environment.setdefault("PYTHONHASHSEED", "0")
+    # Deterministic, low-VA sandbox: OpenBLAS/MKL reserve ~30 MB per worker
+    # thread, so on a 100+ core host a plain `import numpy` blows past the
+    # RLIMIT_AS budget with "OpenBLAS error: Memory allocation still failed
+    # after 10 retries". One thread keeps the test runner inside the limit.
+    for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        environment.setdefault(name, "1")
     if extra:
         environment.update({str(key): str(value) for key, value in extra.items()})
     return environment

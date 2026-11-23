@@ -89,8 +89,16 @@ class BroadcastOperation:
             self.socket.recv_string()
             self.metadata = self.socket.recv_pyobj()
 
-        # broadcast tensor via HCCL
-        self.pyhccl.broadcast(self.bucket, src=0)
+        # broadcast tensor via HCCL.
+        # torch_npu keeps the "current device" per THREAD, and this runs in a
+        # run_in_executor worker thread, whose current device defaults to
+        # npu:0.  On a single node with all chips visible that is the trainer's
+        # chip, so HcclBroadcast gets a stream that belongs to a different
+        # device than the communicator/bucket -> "HCCL error: internal error"
+        # (all_reduce in init_process_group runs on the main thread, which is
+        # why the process group itself looked healthy).
+        with torch.npu.device(self.bucket.device):
+            self.pyhccl.broadcast(self.bucket, src=0)
 
     async def wait_for_complete(self) -> dict[str, TensorMeta]:
         """Wait for the broadcast operation to complete.

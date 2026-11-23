@@ -22,10 +22,11 @@ License note: HF card unreachable from this sandbox -> ``[UNVERIFIED]``.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from agentic_rl_data.loaders.common import (
     GENERIC_TOOL_SYSTEM,
@@ -49,38 +50,75 @@ LICENSE = "apache-2.0[UNVERIFIED]"
 _CALL_SHAPED_RE = re.compile(r"^\s*\[.*\(\s*", re.DOTALL)
 
 
-def _extract_tools_from_text(text: str) -> list[dict[str, Any]]:
-    """Extract tool definitions embedded in ToolACE's system prompt text."""
-    tools: list[dict[str, Any]] = []
-    array_match = re.search(r"\[.*\]", text, re.DOTALL)
-    if array_match:
-        try:
-            candidates = json.loads(array_match.group(0))
-        except (json.JSONDecodeError, TypeError):
-            candidates = None
-        if isinstance(candidates, list):
-            for candidate in candidates:
-                if isinstance(candidate, dict) and candidate.get("name"):
-                    tools.append(candidate)
-    if not tools:
+def _iter_balanced_json(text: str) -> Iterator[str]:
+    """Yield every balanced ``[...]`` / ``{...}`` block, string-aware.
+
+    A greedy regex is useless here: ToolACE system prompts embed the tool list
+    as JSON and then continue with prose that may itself contain brackets, so
+    ``re.search(r"\\[.*\\]", DOTALL)`` spans past the JSON and never parses.
+    """
+    index = 0
+    length = len(text)
+    while index < length:
+        if text[index] not in "[{":
+            index += 1
+            continue
         depth = 0
-        start = -1
-        for index, char in enumerate(text):
-            if char == "{":
-                if depth == 0:
-                    start = index
+        in_string = False
+        escaped = False
+        cursor = index
+        closed = False
+        while cursor < length:
+            char = text[cursor]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char in "[{":
                 depth += 1
-            elif char == "}":
+            elif char in "]}":
                 depth -= 1
-                if depth == 0 and start >= 0:
-                    try:
-                        obj = json.loads(text[start : index + 1])
-                    except json.JSONDecodeError:
-                        obj = None
-                    if isinstance(obj, dict) and obj.get("name"):
-                        tools.append(obj)
-                    start = -1
-    return normalize_tools(tools)
+                if depth == 0:
+                    closed = True
+                    break
+            cursor += 1
+        if closed:
+            yield text[index : cursor + 1]
+            index = cursor + 1
+        else:
+            index += 1
+
+
+def _extract_tools_from_text(text: str) -> list[dict[str, Any]]:
+    """Extract tool definitions embedded in ToolACE's system prompt text.
+
+    Two layouts ship in the public dump: ``{name, description, parameters}`` and
+    ``{tool_name, definition, arguments: [...]}``; ``normalize_tools`` converts
+    both (see ``common.normalize_tool``).
+    """
+    for blob in _iter_balanced_json(text):
+        candidate: Any = None
+        try:
+            candidate = json.loads(blob)
+        except (json.JSONDecodeError, TypeError):
+            # Some rows embed the tool list as a Python literal (single quotes).
+            try:
+                candidate = ast.literal_eval(blob)
+            except (ValueError, SyntaxError, TypeError):
+                candidate = None
+        if isinstance(candidate, Mapping):
+            candidate = [candidate]
+        if not isinstance(candidate, list) or not candidate:
+            continue
+        tools = normalize_tools(candidate)
+        if tools:
+            return tools
+    return []
 
 
 def _find_next_assistant(conversations: list[Any], index: int) -> str:
@@ -113,6 +151,13 @@ def load_tasks(cfg: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
             record_skip(cfg, "empty_conversations")
             continue
         tools = normalize_tools(record.get("tools")) or _extract_tools_from_text(system)
+        if not tools:
+            # Records whose system prompt renders the tool list as an HTML
+            # table (or with unknown keys) cannot be turned into a
+            # function-calling task; validate_task would reject them.  Skip
+            # explicitly rather than emitting a task with an empty tool list.
+            record_skip(cfg, "no_tools")
+            continue
         history: list[str] = []
 
         for turn_index, turn in enumerate(conversations):

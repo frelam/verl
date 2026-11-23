@@ -12,3 +12,6 @@ __pycache__/
 # Local env files
 *.local
 .env
+
+# Node-local mirror of configs/raw_sources_v2.example.json (machine paths)
+configs/raw_sources_v2.json

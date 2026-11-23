@@ -418,18 +418,71 @@ def normalize_tools(tools: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _parameters_from_argument_list(arguments: Any) -> dict[str, Any] | None:
+    """Convert ToolACE's ``arguments`` list into a JSON-schema object.
+
+    ToolACE (and a few other dumps) describe a tool as
+    ``{tool_name, definition, arguments: [{parameter_name, description, type}]}``
+    instead of ``{name, description, parameters: {type: object, ...}}``.
+    Without this the tool list normalises to ``[]`` and every derived task is
+    dropped by ``validate_task`` ("requires a non-empty tools list").
+    """
+    if not isinstance(arguments, list):
+        return None
+    type_map = {
+        "str": "string", "string": "string", "text": "string",
+        "int": "integer", "integer": "integer",
+        "float": "number", "double": "number", "number": "number",
+        "bool": "boolean", "boolean": "boolean",
+        "list": "array", "array": "array",
+        "dict": "object", "object": "object", "map": "object",
+    }
+    properties: dict[str, Any] = {}
+    required: list[str] = []
+    for argument in arguments:
+        if not isinstance(argument, Mapping):
+            continue
+        param_name = argument.get("parameter_name") or argument.get("name") or argument.get("param")
+        if not isinstance(param_name, str) or not param_name.strip():
+            continue
+        raw_type = str(argument.get("type") or "string").strip().lower()
+        schema: dict[str, Any] = {"type": type_map.get(raw_type, "string")}
+        description = argument.get("description")
+        if description:
+            schema["description"] = str(description)
+        # Nested ToolACE entries sometimes carry their own ``arguments``.
+        nested = _parameters_from_argument_list(argument.get("arguments"))
+        if nested is not None:
+            schema.update(nested)
+        properties[param_name.strip()] = schema
+        if argument.get("required", True) is not False:
+            required.append(param_name.strip())
+    if not properties:
+        return None
+    return {"type": "object", "properties": properties, "required": required}
+
+
 def normalize_tool(tool: Any) -> dict[str, Any] | None:
     if not isinstance(tool, Mapping):
         return None
-    fn = tool.get("function") if isinstance(tool.get("function"), Mapping) else tool
-    name = fn.get("name") or tool.get("name")
+    fn: Any = tool.get("function") if isinstance(tool.get("function"), Mapping) else tool
+    name = fn.get("name") or tool.get("name") or fn.get("tool_name") or tool.get("tool_name")
     if not isinstance(name, str) or not name.strip():
         return None
-    description = fn.get("description", tool.get("description", ""))
+    description = fn.get("description")
+    if description is None:
+        description = tool.get("description")
+    if description is None:
+        description = fn.get("definition")
+    if description is None:
+        description = tool.get("definition", "")
     parameters = fn.get("parameters", fn.get("input_parameters", tool.get("parameters")))
     parameters = parse_json_maybe(parameters)
     if not isinstance(parameters, Mapping):
-        parameters = {}
+        # ToolACE-style argument list -> JSON schema.
+        parameters = _parameters_from_argument_list(
+            fn.get("arguments", tool.get("arguments"))
+        ) or {}
     parameters = dict(parameters)
     if "properties" not in parameters:
         # A plain {param_name: {...}} map -> wrap into a JSON schema.

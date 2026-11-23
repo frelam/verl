@@ -232,6 +232,12 @@ class AgenticAgentLoop(AgentLoopBase):
         timeout = False
         assistant_turns = 0
         parse_errors = 0
+        # Model-weight versions spanned by this trajectory.  Fully async tags
+        # every generation with ``min/max_global_steps``; the batch assembler and
+        # the staleness metrics read them from ``extra_fields``, and ``None``
+        # there crashes ``assemble_batch_from_rollout_samples`` (None - None).
+        param_version_min: Optional[int] = None
+        param_version_max: Optional[int] = None
 
         try:
             while True:
@@ -247,6 +253,12 @@ class AgenticAgentLoop(AgentLoopBase):
                     request_id, prompt_ids, sampling_params, priority, metrics
                 )
                 token_ids = list(output.token_ids)
+                turn_min = output.extra_fields.get("min_global_steps")
+                turn_max = output.extra_fields.get("max_global_steps")
+                if isinstance(turn_min, (int, float)):
+                    param_version_min = int(turn_min) if param_version_min is None else min(param_version_min, int(turn_min))
+                if isinstance(turn_max, (int, float)):
+                    param_version_max = int(turn_max) if param_version_max is None else max(param_version_max, int(turn_max))
                 prompt_ids.extend(token_ids)
                 response_mask.extend([1] * len(token_ids))
                 if output.log_probs:
@@ -431,6 +443,10 @@ class AgenticAgentLoop(AgentLoopBase):
             "agentic/env_type": env_type,
             "agentic/env_error": env_error,
             "agentic/parse_errors": parse_errors,
+            # Required by the fully-async batch assembler and staleness metrics;
+            # falls back to version 0 when the server has not synced yet.
+            "min_global_steps": param_version_min if param_version_min is not None else 0,
+            "max_global_steps": param_version_max if param_version_max is not None else 0,
         }
         # Keep the same extras schema as ToolAgentLoop (turn-level shaping hooks
         # are unused here, but downstream batch concat expects the keys).

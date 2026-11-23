@@ -15,9 +15,14 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
+import logging
 from functools import wraps
 
 from verl.utils.device import is_torch_npu_available
+
+logger = logging.getLogger(__name__)
 
 
 def vllm_v013_weight_loader_method_wrapper(fn):
@@ -80,7 +85,18 @@ def apply_npu_vllm_patches() -> None:
         return
 
     # Disable flash_attn in RotaryEmbedding (NPU)
-    from vllm.model_executor.layers.fused_moe import FusedMoE
+    try:
+        patch_vllm013_rotary_emb()
+    except Exception as exc:  # noqa: BLE001 - a missing vLLM symbol must not kill the worker
+        logger.warning("npu_vllm_patch: rotary-embedding patch skipped: %s: %s", type(exc).__name__, exc)
 
-    patch_vllm013_rotary_emb()
+    # vLLM >= 0.11 ships the modular fused-MoE stack (``FusedMoEFactory`` /
+    # ``FusedMoEExpertsModular``) with no ``FusedMoE`` class to patch.  The
+    # legacy class-level weight_loader wrapper is only meaningful when the
+    # symbol exists, so treat a missing import as "nothing to patch" rather
+    # than failing every rollout worker at import time.
+    try:
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+    except ImportError:
+        FusedMoE = None
     _patch_legacy_fused_moe_weight_loader(FusedMoE)
