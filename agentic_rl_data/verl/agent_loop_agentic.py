@@ -68,6 +68,7 @@ if _REPO_ROOT not in sys.path:
 from ..envs.base import build_env  # noqa: E402  (see _REPO_ROOT note)
 from .trajectory import (  # noqa: E402
     MISSING_TASK_REWARD_ERROR,
+    append_masked_observation,
     as_mapping,
     build_calls,
     build_trajectory,
@@ -76,12 +77,12 @@ from .trajectory import (  # noqa: E402
     make_turn,
     normalize_reward_info,
     normalize_tools_for_template,
+    observation_messages,
     parse_agentic_task,
     resolve_max_turns,
     task_env_type,
     task_has_env,
     task_task_type,
-    tool_results_to_messages,
     tool_results_to_trajectory,
 )
 
@@ -354,21 +355,23 @@ class AgenticAgentLoop(AgentLoopBase):
                         timeout = timeout or bool(env_state.get("timeout"))
                     break
 
-                # Encode the tool results as the next prompt segment (same
-                # pattern as ToolAgentLoop: remove_system_prompt + separator).
-                tool_messages = tool_results_to_messages(tool_results)
-                if not tool_messages:
+                # Encode observations as the next prompt segment.  Stateful
+                # dialogue tasks may release the next user instruction only
+                # after the current stage is complete; it is appended after any
+                # tool results and is always masked out of the policy loss.
+                observations = observation_messages(tool_results, info)
+                if not observations:
                     logger.warning(
-                        "[agentic_agent] task=%s turn=%d: env returned no tool_results, stopping",
+                        "[agentic_agent] task=%s turn=%d: env returned no observation, stopping",
                         task_id or "<unknown>",
                         assistant_turns,
                     )
                     final_answer = final_answer_from_turns(turns)
                     break
                 if not await self._append_observation(
-                    tool_messages, prompt_ids, response_mask, response_logprobs
+                    observations, prompt_ids, response_mask, response_logprobs
                 ):
-                    # Tool-response tokens do not fit in the response budget.
+                    # Observation tokens do not fit in the response budget.
                     break
         finally:
             if env is not None:
@@ -505,13 +508,9 @@ class AgenticAgentLoop(AgentLoopBase):
         """
         tool_tokens = await self.apply_chat_template(messages, remove_system_prompt=True)
         tool_tokens = list(self.turn_separator) + list(tool_tokens)
-        if len(response_mask) + len(tool_tokens) >= self.response_length:
-            return False
-        prompt_ids.extend(tool_tokens)
-        response_mask.extend([0] * len(tool_tokens))
-        if response_logprobs:
-            response_logprobs.extend([0.0] * len(tool_tokens))
-        return True
+        return append_masked_observation(
+            prompt_ids, response_mask, response_logprobs, tool_tokens, self.response_length
+        )
 
     def _stop_token_sampling_params(self, sampling_params: dict[str, Any]) -> dict[str, Any]:
         """Add the parser's stop tokens so generation halts after a tool call."""

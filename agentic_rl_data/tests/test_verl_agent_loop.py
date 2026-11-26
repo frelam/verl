@@ -229,6 +229,32 @@ def test_tool_results_to_messages() -> None:
     assert tr.tool_results_to_messages("junk") == []
 
 
+def test_observation_messages_appends_scripted_user_after_tools() -> None:
+    results = [{"id": "call_1", "name": "get_weather", "content": "sunny", "ok": True}]
+    messages = tr.observation_messages(results, {"next_user_message": "Now check London."})
+    assert messages == [
+        {"role": "tool", "content": "sunny", "tool_call_id": "call_1"},
+        {"role": "user", "content": "Now check London."},
+    ]
+    assert tr.observation_messages([], {"next_user_message": "Clarify?"}) == [
+        {"role": "user", "content": "Clarify?"}
+    ]
+    assert tr.observation_messages(None, {}) == []
+
+
+def test_masked_observation_preserves_assistant_loss_and_logprob_alignment() -> None:
+    prompt = [10, 11, 21, 22]
+    mask = [1, 1]
+    logprobs = [-0.2, -0.3]
+    assert tr.append_masked_observation(prompt, mask, logprobs, [31, 32, 33], 12) is True
+    assert prompt == [10, 11, 21, 22, 31, 32, 33]
+    assert mask == [1, 1, 0, 0, 0]
+    assert logprobs == [-0.2, -0.3, 0.0, 0.0, 0.0]
+    assert tr.append_masked_observation(prompt, mask, logprobs, [44], 6) is False
+    assert len(prompt) == 7
+    assert len(mask) == len(logprobs) == 5
+
+
 def test_tool_results_to_trajectory_shape() -> None:
     results = [
         {"id": "call_1", "name": "get_weather", "content": "sunny", "ok": True},

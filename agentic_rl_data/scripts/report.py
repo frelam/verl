@@ -283,6 +283,11 @@ def compute_distributions(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     gt_sources: Counter[str] = Counter()
     licenses: Counter[str] = Counter()
     max_turns: Counter[str] = Counter()
+    domains: Counter[str] = Counter()
+    scenarios: Counter[str] = Counter()
+    schema_styles: Counter[str] = Counter()
+    user_turn_counts: Counter[str] = Counter()
+    parallel_group_counts: Counter[str] = Counter()
     with_group = 0
     with_gt_returns = 0
     unverified_license = 0
@@ -304,6 +309,16 @@ def compute_distributions(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         turns = meta.get("max_turns")
         if isinstance(turns, int) and not isinstance(turns, bool):
             max_turns[str(turns)] += 1
+        for key, distribution in (
+            ("domain", domains),
+            ("scenario", scenarios),
+            ("schema_style", schema_styles),
+            ("user_turn_count", user_turn_counts),
+            ("parallel_group_count", parallel_group_counts),
+        ):
+            value = meta.get(key)
+            if value is not None:
+                distribution[str(value)] += 1
         if meta.get("group_id"):
             with_group += 1
         reference = task.get("reference") if isinstance(task.get("reference"), Mapping) else {}
@@ -318,6 +333,11 @@ def compute_distributions(tasks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "licenses": dict(sorted(licenses.items())),
         "unverified_license_rows": unverified_license,
         "max_turns_buckets": dict(sorted(max_turns.items(), key=lambda item: int(item[0]))),
+        "domains": dict(sorted(domains.items())),
+        "scenarios": dict(sorted(scenarios.items())),
+        "schema_styles": dict(sorted(schema_styles.items())),
+        "user_turn_counts": dict(sorted(user_turn_counts.items())),
+        "parallel_group_counts": dict(sorted(parallel_group_counts.items())),
         "with_group_id": with_group,
         "group_id_coverage": with_group / len(tasks) if tasks else 0.0,
         "with_gt_tool_returns": with_gt_returns,
@@ -970,6 +990,14 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f"（含 [UNVERIFIED] 行数：{dist.get('unverified_license_rows')}）")
         add(f"- group_id 覆盖：{dist.get('with_group_id')} / {dist.get('total')}"
             f"（{_fmt(dist.get('group_id_coverage'))}）")
+        for key, label in (
+            ("domains", "meta.domain"),
+            ("scenarios", "meta.scenario"),
+            ("schema_styles", "meta.schema_style"),
+            ("user_turn_counts", "meta.user_turn_count"),
+            ("parallel_group_counts", "meta.parallel_group_count"),
+        ):
+            add(f"- {label}：`{json.dumps(dist.get(key) or {}, ensure_ascii=False, sort_keys=True)}`")
         add("")
         add("_所有分布均从对应 JSONL 重算，可直接用文件行数复核。_")
         add("")

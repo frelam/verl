@@ -37,6 +37,7 @@ from agentic_rl_data.schema import (  # noqa: E402
     load_jsonl,
     normalize_query,
     task_dedup_key,
+    task_user_texts,
     text_shingles,
 )
 
@@ -80,15 +81,8 @@ def exact_dedup(tasks: Iterable[Mapping[str, Any]]) -> tuple[list[dict[str, Any]
 
 
 def task_text(task: Mapping[str, Any]) -> str:
-    """Concatenated user text used for near-duplicate signatures."""
-    messages = task.get("messages")
-    if not isinstance(messages, list):
-        return ""
-    return "\n".join(
-        normalize_query(message.get("content"))
-        for message in messages
-        if isinstance(message, Mapping) and message.get("role") == "user"
-    )
+    """Concatenated initial and staged user text for near-duplicate signatures."""
+    return "\n".join(normalize_query(text) for text in task_user_texts(task))
 
 
 def task_shingles(task: Mapping[str, Any], k: int = 5) -> set[int]:

@@ -1088,6 +1088,23 @@ def extract_trajectory(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _tool_return_coverage(view: Mapping[str, Any]) -> tuple[int, int]:
+    """Return ``(covered_calls, total_calls)`` using per-name multiset counts."""
+    covered = 0
+    total = 0
+    for turn in view.get("turns") or []:
+        calls = turn.get("calls") or []
+        returns = turn.get("returns") or []
+        total += len(calls)
+        remaining = [str(item.get("name") or "") for item in returns]
+        for call in calls:
+            name = str(call.get("name") or "")
+            if name in remaining:
+                remaining.remove(name)
+                covered += 1
+    return covered, total
+
+
 def load_mt_tasks_from_records(
     records: Iterable[Mapping[str, Any]],
     *,
@@ -1099,9 +1116,11 @@ def load_mt_tasks_from_records(
 
     ``cfg`` keys: ``max_turns`` (default 15, hard-capped at 15), ``max_samples``
     (default 0 = all), ``id_field`` / ``id_prefix``, ``license``, ``impl``
-    (``replay`` default).  ``tool_returns`` is set when the record contains real
-    tool observations, otherwise it is ``None`` and ``meta["gt_returns_source"]``
-    is ``"placeholder"`` so downstream mixing can filter / down-weight it.
+    (``replay`` default).  ``require_complete_returns=True`` drops a record
+    unless every GT call has a same-named real return.  ``tool_returns`` is set
+    when every call group has an observation, otherwise it is ``None`` and
+    ``meta["gt_returns_source"]`` is ``"placeholder"`` so downstream mixing can
+    filter / down-weight it.  Per-call coverage is always reported in meta.
     """
     cfg = dict(cfg or {})
     max_samples = int(cfg.get("max_samples") or 0)
@@ -1113,6 +1132,11 @@ def load_mt_tasks_from_records(
             return
         try:
             view = extract_trajectory(record)
+            covered_calls, total_calls = _tool_return_coverage(view)
+            return_coverage = covered_calls / total_calls if total_calls else 0.0
+            if cfg.get("require_complete_returns") and (not total_calls or covered_calls != total_calls):
+                record_skip(cfg, "incomplete_tool_returns")
+                continue
             turn_estimate = max(
                 len(view["gt_calls"]),
                 int(view.get("expected_turns") or 0),
@@ -1148,6 +1172,9 @@ def load_mt_tasks_from_records(
                 gt_source = "placeholder"
             meta_extra = {
                 "gt_returns_source": gt_source,
+                "gt_returns_coverage": return_coverage,
+                "gt_calls_count": total_calls,
+                "gt_covered_calls_count": covered_calls,
                 "raw_index": index,
             }
             group_id = first_non_empty(

@@ -435,6 +435,37 @@ def tool_results_to_messages(tool_results: Any) -> list[dict[str, Any]]:
     return messages
 
 
+def observation_messages(tool_results: Any, info: Any = None) -> list[dict[str, Any]]:
+    """Build the next masked observation segment, including a scripted user.
+
+    Dialogue envs release ``info.next_user_message`` only after a completed
+    stage.  Keeping message construction here makes the role/order contract
+    testable without importing the training stack.
+    """
+    messages = tool_results_to_messages(tool_results)
+    next_user = info.get("next_user_message") if isinstance(info, Mapping) else None
+    if isinstance(next_user, str) and next_user.strip():
+        messages.append({"role": "user", "content": next_user})
+    return messages
+
+
+def append_masked_observation(
+    prompt_ids: list[int],
+    response_mask: list[int],
+    response_logprobs: list[float],
+    observation_ids: list[int],
+    response_length: int,
+) -> bool:
+    """Append observation tokens with zero loss mask / logprobs within budget."""
+    if len(response_mask) + len(observation_ids) >= response_length:
+        return False
+    prompt_ids.extend(observation_ids)
+    response_mask.extend([0] * len(observation_ids))
+    if response_logprobs:
+        response_logprobs.extend([0.0] * len(observation_ids))
+    return True
+
+
 def tool_results_to_trajectory(tool_results: Any) -> list[dict[str, Any]]:
     """``obs["tool_results"]`` -> ``schema.Trajectory.turns[*].tool_results``."""
     results: list[dict[str, Any]] = []
@@ -630,6 +661,7 @@ __all__ = [
     "MISSING_TASK_REWARD_ERROR",
     "REWARD_INFO_KEYS",
     "as_mapping",
+    "append_masked_observation",
     "build_calls",
     "build_trajectory",
     "clamp_score",
@@ -640,6 +672,7 @@ __all__ = [
     "normalize_reward_info",
     "normalize_tool",
     "normalize_tools_for_template",
+    "observation_messages",
     "parse_agentic_task",
     "parse_tool_call_arguments",
     "resolve_max_turns",

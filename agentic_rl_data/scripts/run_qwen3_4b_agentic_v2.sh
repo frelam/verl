@@ -7,9 +7,9 @@
 # Curriculum (short -> long, one launch per stage, each resumes the previous
 # checkpoint through trainer.default_local_dir + resume_mode=auto):
 #   STAGE=1  train_max_turns8.parquet   MAX_TURNS=8   response 12k   ~40 steps
-#   STAGE=2  train_max_turns12.parquet  MAX_TURNS=12  response 20k   ~50 steps
-#   STAGE=3  train_max_turns15.parquet  MAX_TURNS=15  response 24k   until held-out plateaus
-#   STAGE=all  the full mixture at MAX_TURNS=15 (no curriculum; ablation)
+#   STAGE=2  train_max_turns12.parquet  MAX_TURNS=16  response 20k   ~50 steps
+#   STAGE=3  train_max_turns15.parquet  MAX_TURNS=24  response 24k   until held-out plateaus
+#   STAGE=all  the full mixture at MAX_TURNS=24 (no curriculum; ablation)
 #
 # Stability choices (why each knob is set; all overridable via env):
 #   * GRPO n=8 + DAPO group filter on reward score: all-0 / all-1 groups have
@@ -41,9 +41,9 @@ NGPUS_PER_NODE="${NGPUS_PER_NODE:-8}"
 
 case "$STAGE" in
   1)   TRAIN_FILE="$DATA_DIR/curriculum/stage8.parquet";  MAX_TURNS="${MAX_TURNS:-8}";  RESP_LEN="${MAX_RESPONSE_LENGTH:-12288}"; STEPS="${TOTAL_STEPS:-40}" ;;
-  2)   TRAIN_FILE="$DATA_DIR/curriculum/stage12.parquet"; MAX_TURNS="${MAX_TURNS:-12}"; RESP_LEN="${MAX_RESPONSE_LENGTH:-20480}"; STEPS="${TOTAL_STEPS:-90}" ;;
-  3)   TRAIN_FILE="$DATA_DIR/curriculum/stage15.parquet"; MAX_TURNS="${MAX_TURNS:-15}"; RESP_LEN="${MAX_RESPONSE_LENGTH:-24576}"; STEPS="${TOTAL_STEPS:-160}" ;;
-  all) TRAIN_FILE="$DATA_DIR/train.parquet";              MAX_TURNS="${MAX_TURNS:-15}"; RESP_LEN="${MAX_RESPONSE_LENGTH:-24576}"; STEPS="${TOTAL_STEPS:-150}" ;;
+  2)   TRAIN_FILE="$DATA_DIR/curriculum/stage16.parquet"; MAX_TURNS="${MAX_TURNS:-16}"; RESP_LEN="${MAX_RESPONSE_LENGTH:-20480}"; STEPS="${TOTAL_STEPS:-90}" ;;
+  3)   TRAIN_FILE="$DATA_DIR/curriculum/stage24.parquet"; MAX_TURNS="${MAX_TURNS:-24}"; RESP_LEN="${MAX_RESPONSE_LENGTH:-24576}"; STEPS="${TOTAL_STEPS:-160}" ;;
+  all) TRAIN_FILE="$DATA_DIR/train.parquet";              MAX_TURNS="${MAX_TURNS:-24}"; RESP_LEN="${MAX_RESPONSE_LENGTH:-24576}"; STEPS="${TOTAL_STEPS:-150}" ;;
   *) echo "STAGE must be 1|2|3|all" >&2; exit 2 ;;
 esac
 VAL_FILE="${VAL_FILE:-$DATA_DIR/heldout.parquet}"

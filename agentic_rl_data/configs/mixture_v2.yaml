@@ -1,33 +1,23 @@
 # =============================================================================
-# agentic_rl_data/configs/mixture_v2.yaml  --  Qwen3-4B agentic RL, 10-15 turns
+# agentic_rl_data/configs/mixture_v2.yaml  --  Qwen3-4B agentic RL, up to 24 turns
 #
 # Goal: tool-call accuracy + long-horizon agentic skills (planning, reflection,
-# multi-turn format, recovery from tool errors). Rationale and numbers:
-# reports/AGENTIC_RL_V2.md.  Differences vs mixture.yaml (v1):
+# interleaved multi-user dialogue, clarification, parallel calls and recovery).
 #
-#   * multi-turn is now OUTCOME-verified: 75% of the mt bucket is the
-#     procedural stateful generator (filesystem / trading / retail, 4-15 GT
-#     calls, 25-30% with an injected transient fault).  Replay sources
-#     (FunReason-MT / APIGen-MT / Toucan) can only check "did you reproduce
-#     the reference calls"; they stay as a minority (style/diversity only).
-#   * search moves from Search-R1 NQ (1-2 hop, needs a Wikipedia E5 index
-#     server) to multi-hop QA with a per-task local corpus (HotpotQA /
-#     2Wiki / MuSiQue, in-memory BM25, 0 services).
-#   * single-turn function calling is kept at 20% as an anti-forgetting
-#     anchor for tool-call accuracy (the stage-0 tool_rl skills).
-#   * code_exec is dropped (heavy sandbox, weak transfer to tool use);
-#     math+python is kept small for reasoning retention.
+#   * multi-turn is 50%: 90% outcome-verified generated tasks and 10% replay
+#     (Toucan / APIGen-MT) for real API and schema diversity.
+#   * single-turn function calling is 20%, including generated parallel and
+#     parameter-precision tasks as an anti-forgetting anchor.
+#   * multi-hop search is 20%, math+python is 8%, and Hammer irrelevance is
+#     an independent 2% category.
 #
-# Size: 6000 train rows ~ 47 steps/epoch at batch 128; the recipe trains
-# ~2-3 epochs with DAPO filtering, i.e. 120-150 effective steps, which is the
-# usual saturation point for a 4B model on rule rewards.  Every source
-# below is either generated (unbounded) or has >20k rows, so the mixture
-# can be scaled with --total-train without changing shares.
+# Size: 12000 train rows. Per-source caps below are exact at this baseline and
+# scale linearly when --total-train is overridden.
 # =============================================================================
 
 version: 2
 seed: 20251106
-total_train: 6000
+total_train: 12000
 
 paths:
   raw_dir: data/raw_unified
@@ -58,7 +48,7 @@ heldout:
   oversample: 4
 
 filters:
-  max_gt_turns: 15
+  max_gt_turns: 24
   invalid_schema: drop
   dedup:
     exact: true
@@ -86,16 +76,16 @@ filters:
 
 curriculum:
   enabled: true
-  filter_gt_turns: 15
+  filter_gt_turns: 24
   # short-to-long; the recipe trains stage files in order (see run script)
   stages:
     - max_turns: 8
       start_fraction: 0.0
       end_fraction: 0.3
-    - max_turns: 12
+    - max_turns: 16
       start_fraction: 0.3
       end_fraction: 0.6
-    - max_turns: 15
+    - max_turns: 24
       start_fraction: 0.6
       end_fraction: 1.0
 
@@ -113,25 +103,59 @@ sources:
     file: sealtools.jsonl
     task_type: st_fc
     required: false
+  apibank:
+    file: apibank.jsonl
+    task_type: st_fc
+    required: true
   hammer:
     file: hammer.jsonl
     task_type: irrelevance
     required: true
 
-  # --- outcome-verified multi-turn (generated, unbounded) ---------------------
+  # --- outcome-verified generated tasks ---------------------------------------
+  procedural_st:
+    file: procedural_st.jsonl
+    task_type: st_fc
+    required: true
+    license: "generated (repo-internal)"
   procedural_mt:
     file: procedural_mt.jsonl
     task_type: mt_fc
     required: true
     license: "generated (repo-internal)"
     note: "generators/stateful_tasks.py: 3 domains x 13 templates, self-verified"
+  interleaved_mt:
+    file: interleaved_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: "generated (repo-internal)"
+  stateful_abstain:
+    file: stateful_abstain.jsonl
+    task_type: mt_fc
+    required: true
+    license: "generated (repo-internal)"
+  vehicle_travel_mt:
+    file: vehicle_travel_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: "generated (repo-internal)"
+  social_ops_mt:
+    file: social_ops_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: "generated (repo-internal)"
+  parallel_mt:
+    file: parallel_mt.jsonl
+    task_type: mt_fc
+    required: true
+    license: "generated (repo-internal)"
 
   # --- replay multi-turn (style / tool-schema diversity only) -----------------
   toucan:
     file: toucan.jsonl
     task_type: mt_fc
     required: false
-    subsample: 6000
+    subsample: 1200
   apigen_mt:
     file: apigen_mt.jsonl
     task_type: mt_fc
@@ -151,60 +175,87 @@ sources:
     required: false
 
 categories:
+  multi_turn:
+    # 90% generated outcome-verified tasks; 10% real-return replay
+    share: 0.50
+    heldout: 300
+    turn_cap: 24
+    on_unavailable: fail
+    sources:
+      - name: procedural_mt
+        weight: 0.20
+        cap: 1200
+      - name: interleaved_mt
+        weight: 0.15
+        cap: 900
+      - name: stateful_abstain
+        weight: 0.20
+        cap: 1200
+      - name: vehicle_travel_mt
+        weight: 0.15
+        cap: 900
+      - name: social_ops_mt
+        weight: 0.15
+        cap: 900
+      - name: parallel_mt
+        weight: 0.05
+        cap: 300
+      - name: toucan
+        weight: 0.066667
+        cap: 400
+      - name: apigen_mt
+        weight: 0.033333
+        cap: 200
+
   single_turn:
-    # anti-forgetting for tool-call accuracy; 25% of it is "no tool needed"
     share: 0.20
     heldout: 200
     turn_cap: 15
     on_unavailable: fail
     sources:
+      - name: procedural_st
+        weight: 0.416667
+        cap: 1000
       - name: apigen
-        weight: 0.35
+        weight: 0.25
         cap: 600
       - name: toolace
-        weight: 0.25
+        weight: 0.1875
         cap: 450
       - name: sealtools
-        weight: 0.15
-        cap: 300
-      - name: hammer
-        weight: 0.25
-        cap: 450
-
-  multi_turn:
-    # the core bucket: planning, long horizon, error recovery
-    share: 0.45
-    heldout: 300
-    turn_cap: 15
-    on_unavailable: fail
-    sources:
-      - name: procedural_mt
-        weight: 0.75
-        cap: 2400
-      - name: toucan
-        weight: 0.15
-        cap: 450
-      - name: apigen_mt
-        weight: 0.10
-        cap: 300
+        weight: 0.104166
+        cap: 250
+      - name: apibank
+        weight: 0.041667
+        cap: 100
 
   search_qa:
     # multi-hop retrieval: query planning, reformulation, evidence chaining
-    share: 0.25
+    share: 0.20
     heldout: 200
     turn_cap: 12
     on_unavailable: fail
     sources:
       - name: multihop_local
         weight: 1.0
-        cap: 1800
+        cap: 2400
 
   math_ci:
-    share: 0.10
+    share: 0.08
     heldout: 200
     turn_cap: 15
     on_unavailable: redistribute
     sources:
       - name: reasoning_math
         weight: 1.0
-        cap: 700
+        cap: 960
+
+  irrelevance:
+    share: 0.02
+    heldout: 200
+    turn_cap: 15
+    on_unavailable: fail
+    sources:
+      - name: hammer
+        weight: 1.0
+        cap: 240

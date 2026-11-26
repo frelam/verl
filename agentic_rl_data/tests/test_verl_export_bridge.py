@@ -79,6 +79,29 @@ def test_task_to_row_contract():
     ]
 
 
+def test_dialogue_export_keeps_future_user_out_of_prompt():
+    dialogue_task = task(
+        "mt_fc",
+        task_id="dialogue-1",
+        tools=[GET_WEATHER],
+        gt_calls=[[], []],
+        gt_turns=[{"content": "Which city?"}, {"content": "Done."}],
+        env_config={
+            "impl": "stateful",
+            "dialogue": {"stages": [{"next_user": "Use Paris.", "goal": []}, {"goal": []}]},
+            "tool_aliases": {"weather.now": "get_weather"},
+            "param_aliases": {"weather.now": {"place": "city"}},
+        },
+        meta={"gt_returns_source": "config", "user_turn_count": 2},
+    )
+    row = export.task_to_row(dialogue_task, 0)
+    assert [m["content"] for m in row["prompt"] if m["role"] == "user"] == ["Please help with the task."]
+    restored = json.loads(row["extra_info"]["agentic_task"])
+    assert restored["env"]["config"]["dialogue"]["stages"][0]["next_user"] == "Use Paris."
+    assert restored["env"]["config"]["tool_aliases"] == {"weather.now": "get_weather"}
+    assert restored["meta"]["user_turn_count"] == 2
+
+
 def test_build_rows_rejects_invalid_and_can_count(tmp_path):
     bad = dict(ST_FC_TASK)
     bad.pop("reference")  # breaks schema v2.2

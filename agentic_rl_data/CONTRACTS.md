@@ -1,6 +1,6 @@
 # CONTRACTS（Lead 独占维护，其他席位只读）
 
-> 版本 **v2.4** · 最后更新 2026-11-06 09:45 (+08:00) · 上游 `schema.py`（v2.2）
+> 版本 **v2.6** · 最后更新 2026-11-26 · 上游 `schema.py`（v2.2）
 > v1→v2：`code_exec` 结果迁到 `env_state["code_tests"]`；`reference` 7 键必填 + `final_answers/final_state/tool_returns`；
 > `mt_fc` 结果依据优先级；`reference.tool_returns` 为回放规范来源；reward score 冻结 `[0,1]`。
 > v2.1→v2.4：环境字段（infra_error / task_deadline_s / 回放诊断键）、`meta.group_id`、**data_report 语义（C13）**。
@@ -172,6 +172,14 @@ license 必须逐来源核实（plan §10），不确定写 `null` 并在报告�
   没有 tool_results 属正常 → `st_fc.py` 传 `expect_tool_results=False`，跳过配对检查；
   但 call 级检查（未声明工具/必填参数/参数类型）仍然生效。
 - 该缺陷由 verl 接入时暴露（`verl_reward_bridge` 与 `agentic_agent` 都不会为 env-none 的 st_fc 造 tool_results）。
+
+## C15. 交错多用户与严格行为门控（v2.6）
+
+- stateful `mock_fc` 可用 `env.config.dialogue.stages` 描述后续子任务；初始 `task.messages` 只含第一条 user，未来 user 只能由环境在完成当前阶段后释放。
+- 阶段合法完成且脚本未耗尽时，`step` 返回 `done=False` 和 `info.next_user_message`；rollout 将其排在当前 tool results 后，以 `role=user` 编码，`response_mask=0`，logprob 补 0。没有 tool results 但存在 next user 时不得终止。
+- 阶段推进必须同时满足 goal、required evidence/tools、回复和 invariant 门控；提前 no-call、违规调用或写入不得推进。违规锁存，后续撤销不能恢复成功。
+- `env_state.extras.dialogue` 记录游标、阶段结果和违规；终局 `goal_satisfied=True` 还要求脚本耗尽且无违规。`strict_outcome=true` 的任务在结果失败时 process/format 均为 0，旧任务不受影响。
+- `reference.gt_calls` 与 `reference.gt_turns` 按 assistant action 对齐；文本 action 的 call group 为 `[]`，`gt_turns[*]` 可含 `content` 和期望释放的 `next_user`，供离线 replay 使用。
 
 ## C8. 变更流程
 

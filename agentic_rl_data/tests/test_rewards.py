@@ -358,6 +358,21 @@ class TestMtFc:
         assert math.isclose(result["score"], 0.2, abs_tol=1e-9)
         assert result["info"]["result_basis"] == "goal_satisfied"
 
+    def test_strict_outcome_failure_zeroes_auxiliary_terms(self) -> None:
+        gt = _mt_groups()
+        task_payload = _mt_task(gt, env_config={"strict_outcome": True})
+        trajectory_payload = trajectory(
+            turns_from_call_groups(gt),
+            env_state_value=env_state(
+                impl="stateful", goal_satisfied=False, matched_turns=2, gt_turns=2
+            ),
+        )
+        result = check_result(mt_fc_module.reward(task_payload, trajectory_payload))
+        assert result["score"] == 0.0
+        assert result["info"]["strict_outcome_failed"] is True
+        assert result["info"]["format"] == 0.0
+        assert result["info"]["turn_match"] == 0.0
+
     def test_result_term_dominates_replay_matching(self) -> None:
         """Terminal state right + calls wrong must beat terminal wrong + calls right."""
         gt = _mt_groups()

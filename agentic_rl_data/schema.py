@@ -566,13 +566,36 @@ def tools_signature(tools: Any) -> str:
     return canonical_json(signature)
 
 
+def task_user_texts(task: Mapping) -> list[str]:
+    """Return initial user text followed by staged dialogue user instructions.
+
+    Stateful dialogue tasks keep future instructions out of the initial prompt;
+    deduplication and decontamination must nevertheless inspect every user turn.
+    """
+    texts: list[str] = []
+    for message in task.get("messages") or []:
+        if not _is_mapping(message) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if _is_str(content):
+            texts.append(content)
+
+    env = task.get("env") if _is_mapping(task.get("env")) else {}
+    config = env.get("config") if _is_mapping(env.get("config")) else {}
+    dialogue = config.get("dialogue") if _is_mapping(config.get("dialogue")) else {}
+    stages = dialogue.get("stages")
+    for stage in stages if isinstance(stages, list) else []:
+        if not _is_mapping(stage):
+            continue
+        next_user = stage.get("next_user")
+        if _is_str(next_user) and next_user:
+            texts.append(next_user)
+    return texts
+
+
 def task_dedup_key(task: Mapping) -> str:
     """Exact-dedup hash: normalised user queries + tools signature (plan §3)."""
-    queries = "\n".join(
-        normalize_query(message.get("content"))
-        for message in task.get("messages") or []
-        if _is_mapping(message) and message.get("role") == "user"
-    )
+    queries = "\n".join(normalize_query(text) for text in task_user_texts(task))
     payload = f"{queries}\x1f{tools_signature(task.get('tools'))}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 

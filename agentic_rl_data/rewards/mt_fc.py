@@ -329,6 +329,14 @@ def reward(task: dict, trajectory: dict) -> dict:
             format_score = 0.0
             idle_without_calls = True
 
+    config = base.as_mapping(base.as_mapping(base.as_mapping(task).get("env")).get("config"))
+    strict_outcome_failed = bool(config.get("strict_outcome")) and result_value < 1.0
+    if strict_outcome_failed:
+        # Clarification / abstention dialogues must not earn a structural
+        # consolation score for a well-formatted but behaviourally wrong reply.
+        turn = {**turn, "fraction": 0.0, "reason": "strict_outcome_failed"}
+        format_score = 0.0
+
     score = base.weighted_sum(
         [
             (RESULT_WEIGHT, result_value),
@@ -350,6 +358,7 @@ def reward(task: dict, trajectory: dict) -> dict:
         "turn_match": turn["fraction"],
         "process_term": mode,
         "idle_without_calls": idle_without_calls,
+        "strict_outcome_failed": strict_outcome_failed,
         "format": format_score,
         "components": {
             "result": result_value,

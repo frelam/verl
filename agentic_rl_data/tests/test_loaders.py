@@ -54,7 +54,11 @@ def _load(name, cfg):
 
 def test_registry_lists_sources():
     names = available_sources()
-    for expected in ("apigen", "sealtools", "toolace", "hammer", "apibank", "search_r1", "funreason_mt"):
+    for expected in (
+        "apigen", "sealtools", "toolace", "hammer", "apibank", "search_r1", "funreason_mt",
+        "interleaved_mt", "stateful_abstain", "vehicle_travel_mt", "social_ops_mt",
+        "parallel_mt", "procedural_st",
+    ):
         assert expected in names
 
 
@@ -80,6 +84,23 @@ def test_apigen_loader():
         [{"name": "get_weather", "arguments": {"city": "Paris"}}]
     ]
     assert task["tools"][0]["name"] == "get_weather"
+
+
+def test_apigen_loader_preserves_parallel_calls_in_one_group():
+    records = [
+        {
+            "id": "parallel-1",
+            "query": "Check Paris and London weather.",
+            "tools": json.dumps([WEATHER_TOOL]),
+            "answers": json.dumps([
+                {"name": "get_weather", "arguments": {"city": "Paris"}},
+                {"name": "get_weather", "arguments": {"city": "London"}},
+            ]),
+        }
+    ]
+    task = _load("apigen", {"records": records})[0]
+    assert len(task["reference"]["gt_calls"]) == 1
+    assert len(task["reference"]["gt_calls"][0]) == 2
 
 
 def test_hammer_negative_and_positive():
@@ -157,7 +178,12 @@ def test_sealtools_loader(tmp_path):
             "id": "s-1",
             "query": "Get the match info for team Alpha.",
             "calling": [{"api": "getMatchInfo", "parameters": {"team": "Alpha"}}],
-        }
+        },
+        {
+            "id": "nested-1",
+            "query": "Get the rank for the match winner.",
+            "calling": [{"api": "getTeamRank", "parameters": {"team": "API_call_1.winner"}}],
+        },
     ]
     train_path = tmp_path / "train.jsonl"
     train_path.write_text(json.dumps(train_rows[0]), encoding="utf-8")
@@ -343,6 +369,33 @@ def test_funreason_mt_max_turns_is_capped_and_expected_turns_kept():
 def test_toucan_loader_uses_reference_returns():
     tasks = _load("toucan", {"records": [_mt_record(True)], "max_samples": 1})
     assert tasks[0]["meta"]["gt_returns_source"] == "reference"
+    assert tasks[0]["meta"]["gt_returns_coverage"] == 1.0
+
+
+def _parallel_return_record(second_return: bool):
+    messages = [
+        {"role": "user", "content": "Check both flights."},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"name": "search_flights", "arguments": {"from": "Alpha"}},
+            {"name": "search_flights", "arguments": {"from": "Beta"}},
+        ]},
+        {"role": "tool", "name": "search_flights", "content": "first"},
+    ]
+    if second_return:
+        messages.append({"role": "tool", "name": "search_flights", "content": "second"})
+    messages.append({"role": "assistant", "content": "Done."})
+    return {"id": "parallel-returns", "tools": _mt_record(True)["tools"], "messages": messages}
+
+
+def test_replay_loader_can_require_every_parallel_call_return():
+    assert list(load_source("toucan", {
+        "records": [_parallel_return_record(False)], "require_complete_returns": True,
+    })) == []
+    tasks = _load("toucan", {
+        "records": [_parallel_return_record(True)], "require_complete_returns": True,
+    })
+    assert tasks[0]["meta"]["gt_returns_coverage"] == 1.0
+    assert len(tasks[0]["reference"]["tool_returns"][0]) == 2
 
 
 # ---------------------------------------------------------------------------

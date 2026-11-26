@@ -9,15 +9,15 @@
 # Data (build first):
 #   bash agentic_rl_data/scripts/build_data_v2.sh          -> agentic_rl_data/data/verl_v2
 #   -> data/verl_v2/{train,heldout}.parquet
-#   -> data/verl_v2/curriculum/{stage8,stage12,stage15}.parquet
+#   -> data/verl_v2/curriculum/{stage8,stage16,stage24}.parquet
 # Design/numbers: agentic_rl_data/reports/AGENTIC_RL_V2.md
 # Rollout wiring: agentic_rl_data/reports/VERL_INTEGRATION.md
 #
 # Curriculum (same schedule as the sync recipe, one launch per stage; each stage
 # resumes the previous checkpoint through trainer.resume_mode=resume_path):
 #   STAGE=1  train_max_turns8.parquet   MAX_TURNS=8   response 32k
-#   STAGE=2  train_max_turns12.parquet  MAX_TURNS=12  response 32k
-#   STAGE=3  train_max_turns15.parquet  MAX_TURNS=15  response 32k
+#   STAGE=2  train_max_turns12.parquet  MAX_TURNS=16  response 32k
+#   STAGE=3  train_max_turns15.parquet  MAX_TURNS=24  response 32k
 #   STAGE=all the full mixture (no curriculum; default)
 #
 # Context budget (longer than the reasoning-RL recipe on purpose: 10-15 turns
@@ -109,9 +109,9 @@ NGPUS_ROLLOUT=${NGPUS_ROLLOUT:-8}
 
 case "$STAGE" in
   1)   TRAIN_FILE="$DATA_DIR/curriculum/stage8.parquet";  MAX_TURNS="${MAX_TURNS:-8}"  ;;
-  2)   TRAIN_FILE="$DATA_DIR/curriculum/stage12.parquet"; MAX_TURNS="${MAX_TURNS:-12}" ;;
-  3)   TRAIN_FILE="$DATA_DIR/curriculum/stage15.parquet"; MAX_TURNS="${MAX_TURNS:-15}" ;;
-  all) TRAIN_FILE="$DATA_DIR/train.parquet";              MAX_TURNS="${MAX_TURNS:-15}" ;;
+  2)   TRAIN_FILE="$DATA_DIR/curriculum/stage16.parquet"; MAX_TURNS="${MAX_TURNS:-16}" ;;
+  3)   TRAIN_FILE="$DATA_DIR/curriculum/stage24.parquet"; MAX_TURNS="${MAX_TURNS:-24}" ;;
+  all) TRAIN_FILE="$DATA_DIR/train.parquet";              MAX_TURNS="${MAX_TURNS:-24}" ;;
   *) echo "STAGE must be 1|2|3|all" >&2; exit 2 ;;
 esac
 VAL_FILE=${VAL_FILE:-$DATA_DIR/heldout.parquet}

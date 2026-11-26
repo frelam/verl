@@ -128,7 +128,10 @@ def _reference_final_answer(reference: Mapping[str, Any]) -> str:
         for item in answers:
             if isinstance(item, str) and item.strip():
                 return item
-    return ""
+    # A stateful task without a requested value still needs a visible final
+    # reply; an empty assistant turn is format-invalid and is not the GT used
+    # by the procedural generators (they finish with "All done.").
+    return "All done."
 
 
 def _mock_impl(task: Mapping[str, Any], forced: str) -> str | None:
@@ -198,9 +201,19 @@ def check_task(
     config = (task.get("env") or {}).get("config")
     config = config if isinstance(config, Mapping) else {}
     tolerate_tool_errors = bool(config.get("tolerate_tool_errors", not strict_tool_errors))
+    is_dialogue = isinstance(config.get("dialogue"), Mapping)
 
     reference = task["reference"]
     groups = schema.gt_call_groups(task)
+    gt_turns = reference.get("gt_turns")
+    if is_dialogue and (not isinstance(gt_turns, list) or len(gt_turns) != len(groups)):
+        return _failure(
+            task,
+            "reference",
+            "dialogue tasks require reference.gt_turns with one entry per gt_calls action",
+            gt_actions=len(groups),
+            gt_turns=len(gt_turns) if isinstance(gt_turns, list) else None,
+        )
 
     try:
         env: BaseEnv = build_env(task, impl=forced_impl)
@@ -218,8 +231,25 @@ def check_task(
     try:
         env.reset(task)
         for turn_index, group in enumerate(groups):
-            action = {"content": "", "tool_calls": [dict(call) for call in group]}
+            content = ""
+            if is_dialogue:
+                turn = gt_turns[turn_index]
+                raw_content = turn.get("content")
+                content = raw_content if isinstance(raw_content, str) else ""
+            action = {"content": content, "tool_calls": [dict(call) for call in group]}
             obs, done, info = env.step(action)
+            if is_dialogue:
+                turn = gt_turns[turn_index]
+                expected_next_user = turn.get("next_user") or None
+                actual_next_user = info.get("next_user_message") or None
+                if actual_next_user != expected_next_user:
+                    return _failure(
+                        task,
+                        "next_user",
+                        f"next_user mismatch after GT action {turn_index}",
+                        expected=expected_next_user,
+                        actual=actual_next_user,
+                    )
             for result in obs.get("tool_results") or []:
                 if result.get("ok", True):
                     continue
@@ -245,6 +275,8 @@ def check_task(
                         f"(max_turns={env.max_turns}, gt_turns={len(groups)})",
                         gt_returns_source=_gt_returns_source(env),
                     )
+                if is_dialogue and turn_index == len(groups) - 1:
+                    break
                 return _failure(
                     task,
                     "early_termination",
@@ -253,7 +285,16 @@ def check_task(
                     gt_returns_source=_gt_returns_source(env),
                 )
         if not env.done:
+            if is_dialogue:
+                return _failure(
+                    task,
+                    "no_termination",
+                    "dialogue did not terminate after the final GT action",
+                )
             final_answer = _reference_final_answer(reference)
+            answer_mode = str(config.get("final_answer_mode", "answer_tag" if config.get("require_final_answer") else "none"))
+            if final_answer and config.get("require_final_answer") and answer_mode == "answer_tag":
+                final_answer = f"All done. <answer>{final_answer}</answer>"
             _, done, _ = env.step({"content": final_answer, "tool_calls": []})
             if not done:
                 return _failure(

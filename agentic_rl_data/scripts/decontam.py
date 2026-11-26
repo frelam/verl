@@ -41,7 +41,13 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from agentic_rl_data.loaders.common import normalize_tools  # noqa: E402
-from agentic_rl_data.schema import dump_jsonl, load_jsonl, normalize_query, text_shingles  # noqa: E402
+from agentic_rl_data.schema import (  # noqa: E402
+    dump_jsonl,
+    load_jsonl,
+    normalize_query,
+    task_user_texts,
+    text_shingles,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -183,28 +189,40 @@ def match_task(
     tool_name_hits: list[str] = []
     tool_desc_hits: list[str] = []
     query_texts: list[str] = []
-    messages = task.get("messages")
-    for message in messages if isinstance(messages, list) else []:
-        if not isinstance(message, Mapping) or message.get("role") != "user":
-            continue
-        text = message.get("content")
-        if isinstance(text, str) and text:
+    for text in task_user_texts(task):
+        if text:
             query_texts.append(text)
         for ngram in text_ngrams(text, k=k):
             hits = index["query_ngrams"].get(ngram)
             if hits:
                 query_hits.append(ngram)
                 matched_ids.update(hits)
+
+    env = task.get("env") if isinstance(task.get("env"), Mapping) else {}
+    config = env.get("config") if isinstance(env.get("config"), Mapping) else {}
+    aliases = config.get("tool_aliases") if isinstance(config.get("tool_aliases"), Mapping) else {}
+    public_names: list[str] = []
     for tool in normalize_tools(task.get("tools")):
-        name = normalize_query(tool.get("name"))
-        if name and name in index["tool_names"]:
-            tool_name_hits.append(str(tool.get("name")))
-            matched_ids.update(index["tool_names"][name])
+        name = tool.get("name")
+        if isinstance(name, str):
+            public_names.append(name)
         for ngram in text_ngrams(tool.get("description") or "", k=k):
             hits = index["tool_ngrams"].get(ngram)
             if hits:
                 tool_desc_hits.append(ngram)
                 matched_ids.update(hits)
+
+    candidate_names = public_names + [str(name) for name in aliases.keys()]
+    candidate_names += [str(name) for name in aliases.values()]
+    seen_names: set[str] = set()
+    for candidate in candidate_names:
+        if candidate in seen_names:
+            continue
+        seen_names.add(candidate)
+        name = normalize_query(candidate)
+        if name and name in index["tool_names"]:
+            tool_name_hits.append(candidate)
+            matched_ids.update(index["tool_names"][name])
 
     # Approximate channel: exact Jaccard on 5-shingles against every indexed
     # prompt (BFCL is a few thousand short prompts; this is offline prep code).
