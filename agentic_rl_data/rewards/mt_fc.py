@@ -147,6 +147,77 @@ def process_mode(task: dict) -> str:
     return "efficiency" if mode == "efficiency" else "turn_match"
 
 
+def _fault_budget(task: dict) -> dict[str, dict]:
+    """Mutable per-tool fault budget mirrored from ``env.config.faults``."""
+    config = base.as_mapping(base.as_mapping(base.as_mapping(task).get("env")).get("config"))
+    raw_faults = config.get("faults")
+    if isinstance(raw_faults, Mapping):
+        raw_faults = [raw_faults]
+    faults: dict[str, dict] = {}
+    for fault in base.as_list(raw_faults):
+        if not isinstance(fault, Mapping):
+            continue
+        tool = fault.get("tool")
+        count = fault.get("count", 1)
+        if not isinstance(tool, str) or not base._is_int(count) or count < 0:
+            continue
+        message = fault.get("message")
+        faults[tool] = {
+            "remaining": count,
+            "message": str(message) if message else None,
+        }
+    return faults
+
+
+def _call_waste(task: dict, trajectory: dict) -> dict:
+    """Count adjacent successful duplicates and non-injected tool errors."""
+    faults = _fault_budget(task)
+    total = duplicates = non_fault_errors = injected_fault_errors = 0
+    duplicate_keys: list[str] = []
+    previous_call = None
+    previous_ok = None
+    for turn in base.iter_turns(trajectory):
+        calls = base.turn_calls(turn)
+        results = base.turn_results(turn)
+        for index, raw_call in enumerate(calls):
+            call = base.normalize_call(raw_call)
+            result = results[index] if index < len(results) else None
+            if not isinstance(result, Mapping):
+                result = None
+            ok = result.get("ok") if result is not None else None
+            if not isinstance(ok, bool):
+                ok = None
+            total += 1
+
+            fault = faults.get(call["name"])
+            fault_pending = fault is not None and fault["remaining"] > 0
+            expected_message = fault["message"] if fault_pending else None
+            if fault_pending:
+                fault["remaining"] -= 1
+
+            if ok is False:
+                message_matches = expected_message is None or result.get("content") == expected_message
+                if fault_pending and message_matches:
+                    injected_fault_errors += 1
+                else:
+                    non_fault_errors += 1
+            elif ok is True and previous_ok is True and previous_call == call:
+                duplicates += 1
+                duplicate_keys.append(base.call_repr(call))
+            previous_call = call
+            previous_ok = ok
+
+    waste_calls = duplicates + non_fault_errors
+    return {
+        "total_calls": total,
+        "consecutive_success_duplicates": duplicates,
+        "non_fault_errors": non_fault_errors,
+        "injected_fault_errors": injected_fault_errors,
+        "waste_rate": min(1.0, waste_calls / max(1, total)),
+        "duplicate_keys": duplicate_keys[:5],
+    }
+
+
 def _efficiency(task: dict, trajectory: dict, result_ok: bool) -> dict:
     """0.1 process term for outcome-verified (stateful) tasks.
 
@@ -157,9 +228,11 @@ def _efficiency(task: dict, trajectory: dict, result_ok: bool) -> dict:
 
     * it is **paid only on success** - a failed or idle trajectory can never
       collect it (otherwise "stop early" would be a free 0.1);
-    * ``num_turns <= expected_turns + 2`` earns the full term (retries and a
-      verification read are free), then it decays linearly to 0 at
-      ``meta.max_turns``.
+    * ``num_turns <= expected_turns + 2`` earns the full turn fraction, then
+      it decays linearly to 0 at ``meta.max_turns``;
+    * adjacent identical successful calls and non-injected errors reduce the
+      turn fraction by their share of all calls.  Injected fault retries and
+      non-consecutive verification reads remain free.
 
     There is deliberately no "recovery bonus": rewarding recovered errors
     would pay the policy for causing errors first.  Recovery is learned
@@ -169,16 +242,34 @@ def _efficiency(task: dict, trajectory: dict, result_ok: bool) -> dict:
     num_turns = len(base.iter_turns(trajectory))
     expected = meta.get("expected_turns")
     max_turns = meta.get("max_turns")
-    info = {"num_turns": num_turns, "expected_turns": expected, "max_turns": max_turns,
-            "source": "efficiency"}
+    waste = _call_waste(task, trajectory)
+    info = {
+        "num_turns": num_turns,
+        "expected_turns": expected,
+        "max_turns": max_turns,
+        "source": "efficiency",
+        "waste": waste,
+    }
+
+    reason = None
+    if not (base._is_int(expected) and base._is_int(max_turns)):
+        turn_fraction = 1.0
+        reason = "no_turn_budget"
+    else:
+        free = expected + EFFICIENCY_FREE_TURNS
+        if num_turns <= free or max_turns <= free:
+            turn_fraction = 1.0
+        else:
+            turn_fraction = max(
+                0.0, min(1.0, (max_turns - num_turns) / float(max_turns - free))
+            )
+    info["turn_fraction"] = turn_fraction
+
     if not result_ok:
         return {**info, "fraction": 0.0, "reason": "paid_only_on_success"}
-    if not (base._is_int(expected) and base._is_int(max_turns)):
-        return {**info, "fraction": 1.0, "reason": "no_turn_budget"}
-    free = expected + EFFICIENCY_FREE_TURNS
-    if num_turns <= free or max_turns <= free:
-        return {**info, "fraction": 1.0}
-    fraction = max(0.0, min(1.0, (max_turns - num_turns) / float(max_turns - free)))
+    if reason is not None:
+        info["reason"] = reason
+    fraction = turn_fraction * (1.0 - waste["waste_rate"])
     return {**info, "fraction": fraction}
 
 
@@ -279,4 +370,6 @@ def reward(task: dict, trajectory: dict) -> dict:
         "format_detail": format_info,
         "result_bases_allowed": list(_RESULT_BASES),
     }
+    if mode == "efficiency":
+        info["waste"] = turn["waste"]
     return base.make_result(score, info, task_type=TASK_TYPE)

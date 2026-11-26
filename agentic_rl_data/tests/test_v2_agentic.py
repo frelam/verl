@@ -127,6 +127,15 @@ def test_skipping_the_retry_fails_the_task(tasks):
     assert result["score"] <= 0.1 + 1e-9
 
 
+def test_fault_retry_does_not_count_as_waste(tasks):
+    task = _fault_task(tasks)
+    _, result = _run(task, task["reference"]["gt_calls"], _reply(task))
+    assert result["score"] == pytest.approx(1.0)
+    assert result["info"]["waste"]["injected_fault_errors"] == 1
+    assert result["info"]["waste"]["non_fault_errors"] == 0
+    assert result["info"]["waste"]["consecutive_success_duplicates"] == 0
+
+
 # ---------------------------------------------------------------------------
 # reward hacking probes
 # ---------------------------------------------------------------------------
@@ -200,6 +209,23 @@ def test_efficiency_term_decays_and_is_success_only(tasks):
     # success-only: a failed attempt never gets the efficiency term
     _, failed = _run(task, plan[:1], _reply(task))
     assert failed["info"]["turn_match"] == 0.0
+
+
+def test_parallel_non_fault_error_reduces_efficiency():
+    gen = DOMAIN_GENERATORS["filesystem"][0][0](random.Random(0), 0)
+    task = to_task(gen, task_id="probe-parallel-waste", level=0, slack=3)
+    plan = copy.deepcopy(task["reference"]["gt_calls"])
+    mkdir_index = next(i for i, group in enumerate(plan) if group[0]["name"] == "mkdir")
+    plan[mkdir_index].insert(0, {"name": "mkdir", "arguments": {"path": "/archive"}})
+
+    _, result = _run(task, plan, _reply(task))
+    total_calls = sum(len(group) for group in plan)
+    expected_process = 1.0 - 1.0 / total_calls
+    assert result["info"]["result"] == 1.0
+    assert result["info"]["turn_match_detail"]["turn_fraction"] == 1.0
+    assert result["info"]["waste"]["non_fault_errors"] == 1
+    assert result["info"]["turn_match"] == pytest.approx(expected_process)
+    assert result["score"] == pytest.approx(0.9 + 0.1 * expected_process)
 
 
 def test_timeout_never_pays_result(tasks):

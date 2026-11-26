@@ -584,6 +584,117 @@ class TestMtFc:
         assert math.isclose(result["score"], 0.1, abs_tol=1e-9)
         assert result["score"] < 0.2
 
+    def _efficiency_result(
+        self,
+        groups,
+        result_groups,
+        *,
+        env_config=None,
+        meta=None,
+        goal=True,
+    ) -> dict:
+        config = {"process_term": "efficiency"}
+        config.update(env_config or {})
+        task_payload = _mt_task(
+            env_config=config,
+            meta=meta if meta is not None else {"expected_turns": 2, "max_turns": 8},
+        )
+        turns = [
+            turn(index, calls, results=results)
+            for index, (calls, results) in enumerate(zip(groups, result_groups), start=1)
+        ]
+        trajectory_payload = trajectory(
+            turns,
+            env_state_value=env_state(impl="stateful", goal_satisfied=goal),
+        )
+        return check_result(mt_fc_module.reward(task_payload, trajectory_payload))
+
+    @pytest.mark.parametrize(
+        "meta",
+        [
+            {"expected_turns": 2, "max_turns": 8},
+            {"max_turns": 8},
+        ],
+    )
+    def test_efficiency_penalizes_adjacent_duplicate_success(self, meta) -> None:
+        weather = call("get_weather", {"city": "Paris"})
+        result = self._efficiency_result(
+            [[weather, weather]],
+            [[tool_result("get_weather"), tool_result("get_weather")]],
+            meta=meta,
+        )
+        assert result["info"]["turn_match_detail"]["turn_fraction"] == 1.0
+        assert result["info"]["turn_match"] == pytest.approx(0.5)
+        assert result["info"]["waste"]["consecutive_success_duplicates"] == 1
+        assert result["info"]["waste"]["waste_rate"] == pytest.approx(0.5)
+        assert result["score"] == pytest.approx(0.95)
+
+    def test_efficiency_fault_retry_is_free_but_later_duplicate_is_not(self) -> None:
+        weather = call("get_weather", {"city": "Paris"})
+        message = "503 custom fault; please retry"
+        config = {"faults": [{"tool": "get_weather", "count": 1, "message": message}]}
+        retry = self._efficiency_result(
+            [[weather], [weather]],
+            [
+                [tool_result("get_weather", message, ok=False)],
+                [tool_result("get_weather")],
+            ],
+            env_config=config,
+        )
+        assert retry["score"] == pytest.approx(1.0)
+        assert retry["info"]["waste"]["injected_fault_errors"] == 1
+        assert retry["info"]["waste"]["non_fault_errors"] == 0
+
+        repeated = self._efficiency_result(
+            [[weather], [weather], [weather]],
+            [
+                [tool_result("get_weather", message, ok=False)],
+                [tool_result("get_weather")],
+                [tool_result("get_weather")],
+            ],
+            env_config=config,
+        )
+        assert repeated["info"]["turn_match"] == pytest.approx(2.0 / 3.0)
+        assert repeated["info"]["waste"]["consecutive_success_duplicates"] == 1
+        assert repeated["score"] == pytest.approx(0.9 + 0.1 * (2.0 / 3.0))
+
+    def test_efficiency_allows_non_consecutive_verification_read(self) -> None:
+        read = call("get_weather", {"city": "Paris"})
+        write = call("get_forecast", {"city": "Paris", "days": 3})
+        result = self._efficiency_result(
+            [[read], [write], [read]],
+            [
+                [tool_result("get_weather")],
+                [tool_result("get_forecast")],
+                [tool_result("get_weather")],
+            ],
+            meta={"expected_turns": 3, "max_turns": 8},
+        )
+        assert result["score"] == pytest.approx(1.0)
+        assert result["info"]["waste"]["consecutive_success_duplicates"] == 0
+
+    def test_efficiency_long_argument_prefixes_do_not_collide(self) -> None:
+        prefix = "x" * 240
+        first = call("get_weather", {"city": prefix + "A"})
+        second = call("get_weather", {"city": prefix + "B"})
+        result = self._efficiency_result(
+            [[first, second]],
+            [[tool_result("get_weather"), tool_result("get_weather")]],
+        )
+        assert result["score"] == pytest.approx(1.0)
+        assert result["info"]["waste"]["consecutive_success_duplicates"] == 0
+
+    def test_efficiency_waste_never_pays_failed_trajectory(self) -> None:
+        weather = call("get_weather", {"city": "Paris"})
+        result = self._efficiency_result(
+            [[weather, weather]],
+            [[tool_result("get_weather"), tool_result("get_weather")]],
+            goal=False,
+        )
+        assert result["info"]["turn_match"] == 0.0
+        assert result["info"]["turn_match_detail"]["reason"] == "paid_only_on_success"
+        assert result["score"] == pytest.approx(0.1)
+
     def test_weights_are_reported_in_info(self) -> None:
         result = check_result(
             mt_fc_module.reward(
